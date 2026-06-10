@@ -70,6 +70,7 @@ Each JSON entry includes:
 - `remote_ids`;
 - `status`: `prepared`, `applying`, `applied`, `reconciled`, `reverted`, or `failed`;
 - `failure`: the failed status message when present;
+- `preimage_count`;
 - `plan_summary`;
 - `operation_count`.
 
@@ -81,6 +82,7 @@ Human output is a compact git-log-style list headed by `push <push-id>`.
 
 - `prepared` entries become `reverted` because no remote mutation has started;
 - `reverted` entries return `already_reverted`;
-- `applying`, `applied`, `reconciled`, and `failed` entries return `undo_not_implemented` with exit code `5`.
+- `applied` and `reconciled` entries derive an `undo_plan` from journaled preimages, then stop before remote reverse apply with exit code `5`;
+- `applying` and `failed` entries return `undo_unsafe_journal_status` because partial remote effects may still be in flight or unknown.
 
-Remote reversal intentionally remains blocked until the journal records enough pre-push state for safe reverse apply. This preserves the plan's no-content-loss bar instead of pretending that an applied block update can be reversed from the current journal shape alone.
+Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently include reverse operations for block updates, block moves, and archived blocks. Appended blocks, created entities, property updates, and archived entities remain explicitly unsupported until apply journals created IDs and richer property/entity preimages.

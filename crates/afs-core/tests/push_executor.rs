@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use afs_core::journal::{JournalEntry, JournalStatus, JournalStore, PushId};
+use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{GuardrailDecision, PushOperation, PushPlan};
 use afs_core::push::{
@@ -9,6 +9,7 @@ use afs_core::push::{
     PushExecutionAction, PushExecutionRequest, PushPipelineAction, PushPipelineResult,
     PushReconcileRequest, PushReconcileResult, PushReconciler, PushStage, execute_journaled_push,
 };
+use afs_core::shadow::ShadowDocument;
 use afs_core::validation::ValidationReport;
 use afs_core::{AfsError, AfsResult};
 
@@ -25,7 +26,8 @@ fn executor_journals_checks_applies_and_reconciles_in_order() {
         &mut concurrency,
         &mut applier,
         &mut reconciler,
-        PushExecutionRequest::new(push_id(), mount_id(), approved_pipeline()),
+        PushExecutionRequest::new(push_id(), mount_id(), approved_pipeline())
+            .with_preimages(vec![JournalPreimage::from_shadow(shadow())]),
     )
     .expect("push execution");
 
@@ -55,10 +57,9 @@ fn executor_journals_checks_applies_and_reconciles_in_order() {
             "update:reconciled",
         ]
     );
-    assert_eq!(
-        journal.entry.expect("journal").status,
-        JournalStatus::Reconciled
-    );
+    let entry = journal.entry.expect("journal");
+    assert_eq!(entry.status, JournalStatus::Reconciled);
+    assert_eq!(entry.preimages.len(), 1);
     assert_eq!(concurrency.seen_push_id, Some(push_id()));
     assert_eq!(applier.seen_push_id, Some(push_id()));
     assert_eq!(reconciler.seen_push_id, Some(push_id()));
@@ -416,6 +417,16 @@ fn push_id() -> PushId {
 
 fn mount_id() -> MountId {
     MountId::new("notion-main")
+}
+
+fn shadow() -> ShadowDocument {
+    ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "# Roadmap\n\nOriginal paragraph.",
+        9,
+        [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
 }
 
 fn status_event(prefix: &'static str, status: &JournalStatus) -> &'static str {

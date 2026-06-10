@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use afs_core::AfsResult;
-use afs_core::journal::{JournalEntry, JournalStatus, JournalStore, PushId};
+use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,7 +20,7 @@ use crate::records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapsho
 use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -277,13 +277,21 @@ impl JournalRepository for SqliteStateStore {
 
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO journals (push_id, mount_id, remote_ids_json, plan_json, status_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO journals (
+                push_id,
+                mount_id,
+                remote_ids_json,
+                plan_json,
+                preimages_json,
+                status_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 entry.push_id.0,
                 entry.mount_id.0,
                 to_json(&entry.remote_ids)?,
                 to_json(&entry.plan)?,
+                to_json(&entry.preimages)?,
                 to_json(&entry.status)?,
             ],
         )?;
@@ -314,7 +322,7 @@ impl JournalRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT push_id, mount_id, remote_ids_json, plan_json, status_json
+                "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, status_json
                  FROM journals
                  WHERE push_id = ?1",
                 params![push_id.0],
@@ -328,7 +336,7 @@ impl JournalRepository for SqliteStateStore {
     fn list_journal(&self) -> StoreResult<Vec<JournalEntry>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT push_id, mount_id, remote_ids_json, plan_json, status_json
+            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, status_json
              FROM journals
              ORDER BY push_id",
         )?;
@@ -366,7 +374,7 @@ type EntityRow = (
     Option<String>,
 );
 type ShadowRow = (String, String, String, String, String);
-type JournalRow = (String, String, String, String, String);
+type JournalRow = (String, String, String, String, String, String);
 
 fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -419,11 +427,19 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             mount_id TEXT NOT NULL,
             remote_ids_json TEXT NOT NULL,
             plan_json TEXT NOT NULL,
+            preimages_json TEXT NOT NULL DEFAULT '[]',
             status_json TEXT NOT NULL,
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
         ",
     )?;
+
+    if user_version < 2 && !column_exists(connection, "journals", "preimages_json")? {
+        connection.execute_batch(
+            "ALTER TABLE journals
+             ADD COLUMN preimages_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
 
     if user_version < SCHEMA_VERSION {
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -484,6 +500,7 @@ fn journal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRow> {
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+        row.get(5)?,
     ))
 }
 
@@ -493,8 +510,22 @@ fn journal_from_row(row: JournalRow) -> StoreResult<JournalEntry> {
         mount_id: MountId(row.1),
         remote_ids: from_json::<Vec<RemoteId>>(&row.2)?,
         plan: from_json(&row.3)?,
-        status: from_json(&row.4)?,
+        preimages: from_json::<Vec<JournalPreimage>>(&row.4)?,
+        status: from_json(&row.5)?,
     })
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+
+    for result in columns {
+        if result? == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn path_to_text(path: &Path) -> String {

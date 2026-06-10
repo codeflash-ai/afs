@@ -206,11 +206,11 @@ fn shadow_document() -> ShadowDocument {
 }
 
 fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
-    JournalEntry {
-        push_id: PushId(push_id.to_string()),
-        mount_id: mount_id(),
-        remote_ids: vec![RemoteId::new("page-1")],
-        plan: PushPlan::new(
+    JournalEntry::new(
+        PushId(push_id.to_string()),
+        mount_id(),
+        vec![RemoteId::new("page-1")],
+        PushPlan::new(
             vec![RemoteId::new("page-1")],
             vec![PushOperation::UpdateBlock {
                 block_id: RemoteId::new("paragraph-1"),
@@ -218,5 +218,5 @@ fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
             }],
         ),
         status,
-    }
+    )
 }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_core::journal::{JournalEntry, JournalStatus, PushId};
+use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, PushId};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
@@ -11,7 +11,7 @@ use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
     ShadowRepository, SqliteStateStore, StoreError,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 #[test]
 fn sqlite_store_initializes_idempotently() {
@@ -29,7 +29,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 1);
+    assert_eq!(user_version, 2);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -49,7 +49,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 1,
+            supported: 2,
         }
     );
 }
@@ -182,7 +182,76 @@ fn journal_status_survives_reopen() {
 
     assert_eq!(entry.status, JournalStatus::Reconciled);
     assert_eq!(entry.plan.summary.blocks_updated, 1);
+    assert_eq!(entry.preimages.len(), 1);
     assert_eq!(reopened.list_journal().expect("list journal").len(), 1);
+}
+
+#[test]
+fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
+    let fixture = SqliteFixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "
+            PRAGMA user_version = 1;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1))
+            );
+            CREATE TABLE journals (
+                push_id TEXT PRIMARY KEY,
+                mount_id TEXT NOT NULL,
+                remote_ids_json TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                status_json TEXT NOT NULL,
+                FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+            );
+            ",
+        )
+        .expect("create v1 schema");
+    connection
+        .execute(
+            "INSERT INTO mounts (mount_id, connector, root, read_only)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                fixture.mount_id.0.as_str(),
+                "notion",
+                fixture.mount_root.to_string_lossy(),
+                0
+            ],
+        )
+        .expect("insert mount");
+    connection
+        .execute(
+            "INSERT INTO journals (push_id, mount_id, remote_ids_json, plan_json, status_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "push-1",
+                "notion-main",
+                serde_json::to_string(&vec![RemoteId::new("page-1")]).expect("remote ids json"),
+                serde_json::to_string(&push_plan()).expect("plan json"),
+                serde_json::to_string(&JournalStatus::Reconciled).expect("status json"),
+            ],
+        )
+        .expect("insert v1 journal");
+    drop(connection);
+
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw reopened connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let entry = store
+        .get_journal(&PushId("push-1".to_string()))
+        .expect("get migrated journal")
+        .expect("journal");
+
+    assert_eq!(user_version, 2);
+    assert!(entry.preimages.is_empty());
 }
 
 struct SqliteFixture {
@@ -255,17 +324,24 @@ fn shadow_document(body: &str) -> ShadowDocument {
 }
 
 fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
-    JournalEntry {
-        push_id: PushId(push_id.to_string()),
-        mount_id: MountId::new("notion-main"),
-        remote_ids: vec![RemoteId::new("page-1")],
-        plan: PushPlan::new(
-            vec![RemoteId::new("page-1")],
-            vec![PushOperation::UpdateBlock {
-                block_id: RemoteId::new("paragraph-1"),
-                content: "Updated paragraph.".to_string(),
-            }],
-        ),
+    JournalEntry::new(
+        PushId(push_id.to_string()),
+        MountId::new("notion-main"),
+        vec![RemoteId::new("page-1")],
+        push_plan(),
         status,
-    }
+    )
+    .with_preimages(vec![JournalPreimage::from_shadow(shadow_document(
+        "# Roadmap\n\nOriginal paragraph.",
+    ))])
+}
+
+fn push_plan() -> PushPlan {
+    PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "Updated paragraph.".to_string(),
+        }],
+    )
 }

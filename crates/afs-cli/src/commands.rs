@@ -233,6 +233,14 @@ fn print_undo_report(report: &UndoReport) {
         println!("{}", report.message);
     } else {
         println!("undo blocked for {}: {}", report.push_id, report.message);
+        if let Some(plan) = &report.undo_plan {
+            println!(
+                "  undo plan: {} ({} operations, {} unsupported)",
+                plan.status,
+                plan.operations.len(),
+                plan.unsupported.len()
+            );
+        }
     }
 }
 

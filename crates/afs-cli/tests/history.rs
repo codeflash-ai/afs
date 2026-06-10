@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::history::{HistoryError, LogOptions, run_log, run_undo, undo_report_exit_code};
-use afs_core::journal::{JournalEntry, JournalStatus, PushId};
+use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, PushId};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
+use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
     MountRepository, SqliteStateStore,
@@ -30,6 +31,7 @@ fn log_lists_journal_entries_newest_first() {
     assert_eq!(report.entries[0].push_id, "push-2");
     assert_eq!(report.entries[0].status, "reconciled");
     assert_eq!(report.entries[0].operation_count, 1);
+    assert_eq!(report.entries[0].preimage_count, 1);
     assert_eq!(report.entries[0].plan_summary.blocks_updated, 1);
     assert_eq!(report.entries[1].push_id, "push-1");
 }
@@ -102,7 +104,7 @@ fn undo_prepared_journal_entry_marks_it_reverted() {
 }
 
 #[test]
-fn undo_reconciled_journal_entry_stops_at_remote_undo_boundary() {
+fn undo_reconciled_journal_entry_derives_reverse_plan_and_stops_before_apply() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
     store
@@ -112,8 +114,21 @@ fn undo_reconciled_journal_entry_stops_at_remote_undo_boundary() {
     let report = run_undo(&mut store, "push-1").expect("undo report");
 
     assert!(!report.ok);
-    assert_eq!(report.action, "undo_not_implemented");
+    assert_eq!(report.action, "reverse_apply_not_implemented");
     assert_eq!(report.status, "reconciled");
+    assert_eq!(
+        report.undo_plan.as_ref().expect("undo plan").status,
+        "complete"
+    );
+    assert_eq!(
+        report
+            .undo_plan
+            .as_ref()
+            .expect("undo plan")
+            .operations
+            .len(),
+        1
+    );
     assert_eq!(undo_report_exit_code(&report), 5);
     assert_eq!(
         store
@@ -122,6 +137,35 @@ fn undo_reconciled_journal_entry_stops_at_remote_undo_boundary() {
             .expect("journal")
             .status,
         JournalStatus::Reconciled
+    );
+}
+
+#[test]
+fn undo_reports_blocked_plan_for_append_without_created_id() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    store
+        .append_journal(journal_entry_with_operations(
+            "push-1",
+            "page-1",
+            JournalStatus::Reconciled,
+            vec![PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("page-1-paragraph-1")),
+                content: "New paragraph.".to_string(),
+            }],
+        ))
+        .expect("append journal");
+
+    let report = run_undo(&mut store, "push-1").expect("undo report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "undo_plan_blocked");
+    let undo_plan = report.undo_plan.expect("undo plan");
+    assert_eq!(undo_plan.status, "blocked");
+    assert_eq!(
+        undo_plan.unsupported[0].code,
+        "append_block_missing_created_id"
     );
 }
 
@@ -231,17 +275,42 @@ fn entity_record(fixture: &HistoryFixture, remote_id: &str, path: &str) -> Entit
 }
 
 fn journal_entry(push_id: &str, remote_id: &str, status: JournalStatus) -> JournalEntry {
-    JournalEntry {
-        push_id: PushId(push_id.to_string()),
-        mount_id: MountId::new("notion-main"),
-        remote_ids: vec![RemoteId::new(remote_id)],
-        plan: PushPlan::new(
-            vec![RemoteId::new(remote_id)],
-            vec![PushOperation::UpdateBlock {
-                block_id: RemoteId::new(format!("{remote_id}-paragraph-1")),
-                content: "Updated paragraph.".to_string(),
-            }],
-        ),
+    journal_entry_with_operations(
+        push_id,
+        remote_id,
         status,
-    }
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new(format!("{remote_id}-paragraph-1")),
+            content: "Updated paragraph.".to_string(),
+        }],
+    )
+}
+
+fn journal_entry_with_operations(
+    push_id: &str,
+    remote_id: &str,
+    status: JournalStatus,
+    operations: Vec<PushOperation>,
+) -> JournalEntry {
+    JournalEntry::new(
+        PushId(push_id.to_string()),
+        MountId::new("notion-main"),
+        vec![RemoteId::new(remote_id)],
+        PushPlan::new(vec![RemoteId::new(remote_id)], operations),
+        status,
+    )
+    .with_preimages(vec![JournalPreimage::from_shadow(shadow(remote_id))])
+}
+
+fn shadow(remote_id: &str) -> ShadowDocument {
+    ShadowDocument::from_synced_body(
+        RemoteId::new(remote_id),
+        "# Roadmap\n\nOriginal paragraph.",
+        9,
+        [
+            RemoteId::new(format!("{remote_id}-heading-1")),
+            RemoteId::new(format!("{remote_id}-paragraph-1")),
+        ],
+    )
+    .expect("shadow")
 }

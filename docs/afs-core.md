@@ -27,6 +27,7 @@
 | `shadow` | Shadow document snapshots, Markdown block segmentation, stable block hashes, and source spans. |
 | `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents. |
 | `journal` | Push journal entry and status contracts. |
+| `undo` | Connector-neutral reverse-plan derivation from journaled preimage snapshots. |
 | `error` | Core error categories. |
 
 ## First Invariants Implemented
@@ -93,3 +94,14 @@ The push execution layer starts only from `ProceedToApply`. It is connector-neut
 - post-apply read-back and reconciliation.
 
 Execution prepares the journal before any remote mutation, moves status through `Prepared`, `Applying`, `Applied`, and `Reconciled`, and marks `Failed` on concurrency, apply, or reconcile errors. Non-approved pipeline actions return `NotReady` without touching the journal or connector hooks.
+
+## Undo Contract
+
+Journal entries now include shadow preimages for affected entities. The undo planner uses those preimages to derive reverse operations without guessing:
+
+- block updates reverse to the previous block text;
+- block moves reverse to the previous sibling position;
+- archived blocks reverse to a restore operation with original content and position;
+- appends, created entities, property updates, and archived entities are reported as unsupported until apply journals created IDs and property/entity preimages.
+
+Undo plans are marked `Complete`, `Partial`, or `Blocked`. The CLI still stops before remote reverse apply until connector support exists.

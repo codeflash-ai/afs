@@ -1,0 +1,191 @@
+use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, PushId};
+use afs_core::model::{MountId, RemoteId};
+use afs_core::planner::{PushOperation, PushPlan};
+use afs_core::shadow::ShadowDocument;
+use afs_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
+
+#[test]
+fn update_block_reverses_to_preimage_content() {
+    let entry = journal_entry(vec![PushOperation::UpdateBlock {
+        block_id: RemoteId::new("paragraph-1"),
+        content: "New paragraph.".to_string(),
+    }]);
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::RestoreBlockContent {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "Old paragraph.".to_string(),
+        }]
+    );
+    assert!(plan.unsupported.is_empty());
+}
+
+#[test]
+fn archive_block_reverses_to_restore_with_original_position() {
+    let entry = journal_entry(vec![PushOperation::ArchiveBlock {
+        block_id: RemoteId::new("paragraph-1"),
+    }]);
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::RestoreArchivedBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("heading-1")),
+            content: "Old paragraph.".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn move_block_reverses_to_original_position() {
+    let entry = journal_entry(vec![PushOperation::MoveBlock {
+        block_id: RemoteId::new("paragraph-1"),
+        after: None,
+    }]);
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::MoveBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            after: Some(RemoteId::new("heading-1")),
+        }]
+    );
+}
+
+#[test]
+fn reverse_plan_orders_dependent_moves_for_safe_apply() {
+    let entry = journal_entry_with_shadow(
+        vec![
+            PushOperation::MoveBlock {
+                block_id: RemoteId::new("c"),
+                after: Some(RemoteId::new("a")),
+            },
+            PushOperation::MoveBlock {
+                block_id: RemoteId::new("b"),
+                after: Some(RemoteId::new("d")),
+            },
+        ],
+        multi_block_shadow(),
+    );
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![
+            UndoOperation::MoveBlock {
+                block_id: RemoteId::new("b"),
+                after: Some(RemoteId::new("a")),
+            },
+            UndoOperation::MoveBlock {
+                block_id: RemoteId::new("c"),
+                after: Some(RemoteId::new("b")),
+            },
+        ]
+    );
+}
+
+#[test]
+fn append_block_is_unsupported_until_apply_records_created_id() {
+    let entry = journal_entry(vec![PushOperation::AppendBlock {
+        parent_id: RemoteId::new("page-1"),
+        after: Some(RemoteId::new("paragraph-1")),
+        content: "New paragraph.".to_string(),
+    }]);
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Blocked);
+    assert!(plan.operations.is_empty());
+    assert_eq!(plan.unsupported[0].code, "append_block_missing_created_id");
+}
+
+#[test]
+fn mixed_plan_reports_partial_undo() {
+    let entry = journal_entry(vec![
+        PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "New paragraph.".to_string(),
+        },
+        PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: "New paragraph.".to_string(),
+        },
+    ]);
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Partial);
+    assert_eq!(plan.operations.len(), 1);
+    assert_eq!(plan.unsupported.len(), 1);
+}
+
+#[test]
+fn missing_preimage_blocks_undo_for_preimage_dependent_operation() {
+    let mut entry = journal_entry(vec![PushOperation::UpdateBlock {
+        block_id: RemoteId::new("paragraph-1"),
+        content: "New paragraph.".to_string(),
+    }]);
+    entry.preimages.clear();
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Blocked);
+    assert_eq!(plan.unsupported[0].code, "missing_block_preimage");
+}
+
+fn journal_entry(operations: Vec<PushOperation>) -> JournalEntry {
+    journal_entry_with_shadow(operations, shadow())
+}
+
+fn journal_entry_with_shadow(
+    operations: Vec<PushOperation>,
+    shadow: ShadowDocument,
+) -> JournalEntry {
+    JournalEntry::new(
+        PushId("push-1".to_string()),
+        MountId::new("notion-main"),
+        vec![RemoteId::new("page-1")],
+        PushPlan::new(vec![RemoteId::new("page-1")], operations),
+        JournalStatus::Reconciled,
+    )
+    .with_preimages(vec![JournalPreimage::from_shadow(shadow)])
+}
+
+fn shadow() -> ShadowDocument {
+    ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "# Roadmap\n\nOld paragraph.",
+        9,
+        [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
+}
+
+fn multi_block_shadow() -> ShadowDocument {
+    ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "A\n\nB\n\nC\n\nD",
+        9,
+        [
+            RemoteId::new("a"),
+            RemoteId::new("b"),
+            RemoteId::new("c"),
+            RemoteId::new("d"),
+        ],
+    )
+    .expect("shadow")
+}

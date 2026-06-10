@@ -7,6 +7,7 @@ Correctness belongs primarily in `afs-core` and `afs-store`.
 - Local, remote, and synced tree state are explicit.
 - Local file mutations use temp-write-plus-rename.
 - Pushes are journaled before remote mutation.
+- Push journals include shadow preimages for reverse-plan derivation.
 - Remote apply operations are idempotent.
 - Remote concurrency is checked after journaling and immediately before apply.
 - Apply and reconcile failures mark the journal failed instead of leaving an ambiguous success.

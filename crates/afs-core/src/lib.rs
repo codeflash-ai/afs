@@ -21,6 +21,7 @@ pub mod pull;
 pub mod push;
 pub mod shadow;
 pub mod sync;
+pub mod undo;
 pub mod validation;
 
 pub use error::{AfsError, AfsResult};

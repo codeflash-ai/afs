@@ -1,14 +1,16 @@
 //! Journal-backed `afs log` and `afs undo` orchestration.
 //!
-//! The log surface is a read-only view over durable push journals. The initial
-//! undo surface only cancels a journal entry that is still `prepared`, because
-//! current journal entries do not yet contain the pre-push remote state required
-//! to safely reverse already-applied connector mutations.
+//! The log surface is a read-only view over durable push journals. Undo uses the
+//! journaled preimage snapshots to derive a connector-neutral reverse plan, but
+//! still stops before remote reverse apply until connector support exists.
 
 use std::path::{Path, PathBuf};
 
 use afs_core::journal::{JournalEntry, JournalStatus, PushId};
 use afs_core::model::{MountId, RemoteId};
+use afs_core::undo::{
+    UndoOperation, UndoPlan, UndoPlanStatus, UnsupportedUndoOperation, plan_journal_undo,
+};
 use afs_store::{EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError};
 use serde::Serialize;
 
@@ -59,6 +61,7 @@ pub struct UndoReport {
     pub action: String,
     pub message: String,
     pub entry: Option<JournalEntryOutput>,
+    pub undo_plan: Option<UndoPlanOutput>,
 }
 
 pub fn run_undo<S>(store: &mut S, push_id: impl Into<String>) -> Result<UndoReport, HistoryError>
@@ -87,6 +90,7 @@ where
                 action: "reverted_local_journal".to_string(),
                 message: "journal entry reverted before remote apply".to_string(),
                 entry: Some(JournalEntryOutput::from(reverted)),
+                undo_plan: None,
             })
         }
         JournalStatus::Reverted => Ok(UndoReport {
@@ -97,15 +101,31 @@ where
             action: "already_reverted".to_string(),
             message: "journal entry was already reverted".to_string(),
             entry: Some(JournalEntryOutput::from(entry)),
+            undo_plan: None,
         }),
+        JournalStatus::Applied | JournalStatus::Reconciled => {
+            let undo_plan = plan_journal_undo(&entry);
+            let (action, message) = undo_boundary(&undo_plan);
+            Ok(UndoReport {
+                ok: false,
+                command: "undo",
+                push_id: push_id.0,
+                status: status_name(&entry.status).to_string(),
+                action: action.to_string(),
+                message: message.to_string(),
+                undo_plan: Some(UndoPlanOutput::from(undo_plan)),
+                entry: Some(JournalEntryOutput::from(entry)),
+            })
+        }
         status => Ok(UndoReport {
             ok: false,
             command: "undo",
             push_id: push_id.0,
             status: status_name(&status).to_string(),
-            action: "undo_not_implemented".to_string(),
+            action: "undo_unsafe_journal_status".to_string(),
             message: undo_boundary_message(&status).to_string(),
             entry: Some(JournalEntryOutput::from(entry)),
+            undo_plan: None,
         }),
     }
 }
@@ -121,6 +141,7 @@ pub struct JournalEntryOutput {
     pub remote_ids: Vec<String>,
     pub status: String,
     pub failure: Option<String>,
+    pub preimage_count: usize,
     pub plan_summary: PlanSummaryOutput,
     pub operation_count: usize,
 }
@@ -140,8 +161,106 @@ impl From<JournalEntry> for JournalEntryOutput {
                 .collect(),
             status,
             failure,
+            preimage_count: value.preimages.len(),
             plan_summary: PlanSummaryOutput::from(value.plan.summary),
             operation_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UndoPlanOutput {
+    pub target_push_id: String,
+    pub mount_id: String,
+    pub affected_entities: Vec<String>,
+    pub status: String,
+    pub operations: Vec<UndoOperationOutput>,
+    pub unsupported: Vec<UnsupportedUndoOutput>,
+}
+
+impl From<UndoPlan> for UndoPlanOutput {
+    fn from(value: UndoPlan) -> Self {
+        Self {
+            target_push_id: value.target_push_id.0,
+            mount_id: value.mount_id.0,
+            affected_entities: value
+                .affected_entities
+                .into_iter()
+                .map(|remote_id| remote_id.0)
+                .collect(),
+            status: undo_plan_status_name(&value.status).to_string(),
+            operations: value
+                .operations
+                .into_iter()
+                .map(UndoOperationOutput::from)
+                .collect(),
+            unsupported: value
+                .unsupported
+                .into_iter()
+                .map(UnsupportedUndoOutput::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UndoOperationOutput {
+    RestoreBlockContent {
+        block_id: String,
+        content: String,
+    },
+    MoveBlock {
+        block_id: String,
+        after: Option<String>,
+    },
+    RestoreArchivedBlock {
+        block_id: String,
+        parent_id: String,
+        after: Option<String>,
+        content: String,
+    },
+}
+
+impl From<UndoOperation> for UndoOperationOutput {
+    fn from(value: UndoOperation) -> Self {
+        match value {
+            UndoOperation::RestoreBlockContent { block_id, content } => Self::RestoreBlockContent {
+                block_id: block_id.0,
+                content,
+            },
+            UndoOperation::MoveBlock { block_id, after } => Self::MoveBlock {
+                block_id: block_id.0,
+                after: after.map(|remote_id| remote_id.0),
+            },
+            UndoOperation::RestoreArchivedBlock {
+                block_id,
+                parent_id,
+                after,
+                content,
+            } => Self::RestoreArchivedBlock {
+                block_id: block_id.0,
+                parent_id: parent_id.0,
+                after: after.map(|remote_id| remote_id.0),
+                content,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UnsupportedUndoOutput {
+    pub operation_index: usize,
+    pub code: String,
+    pub message: String,
+}
+
+impl From<UnsupportedUndoOperation> for UnsupportedUndoOutput {
+    fn from(value: UnsupportedUndoOperation) -> Self {
+        Self {
+            operation_index: value.operation_index,
+            code: value.code,
+            message: value.message,
         }
     }
 }
@@ -270,14 +389,42 @@ fn status_name(status: &JournalStatus) -> &'static str {
 
 fn undo_boundary_message(status: &JournalStatus) -> &'static str {
     match status {
-        JournalStatus::Applying | JournalStatus::Applied | JournalStatus::Reconciled => {
-            "remote undo requires pre-push snapshots and connector reverse-apply support"
+        JournalStatus::Applying => {
+            "journal is currently applying; wait for it to finish before undoing"
         }
         JournalStatus::Failed(_) => {
             "failed journals may have partial remote effects; remote undo requires pre-push snapshots"
         }
+        JournalStatus::Applied | JournalStatus::Reconciled => {
+            "remote undo requires connector reverse-apply support"
+        }
         JournalStatus::Prepared | JournalStatus::Reverted => {
             "journal entry does not need remote undo"
         }
+    }
+}
+
+fn undo_boundary(plan: &UndoPlan) -> (&'static str, &'static str) {
+    match plan.status {
+        UndoPlanStatus::Complete => (
+            "reverse_apply_not_implemented",
+            "reverse apply is not implemented yet",
+        ),
+        UndoPlanStatus::Partial => (
+            "undo_plan_partial",
+            "undo plan is partial; some operations cannot be reversed safely",
+        ),
+        UndoPlanStatus::Blocked => (
+            "undo_plan_blocked",
+            "no reversible operations can be derived from the journal preimages",
+        ),
+    }
+}
+
+fn undo_plan_status_name(status: &UndoPlanStatus) -> &'static str {
+    match status {
+        UndoPlanStatus::Complete => "complete",
+        UndoPlanStatus::Partial => "partial",
+        UndoPlanStatus::Blocked => "blocked",
     }
 }

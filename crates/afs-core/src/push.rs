@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::canonical::ParsedCanonicalDocument;
 use crate::diff::{BlockDiffEngine, DiffEngine};
-use crate::journal::{JournalEntry, JournalStatus, JournalStore, PushId};
+use crate::journal::{JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId};
 use crate::model::{MountId, RemoteId};
 use crate::planner::{GuardrailDecision, GuardrailPolicy, PushPlan};
 use crate::shadow::ShadowDocument;
@@ -281,6 +281,8 @@ pub struct PushExecutionRequest {
     pub mount_id: MountId,
     /// Validated and approved pipeline result to execute.
     pub pipeline: PushPipelineResult,
+    /// Pre-push canonical snapshots used by future resume and undo flows.
+    pub preimages: Vec<JournalPreimage>,
 }
 
 impl PushExecutionRequest {
@@ -289,7 +291,13 @@ impl PushExecutionRequest {
             push_id,
             mount_id,
             pipeline,
+            preimages: Vec::new(),
         }
+    }
+
+    pub fn with_preimages(mut self, preimages: Vec<JournalPreimage>) -> Self {
+        self.preimages = preimages;
+        self
     }
 }
 
@@ -425,6 +433,7 @@ where
         mount_id: request.mount_id.clone(),
         remote_ids: remote_ids.clone(),
         plan: plan.clone(),
+        preimages: request.preimages.clone(),
         status: JournalStatus::Prepared,
     })?;
     journal.update_status(&request.push_id, JournalStatus::Applying)?;
