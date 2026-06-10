@@ -26,6 +26,23 @@ The queue preserves deterministic behavior:
 - duplicate lower-priority requests do not move a higher-priority request down;
 - failed drain attempts requeue the failed request instead of dropping it.
 
+## Hydration Execution
+
+`HydrationExecutor` performs the local hydrate transaction for one queued
+request:
+
+1. load the mount and entity from the store;
+2. verify the local file is safe to replace;
+3. fetch and render through a `HydrationSource`;
+4. write the rendered Markdown with temp-file-plus-rename;
+5. persist the shadow snapshot;
+6. mark the entity `hydrated` and store the rendered body hash.
+
+Dirty local files are not overwritten. If a non-stub file no longer matches the
+stored shadow body, the executor skips that request and marks the entity `dirty`
+when the hydration ladder allows it. Source or I/O failures leave the request in
+the queue so a later daemon tick can retry.
+
 ## Supervisor Events
 
 `DaemonSupervisor` currently handles the safe local state transitions that do not
@@ -33,8 +50,8 @@ need connector I/O:
 
 - startup loads mounts from the store and registers each root with the watcher;
 - reading a `virtual` or `stub` entity queues hydration to `hydrated`;
+- queued hydration can be drained through a source-specific executor;
 - writing a `hydrated` entity marks it `dirty` in the store;
 - remove and rename events are ignored until conflict/delete planning is wired.
 
-Connector fetch/apply, remote polling, and conflict materialization remain later
-daemon stages.
+Remote polling and conflict materialization remain later daemon stages.

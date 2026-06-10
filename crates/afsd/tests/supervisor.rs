@@ -2,9 +2,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use afs_core::hydration::HydrationReason;
-use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use afs_store::{EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository};
-use afsd::hydration::HydrationQueue;
+use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::shadow::ShadowDocument;
+use afs_core::{AfsError, AfsResult};
+use afs_store::{
+    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
+    ShadowRepository,
+};
+use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
 use afsd::scheduler::PullScheduler;
 use afsd::supervisor::DaemonSupervisor;
 use afsd::watcher::{FileEvent, FileEventKind, FileWatcher};
@@ -94,6 +99,31 @@ fn scheduler_tick_is_exposed_through_supervisor() {
     assert!(idle.is_idle());
 }
 
+#[test]
+fn supervisor_drains_queued_hydration_through_source() {
+    let _ = std::fs::remove_file("/tmp/afs/notion/Roadmap.md");
+    let mut supervisor = supervisor_with_entity(HydrationState::Stub);
+    supervisor.start().expect("start supervisor");
+    supervisor
+        .handle_file_event(read_event("/tmp/afs/notion/Roadmap.md"))
+        .expect("handle read");
+
+    let report = supervisor
+        .drain_hydration(&FakeHydrationSource)
+        .expect("drain hydration");
+
+    assert_eq!(report.hydrated, 1);
+    let shadow = supervisor
+        .store()
+        .load_shadow(&MountId::new("notion-main"), &RemoteId::new("page-1"))
+        .expect("load shadow");
+    assert_eq!(shadow.entity_id, RemoteId::new("page-1"));
+    let contents = std::fs::read_to_string("/tmp/afs/notion/Roadmap.md")
+        .expect("hydrated file from supervisor");
+    assert!(contents.contains("Hydrated from supervisor."));
+    let _ = std::fs::remove_file("/tmp/afs/notion/Roadmap.md");
+}
+
 fn supervisor_with_entity(
     hydration: HydrationState,
 ) -> DaemonSupervisor<InMemoryStateStore, RecordingWatcher, HydrationQueue> {
@@ -141,5 +171,33 @@ impl FileWatcher for RecordingWatcher {
     fn watch_mount(&mut self, root: PathBuf) -> afs_core::AfsResult<()> {
         self.watched.push(root);
         Ok(())
+    }
+}
+
+struct FakeHydrationSource;
+
+impl HydrationSource for FakeHydrationSource {
+    fn fetch_render(
+        &self,
+        request: &afs_core::hydration::HydrationRequest,
+    ) -> AfsResult<HydratedEntity> {
+        if request.remote_id != RemoteId::new("page-1") {
+            return Err(AfsError::InvalidState("unexpected remote id".to_string()));
+        }
+
+        let body = "# Roadmap\n\nHydrated from supervisor.\n".to_string();
+        let document = CanonicalDocument::new(
+            "afs:\n  id: page-1\n  type: page\ntitle: Roadmap\n",
+            body.clone(),
+        );
+        let shadow = ShadowDocument::from_synced_body(
+            RemoteId::new("page-1"),
+            body,
+            7,
+            [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+        )
+        .expect("shadow");
+
+        Ok(HydratedEntity { document, shadow })
     }
 }

@@ -1,12 +1,146 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
 
-use afs_core::AfsResult;
+use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
-use afs_core::model::{HydrationState, MountId, RemoteId};
+use afs_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
+use afs_core::shadow::ShadowDocument;
+use afs_core::{AfsError, AfsResult};
+use afs_store::{
+    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
+};
 
 pub trait HydrationEngine {
     fn queue(&mut self, request: HydrationRequest) -> AfsResult<()>;
     fn drain_ready(&mut self) -> AfsResult<usize>;
+}
+
+pub trait HydrationSource {
+    fn fetch_render(&self, request: &HydrationRequest) -> AfsResult<HydratedEntity>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HydratedEntity {
+    pub document: CanonicalDocument,
+    pub shadow: ShadowDocument,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HydrationDrainReport {
+    pub hydrated: usize,
+    pub skipped_dirty: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HydrationOutcome {
+    Hydrated,
+    SkippedDirty,
+}
+
+pub struct HydrationExecutor<'a, S, Source: ?Sized> {
+    store: &'a mut S,
+    source: &'a Source,
+}
+
+impl<'a, S, Source> HydrationExecutor<'a, S, Source>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+    Source: HydrationSource + ?Sized,
+{
+    pub fn new(store: &'a mut S, source: &'a Source) -> Self {
+        Self { store, source }
+    }
+
+    pub fn hydrate_request(&mut self, request: HydrationRequest) -> AfsResult<HydrationOutcome> {
+        if request.target_state != HydrationState::Hydrated {
+            return Err(AfsError::Unsupported(
+                "daemon hydration currently supports hydrated targets only",
+            ));
+        }
+
+        let mount = require_mount(self.store, &request.mount_id)?;
+        let entity = require_entity(self.store, &request.mount_id, &request.remote_id)?;
+        let path = request_path(&mount, &request.path);
+
+        if !self.can_replace_file(&mount, &entity, &path)? {
+            self.mark_dirty_if_allowed(entity)?;
+            return Ok(HydrationOutcome::SkippedDirty);
+        }
+
+        let rendered = self.source.fetch_render(&request)?;
+        if rendered.shadow.entity_id != request.remote_id {
+            return Err(AfsError::InvalidState(format!(
+                "hydration source returned shadow for `{}` while hydrating `{}`",
+                rendered.shadow.entity_id.0, request.remote_id.0
+            )));
+        }
+
+        write_atomic(&path, render_canonical_markdown(&rendered.document))?;
+        self.store
+            .save_shadow(&mount.mount_id, rendered.shadow.clone())
+            .map_err(AfsError::from)?;
+        self.store
+            .save_entity(hydrated_record(entity, &rendered.shadow))
+            .map_err(AfsError::from)?;
+
+        Ok(HydrationOutcome::Hydrated)
+    }
+
+    pub fn drain_queue(&mut self, queue: &mut HydrationQueue) -> AfsResult<HydrationDrainReport> {
+        let mut report = HydrationDrainReport::default();
+
+        while let Some(request) = queue.pop_ready() {
+            match self.hydrate_request(request.clone()) {
+                Ok(HydrationOutcome::Hydrated) => report.hydrated += 1,
+                Ok(HydrationOutcome::SkippedDirty) => report.skipped_dirty += 1,
+                Err(error) => {
+                    queue.queue_request(request);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    fn can_replace_file(
+        &mut self,
+        mount: &MountConfig,
+        entity: &EntityRecord,
+        path: &Path,
+    ) -> AfsResult<bool> {
+        if !path.exists() {
+            return Ok(true);
+        }
+
+        if is_stub_file(path)? {
+            return Ok(true);
+        }
+
+        if entity.hydration != HydrationState::Hydrated {
+            return Ok(false);
+        }
+
+        let contents = read_to_string(path)?;
+        let Ok(parsed) = parse_canonical_markdown(&contents) else {
+            return Ok(false);
+        };
+        let shadow = self
+            .store
+            .load_shadow(&mount.mount_id, &entity.remote_id)
+            .map_err(AfsError::from)?;
+
+        Ok(parsed.document.body == shadow.rendered_body)
+    }
+
+    fn mark_dirty_if_allowed(&mut self, mut entity: EntityRecord) -> AfsResult<()> {
+        if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+            entity.hydration = HydrationState::Dirty;
+            self.store.save_entity(entity).map_err(AfsError::from)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -173,4 +307,91 @@ fn hydration_target_rank(state: &HydrationState) -> u8 {
         HydrationState::Dirty => 3,
         HydrationState::Conflicted => 4,
     }
+}
+
+fn require_mount<S>(store: &S, mount_id: &MountId) -> AfsResult<MountConfig>
+where
+    S: MountRepository,
+{
+    store
+        .get_mount(mount_id)
+        .map_err(AfsError::from)?
+        .ok_or_else(|| StoreError::MountMissing(mount_id.clone()).into())
+}
+
+fn require_entity<S>(store: &S, mount_id: &MountId, remote_id: &RemoteId) -> AfsResult<EntityRecord>
+where
+    S: EntityRepository,
+{
+    store
+        .get_entity(mount_id, remote_id)
+        .map_err(AfsError::from)?
+        .ok_or_else(|| {
+            StoreError::EntityMissing {
+                mount_id: mount_id.clone(),
+                remote_id: remote_id.clone(),
+            }
+            .into()
+        })
+}
+
+fn hydrated_record(mut entity: EntityRecord, shadow: &ShadowDocument) -> EntityRecord {
+    entity.hydration = HydrationState::Hydrated;
+    entity.content_hash = Some(shadow.body_hash.clone());
+    entity
+}
+
+fn request_path(mount: &MountConfig, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        mount.root.join(path)
+    }
+}
+
+fn is_stub_file(path: &Path) -> AfsResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let contents = read_to_string(path)?;
+    Ok(contents.contains(CanonicalDocument::STUB_MARKER))
+}
+
+fn write_atomic(path: &Path, contents: String) -> AfsResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            AfsError::Io(format!(
+                "failed to create `{}` for hydration write: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("afs-hydrate");
+    let temp_path = path.with_file_name(format!(".{file_name}.afs-tmp"));
+
+    std::fs::write(&temp_path, contents).map_err(|error| {
+        AfsError::Io(format!(
+            "failed to write hydration temp file `{}`: {error}",
+            temp_path.display()
+        ))
+    })?;
+    std::fs::rename(&temp_path, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp_path);
+        AfsError::Io(format!(
+            "failed to replace hydrated file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn read_to_string(path: &Path) -> AfsResult<String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| AfsError::Io(format!("failed to read `{}`: {error}", path.display())))
 }

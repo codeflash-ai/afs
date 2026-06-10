@@ -1,0 +1,331 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use afs_core::canonical::render_canonical_markdown;
+use afs_core::hydration::{HydrationReason, HydrationRequest};
+use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::shadow::ShadowDocument;
+use afs_core::{AfsError, AfsResult};
+use afs_store::{
+    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
+    ShadowRepository,
+};
+use afsd::hydration::{
+    HydratedEntity, HydrationExecutor, HydrationOutcome, HydrationQueue, HydrationSource,
+};
+
+#[test]
+fn executor_hydrates_stub_file_and_persists_shadow() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let rendered = rendered_entity("Remote body.");
+    let source = FakeHydrationSource::with_entity("page-1", rendered.clone());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(outcome, HydrationOutcome::Hydrated);
+    let contents = fs::read_to_string(fixture.page_path()).expect("hydrated file");
+    assert!(contents.contains("Remote body."));
+    assert!(!contents.contains(CanonicalDocument::STUB_MARKER));
+    assert_eq!(
+        store
+            .load_shadow(&fixture.mount_id, &fixture.remote_id)
+            .expect("load shadow"),
+        rendered.shadow
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Hydrated);
+    assert_eq!(entity.content_hash, Some(rendered.shadow.body_hash));
+}
+
+#[test]
+fn executor_replaces_clean_hydrated_file() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let old = rendered_entity("Old body.");
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    fixture.write_markdown(&old.document);
+    let new = rendered_entity("New body.");
+    let source = FakeHydrationSource::with_entity("page-1", new.clone());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(outcome, HydrationOutcome::Hydrated);
+    let contents = fs::read_to_string(fixture.page_path()).expect("hydrated file");
+    assert!(contents.contains("New body."));
+    assert_eq!(
+        store
+            .load_shadow(&fixture.mount_id, &fixture.remote_id)
+            .expect("load shadow")
+            .body_hash,
+        new.shadow.body_hash
+    );
+}
+
+#[test]
+fn executor_skips_dirty_file_and_marks_entity_dirty() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let old = rendered_entity("Old body.");
+    store
+        .save_shadow(&fixture.mount_id, old.shadow)
+        .expect("save old shadow");
+    fixture.write_raw("---\nafs:\n  id: page-1\n  type: page\ntitle: Roadmap\n---\nLocal edit.\n");
+    let source = FakeHydrationSource::failing("source should not be called");
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("skip dirty file");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    let contents = fs::read_to_string(fixture.page_path()).expect("dirty file");
+    assert!(contents.contains("Local edit."));
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Dirty);
+}
+
+#[test]
+fn drain_queue_requeues_failed_source_request() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    let source = FakeHydrationSource::failing("temporary fetch failure");
+    let mut queue = HydrationQueue::new();
+    queue.queue_request(fixture.request());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let error = executor
+        .drain_queue(&mut queue)
+        .expect_err("source failure");
+
+    assert_eq!(
+        error,
+        AfsError::InvalidState("temporary fetch failure".to_string())
+    );
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        queue.peek_ready().expect("requeued").remote_id,
+        fixture.remote_id
+    );
+}
+
+#[test]
+fn drain_queue_counts_hydrated_and_dirty_skips() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    let dirty = EntityRecord::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("page-2"),
+        EntityKind::Page,
+        "Dirty",
+        "Dirty.md",
+    )
+    .with_hydration(HydrationState::Hydrated);
+    store.save_entity(dirty).expect("save dirty entity");
+    let old_dirty = rendered_entity_for("page-2", "Old dirty body.");
+    store
+        .save_shadow(&fixture.mount_id, old_dirty.shadow)
+        .expect("save dirty shadow");
+    fixture.write_raw_at(
+        "Dirty.md",
+        "---\nafs:\n  id: page-2\n  type: page\ntitle: Dirty\n---\nLocal edit.\n",
+    );
+
+    let mut source = FakeHydrationSource::new();
+    source.insert("page-1", rendered_entity("Remote body."));
+    source.insert(
+        "page-2",
+        rendered_entity_for("page-2", "Remote dirty body."),
+    );
+    let mut queue = HydrationQueue::new();
+    queue.queue_request(fixture.request());
+    queue.queue_request(HydrationRequest::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("page-2"),
+        fixture.root.join("Dirty.md"),
+        HydrationState::Hydrated,
+        HydrationReason::StubRead,
+    ));
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let report = executor.drain_queue(&mut queue).expect("drain queue");
+
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.skipped_dirty, 1);
+    assert!(queue.is_empty());
+}
+
+#[derive(Clone, Debug)]
+struct HydrationFixture {
+    root: PathBuf,
+    mount_id: MountId,
+    remote_id: RemoteId,
+}
+
+impl HydrationFixture {
+    fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "afs-hydration-executor-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("fixture root");
+
+        Self {
+            root,
+            mount_id: MountId::new("notion-main"),
+            remote_id: RemoteId::new("page-1"),
+        }
+    }
+
+    fn store(&self, hydration: HydrationState) -> InMemoryStateStore {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(MountConfig::new(
+                self.mount_id.clone(),
+                "notion",
+                self.root.clone(),
+            ))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    self.remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(hydration),
+            )
+            .expect("save entity");
+        store
+    }
+
+    fn request(&self) -> HydrationRequest {
+        HydrationRequest::new(
+            self.mount_id.clone(),
+            self.remote_id.clone(),
+            self.page_path(),
+            HydrationState::Hydrated,
+            HydrationReason::StubRead,
+        )
+    }
+
+    fn page_path(&self) -> PathBuf {
+        self.root.join("Roadmap.md")
+    }
+
+    fn write_stub(&self) {
+        self.write_raw(&format!(
+            "---\nafs:\n  id: page-1\n  type: page\ntitle: Roadmap\n---\n{}\n",
+            CanonicalDocument::STUB_MARKER
+        ));
+    }
+
+    fn write_markdown(&self, document: &CanonicalDocument) {
+        self.write_raw(&render_canonical_markdown(document));
+    }
+
+    fn write_raw(&self, contents: &str) {
+        self.write_raw_at("Roadmap.md", contents);
+    }
+
+    fn write_raw_at(&self, relative_path: &str, contents: &str) {
+        let path = self.root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture parent");
+        }
+        fs::write(path, contents).expect("fixture file");
+    }
+}
+
+impl Drop for HydrationFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FakeHydrationSource {
+    entities: BTreeMap<RemoteId, HydratedEntity>,
+    failure: Option<String>,
+}
+
+impl FakeHydrationSource {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_entity(remote_id: &str, entity: HydratedEntity) -> Self {
+        let mut source = Self::new();
+        source.insert(remote_id, entity);
+        source
+    }
+
+    fn failing(message: &str) -> Self {
+        Self {
+            entities: BTreeMap::new(),
+            failure: Some(message.to_string()),
+        }
+    }
+
+    fn insert(&mut self, remote_id: &str, entity: HydratedEntity) {
+        self.entities.insert(RemoteId::new(remote_id), entity);
+    }
+}
+
+impl HydrationSource for FakeHydrationSource {
+    fn fetch_render(&self, request: &HydrationRequest) -> AfsResult<HydratedEntity> {
+        if let Some(message) = &self.failure {
+            return Err(AfsError::InvalidState(message.clone()));
+        }
+
+        self.entities
+            .get(&request.remote_id)
+            .cloned()
+            .ok_or_else(|| AfsError::InvalidState("missing fake entity".to_string()))
+    }
+}
+
+fn rendered_entity(body: &str) -> HydratedEntity {
+    rendered_entity_for("page-1", body)
+}
+
+fn rendered_entity_for(remote_id: &str, body: &str) -> HydratedEntity {
+    let body = format!("# Roadmap\n\n{body}\n");
+    let document = CanonicalDocument::new(
+        format!("afs:\n  id: {remote_id}\n  type: page\ntitle: Roadmap\n"),
+        body.clone(),
+    );
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new(remote_id),
+        body,
+        7,
+        [
+            RemoteId::new(format!("{remote_id}-heading")),
+            RemoteId::new(format!("{remote_id}-body")),
+        ],
+    )
+    .expect("shadow");
+
+    HydratedEntity { document, shadow }
+}

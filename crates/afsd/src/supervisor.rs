@@ -4,9 +4,11 @@ use std::time::Duration;
 use afs_core::AfsResult;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::HydrationState;
-use afs_store::{EntityRecord, EntityRepository, MountConfig, MountRepository};
+use afs_store::{EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository};
 
-use crate::hydration::HydrationEngine;
+use crate::hydration::{
+    HydrationDrainReport, HydrationEngine, HydrationExecutor, HydrationQueue, HydrationSource,
+};
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 
@@ -143,6 +145,20 @@ where
         }
 
         Ok(None)
+    }
+}
+
+impl<S, W> DaemonSupervisor<S, W, HydrationQueue>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+    W: FileWatcher,
+{
+    pub fn drain_hydration<Source>(&mut self, source: &Source) -> AfsResult<HydrationDrainReport>
+    where
+        Source: HydrationSource + ?Sized,
+    {
+        let mut executor = HydrationExecutor::new(&mut self.store, source);
+        executor.drain_queue(&mut self.hydration)
     }
 }
 
