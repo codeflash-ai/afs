@@ -1,10 +1,37 @@
+//! Shared identity, tree, hydration, and canonical-document types.
+//!
+//! The internal model keys entities by canonical remote IDs rather than paths.
+//! Paths are a filesystem projection and can change when titles change. Equality
+//! for sync decisions intentionally ignores operational state such as hydration
+//! and compares only the projected entity fingerprint.
+
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MountId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+impl MountId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RemoteId(pub String);
+
+impl RemoteId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntityKind {
@@ -31,15 +58,30 @@ impl HydrationState {
         matches!(
             (self, next),
             (Virtual, Stub)
-                | (Virtual, Hydrated)
                 | (Stub, Hydrated)
                 | (Hydrated, Dirty)
-                | (Hydrated, Stub)
                 | (Dirty, Hydrated)
                 | (Dirty, Conflicted)
                 | (Conflicted, Hydrated)
         ) || self == next
     }
+
+    pub fn transition_to(&self, next: Self) -> Result<Self, HydrationTransitionError> {
+        if self.can_transition_to(&next) {
+            Ok(next)
+        } else {
+            Err(HydrationTransitionError {
+                from: self.clone(),
+                to: next,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HydrationTransitionError {
+    pub from: HydrationState,
+    pub to: HydrationState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +103,31 @@ pub struct TreeEntry {
     pub remote_edited_at: Option<String>,
 }
 
+impl TreeEntry {
+    pub fn fingerprint(&self) -> EntryFingerprint {
+        EntryFingerprint {
+            kind: self.kind.clone(),
+            title: self.title.clone(),
+            path: self.path.clone(),
+            content_hash: self.content_hash.clone(),
+            remote_edited_at: self.remote_edited_at.clone(),
+        }
+    }
+
+    pub fn differs_from(&self, synced: &Self) -> bool {
+        self.fingerprint() != synced.fingerprint()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryFingerprint {
+    pub kind: EntityKind,
+    pub title: String,
+    pub path: PathBuf,
+    pub content_hash: Option<String>,
+    pub remote_edited_at: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalDocument {
     pub frontmatter: String,
@@ -69,11 +136,26 @@ pub struct CanonicalDocument {
 }
 
 impl CanonicalDocument {
+    pub const STUB_MARKER: &'static str =
+        "<!-- afs:stub — read triggers hydration, or run: afs pull <path> -->";
+
+    pub fn new(frontmatter: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            frontmatter: frontmatter.into(),
+            body: body.into(),
+            blocks: Vec::new(),
+        }
+    }
+
+    pub fn with_blocks(mut self, blocks: Vec<CanonicalBlock>) -> Self {
+        self.blocks = blocks;
+        self
+    }
+
     pub fn empty_stub() -> Self {
         Self {
             frontmatter: String::new(),
-            body: "<!-- afs:stub - read triggers hydration, or run: afs pull <path> -->\n"
-                .to_string(),
+            body: format!("{}\n", Self::STUB_MARKER),
             blocks: Vec::new(),
         }
     }
@@ -87,10 +169,50 @@ pub struct CanonicalBlock {
     pub content_hash: Option<String>,
 }
 
+impl CanonicalBlock {
+    pub fn native(remote_id: Option<RemoteId>, content_hash: Option<String>) -> Self {
+        Self {
+            remote_id,
+            kind: BlockKind::NativeMarkdown,
+            source_span: None,
+            content_hash,
+        }
+    }
+
+    pub fn directive(
+        remote_id: RemoteId,
+        directive_type: impl Into<String>,
+        raw: impl Into<String>,
+    ) -> Self {
+        Self {
+            remote_id: Some(remote_id),
+            kind: BlockKind::Directive {
+                directive_type: directive_type.into(),
+                raw: raw.into(),
+            },
+            source_span: None,
+            content_hash: None,
+        }
+    }
+
+    pub fn directive_parts(&self) -> Option<(&RemoteId, &str, &str)> {
+        match (&self.remote_id, &self.kind) {
+            (
+                Some(remote_id),
+                BlockKind::Directive {
+                    directive_type,
+                    raw,
+                },
+            ) => Some((remote_id, directive_type.as_str(), raw.as_str())),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     NativeMarkdown,
-    Directive { directive_type: String },
+    Directive { directive_type: String, raw: String },
     Structural,
     Unknown,
 }

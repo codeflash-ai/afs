@@ -1,9 +1,39 @@
+//! Push-plan value types and guardrail policy.
+//!
+//! The core describes intended remote mutations without knowing how a connector
+//! executes them. Plans are inspectable before apply, and their summaries feed
+//! the destructive-change guardrails from `plan.md`.
+
 use crate::model::RemoteId;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PushPlan {
+    pub affected_entities: Vec<RemoteId>,
     pub operations: Vec<PushOperation>,
     pub summary: PlanSummary,
+}
+
+impl PushPlan {
+    pub fn new(affected_entities: Vec<RemoteId>, operations: Vec<PushOperation>) -> Self {
+        let summary = PlanSummary::from_operations(&operations);
+        Self {
+            affected_entities,
+            operations,
+            summary,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    pub fn touches_more_than_percent(&self, total_mount_entities: usize, percent: u8) -> bool {
+        if total_mount_entities == 0 {
+            return false;
+        }
+
+        self.affected_entities.len() * 100 > total_mount_entities * usize::from(percent)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +52,9 @@ pub enum PushOperation {
     ArchiveBlock {
         block_id: RemoteId,
     },
+    ArchiveEntity {
+        entity_id: RemoteId,
+    },
     UpdateProperties {
         entity_id: RemoteId,
         keys: Vec<String>,
@@ -36,9 +69,37 @@ pub enum PushOperation {
 pub struct PlanSummary {
     pub blocks_created: usize,
     pub blocks_updated: usize,
+    pub blocks_moved: usize,
     pub blocks_archived: usize,
     pub entities_created: usize,
     pub entities_archived: usize,
+    pub properties_updated: usize,
+}
+
+impl PlanSummary {
+    pub fn from_operations(operations: &[PushOperation]) -> Self {
+        let mut summary = Self::default();
+
+        for operation in operations {
+            match operation {
+                PushOperation::UpdateBlock { .. } => summary.blocks_updated += 1,
+                PushOperation::AppendBlock { .. } => summary.blocks_created += 1,
+                PushOperation::MoveBlock { .. } => summary.blocks_moved += 1,
+                PushOperation::ArchiveBlock { .. } => summary.blocks_archived += 1,
+                PushOperation::ArchiveEntity { .. } => summary.entities_archived += 1,
+                PushOperation::UpdateProperties { keys, .. } => {
+                    summary.properties_updated += keys.len();
+                }
+                PushOperation::CreateEntity { .. } => summary.entities_created += 1,
+            }
+        }
+
+        summary
+    }
+
+    pub fn destructive_archive_count(&self) -> usize {
+        self.blocks_archived + self.entities_archived
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,5 +120,5 @@ impl Default for GuardrailPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GuardrailDecision {
     Proceed,
-    ConfirmRequired { reason: String },
+    ConfirmRequired { reasons: Vec<String> },
 }

@@ -1,3 +1,10 @@
+//! Hydration policy and request types.
+//!
+//! v1 uses real files and stub files. The policy intentionally keeps eager
+//! thresholds configurable because `plan.md` calls default aggressiveness an open
+//! question. The default follows the current plan: recent content plus prefetch,
+//! no eager-under-size cutoff.
+
 use std::path::PathBuf;
 
 use crate::model::{HydrationState, RemoteId};
@@ -33,4 +40,10 @@ pub enum HydrationReason {
     Policy,
     StubRead,
     Prefetch,
+}
+
+pub fn should_eager_hydrate(workspace_page_count: u32, policy: &HydrationPolicy) -> bool {
+    policy
+        .eager_under_page_count
+        .is_some_and(|threshold| workspace_page_count <= threshold)
 }

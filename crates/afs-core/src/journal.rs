@@ -1,3 +1,9 @@
+//! Journal contracts for resumable and reversible pushes.
+//!
+//! The store implementation is responsible for write-ahead durability and fsync.
+//! The core keeps the journal entry shape explicit so push orchestration can
+//! resume or undo without connector-specific hidden state.
+
 use crate::AfsResult;
 use crate::model::{MountId, RemoteId};
 use crate::planner::PushPlan;

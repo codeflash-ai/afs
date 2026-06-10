@@ -1,3 +1,8 @@
+//! Core error types.
+//!
+//! User-facing CLI formatting should happen above this crate. Core errors carry
+//! structured categories that map cleanly to stable CLI exit codes and JSON.
+
 use std::fmt::{Display, Formatter};
 
 use crate::conflict::ConflictSummary;
