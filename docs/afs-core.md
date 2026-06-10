@@ -15,6 +15,7 @@
 
 | Module | Role |
 | --- | --- |
+| `canonical` | Markdown/frontmatter envelope parsing, stub detection, directive extraction, and stable rendering. |
 | `model` | Mount IDs, remote IDs, entity fingerprints, hydration states, canonical documents, canonical blocks. |
 | `sync` | Three-tree classification and block-collision classification. |
 | `conflict` | Conflict summaries, resolutions, and block change sets. |
@@ -38,3 +39,14 @@
 - Directive lines may move unchanged or be removed as a delete signal, but edits and invented directive anchors fail validation.
 - Push guardrails require confirmation when archives exceed the threshold or the plan touches more than the configured mount percentage.
 
+## Canonical Document Layer
+
+The canonical parser is intentionally shallow:
+
+- It requires a YAML frontmatter envelope at the start of every canonical file.
+- It parses the `afs` identity block, title, and arbitrary connector properties.
+- It detects the exact stub marker from `plan.md`.
+- It extracts `::afs{...}` directive lines and their line numbers.
+- It renders the original frontmatter and body back to stable Markdown.
+
+It does not parse all Markdown into blocks yet. For now, it only materializes directive blocks because directive integrity is a universal AgentFS rule. Full block segmentation belongs to the future block diff engine.

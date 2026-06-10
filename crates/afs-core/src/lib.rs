@@ -9,6 +9,7 @@
 //! remote state, connector code supplies rendered canonical documents, and store
 //! code persists snapshots and journals. The core decides what those facts mean.
 
+pub mod canonical;
 pub mod conflict;
 pub mod diff;
 pub mod error;

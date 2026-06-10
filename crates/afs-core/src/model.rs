@@ -152,6 +152,10 @@ impl CanonicalDocument {
         self
     }
 
+    pub fn is_stub(&self) -> bool {
+        self.body.trim() == Self::STUB_MARKER
+    }
+
     pub fn empty_stub() -> Self {
         Self {
             frontmatter: String::new(),
@@ -191,6 +195,26 @@ impl CanonicalBlock {
                 raw: raw.into(),
             },
             source_span: None,
+            content_hash: None,
+        }
+    }
+
+    pub fn parsed_directive(
+        remote_id: Option<RemoteId>,
+        directive_type: Option<String>,
+        raw: impl Into<String>,
+        line: usize,
+    ) -> Self {
+        Self {
+            remote_id,
+            kind: BlockKind::Directive {
+                directive_type: directive_type.unwrap_or_default(),
+                raw: raw.into(),
+            },
+            source_span: Some(SourceSpan {
+                start_line: line,
+                end_line: line,
+            }),
             content_hash: None,
         }
     }

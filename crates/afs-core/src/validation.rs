@@ -8,7 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::model::{CanonicalBlock, CanonicalDocument, RemoteId};
+use crate::canonical::ParsedCanonicalDocument;
+use crate::model::{CanonicalBlock, CanonicalDocument, EntityKind, RemoteId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationIssue {
@@ -36,6 +37,10 @@ impl ValidationReport {
     pub fn push(&mut self, issue: ValidationIssue) {
         self.issues.push(issue);
     }
+
+    pub fn extend(&mut self, other: ValidationReport) {
+        self.issues.extend(other.issues);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +49,132 @@ pub enum DirectiveIntegrity {
     Moved,
     Deleted,
     Mangled,
+}
+
+pub fn validate_frontmatter_identity(
+    parsed: &ParsedCanonicalDocument,
+    file: impl Into<PathBuf>,
+) -> ValidationReport {
+    let file = file.into();
+    let mut report = ValidationReport::clean();
+    let Some(afs) = parsed.frontmatter.afs.as_ref() else {
+        report.push(issue(
+            "frontmatter_missing_afs",
+            file,
+            Some(1),
+            "frontmatter is missing the `afs` identity block",
+            "restore the generated `afs` frontmatter block before pushing",
+        ));
+        return report;
+    };
+
+    if afs.id.is_none() {
+        report.push(issue(
+            "frontmatter_missing_afs_id",
+            file.clone(),
+            Some(1),
+            "frontmatter is missing `afs.id`",
+            "restore the generated remote id before pushing",
+        ));
+    }
+
+    match afs.entity_type.as_ref() {
+        None => report.push(issue(
+            "frontmatter_missing_afs_type",
+            file.clone(),
+            Some(1),
+            "frontmatter is missing `afs.type`",
+            "restore the generated entity type before pushing",
+        )),
+        Some(EntityKind::Unknown(entity_type)) => report.push(issue(
+            "frontmatter_unknown_afs_type",
+            file.clone(),
+            Some(1),
+            format!("frontmatter has unknown `afs.type` value `{entity_type}`"),
+            "use a supported AgentFS entity type",
+        )),
+        Some(_) => {}
+    }
+
+    if afs.synced_at.is_none() {
+        report.push(issue(
+            "frontmatter_missing_synced_at",
+            file.clone(),
+            Some(1),
+            "frontmatter is missing `afs.synced_at`",
+            "restore the generated sync timestamp before pushing",
+        ));
+    }
+
+    if afs.remote_edited_at.is_none() {
+        report.push(issue(
+            "frontmatter_missing_remote_edited_at",
+            file.clone(),
+            Some(1),
+            "frontmatter is missing `afs.remote_edited_at`",
+            "restore the generated remote edit timestamp before pushing",
+        ));
+    }
+
+    if parsed
+        .frontmatter
+        .title
+        .as_ref()
+        .is_none_or(|title| title.trim().is_empty())
+    {
+        report.push(issue(
+            "frontmatter_missing_title",
+            file,
+            Some(1),
+            "frontmatter is missing `title`",
+            "restore the page title in frontmatter before pushing",
+        ));
+    }
+
+    report
+}
+
+pub fn validate_directive_syntax(
+    parsed: &ParsedCanonicalDocument,
+    file: impl Into<PathBuf>,
+) -> ValidationReport {
+    let file = file.into();
+    let mut report = ValidationReport::clean();
+
+    for directive in &parsed.directives {
+        if directive.malformed {
+            report.push(issue(
+                "directive_malformed",
+                file.clone(),
+                Some(directive.line),
+                "AgentFS directive syntax is malformed",
+                "restore the directive line exactly or delete it to delete the block",
+            ));
+            continue;
+        }
+
+        if directive.remote_id.is_none() {
+            report.push(issue(
+                "directive_missing_id",
+                file.clone(),
+                Some(directive.line),
+                "AgentFS directive is missing an `id` attribute",
+                "restore the directive line exactly or delete it to delete the block",
+            ));
+        }
+
+        if directive.directive_type.is_none() {
+            report.push(issue(
+                "directive_missing_type",
+                file.clone(),
+                Some(directive.line),
+                "AgentFS directive is missing a `type` attribute",
+                "restore the directive line exactly or delete it to delete the block",
+            ));
+        }
+    }
+
+    report
 }
 
 pub fn validate_directive_integrity(
