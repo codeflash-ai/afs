@@ -12,13 +12,25 @@ use afs_core::planner::{
     GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary, PushOperation, PushPlan,
 };
 use afs_core::push::{
-    PushPipelineAction, PushPipelineRequest, PushPipelineResult, PushStage, plan_push_pipeline,
+    PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult, PushStage,
+    plan_push_pipeline,
 };
 use afs_core::validation::ValidationIssue;
 use afs_store::{EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError};
 use serde::Serialize;
 
 pub fn run_diff<S>(store: &S, target_path: impl AsRef<Path>) -> Result<DiffReport, DiffError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    run_preview(store, target_path, PreviewOptions::new("diff"))
+}
+
+pub fn run_preview<S>(
+    store: &S,
+    target_path: impl AsRef<Path>,
+    options: PreviewOptions,
+) -> Result<DiffReport, DiffError>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
 {
@@ -46,6 +58,7 @@ where
         Ok(parsed) => parsed,
         Err(error) => {
             return Ok(DiffReport::validation_failure(
+                options.command,
                 absolute_path,
                 mount,
                 entity.remote_id,
@@ -59,6 +72,7 @@ where
         .is_some_and(|remote_id| remote_id != &entity.remote_id)
     {
         return Ok(DiffReport::validation_failure(
+            options.command,
             absolute_path,
             mount,
             entity.remote_id.clone(),
@@ -76,10 +90,13 @@ where
         .load_shadow(&mount.mount_id, &entity.remote_id)
         .map_err(DiffError::Store)?;
     let output = plan_push_pipeline(
-        PushPipelineRequest::new(relative_path, &parsed, &shadow).read_only(mount.read_only),
+        PushPipelineRequest::new(relative_path, &parsed, &shadow)
+            .with_approval(options.approval)
+            .read_only(mount.read_only),
     );
 
     Ok(DiffReport::from_pipeline(
+        options.command,
         absolute_path,
         mount,
         entity.remote_id,
@@ -130,6 +147,26 @@ fn parse_error_issue(path: &Path, error: CanonicalParseError) -> ValidationIssue
     )
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreviewOptions {
+    pub command: &'static str,
+    pub approval: PushApproval,
+}
+
+impl PreviewOptions {
+    pub fn new(command: &'static str) -> Self {
+        Self {
+            command,
+            approval: PushApproval::default(),
+        }
+    }
+
+    pub fn with_approval(mut self, approval: PushApproval) -> Self {
+        self.approval = approval;
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffError {
     MountNotFound(PathBuf),
@@ -178,6 +215,7 @@ pub struct DiffReport {
 
 impl DiffReport {
     fn validation_failure(
+        command: &'static str,
         absolute_path: PathBuf,
         mount: &MountConfig,
         entity_id: RemoteId,
@@ -185,7 +223,7 @@ impl DiffReport {
     ) -> Self {
         Self {
             ok: false,
-            command: "diff",
+            command,
             path: absolute_path.display().to_string(),
             mount_id: mount.mount_id.0.clone(),
             entity_id: entity_id.0,
@@ -201,6 +239,7 @@ impl DiffReport {
     }
 
     fn from_pipeline(
+        command: &'static str,
         absolute_path: PathBuf,
         mount: &MountConfig,
         entity_id: RemoteId,
@@ -209,7 +248,7 @@ impl DiffReport {
         let ok = result.validation.is_clean();
         Self {
             ok,
-            command: "diff",
+            command,
             path: absolute_path.display().to_string(),
             mount_id: mount.mount_id.0.clone(),
             entity_id: entity_id.0,

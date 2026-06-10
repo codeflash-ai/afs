@@ -4,6 +4,7 @@ use afs_store::SqliteStateStore;
 use serde::Serialize;
 
 use crate::diff::{DiffError, run_diff};
+use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
@@ -26,7 +27,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         "mount" => stub("mount", json),
         "status" => stub("status", json),
         "pull" => stub("pull", json),
-        "push" => stub("push", json),
+        "push" => push(&args[1..], json),
         "diff" => diff(&args[1..], json),
         "undo" => stub("undo", json),
         "log" => stub("log", json),
@@ -36,6 +37,57 @@ pub fn dispatch(args: &[String]) -> i32 {
             eprintln!("unknown command: {command}");
             print_help();
             EXIT_USAGE
+        }
+    }
+}
+
+fn push(args: &[String], json: bool) -> i32 {
+    let Some(path) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "push",
+                "usage",
+                "usage: afs push <path> [-y|--yes] [--confirm] [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("push", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    let options = PushOptions {
+        assume_yes: has_flag(args, "-y") || has_flag(args, "--yes"),
+        confirm_dangerous: has_flag(args, "--confirm"),
+    };
+
+    match run_push(&store, PathBuf::from(path), options) {
+        Ok(report) if json => {
+            let exit_code = push_report_exit_code(&report);
+            print_json(&report);
+            exit_code
+        }
+        Ok(report) => {
+            let exit_code = push_report_exit_code(&report);
+            print_push_report(&report);
+            exit_code
+        }
+        Err(error) => {
+            let exit_code = diff_error_exit_code(&error);
+            command_error(
+                json,
+                CommandError::new("push", error.code(), error.message()),
+                exit_code,
+            )
         }
     }
 }
@@ -82,6 +134,26 @@ fn diff(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn print_push_report(report: &PushReport) {
+    match report.action.as_str() {
+        "noop" => println!("nothing to push"),
+        "fix_validation" => print_diff_report_fields(&report.validation, report.plan.as_ref()),
+        "confirm_plan" => println!("push requires confirmation; rerun with -y or --yes"),
+        "confirm_dangerous_plan" => println!("dangerous push requires --confirm"),
+        "read_only_blocked" => println!("push blocked: mount is read-only"),
+        "apply_not_implemented" => {
+            println!(
+                "{}",
+                report
+                    .message
+                    .as_deref()
+                    .unwrap_or("connector apply is not implemented yet")
+            );
+        }
+        _ => println!("push stopped: {}", report.action),
+    }
+}
+
 fn stub(command: &str, json: bool) -> i32 {
     if json {
         println!("{{\"ok\":false,\"command\":\"{command}\",\"error\":\"not_implemented\"}}");
@@ -93,8 +165,15 @@ fn stub(command: &str, json: bool) -> i32 {
 }
 
 fn print_diff_report(report: &crate::diff::DiffReport) {
-    if !report.validation.is_empty() {
-        for issue in &report.validation {
+    print_diff_report_fields(&report.validation, report.plan.as_ref());
+}
+
+fn print_diff_report_fields(
+    validation: &[crate::diff::ValidationIssueOutput],
+    plan: Option<&crate::diff::PushPlanOutput>,
+) {
+    if !validation.is_empty() {
+        for issue in validation {
             match issue.line {
                 Some(line) => println!(
                     "{}:{}: {} ({})",
@@ -106,7 +185,7 @@ fn print_diff_report(report: &crate::diff::DiffReport) {
         return;
     }
 
-    let Some(plan) = &report.plan else {
+    let Some(plan) = plan else {
         println!("no plan");
         return;
     };
@@ -215,6 +294,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use crate::diff::{DiffReport, GuardrailOutput};
+    use crate::push::PushReport;
 
     use super::{EXIT_SUCCESS, EXIT_VALIDATION, diff_report_exit_code};
 
@@ -226,6 +306,26 @@ mod tests {
     #[test]
     fn validation_diff_report_exits_with_validation_code() {
         assert_eq!(diff_report_exit_code(&report(false)), EXIT_VALIDATION);
+    }
+
+    #[test]
+    fn push_report_exit_codes_track_gate_states() {
+        assert_eq!(
+            crate::push::push_report_exit_code(&push_report("noop")),
+            EXIT_SUCCESS
+        );
+        assert_eq!(
+            crate::push::push_report_exit_code(&push_report("fix_validation")),
+            EXIT_VALIDATION
+        );
+        assert_eq!(
+            crate::push::push_report_exit_code(&push_report("confirm_plan")),
+            4
+        );
+        assert_eq!(
+            crate::push::push_report_exit_code(&push_report("apply_not_implemented")),
+            5
+        );
     }
 
     fn report(ok: bool) -> DiffReport {
@@ -243,6 +343,26 @@ mod tests {
             },
             action: if ok { "noop" } else { "fix_validation" }.to_string(),
             completed_stages: Vec::new(),
+        }
+    }
+
+    fn push_report(action: &str) -> PushReport {
+        PushReport {
+            ok: action == "noop",
+            command: "push",
+            path: "Roadmap.md".to_string(),
+            mount_id: "notion-main".to_string(),
+            entity_id: "page-1".to_string(),
+            validation: Vec::new(),
+            plan: None,
+            guardrail: GuardrailOutput {
+                decision: "proceed".to_string(),
+                reasons: Vec::new(),
+            },
+            action: action.to_string(),
+            pipeline_action: action.to_string(),
+            completed_stages: Vec::new(),
+            message: None,
         }
     }
 }
