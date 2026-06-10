@@ -1,9 +1,11 @@
 //! Apply connector-neutral push plans to Notion.
 //!
-//! This module is intentionally narrow. The first write loop supports simple
-//! Markdown blocks that map cleanly to one Notion block without preserving rich
-//! inline annotations. Unsupported content fails before making a lossy request.
+//! This module is intentionally conservative. It supports Markdown blocks that
+//! map cleanly to one Notion block and rich-text spans whose Markdown shape is
+//! already emitted by the renderer. Unsupported content fails before making a
+//! lossy request.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult};
@@ -15,7 +17,7 @@ use afs_core::{AfsError, AfsResult};
 use serde_json::{Map, Value, json};
 
 use crate::client::NotionApi;
-use crate::dto::{BlockDto, BlockTreeDto, NotionPageBundle, RichTextDto};
+use crate::dto::{BlockDto, BlockTreeDto, NotionPageBundle, RichTextAnnotationsDto, RichTextDto};
 use crate::fetch::fetch_page_bundle;
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
@@ -56,7 +58,7 @@ pub fn apply_plan(
         match operation {
             PushOperation::UpdateBlock { block_id, content } => {
                 let current = current_block(&current_blocks, block_id)?;
-                let patch = parse_supported_block(content)?;
+                let patch = parse_supported_block(content, current_block_rich_text(current)?)?;
                 ensure_update_supported(current, &patch)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
                 effects.push(JournalApplyEffect::UpdatedBlock {
@@ -70,7 +72,7 @@ pub fn apply_plan(
                 after,
                 content,
             } => {
-                let patch = parse_supported_block(content)?;
+                let patch = parse_supported_block(content, None)?;
                 let chain_key = (parent_id.clone(), after.clone());
                 let effective_after = append_chains
                     .get(&chain_key)
@@ -133,7 +135,7 @@ pub fn apply_undo(
     for operation in &request.plan.operations {
         match operation {
             UndoOperation::RestoreBlockContent { block_id, content } => {
-                let patch = parse_supported_block(content)?;
+                let patch = parse_supported_block(content, None)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
             }
             UndoOperation::ArchiveCreatedBlock { block_id } => {
@@ -205,16 +207,10 @@ fn ensure_update_supported(current: &BlockDto, patch: &NotionBlockPatch) -> AfsR
         return Err(AfsError::Unsupported("changing Notion block type"));
     }
 
-    if !current_block_has_plain_rich_text(current)? {
-        return Err(AfsError::Unsupported(
-            "updating rich Notion blocks with annotations, links, mentions, or equations",
-        ));
-    }
-
     Ok(())
 }
 
-fn current_block_has_plain_rich_text(block: &BlockDto) -> AfsResult<bool> {
+fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>> {
     let rich_text = match block.kind.as_str() {
         "paragraph" => block
             .paragraph
@@ -243,8 +239,8 @@ fn current_block_has_plain_rich_text(block: &BlockDto) -> AfsResult<bool> {
         "quote" => block.quote.as_ref().map(|block| block.rich_text.as_slice()),
         "to_do" => block.to_do.as_ref().map(|block| block.rich_text.as_slice()),
         "code" => block.code.as_ref().map(|block| block.rich_text.as_slice()),
-        "divider" => return Ok(true),
-        _ => return Ok(false),
+        "divider" => return Ok(None),
+        _ => return Ok(None),
     }
     .ok_or_else(|| {
         AfsError::InvalidState(format!(
@@ -253,29 +249,7 @@ fn current_block_has_plain_rich_text(block: &BlockDto) -> AfsResult<bool> {
         ))
     })?;
 
-    Ok(rich_text.iter().all(is_plain_text_part))
-}
-
-fn is_plain_text_part(part: &RichTextDto) -> bool {
-    let text_variant = part.kind.is_empty() || part.kind == "text";
-    let no_annotations = !part.annotations.bold
-        && !part.annotations.italic
-        && !part.annotations.strikethrough
-        && !part.annotations.underline
-        && !part.annotations.code
-        && part
-            .annotations
-            .color
-            .as_deref()
-            .is_none_or(|color| color == "default");
-    let no_link = part.href.is_none()
-        && part
-            .text
-            .as_ref()
-            .and_then(|text| text.link.as_ref())
-            .is_none();
-
-    text_variant && no_annotations && no_link && part.mention.is_none() && part.equation.is_none()
+    Ok(Some(rich_text))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,7 +276,10 @@ impl NotionBlockPatch {
     }
 }
 
-fn parse_supported_block(markdown: &str) -> AfsResult<NotionBlockPatch> {
+fn parse_supported_block(
+    markdown: &str,
+    preimage: Option<&[RichTextDto]>,
+) -> AfsResult<NotionBlockPatch> {
     let trimmed = markdown.trim_end_matches('\n');
 
     if trimmed.trim().is_empty() {
@@ -337,7 +314,7 @@ fn parse_supported_block(markdown: &str) -> AfsResult<NotionBlockPatch> {
         };
         return Ok(NotionBlockPatch::new(
             kind,
-            json!({ "rich_text": rich_text(text) }),
+            json!({ "rich_text": rich_text_payload(text, preimage)? }),
         ));
     }
 
@@ -345,7 +322,7 @@ fn parse_supported_block(markdown: &str) -> AfsResult<NotionBlockPatch> {
         return Ok(NotionBlockPatch::new(
             "to_do",
             json!({
-                "rich_text": rich_text(text),
+                "rich_text": rich_text_payload(text, preimage)?,
                 "checked": checked,
             }),
         ));
@@ -354,21 +331,21 @@ fn parse_supported_block(markdown: &str) -> AfsResult<NotionBlockPatch> {
     if let Some(text) = parse_bulleted_list_item(trimmed) {
         return Ok(NotionBlockPatch::new(
             "bulleted_list_item",
-            json!({ "rich_text": rich_text(text) }),
+            json!({ "rich_text": rich_text_payload(text, preimage)? }),
         ));
     }
 
     if let Some(text) = parse_numbered_list_item(trimmed) {
         return Ok(NotionBlockPatch::new(
             "numbered_list_item",
-            json!({ "rich_text": rich_text(text) }),
+            json!({ "rich_text": rich_text_payload(text, preimage)? }),
         ));
     }
 
     if let Some(text) = parse_quote(trimmed) {
         return Ok(NotionBlockPatch::new(
             "quote",
-            json!({ "rich_text": rich_text(&text) }),
+            json!({ "rich_text": rich_text_payload(&text, preimage)? }),
         ));
     }
 
@@ -378,7 +355,7 @@ fn parse_supported_block(markdown: &str) -> AfsResult<NotionBlockPatch> {
 
     Ok(NotionBlockPatch::new(
         "paragraph",
-        json!({ "rich_text": rich_text(trimmed) }),
+        json!({ "rich_text": rich_text_payload(trimmed, preimage)? }),
     ))
 }
 
@@ -409,6 +386,723 @@ fn rich_text(content: &str) -> Value {
             },
         }
     ])
+}
+
+fn rich_text_payload(content: &str, preimage: Option<&[RichTextDto]>) -> AfsResult<Value> {
+    let parts = parse_rich_text_markdown(content, preimage)?;
+    Ok(Value::Array(
+        parts
+            .iter()
+            .map(RichTextWritePart::to_request_value)
+            .collect::<AfsResult<Vec<_>>>()?,
+    ))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct InlineAnnotations {
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    underline: bool,
+    code: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RichTextWritePart {
+    Text {
+        content: String,
+        link: Option<String>,
+        annotations: InlineAnnotations,
+    },
+    Equation {
+        expression: String,
+        annotations: InlineAnnotations,
+    },
+    PageMention {
+        id: String,
+        annotations: InlineAnnotations,
+    },
+    Preimage(Box<RichTextDto>),
+}
+
+impl RichTextWritePart {
+    fn apply_annotation(&mut self, apply: impl FnOnce(&mut InlineAnnotations)) {
+        match self {
+            Self::Text { annotations, .. }
+            | Self::Equation { annotations, .. }
+            | Self::PageMention { annotations, .. } => apply(annotations),
+            Self::Preimage(part) => {
+                let mut annotations = InlineAnnotations::from(&part.annotations);
+                apply(&mut annotations);
+                part.annotations = RichTextAnnotationsDto::from(annotations);
+            }
+        }
+    }
+
+    fn apply_link(&mut self, href: &str) -> AfsResult<()> {
+        match self {
+            Self::Text { link, .. } => {
+                *link = Some(href.to_string());
+                Ok(())
+            }
+            Self::Preimage(part) if part.kind == "text" || part.kind.is_empty() => {
+                part.href = Some(href.to_string());
+                if let Some(text) = part.text.as_mut() {
+                    text.link = Some(crate::dto::LinkDto {
+                        url: href.to_string(),
+                    });
+                }
+                Ok(())
+            }
+            _ => Err(AfsError::Unsupported("links on non-text rich spans")),
+        }
+    }
+
+    fn to_request_value(&self) -> AfsResult<Value> {
+        match self {
+            Self::Text {
+                content,
+                link,
+                annotations,
+            } => {
+                let mut text = json!({ "content": content });
+                if let Some(link) = link {
+                    text["link"] = json!({ "url": link });
+                }
+                let mut value = json!({
+                    "type": "text",
+                    "text": text,
+                });
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::Equation {
+                expression,
+                annotations,
+            } => {
+                let mut value = json!({
+                    "type": "equation",
+                    "equation": {
+                        "expression": expression,
+                    },
+                });
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::PageMention { id, annotations } => {
+                let mut value = json!({
+                    "type": "mention",
+                    "mention": {
+                        "type": "page",
+                        "page": {
+                            "id": id,
+                        },
+                    },
+                });
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::Preimage(part) => preimage_part_to_request_value(part),
+        }
+    }
+}
+
+impl From<&RichTextAnnotationsDto> for InlineAnnotations {
+    fn from(value: &RichTextAnnotationsDto) -> Self {
+        Self {
+            bold: value.bold,
+            italic: value.italic,
+            strikethrough: value.strikethrough,
+            underline: value.underline,
+            code: value.code,
+        }
+    }
+}
+
+impl From<InlineAnnotations> for RichTextAnnotationsDto {
+    fn from(value: InlineAnnotations) -> Self {
+        Self {
+            bold: value.bold,
+            italic: value.italic,
+            strikethrough: value.strikethrough,
+            underline: value.underline,
+            code: value.code,
+            color: None,
+        }
+    }
+}
+
+fn parse_rich_text_markdown(
+    content: &str,
+    preimage: Option<&[RichTextDto]>,
+) -> AfsResult<Vec<RichTextWritePart>> {
+    let preimage_tokens = preimage.map(preimage_tokens).unwrap_or_default();
+    let mut parser = InlineParser {
+        input: content,
+        preimage_tokens: &preimage_tokens,
+        allow_preimage: true,
+    };
+    parser.parse_until(None)
+}
+
+#[derive(Clone, Debug)]
+struct PreimageToken {
+    markdown: String,
+    part: RichTextDto,
+}
+
+fn preimage_tokens(parts: &[RichTextDto]) -> Vec<PreimageToken> {
+    let mut tokens = parts
+        .iter()
+        .filter_map(|part| {
+            let markdown = render_rich_text_part_for_match(part);
+            if markdown.is_empty() {
+                None
+            } else {
+                Some(PreimageToken {
+                    markdown,
+                    part: part.clone(),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    tokens.sort_by_key(|token| Reverse(token.markdown.len()));
+    tokens
+}
+
+struct InlineParser<'a> {
+    input: &'a str,
+    preimage_tokens: &'a [PreimageToken],
+    allow_preimage: bool,
+}
+
+impl InlineParser<'_> {
+    fn parse_until(&mut self, closing: Option<&str>) -> AfsResult<Vec<RichTextWritePart>> {
+        let mut parts = Vec::new();
+        let mut index = 0;
+
+        while index < self.input.len() {
+            if let Some(closing) = closing
+                && self.input[index..].starts_with(closing)
+            {
+                break;
+            }
+
+            if self.allow_preimage
+                && let Some(token) = self.match_preimage(index)
+            {
+                parts.push(RichTextWritePart::Preimage(Box::new(token.part.clone())));
+                index += token.markdown.len();
+                continue;
+            }
+
+            if let Some((part, consumed)) = self.parse_special(index)? {
+                parts.extend(part);
+                index += consumed;
+                continue;
+            }
+
+            let next = self.next_special_or_preimage(index + 1, closing);
+            parts.push(RichTextWritePart::Text {
+                content: unescape_markdown_text(&self.input[index..next]),
+                link: None,
+                annotations: InlineAnnotations::default(),
+            });
+            index = next;
+        }
+
+        Ok(parts)
+    }
+
+    fn match_preimage(&self, index: usize) -> Option<&PreimageToken> {
+        self.preimage_tokens
+            .iter()
+            .find(|token| self.input[index..].starts_with(&token.markdown))
+    }
+
+    fn parse_special(&self, index: usize) -> AfsResult<Option<(Vec<RichTextWritePart>, usize)>> {
+        let rest = &self.input[index..];
+
+        if rest.starts_with("**")
+            && let Some(end) = find_closing(rest, 2, "**")
+        {
+            let mut parts = parse_nested(&rest[2..end], self.preimage_tokens, false)?;
+            for part in &mut parts {
+                part.apply_annotation(|annotations| annotations.bold = true);
+            }
+            return Ok(Some((parts, end + 2)));
+        }
+
+        if rest.starts_with("~~")
+            && let Some(end) = find_closing(rest, 2, "~~")
+        {
+            let mut parts = parse_nested(&rest[2..end], self.preimage_tokens, false)?;
+            for part in &mut parts {
+                part.apply_annotation(|annotations| annotations.strikethrough = true);
+            }
+            return Ok(Some((parts, end + 2)));
+        }
+
+        if rest.starts_with("<u>")
+            && let Some(end) = rest[3..].find("</u>").map(|offset| offset + 3)
+        {
+            let mut parts = parse_nested(&rest[3..end], self.preimage_tokens, false)?;
+            for part in &mut parts {
+                part.apply_annotation(|annotations| annotations.underline = true);
+            }
+            return Ok(Some((parts, end + 4)));
+        }
+
+        if rest.starts_with('`')
+            && let Some(end) = find_closing(rest, 1, "`")
+        {
+            return Ok(Some((
+                vec![RichTextWritePart::Text {
+                    content: rest[1..end].replace("\\`", "`"),
+                    link: None,
+                    annotations: InlineAnnotations {
+                        code: true,
+                        ..Default::default()
+                    },
+                }],
+                end + 1,
+            )));
+        }
+
+        if rest.starts_with('$')
+            && let Some(end) = find_closing(rest, 1, "$")
+        {
+            return Ok(Some((
+                vec![RichTextWritePart::Equation {
+                    expression: rest[1..end].replace("\\$", "$"),
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
+        if rest.starts_with('[')
+            && let Some((label, href, consumed)) = parse_markdown_link(rest)
+        {
+            if let Some(id) = href.strip_prefix("afs://") {
+                return Ok(Some((
+                    vec![RichTextWritePart::PageMention {
+                        id: id.to_string(),
+                        annotations: InlineAnnotations::default(),
+                    }],
+                    consumed,
+                )));
+            }
+
+            let mut parts = parse_nested(label, self.preimage_tokens, false)?;
+            for part in &mut parts {
+                part.apply_link(href)?;
+            }
+            return Ok(Some((parts, consumed)));
+        }
+
+        if rest.starts_with('_')
+            && let Some(end) = find_closing(rest, 1, "_")
+        {
+            let mut parts = parse_nested(&rest[1..end], self.preimage_tokens, false)?;
+            for part in &mut parts {
+                part.apply_annotation(|annotations| annotations.italic = true);
+            }
+            return Ok(Some((parts, end + 1)));
+        }
+
+        Ok(None)
+    }
+
+    fn next_special_or_preimage(&self, start: usize, closing: Option<&str>) -> usize {
+        let mut next = self.input.len();
+        for marker in ["**", "~~", "<u>", "`", "$", "[", "_"] {
+            if let Some(offset) = self.input[start..].find(marker) {
+                next = next.min(start + offset);
+            }
+        }
+        if let Some(closing) = closing
+            && let Some(offset) = self.input[start..].find(closing)
+        {
+            next = next.min(start + offset);
+        }
+        if self.allow_preimage {
+            for token in self.preimage_tokens {
+                if let Some(offset) = self.input[start..].find(&token.markdown) {
+                    next = next.min(start + offset);
+                }
+            }
+        }
+        next
+    }
+}
+
+fn parse_nested(
+    input: &str,
+    preimage_tokens: &[PreimageToken],
+    allow_preimage: bool,
+) -> AfsResult<Vec<RichTextWritePart>> {
+    let mut parser = InlineParser {
+        input,
+        preimage_tokens,
+        allow_preimage,
+    };
+    parser.parse_until(None)
+}
+
+fn find_closing(input: &str, start: usize, marker: &str) -> Option<usize> {
+    input[start..].find(marker).map(|offset| start + offset)
+}
+
+fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
+    let label_end = input.find("](")?;
+    let href_start = label_end + 2;
+    let href_end = input[href_start..]
+        .find(')')
+        .map(|offset| href_start + offset)?;
+    Some((
+        &input[1..label_end],
+        &input[href_start..href_end],
+        href_end + 1,
+    ))
+}
+
+fn unescape_markdown_text(value: &str) -> String {
+    value.replace("\\\\", "\\")
+}
+
+fn preimage_part_to_request_value(part: &RichTextDto) -> AfsResult<Value> {
+    let mut value = match part.kind.as_str() {
+        "equation" => json!({
+            "type": "equation",
+            "equation": {
+                "expression": part
+                    .equation
+                    .as_ref()
+                    .map(|equation| equation.expression.as_str())
+                    .unwrap_or(part.plain_text.as_str()),
+            },
+        }),
+        "mention" => {
+            let mention = part.mention.as_ref().ok_or_else(|| {
+                AfsError::InvalidState(
+                    "notion mention rich text had no mention payload".to_string(),
+                )
+            })?;
+            json!({
+                "type": "mention",
+                "mention": mention_to_request_value(mention)?,
+            })
+        }
+        _ => {
+            let content = part
+                .text
+                .as_ref()
+                .map(|text| text.content.as_str())
+                .filter(|content| !content.is_empty())
+                .unwrap_or(part.plain_text.as_str());
+            let mut text = json!({ "content": content });
+            if let Some(href) = rich_text_href(part) {
+                text["link"] = json!({ "url": href });
+            }
+            json!({
+                "type": "text",
+                "text": text,
+            })
+        }
+    };
+    insert_annotations(&mut value, &InlineAnnotations::from(&part.annotations));
+    Ok(value)
+}
+
+fn mention_to_request_value(mention: &crate::dto::MentionRichTextDto) -> AfsResult<Value> {
+    match mention.kind.as_str() {
+        "page" => Ok(json!({
+            "type": "page",
+            "page": {
+                "id": mention
+                    .page
+                    .as_ref()
+                    .map(|page| page.id.as_str())
+                    .unwrap_or_default(),
+            },
+        })),
+        "database" => Ok(json!({
+            "type": "database",
+            "database": {
+                "id": mention
+                    .database
+                    .as_ref()
+                    .map(|database| database.id.as_str())
+                    .unwrap_or_default(),
+            },
+        })),
+        "date" => {
+            let date = mention.date.as_ref().ok_or_else(|| {
+                AfsError::InvalidState("notion date mention had no date payload".to_string())
+            })?;
+            let mut value = json!({
+                "type": "date",
+                "date": {
+                    "start": date.start,
+                },
+            });
+            if let Some(end) = &date.end {
+                value["date"]["end"] = json!(end);
+            }
+            if let Some(time_zone) = &date.time_zone {
+                value["date"]["time_zone"] = json!(time_zone);
+            }
+            Ok(value)
+        }
+        "user" => Ok(json!({
+            "type": "user",
+            "user": {
+                "id": mention
+                    .user
+                    .as_ref()
+                    .map(|user| user.id.as_str())
+                    .unwrap_or_default(),
+            },
+        })),
+        _ => Err(AfsError::Unsupported("preserving this Notion mention type")),
+    }
+}
+
+fn insert_annotations(value: &mut Value, annotations: &InlineAnnotations) {
+    if annotations == &InlineAnnotations::default() {
+        return;
+    }
+
+    value["annotations"] = json!({
+        "bold": annotations.bold,
+        "italic": annotations.italic,
+        "strikethrough": annotations.strikethrough,
+        "underline": annotations.underline,
+        "code": annotations.code,
+        "color": "default",
+    });
+}
+
+fn render_rich_text_part_for_match(part: &RichTextDto) -> String {
+    let (mut text, link_applied) = match part.kind.as_str() {
+        "equation" => (equation_to_markdown(part), false),
+        "mention" => mention_to_markdown(part),
+        _ => (text_rich_text_to_markdown(part), false),
+    };
+
+    text = apply_annotations(text, &part.annotations);
+
+    if !link_applied && let Some(href) = rich_text_href(part) {
+        text = markdown_link_preserving_whitespace(&text, href);
+    }
+
+    text
+}
+
+fn text_rich_text_to_markdown(part: &RichTextDto) -> String {
+    escape_markdown_text(&rich_text_part_plain_text(part))
+}
+
+fn equation_to_markdown(part: &RichTextDto) -> String {
+    let expression = part
+        .equation
+        .as_ref()
+        .map(|equation| equation.expression.as_str())
+        .filter(|expression| !expression.is_empty())
+        .unwrap_or(part.plain_text.as_str());
+
+    if expression.is_empty() {
+        String::new()
+    } else {
+        format!("${}$", expression.replace('$', "\\$"))
+    }
+}
+
+fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
+    let Some(mention) = &part.mention else {
+        return (text_rich_text_to_markdown(part), false);
+    };
+
+    match mention.kind.as_str() {
+        "page" => mention
+            .page
+            .as_ref()
+            .map(|page| {
+                (
+                    markdown_link_preserving_whitespace(
+                        &mention_label(part),
+                        &format!("afs://{}", page.id),
+                    ),
+                    true,
+                )
+            })
+            .unwrap_or_else(|| (text_rich_text_to_markdown(part), false)),
+        "database" => mention
+            .database
+            .as_ref()
+            .map(|database| {
+                (
+                    markdown_link_preserving_whitespace(
+                        &mention_label(part),
+                        &format!("afs://{}", database.id),
+                    ),
+                    true,
+                )
+            })
+            .unwrap_or_else(|| (text_rich_text_to_markdown(part), false)),
+        "date" => {
+            let text = text_rich_text_to_markdown(part);
+            if text.is_empty() {
+                (
+                    mention
+                        .date
+                        .as_ref()
+                        .map(date_mention_label)
+                        .map(|label| escape_markdown_text(&label))
+                        .unwrap_or_default(),
+                    false,
+                )
+            } else {
+                (text, false)
+            }
+        }
+        "user" => {
+            let text = text_rich_text_to_markdown(part);
+            if text.is_empty() {
+                (
+                    mention
+                        .user
+                        .as_ref()
+                        .and_then(|user| user.name.clone())
+                        .map(|name| escape_markdown_text(&format!("@{name}")))
+                        .unwrap_or_default(),
+                    false,
+                )
+            } else {
+                (text, false)
+            }
+        }
+        "link_preview" => mention
+            .link_preview
+            .as_ref()
+            .filter(|link| !link.url.is_empty())
+            .map(|link| {
+                (
+                    markdown_link_preserving_whitespace(&mention_label(part), &link.url),
+                    true,
+                )
+            })
+            .unwrap_or_else(|| (text_rich_text_to_markdown(part), false)),
+        _ => (text_rich_text_to_markdown(part), false),
+    }
+}
+
+fn mention_label(part: &RichTextDto) -> String {
+    let label = rich_text_part_plain_text(part);
+    if label.is_empty() {
+        "mention".to_string()
+    } else {
+        escape_markdown_text(&label)
+    }
+}
+
+fn date_mention_label(date: &crate::dto::DateMentionDto) -> String {
+    match &date.end {
+        Some(end) if !end.is_empty() => format!("{} to {end}", date.start),
+        _ => date.start.clone(),
+    }
+}
+
+fn apply_annotations(mut text: String, annotations: &RichTextAnnotationsDto) -> String {
+    if annotations.code {
+        text =
+            wrap_preserving_whitespace(&text, |value| format!("`{}`", value.replace('`', "\\`")));
+    }
+    if annotations.bold {
+        text = wrap_preserving_whitespace(&text, |value| format!("**{value}**"));
+    }
+    if annotations.italic {
+        text = wrap_preserving_whitespace(&text, |value| format!("_{value}_"));
+    }
+    if annotations.strikethrough {
+        text = wrap_preserving_whitespace(&text, |value| format!("~~{value}~~"));
+    }
+    if annotations.underline {
+        text = wrap_preserving_whitespace(&text, |value| format!("<u>{value}</u>"));
+    }
+
+    text
+}
+
+fn rich_text_href(part: &RichTextDto) -> Option<&str> {
+    part.href
+        .as_deref()
+        .or_else(|| {
+            part.text
+                .as_ref()?
+                .link
+                .as_ref()
+                .map(|link| link.url.as_str())
+        })
+        .filter(|href| !href.is_empty())
+}
+
+fn rich_text_part_plain_text(part: &RichTextDto) -> String {
+    if !part.plain_text.is_empty() {
+        return part.plain_text.clone();
+    }
+
+    match part.kind.as_str() {
+        "text" | "" => part
+            .text
+            .as_ref()
+            .map(|text| text.content.clone())
+            .unwrap_or_default(),
+        "equation" => part
+            .equation
+            .as_ref()
+            .map(|equation| equation.expression.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
+    wrap_preserving_whitespace(label, |value| {
+        format!("[{}]({href})", escape_markdown_link_label(value))
+    })
+}
+
+fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) -> String {
+    let Some(start) = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(index, _)| index)
+    else {
+        return value.to_string();
+    };
+    let end = value
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(value.len());
+
+    format!(
+        "{}{}{}",
+        &value[..start],
+        wrap(&value[start..end]),
+        &value[end..]
+    )
+}
+
+fn escape_markdown_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+}
+
+fn escape_markdown_link_label(text: &str) -> String {
+    text.replace('[', "\\[").replace(']', "\\]")
 }
 
 fn parse_code_fence(markdown: &str) -> Option<(String, String)> {

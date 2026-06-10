@@ -53,12 +53,13 @@ The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, and block archive;
 - supported writable block forms: paragraphs, headings 1-3, bulleted list items, numbered list items, to-dos, quotes, code fences, and dividers;
-- unsupported write forms fail before API mutation, including tables, page/database creation, property edits, block moves, and updates to existing rich-text blocks containing annotations, links, mentions, or equations;
+- supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, `afs://` page links, and unchanged preimage mentions such as dates;
+- unsupported write forms fail before API mutation, including tables, page/database creation, property edits, block moves, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
 - after apply, the CLI reconciler fetches the changed page, rewrites the local file atomically, saves the refreshed shadow, and updates the entity's `remote_edited_at`.
 
-This gives the end-to-end write loop without pretending rich inline round-trip is solved. The next fidelity step is a Markdown inline parser that can preserve and update rich text spans instead of flattening them.
+This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
 
 ## Path Projection
 

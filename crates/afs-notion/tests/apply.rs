@@ -10,8 +10,8 @@ use afs_core::push::RemotePrecondition;
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, PageDto, PageListDto, PaginatedListDto, RichTextAnnotationsDto,
-    RichTextBlockDto, RichTextDto, TextRichTextDto,
+    BlockDto, BlockListDto, DateMentionDto, LinkDto, MentionRichTextDto, PageDto, PageListDto,
+    PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, TextRichTextDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -198,7 +198,7 @@ fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
 #[test]
 fn check_concurrency_rejects_remote_timestamp_mismatch() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T01:00:00.000Z", false));
-    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
     let plan = PushPlan::new(vec![RemoteId::new("page-1")], Vec::new());
     let push_id = PushId("push-1".to_string());
     let mount_id = MountId::new("notion-main");
@@ -221,21 +221,31 @@ fn check_concurrency_rejects_remote_timestamp_mismatch() {
 }
 
 #[test]
-fn apply_rejects_updates_that_would_flatten_existing_rich_text() {
-    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", true));
-    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
+    let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            annotated_text("Bold", |annotations| annotations.bold = true),
+            rich_text_part(" and "),
+            date_mention("2026-06-10", "2026-06-10"),
+            rich_text_part(" plus "),
+            linked_text("Docs", "https://example.com/"),
+            rich_text_part("."),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
     let plan = PushPlan::new(
         vec![RemoteId::new("page-1")],
         vec![PushOperation::UpdateBlock {
             block_id: RemoteId::new("paragraph-1"),
-            content: "Changed paragraph.".to_string(),
+            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and $E=mc^2$ [Roadmap](afs://page-2)".to_string(),
         }],
     );
     let push_id = PushId("push-1".to_string());
     let operation_ids = operation_ids(&push_id, &plan);
     let mount_id = MountId::new("notion-main");
 
-    let error = connector
+    let result = connector
         .apply(ApplyPlanRequest {
             push_id: &push_id,
             mount_id: &mount_id,
@@ -243,13 +253,92 @@ fn apply_rejects_updates_that_would_flatten_existing_rich_text() {
             operation_ids: &operation_ids,
             remote_preconditions: &[],
         })
-        .expect_err("rich text unsupported");
+        .expect("apply");
 
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    let writes = api.writes.lock().expect("writes");
     assert_eq!(
-        error,
-        AfsError::Unsupported(
-            "updating rich Notion blocks with annotations, links, mentions, or equations"
-        )
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "paragraph-1".to_string(),
+            body: json!({
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": "Boldly",
+                            },
+                            "annotations": {
+                                "bold": true,
+                                "italic": false,
+                                "strikethrough": false,
+                                "underline": false,
+                                "code": false,
+                                "color": "default",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "date",
+                                "date": {
+                                    "start": "2026-06-10",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " plus ",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": "Docs",
+                                "link": {
+                                    "url": "https://example.com/",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
+                            "type": "equation",
+                            "equation": {
+                                "expression": "E=mc^2",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "page",
+                                "page": {
+                                    "id": "page-2",
+                                },
+                            },
+                        },
+                    ],
+                },
+            }),
+        }]
     );
 }
 
@@ -271,6 +360,17 @@ struct RecordingNotionApi {
 
 impl RecordingNotionApi {
     fn new(last_edited_time: &str, rich_paragraph: bool) -> Self {
+        let rich_text = if rich_paragraph {
+            vec![annotated_text("Old paragraph.", |annotations| {
+                annotations.bold = true;
+            })]
+        } else {
+            rich_text("Old paragraph.")
+        };
+        Self::with_paragraph_rich_text(last_edited_time, rich_text)
+    }
+
+    fn with_paragraph_rich_text(last_edited_time: &str, rich_text: Vec<RichTextDto>) -> Self {
         let page = PageDto {
             id: "page-1".to_string(),
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
@@ -283,7 +383,7 @@ impl RecordingNotionApi {
             ("page-1".to_string(), None),
             PaginatedListDto {
                 results: vec![
-                    paragraph_block("paragraph-1", "Old paragraph.", rich_paragraph),
+                    paragraph_block_with_rich_text("paragraph-1", rich_text),
                     paragraph_block("old-block", "Old block.", false),
                 ],
                 next_cursor: None,
@@ -394,8 +494,21 @@ fn paragraph_block(id: &str, text: &str, rich: bool) -> BlockDto {
     block
 }
 
+fn paragraph_block_with_rich_text(id: &str, rich_text: Vec<RichTextDto>) -> BlockDto {
+    let mut block = block(id, "paragraph");
+    block.paragraph = Some(RichTextBlockDto {
+        rich_text,
+        color: None,
+    });
+    block
+}
+
 fn rich_text(text: &str) -> Vec<RichTextDto> {
-    vec![RichTextDto {
+    vec![rich_text_part(text)]
+}
+
+fn rich_text_part(text: &str) -> RichTextDto {
+    RichTextDto {
         kind: "text".to_string(),
         text: Some(TextRichTextDto {
             content: text.to_string(),
@@ -403,7 +516,43 @@ fn rich_text(text: &str) -> Vec<RichTextDto> {
         }),
         plain_text: text.to_string(),
         ..Default::default()
-    }]
+    }
+}
+
+fn annotated_text(text: &str, apply: impl FnOnce(&mut RichTextAnnotationsDto)) -> RichTextDto {
+    let mut part = rich_text_part(text);
+    apply(&mut part.annotations);
+    part
+}
+
+fn linked_text(text: &str, href: &str) -> RichTextDto {
+    RichTextDto {
+        href: Some(href.to_string()),
+        text: Some(TextRichTextDto {
+            content: text.to_string(),
+            link: Some(LinkDto {
+                url: href.to_string(),
+            }),
+        }),
+        ..rich_text_part(text)
+    }
+}
+
+fn date_mention(text: &str, start: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "date".to_string(),
+            date: Some(DateMentionDto {
+                start: start.to_string(),
+                end: None,
+                time_zone: None,
+            }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }
 }
 
 fn rich_text_json(text: &str) -> Value {
