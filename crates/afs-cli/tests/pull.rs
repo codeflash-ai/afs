@@ -223,6 +223,28 @@ impl NotionApi for FixtureNotionApi {
             has_more: false,
         })
     }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> afs_core::AfsResult<BlockDto> {
+        Err(afs_core::AfsError::NotImplemented("fixture update block"))
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> afs_core::AfsResult<BlockListDto> {
+        Err(afs_core::AfsError::NotImplemented(
+            "fixture append block children",
+        ))
+    }
+
+    fn delete_block(&self, _block_id: &str) -> afs_core::AfsResult<BlockDto> {
+        Err(afs_core::AfsError::NotImplemented("fixture delete block"))
+    }
 }
 
 fn page(id: &str, title: &str) -> PageDto {

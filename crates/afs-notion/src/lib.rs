@@ -3,6 +3,7 @@
 //! The connector keeps Notion API transport, DTOs, and block rendering separate
 //! from the connector-neutral sync contracts in `afs-core`.
 
+pub mod apply;
 pub mod client;
 pub mod dto;
 pub mod fetch;
@@ -20,6 +21,7 @@ use afs_connector::{
 use afs_core::model::{CanonicalDocument, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 
+use crate::apply::{apply_plan, apply_undo, check_concurrency};
 use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use crate::fetch::fetch_page_bundle;
 use crate::projection::{enumerate_root_page_tree, enumerate_shared_pages};
@@ -134,15 +136,15 @@ impl Connector for NotionConnector {
         Err(AfsError::NotImplemented("Notion parse"))
     }
 
-    fn check_concurrency(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<()> {
-        Err(AfsError::NotImplemented("Notion concurrency check"))
+    fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
+        check_concurrency(self.api.as_ref(), request)
     }
 
-    fn apply(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult> {
-        Err(AfsError::NotImplemented("Notion apply"))
+    fn apply(&self, request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult> {
+        apply_plan(self.api.as_ref(), request)
     }
 
-    fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult> {
-        Err(AfsError::NotImplemented("Notion undo apply"))
+    fn apply_undo(&self, request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult> {
+        apply_undo(self.api.as_ref(), request)
     }
 }

@@ -17,7 +17,9 @@ use afs_core::push::{
 };
 use afs_core::shadow::ShadowDocument;
 use afs_core::validation::ValidationIssue;
-use afs_store::{EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError};
+use afs_store::{
+    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
+};
 use serde::Serialize;
 
 pub fn run_diff<S>(store: &S, target_path: impl AsRef<Path>) -> Result<DiffReport, DiffError>
@@ -120,7 +122,8 @@ where
     Ok(PreviewArtifacts {
         report,
         mount: Some(mount.clone()),
-        entity_id: Some(entity.remote_id),
+        entity_id: Some(entity.remote_id.clone()),
+        entity: Some(entity),
         shadow: Some(shadow),
         pipeline: Some(output),
     })
@@ -180,6 +183,7 @@ pub struct PreviewArtifacts {
     pub report: DiffReport,
     pub mount: Option<MountConfig>,
     pub entity_id: Option<RemoteId>,
+    pub entity: Option<EntityRecord>,
     pub shadow: Option<ShadowDocument>,
     pub pipeline: Option<PushPipelineResult>,
 }
@@ -190,6 +194,7 @@ impl PreviewArtifacts {
             report,
             mount: None,
             entity_id: None,
+            entity: None,
             shadow: None,
             pipeline: None,
         }

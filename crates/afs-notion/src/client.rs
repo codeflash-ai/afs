@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::NotionConfig;
-use crate::dto::{BlockListDto, PageDto, PageListDto};
+use crate::dto::{BlockDto, BlockListDto, PageDto, PageListDto};
 
 pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
 pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
@@ -24,6 +24,13 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         start_cursor: Option<&str>,
     ) -> AfsResult<BlockListDto>;
     fn search_pages(&self, start_cursor: Option<&str>) -> AfsResult<PageListDto>;
+    fn update_block(&self, block_id: &str, body: serde_json::Value) -> AfsResult<BlockDto>;
+    fn append_block_children(
+        &self,
+        block_id: &str,
+        body: serde_json::Value,
+    ) -> AfsResult<BlockListDto>;
+    fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto>;
 }
 
 #[derive(Clone, Debug)]
@@ -83,18 +90,44 @@ impl HttpNotionApi {
     where
         T: DeserializeOwned,
     {
+        self.send_json(reqwest::Method::POST, path, Some(body))
+    }
+
+    fn patch_json<T>(&self, path: &str, body: impl Serialize) -> AfsResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.send_json(reqwest::Method::PATCH, path, Some(body))
+    }
+
+    fn delete_json<T>(&self, path: &str) -> AfsResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.send_json::<T, serde_json::Value>(reqwest::Method::DELETE, path, None)
+    }
+
+    fn send_json<T, B>(&self, method: reqwest::Method, path: &str, body: Option<B>) -> AfsResult<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
         let token = self.token()?;
         let url = format!(
             "{}/{}",
             DEFAULT_NOTION_API_BASE_URL,
             path.trim_start_matches('/')
         );
-        let response = self
+        let mut request = self
             .client
-            .post(url)
+            .request(method, url)
             .bearer_auth(token)
-            .header("Notion-Version", DEFAULT_NOTION_VERSION)
-            .json(&body)
+            .header("Notion-Version", DEFAULT_NOTION_VERSION);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+
+        let response = request
             .send()
             .map_err(|error| AfsError::Io(format!("notion request failed: {error}")))?;
         let status = response.status();
@@ -161,5 +194,21 @@ impl NotionApi for HttpNotionApi {
         }
 
         self.post_json("/v1/search", body)
+    }
+
+    fn update_block(&self, block_id: &str, body: serde_json::Value) -> AfsResult<BlockDto> {
+        self.patch_json(&format!("/v1/blocks/{block_id}"), body)
+    }
+
+    fn append_block_children(
+        &self,
+        block_id: &str,
+        body: serde_json::Value,
+    ) -> AfsResult<BlockListDto> {
+        self.patch_json(&format!("/v1/blocks/{block_id}/children"), body)
+    }
+
+    fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto> {
+        self.delete_json(&format!("/v1/blocks/{block_id}"))
     }
 }

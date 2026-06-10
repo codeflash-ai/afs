@@ -286,6 +286,9 @@ pub struct PushExecutionRequest {
     pub pipeline: PushPipelineResult,
     /// Pre-push canonical snapshots used by future resume and undo flows.
     pub preimages: Vec<JournalPreimage>,
+    /// Last-synced remote edit timestamps for entities that the connector
+    /// should compare immediately before apply.
+    pub remote_preconditions: Vec<RemotePrecondition>,
 }
 
 impl PushExecutionRequest {
@@ -295,11 +298,17 @@ impl PushExecutionRequest {
             mount_id,
             pipeline,
             preimages: Vec::new(),
+            remote_preconditions: Vec::new(),
         }
     }
 
     pub fn with_preimages(mut self, preimages: Vec<JournalPreimage>) -> Self {
         self.preimages = preimages;
+        self
+    }
+
+    pub fn with_remote_preconditions(mut self, preconditions: Vec<RemotePrecondition>) -> Self {
+        self.remote_preconditions = preconditions;
         self
     }
 }
@@ -331,6 +340,12 @@ pub enum PushExecutionAction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemotePrecondition {
+    pub remote_id: RemoteId,
+    pub remote_edited_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushConcurrencyRequest<'a> {
     /// Stable push identifier available for source-side request correlation.
     pub push_id: &'a PushId,
@@ -342,6 +357,8 @@ pub struct PushConcurrencyRequest<'a> {
     pub operation_ids: &'a [PushOperationId],
     /// Remote entities covered by the journal entry.
     pub remote_ids: &'a [RemoteId],
+    /// Last-synced remote timestamps for compare-and-swap checks.
+    pub remote_preconditions: &'a [RemotePrecondition],
 }
 
 /// Hook for compare-and-swap style remote freshness checks before apply.
@@ -361,6 +378,8 @@ pub struct PushApplyRequest<'a> {
     pub operation_ids: &'a [PushOperationId],
     /// Remote entities covered by the journal entry.
     pub remote_ids: &'a [RemoteId],
+    /// Last-synced remote timestamps available to source-specific apply code.
+    pub remote_preconditions: &'a [RemotePrecondition],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,6 +485,7 @@ where
         plan: &plan,
         operation_ids: &operation_ids,
         remote_ids: &remote_ids,
+        remote_preconditions: &request.remote_preconditions,
     }) {
         mark_failed(journal, &request.push_id, &error)?;
         return Err(error);
@@ -477,6 +497,7 @@ where
         plan: &plan,
         operation_ids: &operation_ids,
         remote_ids: &remote_ids,
+        remote_preconditions: &request.remote_preconditions,
     }) {
         Ok(result) => result,
         Err(error) => {

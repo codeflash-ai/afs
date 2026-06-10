@@ -35,6 +35,7 @@ fn connector_adapters_forward_push_identity_and_plan() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_ids: &remote_ids,
+            remote_preconditions: &[],
         })
         .expect("concurrency check");
 
@@ -46,6 +47,7 @@ fn connector_adapters_forward_push_identity_and_plan() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_ids: &remote_ids,
+            remote_preconditions: &[],
         })
         .expect("apply");
 

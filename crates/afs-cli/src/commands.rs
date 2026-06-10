@@ -14,8 +14,7 @@ use crate::history::{
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull};
 use crate::push::{
-    NotImplementedReconciler, PushOptions, PushReport, push_report_exit_code,
-    run_push_with_executor,
+    NotionPushReconciler, PushOptions, PushReport, push_report_exit_code, run_push_with_executor,
 };
 
 const EXIT_SUCCESS: i32 = 0;
@@ -259,7 +258,7 @@ fn push(args: &[String], json: bool) -> i32 {
     let connector = default_notion_connector();
     let mut concurrency = ConnectorPushConcurrencyCheck::new(&connector);
     let mut applier = ConnectorPushApplier::new(&connector);
-    let mut reconciler = NotImplementedReconciler;
+    let mut reconciler = NotionPushReconciler::new(store.clone(), connector.clone());
 
     match run_push_with_executor(
         &mut store,

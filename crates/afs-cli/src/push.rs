@@ -1,21 +1,26 @@
 //! `afs push` orchestration.
 //!
 //! This push surface runs validation, diff, plan, guardrail, and the journaled
-//! connector-apply spine. Real source mutation is still connector-dependent, but
-//! the CLI path now exercises the same write-ahead executor that production
-//! connectors will use.
+//! connector-apply spine.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use afs_connector::{Connector, FetchRequest};
+use afs_core::canonical::render_canonical_markdown;
 use afs_core::journal::{JournalPreimage, JournalStatus, JournalStore, PushId};
-use afs_core::model::RemoteId;
+use afs_core::model::{HydrationState, RemoteId};
 use afs_core::push::{
     PushApproval, PushExecutionAction, PushExecutionRequest, PushExecutionResult,
-    PushReconcileRequest, PushReconcileResult, PushReconciler, execute_journaled_push,
+    PushReconcileRequest, PushReconcileResult, PushReconciler, RemotePrecondition,
+    execute_journaled_push,
 };
 use afs_core::{AfsError, AfsResult};
-use afs_store::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
+use afs_notion::NotionConnector;
+use afs_notion::dto::NotionPageBundle;
+use afs_store::{
+    EntityRepository, JournalRepository, MountRepository, ShadowRepository, SqliteStateStore,
+};
 use serde::Serialize;
 
 use crate::diff::{
@@ -71,14 +76,21 @@ where
         return Ok(report);
     }
 
-    let (Some(mount), Some(shadow), Some(pipeline)) =
-        (artifacts.mount, artifacts.shadow, artifacts.pipeline)
-    else {
+    let (Some(mount), Some(entity), Some(shadow), Some(pipeline)) = (
+        artifacts.mount,
+        artifacts.entity,
+        artifacts.shadow,
+        artifacts.pipeline,
+    ) else {
         return Ok(report);
     };
     let push_id = generate_push_id();
     let execution_request = PushExecutionRequest::new(push_id.clone(), mount.mount_id, pipeline)
-        .with_preimages(vec![JournalPreimage::from_shadow(shadow)]);
+        .with_preimages(vec![JournalPreimage::from_shadow(shadow)])
+        .with_remote_preconditions(vec![RemotePrecondition {
+            remote_id: entity.remote_id,
+            remote_edited_at: entity.remote_edited_at,
+        }]);
 
     match execute_journaled_push(store, concurrency, applier, reconciler, execution_request) {
         Ok(result) => Ok(PushReport::from_execution(report, result)),
@@ -214,6 +226,81 @@ impl PushReconciler for NotImplementedReconciler {
     fn reconcile(&mut self, _request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
         Err(AfsError::NotImplemented("post-apply reconcile"))
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct NotionPushReconciler {
+    store: SqliteStateStore,
+    connector: NotionConnector,
+}
+
+impl NotionPushReconciler {
+    pub fn new(store: SqliteStateStore, connector: NotionConnector) -> Self {
+        Self { store, connector }
+    }
+}
+
+impl PushReconciler for NotionPushReconciler {
+    fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
+        let mount = self.store.get_mount(request.mount_id)?.ok_or_else(|| {
+            AfsError::InvalidState(format!("missing mount {}", request.mount_id.0))
+        })?;
+        let mut reconciled_remote_ids = Vec::new();
+
+        for remote_id in request.changed_remote_ids {
+            let mut entity = self
+                .store
+                .get_entity(request.mount_id, remote_id)?
+                .ok_or_else(|| {
+                    AfsError::InvalidState(format!(
+                        "missing entity `{}` in mount `{}`",
+                        remote_id.0, request.mount_id.0
+                    ))
+                })?;
+            let native = self.connector.fetch(FetchRequest {
+                remote_id: remote_id.clone(),
+            })?;
+            let rendered = self.connector.render_native_entity(&native)?;
+            let bundle = serde_json::from_slice::<NotionPageBundle>(&native.raw)
+                .map_err(|error| AfsError::Io(format!("notion native decode failed: {error}")))?;
+
+            write_atomic(
+                &mount.root.join(&entity.path),
+                render_canonical_markdown(&rendered.document),
+            )?;
+            self.store
+                .save_shadow(request.mount_id, rendered.shadow.clone())?;
+
+            entity.hydration = HydrationState::Hydrated;
+            entity.content_hash = Some(rendered.shadow.body_hash);
+            entity.remote_edited_at = bundle.page.last_edited_time;
+            self.store.save_entity(entity)?;
+            reconciled_remote_ids.push(remote_id.clone());
+        }
+
+        Ok(PushReconcileResult {
+            reconciled_remote_ids,
+        })
+    }
+}
+
+fn write_atomic(path: &Path, contents: String) -> AfsResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let temp_path = temp_path_for(path);
+    std::fs::write(&temp_path, contents)?;
+    std::fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("afs-write");
+    path.with_file_name(format!(".{file_name}.afs-tmp"))
 }
 
 fn generate_push_id() -> PushId {

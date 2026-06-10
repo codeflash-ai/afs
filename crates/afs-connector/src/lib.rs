@@ -11,6 +11,7 @@ use afs_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
 use afs_core::planner::PushPlan;
 use afs_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushConcurrencyCheck, PushConcurrencyRequest,
+    RemotePrecondition,
 };
 use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
 
@@ -58,6 +59,8 @@ pub struct ApplyPlanRequest<'a> {
     pub plan: &'a PushPlan,
     /// Stable idempotency keys aligned to `plan.operations`.
     pub operation_ids: &'a [afs_core::journal::PushOperationId],
+    /// Last-synced remote timestamps for compare-and-swap checks.
+    pub remote_preconditions: &'a [RemotePrecondition],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +127,7 @@ where
             mount_id: request.mount_id,
             plan: request.plan,
             operation_ids: request.operation_ids,
+            remote_preconditions: request.remote_preconditions,
         })
     }
 }
@@ -155,6 +159,7 @@ where
             mount_id: request.mount_id,
             plan: request.plan,
             operation_ids: request.operation_ids,
+            remote_preconditions: request.remote_preconditions,
         })?;
 
         Ok(PushApplyResult {
