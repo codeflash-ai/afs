@@ -1,13 +1,20 @@
 //! `afs mount` orchestration.
 //!
 //! This first real mount command records enough connector configuration for the
-//! pull path to build a filesystem projection from a Notion root page.
+//! pull path to build a filesystem projection from a Notion root page and drops
+//! concise agent guidance into the mount root.
 
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use afs_core::model::{MountId, RemoteId};
 use afs_store::{MountConfig, MountRepository, StoreError};
 use serde::Serialize;
+
+const AGENT_GUIDANCE: &str = include_str!("../../../templates/mount/AGENTS.md");
+const AGENTS_FILE: &str = "AGENTS.md";
+const CLAUDE_FILE: &str = "CLAUDE.md";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountOptions {
@@ -27,6 +34,39 @@ pub struct MountReport {
     pub root: String,
     pub remote_root_id: Option<String>,
     pub read_only: bool,
+    pub guidance: MountGuidanceReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MountGuidanceReport {
+    pub agents_md: GuidanceFileReport,
+    pub claude_md: GuidanceFileReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GuidanceFileReport {
+    pub path: String,
+    pub action: GuidanceFileAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidanceFileAction {
+    Created,
+    Preserved,
+    Symlinked,
+    Copied,
+}
+
+impl GuidanceFileAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Preserved => "preserved",
+            Self::Symlinked => "symlinked",
+            Self::Copied => "copied",
+        }
+    }
 }
 
 pub fn run_mount<S>(store: &mut S, options: MountOptions) -> Result<MountReport, MountError>
@@ -38,6 +78,8 @@ where
         path: root.clone(),
         message: error.to_string(),
     })?;
+
+    let guidance = install_mount_guidance(&root)?;
 
     let mut mount = MountConfig::new(options.mount_id.clone(), options.connector.clone(), &root)
         .read_only(options.read_only);
@@ -55,6 +97,7 @@ where
         root: root.display().to_string(),
         remote_root_id: options.remote_root_id.map(|remote_id| remote_id.0),
         read_only: options.read_only,
+        guidance,
     })
 }
 
@@ -62,7 +105,9 @@ where
 pub enum MountError {
     CreateRoot { path: PathBuf, message: String },
     CurrentDir(String),
+    ReadGuidance { path: PathBuf, message: String },
     Store(StoreError),
+    WriteGuidance { path: PathBuf, message: String },
 }
 
 impl MountError {
@@ -70,7 +115,9 @@ impl MountError {
         match self {
             Self::CreateRoot { .. } => "create_mount_root_failed",
             Self::CurrentDir(_) => "current_dir_failed",
+            Self::ReadGuidance { .. } => "read_mount_guidance_failed",
             Self::Store(_) => "store_error",
+            Self::WriteGuidance { .. } => "write_mount_guidance_failed",
         }
     }
 
@@ -83,8 +130,110 @@ impl MountError {
                 )
             }
             Self::CurrentDir(message) => format!("failed to resolve current directory: {message}"),
+            Self::ReadGuidance { path, message } => {
+                format!(
+                    "failed to read mount guidance `{}`: {message}",
+                    path.display()
+                )
+            }
             Self::Store(error) => error.to_string(),
+            Self::WriteGuidance { path, message } => {
+                format!(
+                    "failed to write mount guidance `{}`: {message}",
+                    path.display()
+                )
+            }
         }
+    }
+}
+
+fn install_mount_guidance(root: &Path) -> Result<MountGuidanceReport, MountError> {
+    let agents_path = root.join(AGENTS_FILE);
+    let claude_path = root.join(CLAUDE_FILE);
+    let agents_action = write_guidance_if_absent(&agents_path, AGENT_GUIDANCE)?;
+    let claude_action = install_claude_guidance(&agents_path, &claude_path)?;
+
+    Ok(MountGuidanceReport {
+        agents_md: GuidanceFileReport {
+            path: agents_path.display().to_string(),
+            action: agents_action,
+        },
+        claude_md: GuidanceFileReport {
+            path: claude_path.display().to_string(),
+            action: claude_action,
+        },
+    })
+}
+
+fn write_guidance_if_absent(path: &Path, contents: &str) -> Result<GuidanceFileAction, MountError> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(contents.as_bytes())
+                .map_err(|error| MountError::WriteGuidance {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
+                })?;
+            Ok(GuidanceFileAction::Created)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Ok(GuidanceFileAction::Preserved)
+        }
+        Err(error) => Err(MountError::WriteGuidance {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+fn install_claude_guidance(
+    agents_path: &Path,
+    claude_path: &Path,
+) -> Result<GuidanceFileAction, MountError> {
+    if claude_path
+        .try_exists()
+        .map_err(|error| MountError::WriteGuidance {
+            path: claude_path.to_path_buf(),
+            message: error.to_string(),
+        })?
+    {
+        return Ok(GuidanceFileAction::Preserved);
+    }
+
+    symlink_agents_guidance(claude_path).or_else(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            Ok(GuidanceFileAction::Preserved)
+        } else {
+            copy_agents_guidance(agents_path, claude_path)
+        }
+    })
+}
+
+#[cfg(unix)]
+fn symlink_agents_guidance(claude_path: &Path) -> io::Result<GuidanceFileAction> {
+    std::os::unix::fs::symlink(AGENTS_FILE, claude_path)?;
+    Ok(GuidanceFileAction::Symlinked)
+}
+
+#[cfg(not(unix))]
+fn symlink_agents_guidance(_claude_path: &Path) -> io::Result<GuidanceFileAction> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symbolic links are not used on this platform",
+    ))
+}
+
+fn copy_agents_guidance(
+    agents_path: &Path,
+    claude_path: &Path,
+) -> Result<GuidanceFileAction, MountError> {
+    let contents = fs::read_to_string(agents_path).map_err(|error| MountError::ReadGuidance {
+        path: agents_path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+
+    match write_guidance_if_absent(claude_path, &contents)? {
+        GuidanceFileAction::Created => Ok(GuidanceFileAction::Copied),
+        action => Ok(action),
     }
 }
 

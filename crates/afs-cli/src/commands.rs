@@ -404,6 +404,13 @@ fn print_mount_report(report: &MountReport) {
         "mounted {} at {} ({})",
         report.mount_id, report.root, report.connector
     );
+    println!(
+        "agent guidance: {} {}, {} {}",
+        report.guidance.agents_md.action.as_str(),
+        report.guidance.agents_md.path,
+        report.guidance.claude_md.action.as_str(),
+        report.guidance.claude_md.path
+    );
 }
 
 fn print_pull_report(report: &PullReport) {
