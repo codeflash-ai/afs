@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::{HydrationState, RemoteId};
+use crate::model::{HydrationState, MountId, RemoteId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HydrationPolicy {
@@ -28,10 +28,29 @@ impl Default for HydrationPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HydrationRequest {
+    pub mount_id: MountId,
     pub remote_id: RemoteId,
     pub path: PathBuf,
     pub target_state: HydrationState,
     pub reason: HydrationReason,
+}
+
+impl HydrationRequest {
+    pub fn new(
+        mount_id: MountId,
+        remote_id: RemoteId,
+        path: impl Into<PathBuf>,
+        target_state: HydrationState,
+        reason: HydrationReason,
+    ) -> Self {
+        Self {
+            mount_id,
+            remote_id,
+            path: path.into(),
+            target_state,
+            reason,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
