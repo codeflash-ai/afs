@@ -11,7 +11,7 @@ use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextBlockDto, RichTextDto, TitleBlockDto,
+    RichTextBlockDto, RichTextDto, TextRichTextDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{EntityRepository, InMemoryStateStore, MountRepository, ShadowRepository};
@@ -286,6 +286,13 @@ fn block(id: &str, kind: &str) -> BlockDto {
 
 fn rich_text(text: &str) -> RichTextDto {
     RichTextDto {
+        kind: "text".to_string(),
+        text: Some(TextRichTextDto {
+            content: text.to_string(),
+            link: None,
+        }),
+        mention: None,
+        equation: None,
         plain_text: text.to_string(),
         href: None,
         annotations: Default::default(),

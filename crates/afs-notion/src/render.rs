@@ -350,37 +350,231 @@ pub(crate) fn page_title(page: &PageDto) -> String {
 fn rich_text_plain_text(rich_text: &[RichTextDto]) -> String {
     rich_text
         .iter()
-        .map(|part| part.plain_text.as_str())
+        .map(rich_text_part_plain_text)
         .collect::<String>()
 }
 
 fn rich_text_to_markdown(rich_text: &[RichTextDto]) -> String {
     rich_text
         .iter()
-        .map(|part| {
-            let mut text = escape_markdown_text(&part.plain_text);
-            if part.annotations.code {
-                text = format!("`{}`", text.replace('`', "\\`"));
-            }
-            if part.annotations.bold {
-                text = format!("**{text}**");
-            }
-            if part.annotations.italic {
-                text = format!("_{text}_");
-            }
-            if part.annotations.strikethrough {
-                text = format!("~~{text}~~");
-            }
-            if let Some(href) = &part.href {
-                text = format!("[{text}]({href})");
-            }
-            text
-        })
+        .map(rich_text_part_to_markdown)
         .collect::<String>()
+}
+
+fn rich_text_part_to_markdown(part: &RichTextDto) -> String {
+    let (mut text, link_applied) = match part.kind.as_str() {
+        "equation" => (equation_to_markdown(part), false),
+        "mention" => mention_to_markdown(part),
+        _ => (text_rich_text_to_markdown(part), false),
+    };
+
+    text = apply_annotations(text, &part.annotations);
+
+    if !link_applied && let Some(href) = rich_text_href(part) {
+        text = markdown_link_preserving_whitespace(&text, href);
+    }
+
+    text
+}
+
+fn text_rich_text_to_markdown(part: &RichTextDto) -> String {
+    escape_markdown_text(&rich_text_part_plain_text(part))
+}
+
+fn equation_to_markdown(part: &RichTextDto) -> String {
+    let expression = part
+        .equation
+        .as_ref()
+        .map(|equation| equation.expression.as_str())
+        .filter(|expression| !expression.is_empty())
+        .unwrap_or(part.plain_text.as_str());
+
+    if expression.is_empty() {
+        String::new()
+    } else {
+        format!("${}$", expression.replace('$', "\\$"))
+    }
+}
+
+fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
+    let Some(mention) = &part.mention else {
+        return (text_rich_text_to_markdown(part), false);
+    };
+
+    match mention.kind.as_str() {
+        "page" => mention
+            .page
+            .as_ref()
+            .map(|page| {
+                (
+                    markdown_link_preserving_whitespace(
+                        &mention_label(part),
+                        &format!("afs://{}", page.id),
+                    ),
+                    true,
+                )
+            })
+            .unwrap_or_else(|| (text_rich_text_to_markdown(part), false)),
+        "database" => mention
+            .database
+            .as_ref()
+            .map(|database| {
+                (
+                    markdown_link_preserving_whitespace(
+                        &mention_label(part),
+                        &format!("afs://{}", database.id),
+                    ),
+                    true,
+                )
+            })
+            .unwrap_or_else(|| (text_rich_text_to_markdown(part), false)),
+        "user" => {
+            let fallback = || {
+                mention
+                    .user
+                    .as_ref()
+                    .and_then(|user| user.name.clone())
+                    .map(|name| escape_markdown_text(&format!("@{name}")))
+                    .unwrap_or_default()
+            };
+            (text_or_fallback(part, fallback), false)
+        }
+        "date" => {
+            let fallback = || {
+                mention
+                    .date
+                    .as_ref()
+                    .map(date_mention_label)
+                    .map(|label| escape_markdown_text(&label))
+                    .unwrap_or_default()
+            };
+            (text_or_fallback(part, fallback), false)
+        }
+        "link_preview" => mention
+            .link_preview
+            .as_ref()
+            .filter(|link| !link.url.is_empty())
+            .map(|link| {
+                (
+                    markdown_link_preserving_whitespace(&mention_label(part), &link.url),
+                    true,
+                )
+            })
+            .unwrap_or_else(|| (text_rich_text_to_markdown(part), false)),
+        _ => (text_rich_text_to_markdown(part), false),
+    }
+}
+
+fn text_or_fallback(part: &RichTextDto, fallback: impl FnOnce() -> String) -> String {
+    let text = text_rich_text_to_markdown(part);
+    if text.is_empty() { fallback() } else { text }
+}
+
+fn mention_label(part: &RichTextDto) -> String {
+    let label = rich_text_part_plain_text(part);
+    if label.is_empty() {
+        "mention".to_string()
+    } else {
+        escape_markdown_text(&label)
+    }
+}
+
+fn date_mention_label(date: &crate::dto::DateMentionDto) -> String {
+    match &date.end {
+        Some(end) if !end.is_empty() => format!("{} to {end}", date.start),
+        _ => date.start.clone(),
+    }
+}
+
+fn apply_annotations(mut text: String, annotations: &crate::dto::RichTextAnnotationsDto) -> String {
+    if annotations.code {
+        text =
+            wrap_preserving_whitespace(&text, |value| format!("`{}`", value.replace('`', "\\`")));
+    }
+    if annotations.bold {
+        text = wrap_preserving_whitespace(&text, |value| format!("**{value}**"));
+    }
+    if annotations.italic {
+        text = wrap_preserving_whitespace(&text, |value| format!("_{value}_"));
+    }
+    if annotations.strikethrough {
+        text = wrap_preserving_whitespace(&text, |value| format!("~~{value}~~"));
+    }
+    if annotations.underline {
+        text = wrap_preserving_whitespace(&text, |value| format!("<u>{value}</u>"));
+    }
+
+    text
+}
+
+fn rich_text_href(part: &RichTextDto) -> Option<&str> {
+    part.href
+        .as_deref()
+        .or_else(|| {
+            part.text
+                .as_ref()?
+                .link
+                .as_ref()
+                .map(|link| link.url.as_str())
+        })
+        .filter(|href| !href.is_empty())
+}
+
+fn rich_text_part_plain_text(part: &RichTextDto) -> String {
+    if !part.plain_text.is_empty() {
+        return part.plain_text.clone();
+    }
+
+    match part.kind.as_str() {
+        "text" | "" => part
+            .text
+            .as_ref()
+            .map(|text| text.content.clone())
+            .unwrap_or_default(),
+        "equation" => part
+            .equation
+            .as_ref()
+            .map(|equation| equation.expression.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
+    wrap_preserving_whitespace(label, |value| {
+        format!("[{}]({href})", escape_markdown_link_label(value))
+    })
+}
+
+fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) -> String {
+    let Some(start) = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(index, _)| index)
+    else {
+        return value.to_string();
+    };
+    let end = value
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(value.len());
+
+    format!(
+        "{}{}{}",
+        &value[..start],
+        wrap(&value[start..end]),
+        &value[end..]
+    )
 }
 
 fn escape_markdown_text(text: &str) -> String {
     text.replace('\\', "\\\\")
+}
+
+fn escape_markdown_link_label(text: &str) -> String {
+    text.replace('[', "\\[").replace(']', "\\]")
 }
 
 fn escape_directive_value(value: &str) -> String {

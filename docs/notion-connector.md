@@ -12,6 +12,8 @@ The current implementation is a live-capable read and pull projection:
 - `fetch` retrieves page metadata and recursively retrieves paginated block children.
 - fetched pages are serialized into a versioned native JSON bundle inside `NativeEntity.raw`;
 - `render_native_entity` converts that native bundle into canonical Markdown plus a `ShadowDocument`;
+- rich text annotations, external links, date/page/database mentions, link previews, and inline
+  equations render to Markdown where there is a stable textual representation;
 - simple Notion tables render as Markdown tables with table-row IDs retained in shadow metadata;
 - unsupported or lossy blocks render as `::afs{...}` directives so they retain remote identity.
 
@@ -32,6 +34,14 @@ The token must have access to the target page. Live tests are ignored by default
 ## Initial Block Rendering
 
 The renderer currently supports paragraphs, headings, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, child-page/database directives, and unsupported-block directives.
+
+Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
+
+- `RichTextDto` mirrors Notion's `text`, `mention`, and `equation` variants plus shared annotations and links.
+- `TextRichTextDto`, `MentionRichTextDto`, and `EquationRichTextDto` keep variant-specific payloads out of renderer control flow.
+- The renderer preserves whitespace around annotated spans so text like ` bold ` becomes ` **bold** ` instead of pulling spaces into Markdown delimiters.
+- Page and database mentions render as `afs://...` links for now. That keeps the remote identity visible until local cross-document link resolution is implemented.
+- Unknown or partially populated rich text falls back to `plain_text` so live API additions remain readable.
 
 Nested children are fetched recursively and rendered after their parent, except valid table rows, which are folded into their parent table's Markdown block. This preserves content and block IDs for the first read path, but it does not yet preserve every Notion nesting/layout nuance. Layout-rich blocks should stay directive-backed until the renderer can round-trip them safely.
 

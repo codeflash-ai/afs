@@ -7,8 +7,10 @@ use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::shadow::MarkdownBlockKind;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, BlockTreeDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextBlockDto, RichTextDto, TableBlockDto, TableRowBlockDto, TitleBlockDto,
+    BlockDto, BlockListDto, BlockTreeDto, DateMentionDto, EquationRichTextDto, IdRefDto, LinkDto,
+    MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
+    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, TableBlockDto, TableRowBlockDto,
+    TextRichTextDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 
@@ -178,6 +180,66 @@ fn render_malformed_table_as_directives() {
             .blocks
             .iter()
             .all(|block| matches!(block.kind, MarkdownBlockKind::Directive { .. }))
+    );
+}
+
+#[test]
+fn render_rich_text_annotations_links_mentions_and_equations() {
+    let mut bold = rich_text("Bold");
+    bold.annotations.bold = true;
+
+    let mut italic = rich_text(" italic");
+    italic.annotations.italic = true;
+
+    let mut strikethrough = rich_text(" strike");
+    strikethrough.annotations.strikethrough = true;
+
+    let mut underline = rich_text(" underline");
+    underline.annotations.underline = true;
+
+    let mut code = rich_text(" code");
+    code.annotations.code = true;
+
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block(
+                "paragraph-1",
+                vec![
+                    bold,
+                    italic,
+                    strikethrough,
+                    underline,
+                    code,
+                    linked_text(" external link", "https://example.com/"),
+                    rich_text(" after link."),
+                    rich_text(" "),
+                    date_mention("2026-06-10", "2026-06-10"),
+                    rich_text(" and inline equation "),
+                    equation("E=mc^2"),
+                    rich_text(" plus page mention "),
+                    page_mention("Roadmap", "page-1"),
+                ],
+            ),
+            children: Vec::new(),
+        }],
+    };
+    let raw = serde_json::to_vec(&bundle).expect("raw");
+    let native = afs_connector::NativeEntity {
+        remote_id: RemoteId::new("page-1"),
+        kind: "notion_page".to_string(),
+        raw,
+    };
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(FixtureNotionApi::new()));
+
+    let rendered = connector
+        .render_native_entity(&native)
+        .expect("render native entity");
+
+    assert_eq!(
+        rendered.document.body,
+        "**Bold** _italic_ ~~strike~~ <u>underline</u> `code` [external link](https://example.com/) after link. 2026-06-10 and inline equation $E=mc^2$ plus page mention [Roadmap](afs://page-1)\n"
     );
 }
 
@@ -364,10 +426,7 @@ fn page(id: &str, title: &str) -> PageDto {
 
 fn rich_text_block(id: &str, kind: &str, text: &str) -> BlockDto {
     let mut block = block(id, kind);
-    let value = Some(RichTextBlockDto {
-        rich_text: vec![rich_text(text)],
-        color: None,
-    });
+    let value = Some(rich_text_block_content(vec![rich_text(text)]));
 
     match kind {
         "paragraph" => block.paragraph = value,
@@ -378,6 +437,19 @@ fn rich_text_block(id: &str, kind: &str, text: &str) -> BlockDto {
     }
 
     block
+}
+
+fn paragraph_block(id: &str, rich_text: Vec<RichTextDto>) -> BlockDto {
+    let mut block = block(id, "paragraph");
+    block.paragraph = Some(rich_text_block_content(rich_text));
+    block
+}
+
+fn rich_text_block_content(rich_text: Vec<RichTextDto>) -> RichTextBlockDto {
+    RichTextBlockDto {
+        rich_text,
+        color: None,
+    }
 }
 
 fn unsupported_block(id: &str, kind: &str) -> BlockDto {
@@ -447,8 +519,71 @@ fn table_row_block<const N: usize>(id: &str, cells: [&str; N]) -> BlockDto {
 
 fn rich_text(text: &str) -> RichTextDto {
     RichTextDto {
+        kind: "text".to_string(),
+        text: Some(TextRichTextDto {
+            content: text.to_string(),
+            link: None,
+        }),
+        mention: None,
+        equation: None,
         plain_text: text.to_string(),
         href: None,
         annotations: Default::default(),
+    }
+}
+
+fn linked_text(text: &str, url: &str) -> RichTextDto {
+    RichTextDto {
+        href: Some(url.to_string()),
+        text: Some(TextRichTextDto {
+            content: text.to_string(),
+            link: Some(LinkDto {
+                url: url.to_string(),
+            }),
+        }),
+        ..rich_text(text)
+    }
+}
+
+fn date_mention(text: &str, start: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        text: None,
+        mention: Some(MentionRichTextDto {
+            kind: "date".to_string(),
+            date: Some(DateMentionDto {
+                start: start.to_string(),
+                end: None,
+                time_zone: None,
+            }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        annotations: RichTextAnnotationsDto::default(),
+        ..Default::default()
+    }
+}
+
+fn equation(expression: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "equation".to_string(),
+        equation: Some(EquationRichTextDto {
+            expression: expression.to_string(),
+        }),
+        plain_text: expression.to_string(),
+        ..Default::default()
+    }
+}
+
+fn page_mention(text: &str, id: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "page".to_string(),
+            page: Some(IdRefDto { id: id.to_string() }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
     }
 }

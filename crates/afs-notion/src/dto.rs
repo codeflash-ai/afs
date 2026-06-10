@@ -157,14 +157,97 @@ pub struct TableRowBlockDto {
     pub cells: Vec<Vec<RichTextDto>>,
 }
 
+/// One Notion rich text segment.
+///
+/// Notion stores text, mention, and equation payloads under variant-specific
+/// keys while sharing `plain_text`, `href`, and annotations across variants.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RichTextDto {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<TextRichTextDto>,
+    #[serde(default)]
+    pub mention: Option<MentionRichTextDto>,
+    #[serde(default)]
+    pub equation: Option<EquationRichTextDto>,
     #[serde(default)]
     pub plain_text: String,
     #[serde(default)]
     pub href: Option<String>,
     #[serde(default)]
     pub annotations: RichTextAnnotationsDto,
+}
+
+/// Payload for a rich text segment whose `type` is `text`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextRichTextDto {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub link: Option<LinkDto>,
+}
+
+/// Notion link payload used by text links and link-preview mentions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkDto {
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Payload for an inline Notion equation segment.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquationRichTextDto {
+    #[serde(default)]
+    pub expression: String,
+}
+
+/// Payload for a Notion mention segment.
+///
+/// The supported fields cover the mention variants that currently render to a
+/// stable Markdown representation. Unknown API fields are intentionally ignored
+/// by serde and can still fall back to the segment's `plain_text`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionRichTextDto {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub page: Option<IdRefDto>,
+    #[serde(default)]
+    pub database: Option<IdRefDto>,
+    #[serde(default)]
+    pub user: Option<UserMentionDto>,
+    #[serde(default)]
+    pub date: Option<DateMentionDto>,
+    #[serde(default)]
+    pub link_preview: Option<LinkDto>,
+}
+
+/// Minimal reference to another Notion object by remote ID.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdRefDto {
+    #[serde(default)]
+    pub id: String,
+}
+
+/// Minimal user mention payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserMentionDto {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Date mention payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DateMentionDto {
+    #[serde(default)]
+    pub start: String,
+    #[serde(default)]
+    pub end: Option<String>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
