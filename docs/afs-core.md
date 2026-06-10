@@ -24,7 +24,8 @@
 | `planner` | Connector-neutral push plans, plan summaries, and guardrail policy. |
 | `push` | Explicit push pipeline stage types and guardrail evaluation. |
 | `pull` | Polling/relay pull scheduler configuration. |
-| `diff` | Block-aware diff trait boundary. |
+| `shadow` | Shadow document snapshots, Markdown block segmentation, stable block hashes, and source spans. |
+| `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents. |
 | `journal` | Push journal entry and status contracts. |
 | `error` | Core error categories. |
 
@@ -50,3 +51,23 @@ The canonical parser is intentionally shallow:
 - It renders the original frontmatter and body back to stable Markdown.
 
 It does not parse all Markdown into blocks yet. For now, it only materializes directive blocks because directive integrity is a universal AgentFS rule. Full block segmentation belongs to the future block diff engine.
+
+## Shadow And Diff Layer
+
+The shadow layer stores the synced body text plus a block tree:
+
+- each shadow block has a remote block ID, kind, source span, stable content hash, and rendered text;
+- directive blocks get their remote ID from the visible directive line;
+- clean Markdown blocks get their remote IDs from connector-rendered shadow metadata;
+- stable hashes use a deterministic in-process hash, not randomized runtime hashing.
+
+The first planner is deliberately conservative:
+
+- exact block hashes align first;
+- directive IDs are anchored and validated before planning;
+- residual unmatched native blocks align by order for simple edits;
+- ambiguous residual alignment adds an explicit degradation note to the plan;
+- directive edits fail validation instead of becoming lossy updates;
+- directive moves are represented as block moves.
+
+This is not the final Notion-grade diff engine from `plan.md`; it is the first correct contract surface. Later exact/structural/residual passes can improve the internals while preserving the same `ShadowDocument -> PushPlan` boundary.

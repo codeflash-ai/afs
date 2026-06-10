@@ -33,6 +33,7 @@ fn parses_frontmatter_identity_directives_and_renders_stably() {
     assert_eq!(parsed.frontmatter.title.as_deref(), Some("Roadmap 2026"));
     assert!(parsed.frontmatter.properties.contains_key("status"));
     assert!(!parsed.is_stub());
+    assert_eq!(parsed.body_start_line, 11);
 
     assert_eq!(parsed.directives.len(), 1);
     let directive = &parsed.directives[0];

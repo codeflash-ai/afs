@@ -302,6 +302,7 @@ fn guardrails_require_confirm_for_large_archives_or_mount_touch() {
             .collect(),
         vec![PushOperation::UpdateBlock {
             block_id: RemoteId::new("block-1"),
+            content: "updated".to_string(),
         }],
     );
 

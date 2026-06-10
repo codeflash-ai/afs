@@ -20,6 +20,24 @@ pub struct ValidationIssue {
     pub suggested_fix: Option<String>,
 }
 
+impl ValidationIssue {
+    pub fn new(
+        code: impl Into<String>,
+        file: impl Into<PathBuf>,
+        line: Option<usize>,
+        message: impl Into<String>,
+        suggested_fix: Option<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            file: file.into(),
+            line,
+            message: message.into(),
+            suggested_fix,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ValidationReport {
     pub issues: Vec<ValidationIssue>,

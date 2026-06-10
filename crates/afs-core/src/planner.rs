@@ -11,6 +11,7 @@ pub struct PushPlan {
     pub affected_entities: Vec<RemoteId>,
     pub operations: Vec<PushOperation>,
     pub summary: PlanSummary,
+    pub degradations: Vec<PlanDegradation>,
 }
 
 impl PushPlan {
@@ -20,7 +21,13 @@ impl PushPlan {
             affected_entities,
             operations,
             summary,
+            degradations: Vec::new(),
         }
+    }
+
+    pub fn with_degradations(mut self, degradations: Vec<PlanDegradation>) -> Self {
+        self.degradations = degradations;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -40,10 +47,12 @@ impl PushPlan {
 pub enum PushOperation {
     UpdateBlock {
         block_id: RemoteId,
+        content: String,
     },
     AppendBlock {
         parent_id: RemoteId,
         after: Option<RemoteId>,
+        content: String,
     },
     MoveBlock {
         block_id: RemoteId,
@@ -121,4 +130,24 @@ impl Default for GuardrailPolicy {
 pub enum GuardrailDecision {
     Proceed,
     ConfirmRequired { reasons: Vec<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanDegradation {
+    pub kind: PlanDegradationKind,
+    pub message: String,
+}
+
+impl PlanDegradation {
+    pub fn new(kind: PlanDegradationKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanDegradationKind {
+    AmbiguousBlockAlignment,
 }

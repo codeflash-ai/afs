@@ -19,6 +19,7 @@ pub mod model;
 pub mod planner;
 pub mod pull;
 pub mod push;
+pub mod shadow;
 pub mod sync;
 pub mod validation;
 

@@ -21,6 +21,7 @@ pub struct ParsedCanonicalDocument {
     pub document: CanonicalDocument,
     pub frontmatter: Frontmatter,
     pub directives: Vec<Directive>,
+    pub body_start_line: usize,
 }
 
 impl ParsedCanonicalDocument {
@@ -121,6 +122,7 @@ pub fn parse_canonical_markdown(
         document,
         frontmatter,
         directives,
+        body_start_line: split.body_start_line,
     })
 }
 
