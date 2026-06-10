@@ -1,0 +1,7 @@
+/target/
+/.afs/
+/.idea/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

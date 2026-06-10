@@ -1,0 +1,21 @@
+# Reliability Strategy
+
+Correctness belongs primarily in `afs-core` and `afs-store`.
+
+## Invariants
+
+- Local, remote, and synced tree state are explicit.
+- Local file mutations use temp-write-plus-rename.
+- Pushes are journaled before remote mutation.
+- Remote apply operations are idempotent.
+- Dangerous plans require explicit confirmation.
+- Conflicted local files are preserved untouched.
+- Unknown or unsupported remote blocks round-trip through shadow state.
+
+## Test layers
+
+- Round-trip tests for render/parse idempotence.
+- Property tests for hydration state transitions and push-plan invariants.
+- Randomized simulation of local edits, remote edits, crashes, retries, and network failures.
+- Canary tests against a scratch Notion workspace before release.
+

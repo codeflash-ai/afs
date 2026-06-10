@@ -1,0 +1,21 @@
+[package]
+name = "afsd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "afsd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "afsd"
+path = "src/main.rs"
+
+[dependencies]
+afs-core.workspace = true
+afs-store.workspace = true
+afs-connector.workspace = true
+

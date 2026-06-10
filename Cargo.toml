@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "crates/afs-cli",
+  "crates/afsd",
+  "crates/afs-core",
+  "crates/afs-connector",
+  "crates/afs-store",
+  "crates/afs-notion",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "TBD"
+repository = "TBD"
+rust-version = "1.96"
+
+[workspace.dependencies]
+afs-core = { path = "crates/afs-core" }
+afs-connector = { path = "crates/afs-connector" }
+afs-store = { path = "crates/afs-store" }
+afs-notion = { path = "crates/afs-notion" }
