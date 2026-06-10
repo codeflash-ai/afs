@@ -22,7 +22,7 @@
 | `hydration` | Hydration policy and request types. |
 | `validation` | Structured validation reports and directive integrity checks. |
 | `planner` | Connector-neutral push plans, plan summaries, and guardrail policy. |
-| `push` | Explicit push pipeline stage types and guardrail evaluation. |
+| `push` | Explicit push pipeline request/output types, validation/diff/guardrail orchestration, and guardrail evaluation. |
 | `pull` | Polling/relay pull scheduler configuration. |
 | `shadow` | Shadow document snapshots, Markdown block segmentation, stable block hashes, and source spans. |
 | `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents. |
@@ -71,3 +71,17 @@ The first planner is deliberately conservative:
 - directive moves are represented as block moves.
 
 This is not the final Notion-grade diff engine from `plan.md`; it is the first correct contract surface. Later exact/structural/residual passes can improve the internals while preserving the same `ShadowDocument -> PushPlan` boundary.
+
+## Push Pipeline Contract
+
+The push pipeline composes the core primitives into the decision surface used by `afs diff` and `afs push`:
+
+- read-only mounts stop before validation or planning;
+- frontmatter identity and directive syntax validate before diffing;
+- directive integrity errors from diff planning are surfaced as validation issues with file/line context;
+- no-op plans return `Noop`;
+- normal non-empty plans return `ConfirmPlan` unless `assume_yes` is set;
+- dangerous plans return `ConfirmDangerousPlan` unless `confirm_dangerous` is set;
+- confirmed dangerous plans still preserve the guardrail reasons in the output.
+
+The core pipeline still does not apply remote operations, write journals, or perform concurrency checks. It returns the next required action so CLI/daemon code can decide whether to ask for confirmation, call the connector, or stop for fixes.
