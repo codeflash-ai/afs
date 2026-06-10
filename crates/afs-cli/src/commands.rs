@@ -290,10 +290,7 @@ fn print_push_report(report: &PushReport) {
 }
 
 fn default_notion_connector() -> NotionConnector {
-    NotionConnector::new(NotionConfig {
-        workspace_id: None,
-        token_key: "notion-default".to_string(),
-    })
+    NotionConnector::new(NotionConfig::default())
 }
 
 fn stub(command: &str, json: bool) -> i32 {

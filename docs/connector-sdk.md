@@ -21,3 +21,5 @@ Undo requests include the target push ID, mount ID, and a connector-neutral comp
 ## v1 connector
 
 `afs-notion` is the first connector. It owns Notion-specific block mapping, database schema translation, OAuth/API behavior, and conversion between Notion payloads and the canonical AgentFS document model.
+
+The first Notion slice is live-capable but read-only: it retrieves page metadata, recursively fetches paginated block children, stores a native JSON bundle, and renders canonical Markdown plus a shadow snapshot. Apply and reverse-apply remain stubbed until the read path and pull projection are solid.

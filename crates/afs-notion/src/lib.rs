@@ -1,4 +1,15 @@
+//! Notion connector.
+//!
+//! The connector keeps Notion API transport, DTOs, and block rendering separate
+//! from the connector-neutral sync contracts in `afs-core`.
+
+pub mod client;
+pub mod dto;
+pub mod fetch;
 pub mod mapping;
+pub mod render;
+
+use std::sync::Arc;
 
 use afs_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -8,24 +19,55 @@ use afs_connector::{
 use afs_core::model::{CanonicalDocument, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 
+use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
+use crate::fetch::fetch_page_bundle;
+use crate::render::{NotionRenderedEntity, render_native_entity};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionConfig {
     pub workspace_id: Option<String>,
+    /// Environment variable or future keychain key used to find the bearer token.
     pub token_key: String,
 }
 
-#[derive(Clone, Debug)]
+impl Default for NotionConfig {
+    fn default() -> Self {
+        Self {
+            workspace_id: None,
+            token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct NotionConnector {
     config: NotionConfig,
+    api: Arc<dyn NotionApi>,
+}
+
+impl std::fmt::Debug for NotionConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotionConnector")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NotionConnector {
     pub fn new(config: NotionConfig) -> Self {
-        Self { config }
+        Self::with_api(config.clone(), Arc::new(HttpNotionApi::new(config)))
+    }
+
+    pub fn with_api(config: NotionConfig, api: Arc<dyn NotionApi>) -> Self {
+        Self { config, api }
     }
 
     pub fn config(&self) -> &NotionConfig {
         &self.config
+    }
+
+    pub fn render_native_entity(&self, entity: &NativeEntity) -> AfsResult<NotionRenderedEntity> {
+        render_native_entity(entity)
     }
 }
 
@@ -46,12 +88,22 @@ impl Connector for NotionConnector {
         Err(AfsError::NotImplemented("Notion enumerate"))
     }
 
-    fn fetch(&self, _request: FetchRequest) -> AfsResult<NativeEntity> {
-        Err(AfsError::NotImplemented("Notion fetch"))
+    fn fetch(&self, request: FetchRequest) -> AfsResult<NativeEntity> {
+        let bundle = fetch_page_bundle(self.api.as_ref(), request.remote_id.as_str())?;
+        let remote_id = afs_core::model::RemoteId::new(bundle.page.id.clone());
+        let raw = serde_json::to_vec(&bundle)
+            .map_err(|error| AfsError::Io(format!("notion native encode failed: {error}")))?;
+
+        Ok(NativeEntity {
+            remote_id,
+            kind: "notion_page".to_string(),
+            raw,
+        })
     }
 
-    fn render(&self, _entity: &NativeEntity) -> AfsResult<CanonicalDocument> {
-        Err(AfsError::NotImplemented("Notion render"))
+    fn render(&self, entity: &NativeEntity) -> AfsResult<CanonicalDocument> {
+        self.render_native_entity(entity)
+            .map(|rendered| rendered.document)
     }
 
     fn parse(&self, _document: &CanonicalDocument) -> AfsResult<ParsedEntity> {
