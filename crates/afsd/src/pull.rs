@@ -80,8 +80,12 @@ where
     let mut stubbed = 0;
 
     for entry in &entries {
-        let record = merged_entity_record(store, entry)?;
+        let existing = store
+            .get_entity(&entry.mount_id, &entry.remote_id)
+            .map_err(PullError::Store)?;
+        let record = merged_entity_record(entry, existing.as_ref());
         store.save_entity(record).map_err(PullError::Store)?;
+        rename_projection_if_needed(mount, existing.as_ref(), entry)?;
         if write_stub_if_needed(connector, mount, entry)? {
             stubbed += 1;
         }
@@ -159,21 +163,15 @@ where
     })
 }
 
-fn merged_entity_record<S>(store: &S, entry: &TreeEntry) -> Result<EntityRecord, PullError>
-where
-    S: EntityRepository,
-{
-    let existing = store
-        .get_entity(&entry.mount_id, &entry.remote_id)
-        .map_err(PullError::Store)?;
+fn merged_entity_record(entry: &TreeEntry, existing: Option<&EntityRecord>) -> EntityRecord {
     let mut record = EntityRecord::from(entry.clone());
 
     if let Some(existing) = existing {
-        record.hydration = existing.hydration;
-        record.content_hash = existing.content_hash;
+        record.hydration = existing.hydration.clone();
+        record.content_hash = existing.content_hash.clone();
     }
 
-    Ok(record)
+    record
 }
 
 fn write_stub_if_needed(
@@ -216,6 +214,47 @@ fn write_stub_if_needed(
         }
         EntityKind::Asset | EntityKind::Unknown(_) => Ok(false),
     }
+}
+
+fn rename_projection_if_needed(
+    mount: &MountConfig,
+    existing: Option<&EntityRecord>,
+    entry: &TreeEntry,
+) -> Result<(), PullError> {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        return Ok(());
+    }
+
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if existing.path == entry.path {
+        return Ok(());
+    }
+
+    match entry.kind {
+        EntityKind::Page => {
+            rename_projected_path(
+                &mount.root.join(&existing.path),
+                &mount.root.join(&entry.path),
+            )?;
+            rename_projected_path(
+                &mount.root.join(existing.path.with_extension("")),
+                &mount.root.join(entry.path.with_extension("")),
+            )?;
+        }
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => {
+            rename_projected_path(
+                &mount.root.join(&existing.path),
+                &mount.root.join(&entry.path),
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn hydrate_entity<S>(
@@ -368,6 +407,28 @@ fn write_atomic(path: &Path, contents: String) -> Result<(), PullError> {
         message: error.to_string(),
     })?;
     Ok(())
+}
+
+fn rename_projected_path(from: &Path, to: &Path) -> Result<(), PullError> {
+    if from == to || !from.exists() || to.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| PullError::WriteFile {
+            path: parent.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    }
+
+    std::fs::rename(from, to).map_err(|error| PullError::WriteFile {
+        path: to.to_path_buf(),
+        message: format!(
+            "failed to rename projected path `{}` to `{}`: {error}",
+            from.display(),
+            to.display(),
+        ),
+    })
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, PullError> {
