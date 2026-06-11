@@ -20,6 +20,32 @@ The boundary keeps responsibilities sharp:
 - `afsd` executes jobs and is the only layer that advances durable sync state or
   mutates the local projection.
 
+## Process Management
+
+`afsd` stays intentionally small: it runs the daemon in the foreground and owns
+the runtime, sockets, watchers, scheduler, and job queue. User-facing process
+management lives in `afs daemon ...`:
+
+- `afs daemon start` starts a background daemon. On macOS this installs and
+  bootstraps `~/Library/LaunchAgents/ai.codeflash.afs.afsd.plist` by default,
+  with `RunAtLoad` and `KeepAlive` so it starts at login and restarts after
+  crashes.
+- `afs daemon start --session` starts a detached child process that inherits the
+  current shell environment and writes `~/.afs/afsd.pid`. This is useful for
+  development credentials and temporary test state, but it does not survive
+  logout.
+- `afs daemon status` pings the daemon socket and reports the state root, socket,
+  manager, and log path.
+- `afs daemon stop` unloads the LaunchAgent or kills the session pid file when
+  the CLI owns the daemon. A manually started foreground `afsd` still needs to be
+  stopped directly.
+
+The process manager passes `AFS_STATE_DIR` to the daemon it starts. `--tcp-addr`
+persists `AFS_DAEMON_TCP_ADDR` for that managed daemon. `--include-env <KEY>` is
+available for short-lived development variables that launchd would not otherwise
+inherit; long-lived connector auth should move to `afs connect` and keychain
+storage instead of plist environment variables.
+
 ## Foreground Daemon
 
 `afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`

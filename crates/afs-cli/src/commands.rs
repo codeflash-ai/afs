@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff};
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
@@ -35,6 +36,7 @@ const COMMANDS: &[&str] = &[
     "status",
     "pull",
     "push",
+    "daemon",
     "diff",
     "undo",
     "log",
@@ -57,6 +59,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         "status" => status(&args[1..], json),
         "pull" => pull(&args[1..], json),
         "push" => push(&args[1..], json),
+        "daemon" => daemon(&args[1..], json),
         "diff" => diff(&args[1..], json),
         "undo" => undo(&args[1..], json),
         "log" => log(&args[1..], json),
@@ -68,6 +71,20 @@ pub fn dispatch(args: &[String]) -> i32 {
             print_help();
             EXIT_USAGE
         }
+    }
+}
+
+fn daemon(args: &[String], json: bool) -> i32 {
+    match run_daemon_control(args) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_daemon_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => daemon_command_error(json, error),
     }
 }
 
@@ -796,6 +813,17 @@ fn print_info_report(report: &InfoReport) {
     }
 }
 
+fn print_daemon_report(report: &DaemonControlReport) {
+    println!("{}", report.message);
+    println!("  state: {}", report.state.as_str());
+    println!("  manager: {}", report.manager.as_str());
+    println!("  state root: {}", report.state_root);
+    println!("  socket: {}", report.socket);
+    if let Some(log) = &report.stderr_log {
+        println!("  log: {log}");
+    }
+}
+
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
@@ -1120,6 +1148,18 @@ fn history_command_error(command: &'static str, json: bool, error: HistoryError)
     command_error(
         json,
         CommandError::new(command, error.code(), error.message()),
+        exit_code,
+    )
+}
+
+fn daemon_command_error(json: bool, error: DaemonControlError) -> i32 {
+    let exit_code = match error.code() {
+        "usage" => EXIT_USAGE,
+        _ => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("daemon", error.code(), error.message()),
         exit_code,
     )
 }

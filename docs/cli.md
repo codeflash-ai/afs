@@ -10,6 +10,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs status [path] [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
+- `afs daemon start|stop|status|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
 - `afs diff [path] [--json]`
 - `afs undo [push-id] [--json]`
 - `afs log [path] [--json]`
@@ -44,6 +45,35 @@ Remaining categories to assign before `afs push` applies remote mutations:
 `afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. For macOS File Provider mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
 
 The JSON report includes `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts.
+
+## Daemon Process Management
+
+`afs daemon start` starts `afsd` as a background daemon. On macOS, the default
+manager is a per-user LaunchAgent at
+`~/Library/LaunchAgents/ai.codeflash.afs.afsd.plist`, with stdout/stderr under
+`~/.afs/logs/`. The LaunchAgent uses `RunAtLoad` and `KeepAlive`, so the daemon
+starts at login and launchd restarts it if it exits. On non-macOS systems, or
+when `--session` is passed, the CLI starts a detached child process and writes
+`~/.afs/afsd.pid`; session mode inherits the current shell environment but does
+not survive logout.
+
+Useful forms:
+
+```sh
+afs daemon start
+afs daemon start --session
+afs daemon status
+afs daemon stop
+afs daemon restart
+```
+
+`--state-dir <path>` starts or queries a daemon for an isolated state root.
+`--tcp-addr <host:port|off>` persists the TCP listener setting for that managed
+daemon. `--afsd-bin <path>` points the manager at a specific daemon binary. For
+development-only environment variables that launchd would not otherwise know
+about, `--include-env <KEY>` copies the current value into the LaunchAgent plist;
+do not use it for long-lived secrets once keychain-backed `afs connect` is
+available.
 
 ## Initial `afs info --json` Shape
 
