@@ -5,16 +5,27 @@ use std::thread;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use afs_core::{AfsError, AfsResult};
+use afs_store::{MountRepository, SqliteStateStore};
 
 use crate::DaemonConfig;
 use crate::ipc::DaemonResponse;
 use crate::runtime::{DaemonRuntime, DaemonRuntimeHandle};
+use crate::watcher::{FileWatcher, NotifyFileWatcher};
 
 #[cfg(unix)]
 pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
     std::fs::create_dir_all(&config.state_root)?;
     let runtime = DaemonRuntime::spawn(config.clone())?;
     let runtime_handle = runtime.handle();
+    let mut file_watcher = NotifyFileWatcher::new({
+        let runtime = runtime_handle.clone();
+        move |event| {
+            if runtime.file_event(event).is_err() {
+                eprintln!("afsd watcher could not submit file event: runtime stopped");
+            }
+        }
+    })?;
+    watch_existing_mounts(config, &mut file_watcher)?;
     let socket_path = crate::ipc::socket_path(&config.state_root);
     remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
@@ -28,6 +39,16 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
             }
             Err(error) => eprintln!("afsd accept failed: {error}"),
         }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn watch_existing_mounts(config: &DaemonConfig, watcher: &mut impl FileWatcher) -> AfsResult<()> {
+    let store = SqliteStateStore::open(config.state_root.clone()).map_err(AfsError::from)?;
+    for mount in store.load_mounts().map_err(AfsError::from)? {
+        watcher.watch_mount(mount.root)?;
     }
 
     Ok(())

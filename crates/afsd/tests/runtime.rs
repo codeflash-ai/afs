@@ -5,15 +5,24 @@ use std::thread;
 use std::time::Duration;
 
 use afs_core::AfsError;
+use afs_core::canonical::render_canonical_markdown;
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use afs_core::model::{HydrationState, MountId, RemoteId};
+use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
+use afs_core::shadow::ShadowDocument;
+use afs_store::{
+    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
+    SqliteStateStore,
+};
 use afsd::DaemonConfig;
-use afsd::execution::PushJob;
+use afsd::execution::{DaemonEventReport, PushJob};
 use afsd::hydration::HydrationOutcome;
 use afsd::ipc::{DaemonRequest, DaemonResponse};
-use afsd::runtime::{DaemonRuntime, RuntimeJobRunner, ScheduledPullRuntimeReport};
+use afsd::runtime::{
+    DaemonRuntime, DefaultRuntimeJobRunner, RuntimeJobRunner, ScheduledPullRuntimeReport,
+};
 use afsd::scheduler::PullSchedulerTick;
+use afsd::watcher::{FileEvent, FileEventKind};
 use serde_json::json;
 
 #[test]
@@ -111,6 +120,90 @@ fn runtime_scheduler_queues_and_drains_hydration() {
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
     assert_eq!(request.reason, HydrationReason::Policy);
     runtime.shutdown();
+}
+
+#[test]
+fn runtime_routes_file_events_through_worker_queue() {
+    let (event_tx, event_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("file-event-routing"),
+        EventRunner { event_tx },
+    )
+    .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .file_event(FileEvent {
+            path: PathBuf::from("Roadmap.md"),
+            kind: FileEventKind::Write,
+        })
+        .expect("submit file event");
+
+    let event = event_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("file event ran");
+    assert_eq!(event.path, PathBuf::from("Roadmap.md"));
+    assert_eq!(event.kind, FileEventKind::Write);
+    runtime.shutdown();
+}
+
+#[test]
+fn default_runner_marks_hydrated_write_dirty() {
+    let fixture = EventFixture::new("dirty-write");
+    fixture.write_hydrated_page("Original body.");
+    fixture.write_hydrated_page("Edited body.");
+
+    let report = DefaultRuntimeJobRunner
+        .run_file_event(fixture.state_root.clone(), fixture.write_event())
+        .expect("run file event");
+
+    assert_eq!(report.marked_dirty, 1);
+    let store = SqliteStateStore::open(fixture.state_root).expect("open store");
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Dirty);
+}
+
+#[test]
+fn default_runner_marks_frontmatter_only_write_dirty() {
+    let fixture = EventFixture::new("frontmatter-write");
+    fixture.write_hydrated_page("Original body.");
+    fixture.write_hydrated_page_with_frontmatter(
+        "afs:\n  id: page-1\n  type: page\ntitle: Updated Roadmap\n",
+        "Original body.",
+    );
+
+    let report = DefaultRuntimeJobRunner
+        .run_file_event(fixture.state_root.clone(), fixture.write_event())
+        .expect("run file event");
+
+    assert_eq!(report.marked_dirty, 1);
+    let store = SqliteStateStore::open(fixture.state_root).expect("open store");
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Dirty);
+}
+
+#[test]
+fn default_runner_ignores_clean_daemon_projection_write() {
+    let fixture = EventFixture::new("clean-write");
+    fixture.write_hydrated_page("Original body.");
+
+    let report = DefaultRuntimeJobRunner
+        .run_file_event(fixture.state_root.clone(), fixture.write_event())
+        .expect("run file event");
+
+    assert_eq!(report.ignored_events, 1);
+    let store = SqliteStateStore::open(fixture.state_root).expect("open store");
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Hydrated);
 }
 
 #[derive(Clone)]
@@ -267,6 +360,53 @@ struct SchedulingRunner {
     scheduled_count: AtomicUsize,
 }
 
+struct EventRunner {
+    event_tx: mpsc::Sender<FileEvent>,
+}
+
+impl RuntimeJobRunner for EventRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        event: FileEvent,
+    ) -> afs_core::AfsResult<DaemonEventReport> {
+        self.event_tx.send(event).expect("send file event");
+        Ok(DaemonEventReport {
+            ignored_events: 1,
+            ..Default::default()
+        })
+    }
+}
+
 impl RuntimeJobRunner for SchedulingRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
@@ -352,4 +492,90 @@ fn temp_root(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
     root
+}
+
+struct EventFixture {
+    state_root: PathBuf,
+    mount_root: PathBuf,
+    mount_id: MountId,
+    remote_id: RemoteId,
+}
+
+impl EventFixture {
+    fn new(name: &str) -> Self {
+        let state_root = temp_root(&format!("{name}-state"));
+        let mount_root = temp_root(&format!("{name}-mount"));
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let body = markdown_body("Original body.");
+        let shadow = ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            body,
+            7,
+            [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+        )
+        .expect("shadow")
+        .with_frontmatter(frontmatter());
+
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                mount_root.clone(),
+            ))
+            .expect("save mount");
+        store
+            .save_shadow(&mount_id, shadow.clone())
+            .expect("save shadow");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_content_hash(shadow.body_hash),
+            )
+            .expect("save entity");
+
+        Self {
+            state_root,
+            mount_root,
+            mount_id,
+            remote_id,
+        }
+    }
+
+    fn page_path(&self) -> PathBuf {
+        self.mount_root.join("Roadmap.md")
+    }
+
+    fn write_event(&self) -> FileEvent {
+        FileEvent {
+            path: self.page_path(),
+            kind: FileEventKind::Write,
+        }
+    }
+
+    fn write_hydrated_page(&self, body: &str) {
+        let document = CanonicalDocument::new(frontmatter(), markdown_body(body));
+        std::fs::write(self.page_path(), render_canonical_markdown(&document)).expect("write page");
+    }
+
+    fn write_hydrated_page_with_frontmatter(&self, frontmatter: &str, body: &str) {
+        let document = CanonicalDocument::new(frontmatter, markdown_body(body));
+        std::fs::write(self.page_path(), render_canonical_markdown(&document)).expect("write page");
+    }
+}
+
+fn frontmatter() -> String {
+    "afs:\n  id: page-1\n  type: page\ntitle: Roadmap\n".to_string()
+}
+
+fn markdown_body(body: &str) -> String {
+    format!("# Roadmap\n\n{body}\n")
 }
