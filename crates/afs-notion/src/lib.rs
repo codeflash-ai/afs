@@ -12,6 +12,7 @@ pub mod mapping;
 pub mod media;
 pub mod projection;
 pub mod render;
+pub mod schema;
 
 use std::path::Path;
 use std::sync::Arc;

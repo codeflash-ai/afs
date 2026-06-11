@@ -334,11 +334,12 @@ fn polling_config(name: &str) -> DaemonConfig {
 }
 
 fn test_config(name: &str) -> DaemonConfig {
-    let mut config = DaemonConfig::default();
-    config.state_root = temp_root(name);
-    config.runtime_tick_interval = Duration::from_millis(10);
-    config.hydration_retry_delay = Duration::from_millis(25);
-    config
+    DaemonConfig {
+        state_root: temp_root(name),
+        runtime_tick_interval: Duration::from_millis(10),
+        hydration_retry_delay: Duration::from_millis(25),
+        ..Default::default()
+    }
 }
 
 fn temp_root(name: &str) -> PathBuf {

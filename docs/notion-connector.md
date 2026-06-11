@@ -25,6 +25,8 @@ The current implementation is a live-capable read, pull, and narrow write projec
 - `afs push -y` can update, append, and archive simple Notion blocks, update supported page
   properties, create new rows in single-data-source databases, and reconcile by reading the changed
   or created page back into the local shadow.
+- database row property edits and row creation are validated against the local `_schema.yaml`
+  before journal/apply.
 
 The generic connector `render` method still returns only `CanonicalDocument`. The Notion connector exposes `render_native_entity` for callers that need the shadow in the same pass. A future connector SDK revision can lift that richer return type into the generic trait once another connector validates the shape.
 
@@ -79,7 +81,17 @@ The first Notion apply path is intentionally conservative:
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
 - after apply, the CLI reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
 
-This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is schema-backed property validation for edits and row creation before journal/apply, then widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
+This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
+
+## Schema-Backed Property Validation
+
+Projected database directories carry `_schema.yaml`, generated from the live Notion database data source schema. Before `afs diff` or daemon-backed `afs push` accepts a database row property change, AFS reads that file and validates the frontmatter keys that would actually be written.
+
+For existing rows, only changed frontmatter properties are validated, so read-only values rendered from Notion, such as formulas or rollups, can remain in the file unchanged. For new row files, every non-identity frontmatter property is validated because all of them become create-page payload fields.
+
+The current validator supports the same writable property set as apply: `title`, `rich_text`, `number`, `select`, `status`, `multi_select`, `checkbox`, `date`, `url`, `email`, and `phone_number`. Select-like values must use option names already present in `_schema.yaml`; unknown options stop as `fix_validation` instead of implicitly creating new Notion options. Computed, read-only, or unresolved types such as `files`, `people`, `relation`, `formula`, `rollup`, timestamps, users, `unique_id`, and `verification` are blocked with structured validation errors until their ownership and resolution policies are designed.
+
+Multi-data-source databases still stop before row writes because AFS does not yet have a path-level way to choose the target data source. Pull the database again if `_schema.yaml` is missing or stale.
 
 ## Local Media
 
