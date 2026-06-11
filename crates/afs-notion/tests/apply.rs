@@ -5,13 +5,14 @@ use std::sync::Mutex;
 use afs_connector::{ApplyPlanRequest, Connector};
 use afs_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use afs_core::model::{MountId, RemoteId};
-use afs_core::planner::{PushOperation, PushPlan};
+use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, DateMentionDto, LinkDto, MentionRichTextDto, PageDto, PageListDto,
-    PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, TextRichTextDto,
+    BlockDto, BlockListDto, DateMentionDto, EquationBlockDto, LinkDto, MentionRichTextDto, PageDto,
+    PageListDto, PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto,
+    RichTextDto, SelectOptionDto, TextRichTextDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -111,7 +112,9 @@ fn apply_updates_appends_and_archives_supported_blocks() {
                     }],
                     "position": {
                         "type": "after_block",
-                        "after_block": "paragraph-1",
+                        "after_block": {
+                            "id": "paragraph-1",
+                        },
                     },
                 }),
             },
@@ -188,10 +191,54 @@ fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
                 }],
                 "position": {
                     "type": "after_block",
-                    "after_block": "created-1",
+                    "after_block": {
+                        "id": "created-1",
+                    },
                 },
             }),
         }
+    );
+}
+
+#[test]
+fn apply_updates_equation_blocks_from_display_math() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![equation_block("equation-1", "E=mc^2")],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("equation-1"),
+            content: "$$\nF=ma\n$$".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "equation-1".to_string(),
+            body: json!({
+                "equation": {
+                    "expression": "F=ma",
+                },
+            }),
+        }]
     );
 }
 
@@ -342,6 +389,157 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
     );
 }
 
+#[test]
+fn apply_updates_supported_page_properties() {
+    let api = Arc::new(RecordingNotionApi::with_page_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([
+            ("Name".to_string(), page_property("title")),
+            ("Status".to_string(), page_property("select")),
+            ("Tags".to_string(), page_property("multi_select")),
+            ("Done".to_string(), page_property("checkbox")),
+            ("Points".to_string(), page_property("number")),
+            ("Due".to_string(), page_property("date")),
+            ("URL".to_string(), page_property("url")),
+        ]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateProperties {
+            entity_id: RemoteId::new("page-1"),
+            properties: [
+                (
+                    "title".to_string(),
+                    PropertyValue::String("Fix login bug".to_string()),
+                ),
+                (
+                    "Status".to_string(),
+                    PropertyValue::String("In progress".to_string()),
+                ),
+                (
+                    "Tags".to_string(),
+                    PropertyValue::List(vec!["Backend".to_string(), "Docs".to_string()]),
+                ),
+                ("Done".to_string(), PropertyValue::Bool(false)),
+                ("Points".to_string(), PropertyValue::Number("3".to_string())),
+                (
+                    "Due".to_string(),
+                    PropertyValue::String("2026-06-10".to_string()),
+                ),
+                (
+                    "URL".to_string(),
+                    PropertyValue::String("https://example.com/afs".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::UpdatedProperties {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            entity_id: RemoteId::new("page-1"),
+            keys: vec![
+                "Done".to_string(),
+                "Due".to_string(),
+                "Points".to_string(),
+                "Status".to_string(),
+                "Tags".to_string(),
+                "URL".to_string(),
+                "title".to_string(),
+            ],
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::UpdatePage {
+            page_id: "page-1".to_string(),
+            body: json!({
+                "properties": {
+                    "Name": {
+                        "title": rich_text_json("Fix login bug"),
+                    },
+                    "Status": {
+                        "select": {
+                            "name": "In progress",
+                        },
+                    },
+                    "Tags": {
+                        "multi_select": [
+                            { "name": "Backend" },
+                            { "name": "Docs" },
+                        ],
+                    },
+                    "Done": {
+                        "checkbox": false,
+                    },
+                    "Points": {
+                        "number": 3.0,
+                    },
+                    "Due": {
+                        "date": {
+                            "start": "2026-06-10",
+                        },
+                    },
+                    "URL": {
+                        "url": "https://example.com/afs",
+                    },
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_rejects_legacy_property_update_without_values() {
+    let api = Arc::new(RecordingNotionApi::with_page_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([("Name".to_string(), page_property("title"))]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateProperties {
+            entity_id: RemoteId::new("page-1"),
+            properties: BTreeMap::new(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect_err("legacy property update");
+
+    assert!(matches!(error, AfsError::Unsupported(_)));
+}
+
 fn operation_ids(push_id: &PushId, plan: &PushPlan) -> Vec<PushOperationId> {
     plan.operations
         .iter()
@@ -371,6 +569,35 @@ impl RecordingNotionApi {
     }
 
     fn with_paragraph_rich_text(last_edited_time: &str, rich_text: Vec<RichTextDto>) -> Self {
+        Self::with_page_and_children(
+            PageDto {
+                id: "page-1".to_string(),
+                created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                last_edited_time: Some(last_edited_time.to_string()),
+                archived: false,
+                in_trash: false,
+                properties: BTreeMap::new(),
+            },
+            rich_text,
+        )
+    }
+
+    fn with_page_properties(
+        last_edited_time: &str,
+        properties: BTreeMap<String, PagePropertyDto>,
+    ) -> Self {
+        let page = PageDto {
+            id: "page-1".to_string(),
+            created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            last_edited_time: Some(last_edited_time.to_string()),
+            archived: false,
+            in_trash: false,
+            properties,
+        };
+        Self::with_page_and_children(page, rich_text("Old paragraph."))
+    }
+
+    fn with_blocks(last_edited_time: &str, blocks: Vec<BlockDto>) -> Self {
         let page = PageDto {
             id: "page-1".to_string(),
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
@@ -379,18 +606,28 @@ impl RecordingNotionApi {
             in_trash: false,
             properties: BTreeMap::new(),
         };
+        Self::with_page_and_block_results(page, blocks)
+    }
+
+    fn with_page_and_children(page: PageDto, rich_text: Vec<RichTextDto>) -> Self {
+        Self::with_page_and_block_results(
+            page,
+            vec![
+                paragraph_block_with_rich_text("paragraph-1", rich_text),
+                paragraph_block("old-block", "Old block.", false),
+            ],
+        )
+    }
+
+    fn with_page_and_block_results(page: PageDto, results: Vec<BlockDto>) -> Self {
         let children = BTreeMap::from([(
             ("page-1".to_string(), None),
             PaginatedListDto {
-                results: vec![
-                    paragraph_block_with_rich_text("paragraph-1", rich_text),
-                    paragraph_block("old-block", "Old block.", false),
-                ],
+                results,
                 next_cursor: None,
                 has_more: false,
             },
         )]);
-
         Self {
             page,
             children,
@@ -429,6 +666,17 @@ impl NotionApi for RecordingNotionApi {
         })
     }
 
+    fn update_page(&self, page_id: &str, body: Value) -> AfsResult<PageDto> {
+        self.writes
+            .lock()
+            .expect("writes")
+            .push(WriteCall::UpdatePage {
+                page_id: page_id.to_string(),
+                body,
+            });
+        Ok(self.page.clone())
+    }
+
     fn update_block(&self, block_id: &str, body: Value) -> AfsResult<BlockDto> {
         self.writes.lock().expect("writes").push(WriteCall::Update {
             block_id: block_id.to_string(),
@@ -465,9 +713,29 @@ impl NotionApi for RecordingNotionApi {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WriteCall {
+    UpdatePage { page_id: String, body: Value },
     Update { block_id: String, body: Value },
     Append { block_id: String, body: Value },
     Delete { block_id: String },
+}
+
+fn page_property(kind: &str) -> PagePropertyDto {
+    let mut property = PagePropertyDto {
+        kind: kind.to_string(),
+        ..Default::default()
+    };
+    match kind {
+        "title" => property.title = rich_text("Old title"),
+        "select" => {
+            property.select = Some(SelectOptionDto {
+                id: "todo-id".to_string(),
+                name: "Todo".to_string(),
+                color: None,
+            });
+        }
+        _ => {}
+    }
+    property
 }
 
 fn block(id: &str, kind: &str) -> BlockDto {
@@ -499,6 +767,14 @@ fn paragraph_block_with_rich_text(id: &str, rich_text: Vec<RichTextDto>) -> Bloc
     block.paragraph = Some(RichTextBlockDto {
         rich_text,
         color: None,
+    });
+    block
+}
+
+fn equation_block(id: &str, expression: &str) -> BlockDto {
+    let mut block = block(id, "equation");
+    block.equation = Some(EquationBlockDto {
+        expression: expression.to_string(),
     });
     block
 }

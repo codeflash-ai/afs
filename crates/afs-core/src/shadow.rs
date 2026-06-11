@@ -20,6 +20,8 @@ use crate::model::{RemoteId, SourceSpan};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowDocument {
     pub entity_id: RemoteId,
+    #[serde(default)]
+    pub frontmatter: String,
     pub body_hash: String,
     pub rendered_body: String,
     pub blocks: Vec<ShadowBlock>,
@@ -69,10 +71,16 @@ impl ShadowDocument {
 
         Ok(Self {
             entity_id,
+            frontmatter: String::new(),
             body_hash: stable_hash(&rendered_body),
             rendered_body,
             blocks,
         })
+    }
+
+    pub fn with_frontmatter(mut self, frontmatter: impl Into<String>) -> Self {
+        self.frontmatter = frontmatter.into();
+        self
     }
 
     pub fn block_ids(&self) -> BTreeSet<RemoteId> {

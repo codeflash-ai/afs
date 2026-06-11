@@ -6,6 +6,11 @@
 
 None.
 
+## Temporary Implementation Gaps
+
+- Toggle blocks currently render as anchored directives with their summary in the `title` attribute. This preserves identity and child content, but it is not yet the clean nested-list or `<details>` round-trip targeted by `plan.md`.
+- Layout-rich blocks such as columns, tabs, synced blocks, AI/custom blocks, and meeting notes are directive-backed until the diff/apply layer can preserve their nesting and source-specific semantics safely.
+
 ## Open Design Questions Carried From `plan.md`
 
 - Hydration aggressiveness remains configurable. The code defaults to the 90-day policy and no eager-under-size threshold.

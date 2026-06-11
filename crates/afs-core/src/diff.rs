@@ -7,8 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use yaml_serde::Value;
+
+use crate::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use crate::model::{CanonicalDocument, RemoteId};
-use crate::planner::{PlanDegradation, PlanDegradationKind, PushOperation, PushPlan};
+use crate::planner::{
+    PlanDegradation, PlanDegradationKind, PropertyValue, PushOperation, PushPlan,
+};
 use crate::shadow::{
     MarkdownBlockKind, SegmentedBlock, ShadowBlock, ShadowDocument, segment_markdown_body,
 };
@@ -80,7 +85,7 @@ pub fn plan_block_diff(
     }
 
     let (matches, degradations) = align_blocks(shadow, &edited_blocks);
-    let mut operations = Vec::new();
+    let mut operations = property_diff_operations(shadow, edited)?;
     let mut matched_shadow = BTreeSet::new();
     let mut previous_existing_id: Option<RemoteId> = None;
 
@@ -125,6 +130,105 @@ pub fn plan_block_diff(
     }
 
     Ok(PushPlan::new(vec![shadow.entity_id.clone()], operations).with_degradations(degradations))
+}
+
+fn property_diff_operations(
+    shadow: &ShadowDocument,
+    edited: &CanonicalDocument,
+) -> AfsResult<Vec<PushOperation>> {
+    if shadow.frontmatter.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let synced = parse_canonical_markdown(&render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    )))
+    .map_err(|error| {
+        AfsError::InvalidState(format!(
+            "synced shadow frontmatter is no longer parseable: {error}"
+        ))
+    })?;
+    let edited = parse_canonical_markdown(&render_canonical_markdown(edited)).map_err(|error| {
+        AfsError::InvalidState(format!(
+            "edited frontmatter is no longer parseable: {error}"
+        ))
+    })?;
+
+    let mut updates = BTreeMap::new();
+    if synced.frontmatter.title != edited.frontmatter.title {
+        updates.insert(
+            "title".to_string(),
+            edited
+                .frontmatter
+                .title
+                .map(PropertyValue::String)
+                .unwrap_or(PropertyValue::Null),
+        );
+    }
+
+    let keys = synced
+        .frontmatter
+        .properties
+        .keys()
+        .chain(edited.frontmatter.properties.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in keys {
+        let synced_value = synced.frontmatter.properties.get(&key);
+        let edited_value = edited.frontmatter.properties.get(&key);
+        if synced_value != edited_value {
+            updates.insert(
+                key.clone(),
+                edited_value
+                    .map(frontmatter_property_value)
+                    .unwrap_or(PropertyValue::Null),
+            );
+        }
+    }
+
+    if updates.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![PushOperation::UpdateProperties {
+            entity_id: shadow.entity_id.clone(),
+            properties: updates,
+        }])
+    }
+}
+
+fn frontmatter_property_value(value: &Value) -> PropertyValue {
+    match value {
+        Value::Null => PropertyValue::Null,
+        Value::Bool(value) => PropertyValue::Bool(*value),
+        Value::Number(value) => PropertyValue::Number(value.to_string()),
+        Value::String(value) => PropertyValue::String(value.clone()),
+        Value::Sequence(values) => PropertyValue::List(
+            values
+                .iter()
+                .filter_map(simple_frontmatter_string)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Mapping(mapping) => PropertyValue::Object(
+            mapping
+                .iter()
+                .filter_map(|(key, value)| {
+                    simple_frontmatter_string(key)
+                        .map(|key| (key, frontmatter_property_value(value)))
+                })
+                .collect(),
+        ),
+        Value::Tagged(tagged) => frontmatter_property_value(&tagged.value),
+    }
+}
+
+fn simple_frontmatter_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn validate_edited_directives(

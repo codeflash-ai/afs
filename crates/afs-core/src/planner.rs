@@ -4,6 +4,8 @@
 //! executes them. Plans are inspectable before apply, and their summaries feed
 //! the destructive-change guardrails from `plan.md`.
 
+use std::collections::BTreeMap;
+
 use crate::model::RemoteId;
 use serde::{Deserialize, Serialize};
 
@@ -68,7 +70,8 @@ pub enum PushOperation {
     },
     UpdateProperties {
         entity_id: RemoteId,
-        keys: Vec<String>,
+        #[serde(default)]
+        properties: BTreeMap<String, PropertyValue>,
     },
     CreateEntity {
         parent_id: RemoteId,
@@ -98,8 +101,8 @@ impl PlanSummary {
                 PushOperation::MoveBlock { .. } => summary.blocks_moved += 1,
                 PushOperation::ArchiveBlock { .. } => summary.blocks_archived += 1,
                 PushOperation::ArchiveEntity { .. } => summary.entities_archived += 1,
-                PushOperation::UpdateProperties { keys, .. } => {
-                    summary.properties_updated += keys.len();
+                PushOperation::UpdateProperties { properties, .. } => {
+                    summary.properties_updated += properties.len();
                 }
                 PushOperation::CreateEntity { .. } => summary.entities_created += 1,
             }
@@ -111,6 +114,17 @@ impl PlanSummary {
     pub fn destructive_archive_count(&self) -> usize {
         self.blocks_archived + self.entities_archived
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PropertyValue {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    List(Vec<String>),
+    Object(BTreeMap<String, PropertyValue>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

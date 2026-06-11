@@ -27,9 +27,9 @@ Clean Markdown is preferred for diffable blocks. Undiffable or lossy blocks rend
 
 Directive integrity is validated before push. Agents may move directive lines as whole lines, but editing directive contents is rejected unless the change maps to an explicit supported operation.
 
-The first renderer supports common text blocks, richer inline text, and simple tables directly. Inline bold, italic, strikethrough, code, external links, date mentions, page/database mentions, link previews, and equations use ordinary Markdown or small HTML fallbacks when Markdown has no native equivalent. Child pages, child databases, and unsupported/lossy blocks render as directives. This keeps the page inspectable while preserving remote block IDs for later safer round-trip support.
+The first renderer supports common text blocks, richer inline text, display equations, and simple tables directly. Inline bold, italic, strikethrough, code, external links, date mentions, page/database mentions, link previews, and equations use ordinary Markdown or small HTML fallbacks when Markdown has no native equivalent. Child pages, child databases, toggles, media, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes, AI/custom blocks, and unsupported/lossy blocks render as directives. This keeps the page inspectable while preserving remote block IDs for later safer round-trip support.
 
-The first writer supports block bodies whose Markdown shape maps to one Notion block: paragraphs, headings, single list items, to-dos, quotes, code fences, and dividers. It also parses the rich inline Markdown emitted by the renderer for bold, italic, strikethrough, underline, code, external links, equations, and `afs://` page links. Unchanged preimage mentions, such as date mentions, are preserved during block updates; unsupported inline shapes fail rather than being flattened silently.
+The first writer supports block bodies whose Markdown shape maps to one Notion block: paragraphs, headings, single list items, to-dos, quotes, code fences, dividers, and display equations. It also parses the rich inline Markdown emitted by the renderer for bold, italic, strikethrough, underline, code, external links, equations, and `afs://` page links. Unchanged preimage mentions, such as date mentions, are preserved during block updates; unsupported inline shapes fail rather than being flattened silently.
 
 ## Database Rows
 
@@ -51,4 +51,6 @@ title: "Fix login bug"
 ---
 ```
 
-Supported read-side property values include title, rich text, number, select, multi-select, status, checkbox, date, URL, email, phone, people, relation IDs, created/edited timestamps, created/edited users, and simple formula values. Property writes still fail until schema validation and Notion property update planning are implemented.
+Supported read-side property values include title, rich text, number, select, multi-select, status, checkbox, date, URL, email, phone, people, relation IDs, created/edited timestamps, created/edited users, and simple formula values.
+
+Property writes are planned by comparing edited frontmatter against the shadow frontmatter captured during the last render. The Notion writer currently applies title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone properties. Read-only or computed property classes such as people, relation, formula, rollup, created/edited timestamps, and created/edited users remain read-side only until schema validation and richer property preimages are added.

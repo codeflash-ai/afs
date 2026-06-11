@@ -14,12 +14,16 @@ The current implementation is a live-capable read, pull, and narrow write projec
 - `fetch` retrieves page metadata and recursively retrieves paginated block children.
 - fetched pages are serialized into a versioned native JSON bundle inside `NativeEntity.raw`;
 - `render_native_entity` converts that native bundle into canonical Markdown plus a `ShadowDocument`;
-- rich text annotations, external links, date/page/database mentions, link previews, and inline
-  equations render to Markdown where there is a stable textual representation;
+- rich text annotations, external links, date/page/database mentions, link previews, inline
+  equations, display equations, and heading levels 1-4 render to Markdown where there is a
+  stable textual representation;
 - simple Notion tables render as Markdown tables with table-row IDs retained in shadow metadata;
-- unsupported or lossy blocks render as `::afs{...}` directives so they retain remote identity.
-- `afs push -y` can update, append, and archive simple Notion blocks through the live API, then
-  reconcile by reading the changed page back into the local shadow.
+- toggles, media, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes,
+  AI/custom blocks, and unsupported or lossy blocks render as `::afs{...}` directives so they
+  retain remote identity and useful metadata such as title, URL, source block ID, or target page ID
+  when the API exposes it.
+- `afs push -y` can update, append, and archive simple Notion blocks, update supported page
+  properties, and reconcile by reading the changed page back into the local shadow.
 
 The generic connector `render` method still returns only `CanonicalDocument`. The Notion connector exposes `render_native_entity` for callers that need the shadow in the same pass. A future connector SDK revision can lift that richer return type into the generic trait once another connector validates the shape.
 
@@ -37,7 +41,7 @@ The token must have access to the target page. Live tests are ignored by default
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, child-page/database directives, and unsupported-block directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, and display equations as Markdown. It renders child pages/databases, toggles, media, embeds, bookmarks, synced blocks, column layouts, tabs, table of contents, breadcrumbs, link-to-page blocks, meeting notes, AI/custom blocks, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 
@@ -54,14 +58,15 @@ Nested children are fetched recursively and rendered after their parent, except 
 The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, and block archive;
-- supported writable block forms: paragraphs, headings 1-3, bulleted list items, numbered list items, to-dos, quotes, code fences, and dividers;
+- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, code fences, dividers, and display equations;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, `afs://` page links, and unchanged preimage mentions such as dates;
-- unsupported write forms fail before API mutation, including tables, page/database creation, database row creation, property edits, block moves, and rich inline shapes that cannot be represented by the current Markdown parser;
+- supported page property writes: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone;
+- unsupported write forms fail before API mutation, including tables, page/database creation, database row creation, block moves, computed/read-only properties, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
 - after apply, the CLI reconciler fetches the changed page, rewrites the local file atomically, saves the refreshed shadow, and updates the entity's `remote_edited_at`.
 
-This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
+This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover additional mention types, nested annotation/link combinations, relative-file link resolution, and schema-backed property validation.
 
 ## Path Projection
 
@@ -87,4 +92,4 @@ roadmap ~aaaaaa/
     fix-login-bug ~eeeeee.md
 ```
 
-Row files are normal page files. Their stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. `_view.csv`, row creation, and property writes remain future work.
+Row files are normal page files. Their stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. `_view.csv` and row creation remain future work; property writes now flow through the row file frontmatter for the supported writable property classes.

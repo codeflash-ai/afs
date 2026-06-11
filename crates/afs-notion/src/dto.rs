@@ -221,6 +221,8 @@ pub struct BlockDto {
     #[serde(default)]
     pub heading_3: Option<RichTextBlockDto>,
     #[serde(default)]
+    pub heading_4: Option<RichTextBlockDto>,
+    #[serde(default)]
     pub bulleted_list_item: Option<RichTextBlockDto>,
     #[serde(default)]
     pub numbered_list_item: Option<RichTextBlockDto>,
@@ -240,6 +242,50 @@ pub struct BlockDto {
     pub child_page: Option<TitleBlockDto>,
     #[serde(default)]
     pub child_database: Option<TitleBlockDto>,
+    #[serde(default)]
+    pub toggle: Option<RichTextBlockDto>,
+    #[serde(default)]
+    pub equation: Option<EquationBlockDto>,
+    #[serde(default)]
+    pub embed: Option<UrlBlockDto>,
+    #[serde(default)]
+    pub bookmark: Option<UrlBlockDto>,
+    #[serde(default)]
+    pub link_preview: Option<UrlBlockDto>,
+    #[serde(default)]
+    pub image: Option<FileBlockDto>,
+    #[serde(default)]
+    pub video: Option<FileBlockDto>,
+    #[serde(default)]
+    pub file: Option<FileBlockDto>,
+    #[serde(default)]
+    pub pdf: Option<FileBlockDto>,
+    #[serde(default)]
+    pub audio: Option<FileBlockDto>,
+    #[serde(default)]
+    pub synced_block: Option<SyncedBlockDto>,
+    #[serde(default)]
+    pub link_to_page: Option<LinkToPageBlockDto>,
+    #[serde(default)]
+    pub table_of_contents: Option<ColorOnlyBlockDto>,
+    #[serde(default)]
+    pub breadcrumb: Option<EmptyBlockDto>,
+    #[serde(default)]
+    pub column_list: Option<EmptyBlockDto>,
+    #[serde(default)]
+    pub column: Option<EmptyBlockDto>,
+    #[serde(default)]
+    pub template: Option<RichTextBlockDto>,
+    #[serde(default)]
+    pub meeting_notes: Option<MeetingNotesBlockDto>,
+    #[serde(default)]
+    pub transcription: Option<MeetingNotesBlockDto>,
+    #[serde(default)]
+    pub tab: Option<serde_json::Value>,
+    #[serde(default)]
+    pub ai_block: Option<serde_json::Value>,
+    #[serde(default)]
+    pub custom_block: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +334,96 @@ pub struct TableBlockDto {
 pub struct TableRowBlockDto {
     #[serde(default)]
     pub cells: Vec<Vec<RichTextDto>>,
+}
+
+/// Payload for Notion display equation blocks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquationBlockDto {
+    #[serde(default)]
+    pub expression: String,
+}
+
+/// Payload shared by embed-like blocks that primarily expose a URL.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UrlBlockDto {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub caption: Vec<RichTextDto>,
+}
+
+/// Payload shared by Notion file/media blocks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileBlockDto {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub external: Option<ExternalFileDto>,
+    #[serde(default)]
+    pub file: Option<HostedFileDto>,
+    #[serde(default)]
+    pub caption: Vec<RichTextDto>,
+}
+
+/// External file reference used by image, video, file, PDF, and audio blocks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFileDto {
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Hosted file reference returned by Notion for uploaded media.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedFileDto {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub expiry_time: Option<String>,
+}
+
+/// Synced block payload. For copied synced blocks, `synced_from` points to the source.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedBlockDto {
+    #[serde(default)]
+    pub synced_from: Option<SyncedFromDto>,
+}
+
+/// Source reference for a copied synced block.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedFromDto {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub block_id: Option<String>,
+}
+
+/// Payload for Notion's link-to-page block.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkToPageBlockDto {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub page_id: Option<String>,
+    #[serde(default)]
+    pub database_id: Option<String>,
+}
+
+/// Payload for blocks whose only stable public field is color.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorOnlyBlockDto {
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// Empty payload marker for blocks whose identity matters more than editable fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmptyBlockDto {}
+
+/// Shallow meeting-notes payload; richer metadata remains native JSON for now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingNotesBlockDto {
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// One Notion rich text segment.

@@ -22,7 +22,7 @@ use crate::records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapsho
 use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -221,15 +221,17 @@ impl ShadowRepository for SqliteStateStore {
         let connection = self.connection()?;
         let record = ShadowSnapshotRecord::from_document(mount_id.clone(), &shadow);
         connection.execute(
-            "INSERT INTO shadows (mount_id, entity_id, body_hash, rendered_body, blocks_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO shadows (mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(mount_id, entity_id) DO UPDATE SET
+                frontmatter = excluded.frontmatter,
                 body_hash = excluded.body_hash,
                 rendered_body = excluded.rendered_body,
                 blocks_json = excluded.blocks_json",
             params![
                 record.mount_id.0,
                 record.entity_id.0,
+                record.frontmatter,
                 record.body_hash,
                 record.rendered_body,
                 to_json(&record.blocks)?,
@@ -255,7 +257,7 @@ impl ShadowRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT mount_id, entity_id, body_hash, rendered_body, blocks_json
+                "SELECT mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json
                  FROM shadows
                  WHERE mount_id = ?1 AND entity_id = ?2",
                 params![mount_id.0, entity_id.0],
@@ -266,6 +268,7 @@ impl ShadowRepository for SqliteStateStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -410,7 +413,7 @@ type EntityRow = (
     Option<String>,
     Option<String>,
 );
-type ShadowRow = (String, String, String, String, String);
+type ShadowRow = (String, String, String, String, String, String);
 type JournalRow = (String, String, String, String, String, String, String);
 
 fn initialize_schema(connection: &Connection) -> StoreResult<()> {
@@ -453,6 +456,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         CREATE TABLE IF NOT EXISTS shadows (
             mount_id TEXT NOT NULL,
             entity_id TEXT NOT NULL,
+            frontmatter TEXT NOT NULL DEFAULT '',
             body_hash TEXT NOT NULL,
             rendered_body TEXT NOT NULL,
             blocks_json TEXT NOT NULL,
@@ -491,6 +495,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute_batch(
             "ALTER TABLE mounts
              ADD COLUMN remote_root_id TEXT;",
+        )?;
+    }
+
+    if user_version < 5 && !column_exists(connection, "shadows", "frontmatter")? {
+        connection.execute_batch(
+            "ALTER TABLE shadows
+             ADD COLUMN frontmatter TEXT NOT NULL DEFAULT '';",
         )?;
     }
 
@@ -541,9 +552,10 @@ fn shadow_from_row(row: ShadowRow) -> StoreResult<ShadowSnapshotRecord> {
     Ok(ShadowSnapshotRecord {
         mount_id: MountId(row.0),
         entity_id: RemoteId(row.1),
-        body_hash: row.2,
-        rendered_body: row.3,
-        blocks: from_json::<Vec<ShadowBlockRecord>>(&row.4)?,
+        frontmatter: row.2,
+        body_hash: row.3,
+        rendered_body: row.4,
+        blocks: from_json::<Vec<ShadowBlockRecord>>(&row.5)?,
     })
 }
 
