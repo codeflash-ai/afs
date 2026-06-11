@@ -418,25 +418,29 @@ pub trait PushReconciler {
     fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult>;
 }
 
-/// Executes an approved push plan without letting connector code run before the
-/// write-ahead journal is prepared.
+/// Combined host for daemon-owned push execution.
 ///
-/// Non-approved pipeline actions return `NotReady` and do not touch the journal
-/// or connector hooks. Once execution starts, any concurrency, apply, or
-/// reconcile failure marks the journal `Failed` before returning the original
-/// error.
-pub fn execute_journaled_push<J, C, A, R>(
-    journal: &mut J,
-    concurrency: &mut C,
-    applier: &mut A,
-    reconciler: &mut R,
+/// This avoids splitting journal writes and post-apply reconciliation across
+/// distinct mutable objects. The same state owner prepares the journal, applies
+/// source mutations through connector hooks, reconciles post-apply remote state,
+/// and advances the journal to `Reconciled`.
+pub trait PushExecutionHost:
+    JournalStore + PushConcurrencyCheck + PushApplier + PushReconciler
+{
+}
+
+impl<T> PushExecutionHost for T where
+    T: JournalStore + PushConcurrencyCheck + PushApplier + PushReconciler
+{
+}
+
+/// Executes an approved push plan through one daemon-owned host.
+pub fn execute_journaled_push_with_host<H>(
+    host: &mut H,
     request: PushExecutionRequest,
 ) -> AfsResult<PushExecutionResult>
 where
-    J: JournalStore,
-    C: PushConcurrencyCheck,
-    A: PushApplier,
-    R: PushReconciler,
+    H: PushExecutionHost,
 {
     if request.pipeline.action != PushPipelineAction::ProceedToApply {
         return Ok(PushExecutionResult {
@@ -467,7 +471,7 @@ where
         })
         .collect::<Vec<_>>();
 
-    journal.append(
+    host.append(
         JournalEntry::new(
             request.push_id.clone(),
             request.mount_id.clone(),
@@ -477,9 +481,9 @@ where
         )
         .with_preimages(request.preimages.clone()),
     )?;
-    journal.update_status(&request.push_id, JournalStatus::Applying)?;
+    host.update_status(&request.push_id, JournalStatus::Applying)?;
 
-    if let Err(error) = concurrency.check(PushConcurrencyRequest {
+    if let Err(error) = host.check(PushConcurrencyRequest {
         push_id: &request.push_id,
         mount_id: &request.mount_id,
         plan: &plan,
@@ -487,11 +491,11 @@ where
         remote_ids: &remote_ids,
         remote_preconditions: &request.remote_preconditions,
     }) {
-        mark_failed(journal, &request.push_id, &error)?;
+        mark_failed(host, &request.push_id, &error)?;
         return Err(error);
     }
 
-    let apply_result = match applier.apply(PushApplyRequest {
+    let apply_result = match host.apply(PushApplyRequest {
         push_id: &request.push_id,
         mount_id: &request.mount_id,
         plan: &plan,
@@ -501,18 +505,17 @@ where
     }) {
         Ok(result) => result,
         Err(error) => {
-            mark_failed(journal, &request.push_id, &error)?;
+            mark_failed(host, &request.push_id, &error)?;
             return Err(error);
         }
     };
-    if let Err(error) = journal.record_apply_effects(&request.push_id, apply_result.effects.clone())
-    {
-        mark_failed(journal, &request.push_id, &error)?;
+    if let Err(error) = host.record_apply_effects(&request.push_id, apply_result.effects.clone()) {
+        mark_failed(host, &request.push_id, &error)?;
         return Err(error);
     }
-    journal.update_status(&request.push_id, JournalStatus::Applied)?;
+    host.update_status(&request.push_id, JournalStatus::Applied)?;
 
-    let reconcile_result = match reconciler.reconcile(PushReconcileRequest {
+    let reconcile_result = match host.reconcile(PushReconcileRequest {
         push_id: &request.push_id,
         mount_id: &request.mount_id,
         plan: &plan,
@@ -520,11 +523,11 @@ where
     }) {
         Ok(result) => result,
         Err(error) => {
-            mark_failed(journal, &request.push_id, &error)?;
+            mark_failed(host, &request.push_id, &error)?;
             return Err(error);
         }
     };
-    journal.update_status(&request.push_id, JournalStatus::Reconciled)?;
+    host.update_status(&request.push_id, JournalStatus::Reconciled)?;
 
     let mut completed_stages = request.pipeline.completed_stages;
     completed_stages.push(PushStage::ConcurrencyCheckAndApply);

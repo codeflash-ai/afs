@@ -1,14 +1,19 @@
+use std::cell::Cell;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_cli::push::{PushOptions, push_report_exit_code, run_push, run_push_with_executor};
+use afs_cli::push::{PushOptions, push_report_exit_code, run_push, run_push_with_daemon};
+use afs_connector::{
+    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
+    ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
+    ParsedEntity,
+};
+use afs_core::hydration::HydrationRequest;
 use afs_core::journal::JournalApplyEffect;
-use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use afs_core::push::{
-    PushApplier, PushApplyRequest, PushApplyResult, PushConcurrencyCheck, PushConcurrencyRequest,
-    PushReconcileRequest, PushReconcileResult, PushReconciler,
+use afs_core::model::{
+    CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
@@ -16,6 +21,7 @@ use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
     MountRepository, ShadowRepository, SqliteStateStore,
 };
+use afsd::hydration::{HydratedEntity, HydrationSource};
 
 #[test]
 fn push_noop_succeeds_without_apply() {
@@ -100,27 +106,23 @@ fn push_safe_plan_with_yes_stops_at_apply_boundary() {
 }
 
 #[test]
-fn push_safe_plan_with_executor_journals_applies_and_reconciles() {
+fn push_safe_plan_with_daemon_journals_applies_and_reconciles() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();
     let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
     store
         .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
         .expect("save shadow");
-    let mut concurrency = FakeConcurrency::default();
-    let mut applier = FakeApplier::default();
-    let mut reconciler = FakeReconciler::default();
+    let source = FakePushSource::with_remote(rendered_entity("Changed paragraph."));
 
-    let report = run_push_with_executor(
+    let report = run_push_with_daemon(
         &mut store,
+        &source,
         &path,
         PushOptions {
             assume_yes: true,
             confirm_dangerous: false,
         },
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
     )
     .expect("push report");
 
@@ -141,34 +143,29 @@ fn push_safe_plan_with_executor_journals_applies_and_reconciles() {
     assert_eq!(journal.status, afs_core::journal::JournalStatus::Reconciled);
     assert_eq!(journal.preimages.len(), 1);
     assert_eq!(journal.apply_effects.len(), 1);
-    assert_eq!(concurrency.checks, 1);
-    assert_eq!(applier.applies, 1);
-    assert_eq!(reconciler.reconciles, 1);
+    assert_eq!(source.checks.get(), 1);
+    assert_eq!(source.applies.get(), 1);
 }
 
 #[test]
-fn push_executor_reports_connector_not_implemented_with_failed_journal() {
+fn push_daemon_reports_connector_not_implemented_with_failed_journal() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();
     let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
     store
         .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
         .expect("save shadow");
-    let mut concurrency =
-        FakeConcurrency::default().with_failure(AfsError::NotImplemented("fake concurrency"));
-    let mut applier = FakeApplier::default();
-    let mut reconciler = FakeReconciler::default();
+    let source = FakePushSource::with_remote(rendered_entity("Changed paragraph."))
+        .with_concurrency_failure(AfsError::NotImplemented("fake concurrency"));
 
-    let report = run_push_with_executor(
+    let report = run_push_with_daemon(
         &mut store,
+        &source,
         &path,
         PushOptions {
             assume_yes: true,
             confirm_dangerous: false,
         },
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
     )
     .expect("push report");
 
@@ -334,37 +331,81 @@ impl Drop for PushFixture {
 }
 
 #[derive(Debug, Default)]
-struct FakeConcurrency {
-    checks: usize,
-    failure: Option<AfsError>,
+struct FakePushSource {
+    remote: Option<HydratedEntity>,
+    checks: Cell<usize>,
+    applies: Cell<usize>,
+    concurrency_failure: Option<AfsError>,
 }
 
-impl FakeConcurrency {
-    fn with_failure(mut self, failure: AfsError) -> Self {
-        self.failure = Some(failure);
+impl FakePushSource {
+    fn with_remote(remote: HydratedEntity) -> Self {
+        Self {
+            remote: Some(remote),
+            checks: Cell::new(0),
+            applies: Cell::new(0),
+            concurrency_failure: None,
+        }
+    }
+
+    fn with_concurrency_failure(mut self, failure: AfsError) -> Self {
+        self.concurrency_failure = Some(failure);
         self
     }
 }
 
-impl PushConcurrencyCheck for FakeConcurrency {
-    fn check(&mut self, _request: PushConcurrencyRequest<'_>) -> AfsResult<()> {
-        self.checks += 1;
-        match &self.failure {
+impl HydrationSource for FakePushSource {
+    fn fetch_render(&self, request: &HydrationRequest) -> AfsResult<HydratedEntity> {
+        if request.remote_id != RemoteId::new("page-1") {
+            return Err(AfsError::InvalidState("unexpected remote id".to_string()));
+        }
+
+        self.remote
+            .clone()
+            .ok_or_else(|| AfsError::InvalidState("missing remote fixture".to_string()))
+    }
+}
+
+impl Connector for FakePushSource {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind("fake")
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            supports_block_updates: true,
+            supports_databases: false,
+            supports_oauth: false,
+        }
+    }
+
+    fn enumerate(&self, _request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>> {
+        Err(AfsError::NotImplemented("fake enumerate"))
+    }
+
+    fn fetch(&self, _request: FetchRequest) -> AfsResult<NativeEntity> {
+        Err(AfsError::NotImplemented("fake fetch"))
+    }
+
+    fn render(&self, _entity: &NativeEntity) -> AfsResult<CanonicalDocument> {
+        Err(AfsError::NotImplemented("fake render"))
+    }
+
+    fn parse(&self, _document: &CanonicalDocument) -> AfsResult<ParsedEntity> {
+        Err(AfsError::NotImplemented("fake parse"))
+    }
+
+    fn check_concurrency(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<()> {
+        self.checks.set(self.checks.get() + 1);
+        match &self.concurrency_failure {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
     }
-}
 
-#[derive(Debug, Default)]
-struct FakeApplier {
-    applies: usize,
-}
-
-impl PushApplier for FakeApplier {
-    fn apply(&mut self, request: PushApplyRequest<'_>) -> AfsResult<PushApplyResult> {
-        self.applies += 1;
-        Ok(PushApplyResult {
+    fn apply(&self, request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult> {
+        self.applies.set(self.applies.get() + 1);
+        Ok(ApplyPlanResult {
             changed_remote_ids: request.plan.affected_entities.clone(),
             effects: vec![JournalApplyEffect::UpdatedBlock {
                 operation_id: request.operation_ids[0].clone(),
@@ -373,19 +414,21 @@ impl PushApplier for FakeApplier {
             }],
         })
     }
+
+    fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult> {
+        Err(AfsError::NotImplemented("fake undo"))
+    }
 }
 
-#[derive(Debug, Default)]
-struct FakeReconciler {
-    reconciles: usize,
-}
-
-impl PushReconciler for FakeReconciler {
-    fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
-        self.reconciles += 1;
-        Ok(PushReconcileResult {
-            reconciled_remote_ids: request.changed_remote_ids.to_vec(),
-        })
+fn rendered_entity(body: &str) -> HydratedEntity {
+    let body = format!("# Roadmap\n\n{body}");
+    HydratedEntity {
+        document: CanonicalDocument::new(
+            "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            body.clone(),
+        ),
+        shadow: shadow(&body),
+        remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
     }
 }
 

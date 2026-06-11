@@ -9,7 +9,7 @@ use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
     ShadowRepository,
 };
-use afsd::execution::{DaemonExecutor, HydrationDrainJob, HydrationRequestJob, PushJob};
+use afsd::execution::{DaemonExecutor, HydrationDrainJob, HydrationRequestJob};
 use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
 use afsd::scheduler::PullScheduler;
 use afsd::supervisor::DaemonSupervisor;
@@ -152,22 +152,6 @@ fn supervisor_hydrates_single_request_through_daemon_job() {
     let contents = std::fs::read_to_string(page_path).expect("hydrated file from daemon job");
     assert!(contents.contains("Hydrated from supervisor."));
     let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn push_job_is_reserved_for_daemon_execution_boundary() {
-    let mut supervisor = supervisor_with_entity(HydrationState::Hydrated);
-    supervisor.start().expect("start supervisor");
-
-    let error = supervisor
-        .execute_push(PushJob {
-            target_path: PathBuf::from("/tmp/afs/notion/Roadmap.md"),
-            assume_yes: true,
-            confirm_dangerous: false,
-        })
-        .expect_err("push execution is not wired yet");
-
-    assert_eq!(error, AfsError::NotImplemented("daemon push execution"));
 }
 
 fn supervisor_with_entity(

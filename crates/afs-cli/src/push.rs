@@ -1,31 +1,24 @@
 //! `afs push` orchestration.
 //!
-//! This push surface runs validation, diff, plan, guardrail, and the journaled
-//! connector-apply spine.
+//! This push surface renders daemon execution reports into CLI output. The
+//! apply/reconcile path itself lives in `afsd`.
 
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
-use afs_connector::{Connector, FetchRequest};
-use afs_core::canonical::render_canonical_markdown;
-use afs_core::journal::{JournalPreimage, JournalStatus, JournalStore, PushId};
-use afs_core::model::{HydrationState, RemoteId};
-use afs_core::push::{
-    PushApproval, PushExecutionAction, PushExecutionRequest, PushExecutionResult,
-    PushReconcileRequest, PushReconcileResult, PushReconciler, RemotePrecondition,
-    execute_journaled_push,
-};
+use afs_connector::Connector;
+use afs_core::journal::{JournalStatus, JournalStore};
+use afs_core::model::RemoteId;
+use afs_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
 use afs_core::{AfsError, AfsResult};
-use afs_notion::NotionConnector;
-use afs_notion::dto::NotionPageBundle;
-use afs_store::{
-    EntityRepository, JournalRepository, MountRepository, ShadowRepository, SqliteStateStore,
-};
+use afs_store::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
+use afsd::execution::{PushJob, PushJobReport};
+use afsd::hydration::HydrationSource;
+use afsd::push::{PushJobAction, execute_push_job};
 use serde::Serialize;
 
 use crate::diff::{
-    DiffError, GuardrailOutput, PreviewOptions, PushPlanOutput, ValidationIssueOutput, run_preview,
-    run_preview_artifacts,
+    DiffError, GuardrailOutput, PreviewOptions, PushPlanOutput, ValidationIssueOutput, action_name,
+    run_preview,
 };
 
 pub fn run_push<S>(
@@ -48,59 +41,22 @@ where
     Ok(PushReport::from_preview(preview))
 }
 
-pub fn run_push_with_executor<S, C, A, R>(
+pub fn run_push_with_daemon<S, Source>(
     store: &mut S,
+    source: &Source,
     target_path: impl AsRef<Path>,
     options: PushOptions,
-    concurrency: &mut C,
-    applier: &mut A,
-    reconciler: &mut R,
-) -> Result<PushReport, DiffError>
+) -> AfsResult<PushReport>
 where
     S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
-    C: afs_core::push::PushConcurrencyCheck,
-    A: afs_core::push::PushApplier,
-    R: PushReconciler,
+    Source: Connector + HydrationSource + ?Sized,
 {
-    let artifacts = run_preview_artifacts(
-        store,
-        target_path,
-        PreviewOptions::new("push").with_approval(PushApproval {
-            assume_yes: options.assume_yes,
-            confirm_dangerous: options.confirm_dangerous,
-        }),
-    )?;
-    let report = PushReport::from_preview(artifacts.report);
-
-    if report.pipeline_action != "proceed_to_apply" {
-        return Ok(report);
-    }
-
-    let (Some(mount), Some(entity), Some(shadow), Some(pipeline)) = (
-        artifacts.mount,
-        artifacts.entity,
-        artifacts.shadow,
-        artifacts.pipeline,
-    ) else {
-        return Ok(report);
+    let job = PushJob {
+        target_path: target_path.as_ref().to_path_buf(),
+        assume_yes: options.assume_yes,
+        confirm_dangerous: options.confirm_dangerous,
     };
-    let push_id = generate_push_id();
-    let execution_request = PushExecutionRequest::new(push_id.clone(), mount.mount_id, pipeline)
-        .with_preimages(vec![JournalPreimage::from_shadow(shadow)])
-        .with_remote_preconditions(vec![RemotePrecondition {
-            remote_id: entity.remote_id,
-            remote_edited_at: entity.remote_edited_at,
-        }]);
-
-    match execute_journaled_push(store, concurrency, applier, reconciler, execution_request) {
-        Ok(result) => Ok(PushReport::from_execution(report, result)),
-        Err(error) => Ok(PushReport::from_execution_error(
-            report,
-            push_id.clone(),
-            journal_status_after_error(store, &push_id),
-            error,
-        )),
-    }
+    execute_push_job(store, job, source).map(PushReport::from_daemon)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -131,6 +87,64 @@ pub struct PushReport {
 }
 
 impl PushReport {
+    fn from_daemon(report: PushJobReport) -> Self {
+        let PushJobReport {
+            target_path,
+            mount_id,
+            entity_id,
+            pipeline,
+            action,
+            execution,
+            push_id,
+            journal_status,
+            error,
+        } = report;
+
+        let pipeline_action = action_name(&pipeline.action).to_string();
+        let completed_stages = pipeline
+            .completed_stages
+            .iter()
+            .map(push_stage_name)
+            .map(str::to_string)
+            .collect();
+        let mut cli_report = Self {
+            ok: false,
+            command: "push",
+            path: target_path.display().to_string(),
+            mount_id: mount_id.0,
+            entity_id: entity_id.0,
+            validation: pipeline
+                .validation
+                .issues
+                .into_iter()
+                .map(ValidationIssueOutput::from)
+                .collect(),
+            plan: pipeline.plan.map(PushPlanOutput::from),
+            guardrail: GuardrailOutput::from(pipeline.guardrail),
+            action: daemon_action_name(&action, &pipeline_action, error.as_ref()).to_string(),
+            pipeline_action,
+            push_id: None,
+            journal_status: journal_status.as_ref().map(journal_status_name),
+            changed_remote_ids: Vec::new(),
+            reconciled_remote_ids: Vec::new(),
+            apply_effect_count: 0,
+            completed_stages,
+            message: None,
+        };
+
+        if let Some(result) = execution {
+            cli_report = cli_report.with_execution(result);
+        } else if let Some(error) = error {
+            cli_report.ok = false;
+            cli_report.push_id = push_id.map(|push_id| push_id.0);
+            cli_report.message = Some(error.to_string());
+        } else {
+            cli_report.ok = cli_report.action == "noop";
+        }
+
+        cli_report
+    }
+
     fn from_preview(preview: crate::diff::DiffReport) -> Self {
         let (action, message) = match preview.action.as_str() {
             "proceed_to_apply" => (
@@ -162,50 +176,36 @@ impl PushReport {
         }
     }
 
-    fn from_execution(mut report: Self, result: PushExecutionResult) -> Self {
-        match result.action {
+    fn with_execution(mut self, result: PushExecutionResult) -> Self {
+        match &result.action {
             PushExecutionAction::Reconciled => {
-                report.ok = true;
-                report.action = "reconciled".to_string();
-                report.message = Some("connector apply and reconcile completed".to_string());
+                self.ok = true;
+                self.action = "reconciled".to_string();
+                self.message = Some("connector apply and reconcile completed".to_string());
             }
             PushExecutionAction::NotReady { pipeline_action } => {
-                report.ok = false;
-                report.action = "not_ready".to_string();
-                report.message = Some(format!(
-                    "push executor stopped before apply: {pipeline_action:?}"
-                ));
+                let action = action_name(pipeline_action);
+                self.ok = action == "noop";
+                self.action = action.to_string();
+                self.message = None;
             }
         }
-        report.push_id = Some(result.push_id.0);
-        report.journal_status = result.journal_status.as_ref().map(journal_status_name);
-        report.changed_remote_ids = remote_ids_to_strings(result.changed_remote_ids);
-        report.reconciled_remote_ids = remote_ids_to_strings(result.reconciled_remote_ids);
-        report.apply_effect_count = result.apply_effects.len();
-        report.completed_stages = result
+        if result.journal_status.is_some()
+            || matches!(&result.action, PushExecutionAction::Reconciled)
+        {
+            self.push_id = Some(result.push_id.0);
+        }
+        self.journal_status = result.journal_status.as_ref().map(journal_status_name);
+        self.changed_remote_ids = remote_ids_to_strings(result.changed_remote_ids);
+        self.reconciled_remote_ids = remote_ids_to_strings(result.reconciled_remote_ids);
+        self.apply_effect_count = result.apply_effects.len();
+        self.completed_stages = result
             .completed_stages
             .iter()
             .map(push_stage_name)
             .map(str::to_string)
             .collect();
-        report
-    }
-
-    fn from_execution_error(
-        mut report: Self,
-        push_id: PushId,
-        journal_status: Option<JournalStatus>,
-        error: AfsError,
-    ) -> Self {
-        report.ok = false;
-        report.push_id = Some(push_id.0);
-        report.journal_status = journal_status.as_ref().map(journal_status_name);
-        report.action = match &error {
-            AfsError::NotImplemented(_) => "apply_not_implemented".to_string(),
-            _ => "apply_failed".to_string(),
-        };
-        report.message = Some(error.to_string());
-        report
+        self
     }
 }
 
@@ -219,107 +219,19 @@ pub fn push_report_exit_code(report: &PushReport) -> i32 {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct NotImplementedReconciler;
-
-impl PushReconciler for NotImplementedReconciler {
-    fn reconcile(&mut self, _request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
-        Err(AfsError::NotImplemented("post-apply reconcile"))
+fn daemon_action_name<'a>(
+    action: &PushJobAction,
+    pipeline_action: &'a str,
+    error: Option<&AfsError>,
+) -> &'a str {
+    match action {
+        PushJobAction::NotReady => pipeline_action,
+        PushJobAction::Reconciled => "reconciled",
+        PushJobAction::Failed => match error {
+            Some(AfsError::NotImplemented(_)) => "apply_not_implemented",
+            _ => "apply_failed",
+        },
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct NotionPushReconciler {
-    store: SqliteStateStore,
-    connector: NotionConnector,
-}
-
-impl NotionPushReconciler {
-    pub fn new(store: SqliteStateStore, connector: NotionConnector) -> Self {
-        Self { store, connector }
-    }
-}
-
-impl PushReconciler for NotionPushReconciler {
-    fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
-        let mount = self.store.get_mount(request.mount_id)?.ok_or_else(|| {
-            AfsError::InvalidState(format!("missing mount {}", request.mount_id.0))
-        })?;
-        let mut reconciled_remote_ids = Vec::new();
-
-        for remote_id in request.changed_remote_ids {
-            let mut entity = self
-                .store
-                .get_entity(request.mount_id, remote_id)?
-                .ok_or_else(|| {
-                    AfsError::InvalidState(format!(
-                        "missing entity `{}` in mount `{}`",
-                        remote_id.0, request.mount_id.0
-                    ))
-                })?;
-            let native = self.connector.fetch(FetchRequest {
-                remote_id: remote_id.clone(),
-            })?;
-            let rendered = self.connector.render_native_entity(&native)?;
-            let bundle = serde_json::from_slice::<NotionPageBundle>(&native.raw)
-                .map_err(|error| AfsError::Io(format!("notion native decode failed: {error}")))?;
-
-            write_atomic(
-                &mount.root.join(&entity.path),
-                render_canonical_markdown(&rendered.document),
-            )?;
-            self.store
-                .save_shadow(request.mount_id, rendered.shadow.clone())?;
-
-            entity.hydration = HydrationState::Hydrated;
-            entity.content_hash = Some(rendered.shadow.body_hash);
-            entity.remote_edited_at = bundle.page.last_edited_time;
-            self.store.save_entity(entity)?;
-            reconciled_remote_ids.push(remote_id.clone());
-        }
-
-        Ok(PushReconcileResult {
-            reconciled_remote_ids,
-        })
-    }
-}
-
-fn write_atomic(path: &Path, contents: String) -> AfsResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let temp_path = temp_path_for(path);
-    std::fs::write(&temp_path, contents)?;
-    std::fs::rename(&temp_path, path)?;
-    Ok(())
-}
-
-fn temp_path_for(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("afs-write");
-    path.with_file_name(format!(".{file_name}.afs-tmp"))
-}
-
-fn generate_push_id() -> PushId {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    PushId(format!("push-{timestamp}-{}", std::process::id()))
-}
-
-fn journal_status_after_error<S>(store: &S, push_id: &PushId) -> Option<JournalStatus>
-where
-    S: JournalRepository,
-{
-    store
-        .get_journal(push_id)
-        .ok()
-        .flatten()
-        .map(|entry| entry.status)
 }
 
 fn remote_ids_to_strings(remote_ids: Vec<RemoteId>) -> Vec<String> {

@@ -8,10 +8,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use afs_core::AfsResult;
 use afs_core::hydration::HydrationRequest;
+use afs_core::journal::{JournalStatus, PushId};
+use afs_core::model::{MountId, RemoteId};
+use afs_core::push::{PushExecutionResult, PushPipelineResult};
+use afs_core::{AfsError, AfsResult};
 
 use crate::hydration::{HydrationDrainReport, HydrationOutcome, HydrationSource};
+use crate::push::PushJobAction;
 use crate::reconcile::{FetchScheduleStrategy, ScheduledPullReport, ScheduledPullSource};
 use crate::scheduler::PullSchedulerTick;
 use crate::watcher::FileEvent;
@@ -59,8 +63,18 @@ pub struct PushJob {
     pub confirm_dangerous: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PushJobReport;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushJobReport {
+    pub target_path: PathBuf,
+    pub mount_id: MountId,
+    pub entity_id: RemoteId,
+    pub pipeline: PushPipelineResult,
+    pub action: PushJobAction,
+    pub execution: Option<PushExecutionResult>,
+    pub push_id: Option<PushId>,
+    pub journal_status: Option<JournalStatus>,
+    pub error: Option<AfsError>,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DaemonEventReport {
@@ -113,5 +127,7 @@ pub trait DaemonExecutor {
     where
         Source: HydrationSource + ?Sized;
 
-    fn execute_push(&mut self, job: PushJob) -> AfsResult<PushJobReport>;
+    fn execute_push<Source>(&mut self, job: PushJob, source: &Source) -> AfsResult<PushJobReport>
+    where
+        Source: afs_connector::Connector + HydrationSource + ?Sized;
 }

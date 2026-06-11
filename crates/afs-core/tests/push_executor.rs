@@ -9,7 +9,8 @@ use afs_core::planner::{GuardrailDecision, PushOperation, PushPlan};
 use afs_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushConcurrencyCheck, PushConcurrencyRequest,
     PushExecutionAction, PushExecutionRequest, PushPipelineAction, PushPipelineResult,
-    PushReconcileRequest, PushReconcileResult, PushReconciler, PushStage, execute_journaled_push,
+    PushReconcileRequest, PushReconcileResult, PushReconciler, PushStage,
+    execute_journaled_push_with_host,
 };
 use afs_core::shadow::ShadowDocument;
 use afs_core::validation::ValidationReport;
@@ -18,16 +19,10 @@ use afs_core::{AfsError, AfsResult};
 #[test]
 fn executor_journals_checks_applies_and_reconciles_in_order() {
     let events = event_log();
-    let mut journal = RecordingJournal::new(events.clone());
-    let mut concurrency = FakeConcurrency::new(events.clone());
-    let mut applier = FakeApplier::new(events.clone(), [RemoteId::new("page-1")]);
-    let mut reconciler = FakeReconciler::new(events.clone());
+    let mut host = RecordingHost::new(events.clone());
 
-    let result = execute_journaled_push(
-        &mut journal,
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
+    let result = execute_journaled_push_with_host(
+        &mut host,
         PushExecutionRequest::new(push_id(), mount_id(), approved_pipeline())
             .with_preimages(vec![JournalPreimage::from_shadow(shadow())]),
     )
@@ -61,28 +56,22 @@ fn executor_journals_checks_applies_and_reconciles_in_order() {
             "update:reconciled",
         ]
     );
-    let entry = journal.entry.expect("journal");
+    let entry = host.journal.entry.expect("journal");
     assert_eq!(entry.status, JournalStatus::Reconciled);
     assert_eq!(entry.preimages.len(), 1);
     assert_eq!(entry.apply_effects.len(), 1);
-    assert_eq!(concurrency.seen_push_id, Some(push_id()));
-    assert_eq!(applier.seen_push_id, Some(push_id()));
-    assert_eq!(reconciler.seen_push_id, Some(push_id()));
+    assert_eq!(host.concurrency.seen_push_id, Some(push_id()));
+    assert_eq!(host.applier.seen_push_id, Some(push_id()));
+    assert_eq!(host.reconciler.seen_push_id, Some(push_id()));
 }
 
 #[test]
 fn executor_does_not_journal_or_apply_until_pipeline_is_approved() {
     let events = event_log();
-    let mut journal = RecordingJournal::new(events.clone());
-    let mut concurrency = FakeConcurrency::new(events.clone());
-    let mut applier = FakeApplier::new(events.clone(), [RemoteId::new("page-1")]);
-    let mut reconciler = FakeReconciler::new(events.clone());
+    let mut host = RecordingHost::new(events.clone());
 
-    let result = execute_journaled_push(
-        &mut journal,
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
+    let result = execute_journaled_push_with_host(
+        &mut host,
         PushExecutionRequest::new(
             push_id(),
             mount_id(),
@@ -98,24 +87,20 @@ fn executor_does_not_journal_or_apply_until_pipeline_is_approved() {
         }
     );
     assert_eq!(result.journal_status, None);
-    assert!(journal.entry.is_none());
+    assert!(host.journal.entry.is_none());
     assert!(events.borrow().is_empty());
 }
 
 #[test]
 fn executor_marks_failed_when_concurrency_check_fails_before_apply() {
     let events = event_log();
-    let mut journal = RecordingJournal::new(events.clone());
-    let mut concurrency = FakeConcurrency::new(events.clone())
+    let mut host = RecordingHost::new(events.clone());
+    host.concurrency = host
+        .concurrency
         .with_failure(AfsError::Guardrail("remote moved".into()));
-    let mut applier = FakeApplier::new(events.clone(), [RemoteId::new("page-1")]);
-    let mut reconciler = FakeReconciler::new(events.clone());
 
-    let error = execute_journaled_push(
-        &mut journal,
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
+    let error = execute_journaled_push_with_host(
+        &mut host,
         PushExecutionRequest::new(push_id(), mount_id(), approved_pipeline()),
     )
     .expect_err("concurrency failure");
@@ -131,7 +116,7 @@ fn executor_marks_failed_when_concurrency_check_fails_before_apply() {
         ]
     );
     assert!(matches!(
-        journal.entry.expect("journal").status,
+        host.journal.entry.expect("journal").status,
         JournalStatus::Failed(_)
     ));
 }
@@ -139,17 +124,13 @@ fn executor_marks_failed_when_concurrency_check_fails_before_apply() {
 #[test]
 fn executor_marks_failed_when_apply_fails() {
     let events = event_log();
-    let mut journal = RecordingJournal::new(events.clone());
-    let mut concurrency = FakeConcurrency::new(events.clone());
-    let mut applier = FakeApplier::new(events.clone(), [RemoteId::new("page-1")])
+    let mut host = RecordingHost::new(events.clone());
+    host.applier = host
+        .applier
         .with_failure(AfsError::NotImplemented("fake apply"));
-    let mut reconciler = FakeReconciler::new(events.clone());
 
-    let error = execute_journaled_push(
-        &mut journal,
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
+    let error = execute_journaled_push_with_host(
+        &mut host,
         PushExecutionRequest::new(push_id(), mount_id(), approved_pipeline()),
     )
     .expect_err("apply failure");
@@ -166,7 +147,7 @@ fn executor_marks_failed_when_apply_fails() {
         ]
     );
     assert!(matches!(
-        journal.entry.expect("journal").status,
+        host.journal.entry.expect("journal").status,
         JournalStatus::Failed(_)
     ));
 }
@@ -174,17 +155,13 @@ fn executor_marks_failed_when_apply_fails() {
 #[test]
 fn executor_marks_failed_when_reconcile_fails_after_apply() {
     let events = event_log();
-    let mut journal = RecordingJournal::new(events.clone());
-    let mut concurrency = FakeConcurrency::new(events.clone());
-    let mut applier = FakeApplier::new(events.clone(), [RemoteId::new("page-1")]);
-    let mut reconciler =
-        FakeReconciler::new(events.clone()).with_failure(AfsError::Io("read-back mismatch".into()));
+    let mut host = RecordingHost::new(events.clone());
+    host.reconciler = host
+        .reconciler
+        .with_failure(AfsError::Io("read-back mismatch".into()));
 
-    let error = execute_journaled_push(
-        &mut journal,
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
+    let error = execute_journaled_push_with_host(
+        &mut host,
         PushExecutionRequest::new(push_id(), mount_id(), approved_pipeline()),
     )
     .expect_err("reconcile failure");
@@ -204,7 +181,7 @@ fn executor_marks_failed_when_reconcile_fails_after_apply() {
         ]
     );
     assert!(matches!(
-        journal.entry.expect("journal").status,
+        host.journal.entry.expect("journal").status,
         JournalStatus::Failed(_)
     ));
 }
@@ -212,18 +189,12 @@ fn executor_marks_failed_when_reconcile_fails_after_apply() {
 #[test]
 fn executor_rejects_approved_pipeline_without_plan_before_journaling() {
     let events = event_log();
-    let mut journal = RecordingJournal::new(events.clone());
-    let mut concurrency = FakeConcurrency::new(events.clone());
-    let mut applier = FakeApplier::new(events.clone(), [RemoteId::new("page-1")]);
-    let mut reconciler = FakeReconciler::new(events.clone());
+    let mut host = RecordingHost::new(events.clone());
     let mut pipeline = approved_pipeline();
     pipeline.plan = None;
 
-    let error = execute_journaled_push(
-        &mut journal,
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
+    let error = execute_journaled_push_with_host(
+        &mut host,
         PushExecutionRequest::new(push_id(), mount_id(), pipeline),
     )
     .expect_err("invalid pipeline");
@@ -232,7 +203,7 @@ fn executor_rejects_approved_pipeline_without_plan_before_journaling() {
         error,
         AfsError::InvalidState("push pipeline approved apply without a plan".to_string())
     );
-    assert!(journal.entry.is_none());
+    assert!(host.journal.entry.is_none());
     assert!(events.borrow().is_empty());
 }
 
@@ -240,6 +211,61 @@ type EventLog = Rc<RefCell<Vec<&'static str>>>;
 
 fn event_log() -> EventLog {
     Rc::new(RefCell::new(Vec::new()))
+}
+
+#[derive(Debug)]
+struct RecordingHost {
+    journal: RecordingJournal,
+    concurrency: FakeConcurrency,
+    applier: FakeApplier,
+    reconciler: FakeReconciler,
+}
+
+impl RecordingHost {
+    fn new(events: EventLog) -> Self {
+        Self {
+            journal: RecordingJournal::new(events.clone()),
+            concurrency: FakeConcurrency::new(events.clone()),
+            applier: FakeApplier::new(events.clone(), [RemoteId::new("page-1")]),
+            reconciler: FakeReconciler::new(events),
+        }
+    }
+}
+
+impl JournalStore for RecordingHost {
+    fn append(&mut self, entry: JournalEntry) -> AfsResult<()> {
+        self.journal.append(entry)
+    }
+
+    fn update_status(&mut self, push_id: &PushId, status: JournalStatus) -> AfsResult<()> {
+        self.journal.update_status(push_id, status)
+    }
+
+    fn record_apply_effects(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> AfsResult<()> {
+        self.journal.record_apply_effects(push_id, effects)
+    }
+}
+
+impl PushConcurrencyCheck for RecordingHost {
+    fn check(&mut self, request: PushConcurrencyRequest<'_>) -> AfsResult<()> {
+        self.concurrency.check(request)
+    }
+}
+
+impl PushApplier for RecordingHost {
+    fn apply(&mut self, request: PushApplyRequest<'_>) -> AfsResult<PushApplyResult> {
+        self.applier.apply(request)
+    }
+}
+
+impl PushReconciler for RecordingHost {
+    fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
+        self.reconciler.reconcile(request)
+    }
 }
 
 #[derive(Debug)]

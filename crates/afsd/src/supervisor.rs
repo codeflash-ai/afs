@@ -1,16 +1,21 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use afs_core::AfsResult;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
+use afs_core::journal::JournalStore;
 use afs_core::model::HydrationState;
-use afs_core::{AfsError, AfsResult};
-use afs_store::{EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository};
+use afs_store::{
+    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
+    ShadowRepository,
+};
 
 use crate::execution::{
     AdvanceScheduledPullJob, DaemonEventReport, DaemonExecutor, HydrationDrainJob,
     HydrationRequestJob, HydrationRequestReport, PushJob, PushJobReport, ScheduledPullJob,
 };
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationQueue, HydrationSource};
+use crate::push::execute_push_job;
 use crate::reconcile::{
     FetchScheduleStrategy, ScheduledPullReport, ScheduledPullSource, reconcile_scheduled_pull,
 };
@@ -155,7 +160,7 @@ where
 
 impl<S, W> DaemonExecutor for DaemonSupervisor<S, W, HydrationQueue>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
     W: FileWatcher,
 {
     fn execute_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
@@ -224,8 +229,11 @@ where
         executor.drain_queue(&mut self.hydration)
     }
 
-    fn execute_push(&mut self, _job: PushJob) -> AfsResult<PushJobReport> {
-        Err(AfsError::NotImplemented("daemon push execution"))
+    fn execute_push<Source>(&mut self, job: PushJob, source: &Source) -> AfsResult<PushJobReport>
+    where
+        Source: afs_connector::Connector + HydrationSource + ?Sized,
+    {
+        execute_push_job(&mut self.store, job, source)
     }
 }
 

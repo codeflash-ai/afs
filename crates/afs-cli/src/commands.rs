@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use afs_connector::{ConnectorPushApplier, ConnectorPushConcurrencyCheck, ConnectorUndoApplier};
+use afs_connector::ConnectorUndoApplier;
+use afs_core::AfsError;
 use afs_core::model::{MountId, RemoteId};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::SqliteStateStore;
@@ -13,9 +14,7 @@ use crate::history::{
 };
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull};
-use crate::push::{
-    NotionPushReconciler, PushOptions, PushReport, push_report_exit_code, run_push_with_executor,
-};
+use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
 use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
 
 const EXIT_SUCCESS: i32 = 0;
@@ -286,18 +285,8 @@ fn push(args: &[String], json: bool) -> i32 {
     };
 
     let connector = default_notion_connector();
-    let mut concurrency = ConnectorPushConcurrencyCheck::new(&connector);
-    let mut applier = ConnectorPushApplier::new(&connector);
-    let mut reconciler = NotionPushReconciler::new(store.clone(), connector.clone());
 
-    match run_push_with_executor(
-        &mut store,
-        PathBuf::from(path),
-        options,
-        &mut concurrency,
-        &mut applier,
-        &mut reconciler,
-    ) {
+    match run_push_with_daemon(&mut store, &connector, PathBuf::from(path), options) {
         Ok(report) if json => {
             let exit_code = push_report_exit_code(&report);
             print_json(&report);
@@ -309,10 +298,10 @@ fn push(args: &[String], json: bool) -> i32 {
             exit_code
         }
         Err(error) => {
-            let exit_code = diff_error_exit_code(&error);
+            let exit_code = afs_error_exit_code(&error);
             command_error(
                 json,
-                CommandError::new("push", error.code(), error.message()),
+                CommandError::new("push", afs_error_code(&error), error.to_string()),
                 exit_code,
             )
         }
@@ -645,6 +634,26 @@ fn history_error_exit_code(error: &HistoryError) -> i32 {
         | HistoryError::JournalNotFound(_)
         | HistoryError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
         HistoryError::Store(_) => EXIT_INTERNAL,
+    }
+}
+
+fn afs_error_exit_code(error: &AfsError) -> i32 {
+    match error {
+        AfsError::Validation(_) => EXIT_VALIDATION,
+        AfsError::NotImplemented(_) => 5,
+        _ => EXIT_INTERNAL,
+    }
+}
+
+fn afs_error_code(error: &AfsError) -> &'static str {
+    match error {
+        AfsError::Validation(_) => "validation_failed",
+        AfsError::Conflict(_) => "conflict",
+        AfsError::Guardrail(_) => "guardrail",
+        AfsError::InvalidState(_) => "invalid_state",
+        AfsError::Unsupported(_) => "unsupported",
+        AfsError::NotImplemented(_) => "not_implemented",
+        AfsError::Io(_) => "io_error",
     }
 }
 

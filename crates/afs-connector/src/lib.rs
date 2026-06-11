@@ -9,10 +9,7 @@ use afs_core::AfsResult;
 use afs_core::journal::PushId;
 use afs_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
 use afs_core::planner::PushPlan;
-use afs_core::push::{
-    PushApplier, PushApplyRequest, PushApplyResult, PushConcurrencyCheck, PushConcurrencyRequest,
-    RemotePrecondition,
-};
+use afs_core::push::RemotePrecondition;
 use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,75 +95,6 @@ pub trait Connector {
     fn apply(&self, request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult>;
     /// Apply a complete undo plan using source-specific reverse operations.
     fn apply_undo(&self, request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult>;
-}
-
-/// Adapter from a connector's concurrency check into `afs-core`'s executor hook.
-pub struct ConnectorPushConcurrencyCheck<'a, C>
-where
-    C: Connector + ?Sized,
-{
-    connector: &'a C,
-}
-
-impl<'a, C> ConnectorPushConcurrencyCheck<'a, C>
-where
-    C: Connector + ?Sized,
-{
-    pub fn new(connector: &'a C) -> Self {
-        Self { connector }
-    }
-}
-
-impl<C> PushConcurrencyCheck for ConnectorPushConcurrencyCheck<'_, C>
-where
-    C: Connector + ?Sized,
-{
-    fn check(&mut self, request: PushConcurrencyRequest<'_>) -> AfsResult<()> {
-        self.connector.check_concurrency(ApplyPlanRequest {
-            push_id: request.push_id,
-            mount_id: request.mount_id,
-            plan: request.plan,
-            operation_ids: request.operation_ids,
-            remote_preconditions: request.remote_preconditions,
-        })
-    }
-}
-
-/// Adapter from a connector's apply method into `afs-core`'s executor hook.
-pub struct ConnectorPushApplier<'a, C>
-where
-    C: Connector + ?Sized,
-{
-    connector: &'a C,
-}
-
-impl<'a, C> ConnectorPushApplier<'a, C>
-where
-    C: Connector + ?Sized,
-{
-    pub fn new(connector: &'a C) -> Self {
-        Self { connector }
-    }
-}
-
-impl<C> PushApplier for ConnectorPushApplier<'_, C>
-where
-    C: Connector + ?Sized,
-{
-    fn apply(&mut self, request: PushApplyRequest<'_>) -> AfsResult<PushApplyResult> {
-        let result = self.connector.apply(ApplyPlanRequest {
-            push_id: request.push_id,
-            mount_id: request.mount_id,
-            plan: request.plan,
-            operation_ids: request.operation_ids,
-            remote_preconditions: request.remote_preconditions,
-        })?;
-
-        Ok(PushApplyResult {
-            changed_remote_ids: result.changed_remote_ids,
-            effects: result.effects,
-        })
-    }
 }
 
 /// Adapter from a connector's undo method into `afs-core`'s undo hook.

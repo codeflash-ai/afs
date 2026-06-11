@@ -7,7 +7,7 @@
 - Repository errors stay structured so agent-facing commands can produce stable JSON.
 - Paths are lookup keys only; remote IDs remain the canonical entity identity.
 - Shadow snapshots must round-trip exactly enough for `afs-core` diff planning.
-- Journal APIs exist before remote apply code, because every future push path must be journal-first.
+- Journal APIs are the durable spine for remote apply code; every push path must be journal-first.
 - SQLite is the production target, but an in-memory implementation comes first to prove the repository contract.
 
 ## Modules

@@ -9,9 +9,9 @@ sources through one serialized boundary.
 
 `DaemonExecutor` is the daemon-owned job interface. It currently covers file
 events, scheduled pull reconciliation, one-off hydration requests, hydration
-queue drains, and the future push job. The push job intentionally exists before
-the implementation so push apply, journal writes, and post-apply reconciliation
-have a single owner when that path moves into the daemon.
+queue drains, and push jobs. Push apply, journal writes, and post-apply
+reconciliation run through one daemon-owned host so remote writes and local
+state advancement cannot drift across separate store handles.
 
 The boundary keeps responsibilities sharp:
 
@@ -19,6 +19,26 @@ The boundary keeps responsibilities sharp:
 - connectors enumerate, fetch, render, and apply source-specific mutations;
 - `afsd` executes jobs and is the only layer that advances durable sync state or
   mutates the local projection.
+
+## Push Execution
+
+`afsd::push::execute_push_job` prepares an explicit push job from the target
+path, asks `afs-core` to plan and gate the mutation, and then executes the
+approved plan through a combined journal/check/apply/reconcile host. The host
+owns one mutable store reference for the entire transaction:
+
+1. append the journal entry with the shadow preimage;
+2. mark the journal `Applying`;
+3. perform connector concurrency checks and apply the approved plan;
+4. persist connector apply effects and mark the journal `Applied`;
+5. re-fetch the changed remote entities through the hydration source;
+6. write the canonical local projection, save the new shadow, update entity
+   hydration metadata, and mark the journal `Reconciled`.
+
+If connector apply or read-back fails, the daemon marks the journal `Failed` and
+returns a structured push report containing the push id, journal status, and
+error. Non-approved plans such as validation failures, confirmation gates, noops,
+and read-only mounts return `NotReady` without touching the journal or connector.
 
 ## Scheduler
 
@@ -98,6 +118,7 @@ stateful operations:
 - scheduled pull ticks can enumerate mounts, refresh projections, and queue
   strategy-selected hydration;
 - queued hydration can be drained through a source-specific executor;
+- push jobs can apply connector mutations, refresh shadows, and advance journals;
 - writing a `hydrated` entity marks it `dirty` in the store;
 - remove and rename events are ignored until conflict/delete planning is wired.
 
