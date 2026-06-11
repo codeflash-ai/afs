@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::canonical::ParsedCanonicalDocument;
 use crate::diff::{BlockDiffEngine, DiffEngine};
 use crate::journal::{
@@ -21,7 +23,8 @@ use crate::validation::{
 };
 use crate::{AfsError, AfsResult};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PushStage {
     /// Parsed the canonical file and ran local validation that does not require
     /// remote I/O.
@@ -37,7 +40,7 @@ pub enum PushStage {
     JournalAndReconcile,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushPipelineResult {
     /// Structured validation issues that should be fixable by an agent loop.
     pub validation: ValidationReport,
@@ -108,7 +111,7 @@ impl<'a> PushPipelineRequest<'a> {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushApproval {
     /// Equivalent to `afs push -y`: allow safe non-empty plans to proceed
     /// without an interactive prompt.
@@ -118,7 +121,8 @@ pub struct PushApproval {
     pub confirm_dangerous: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PushPipelineAction {
     /// Validation and diffing succeeded, but there is nothing to apply.
     Noop,
@@ -313,7 +317,7 @@ impl PushExecutionRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushExecutionResult {
     /// Stable push identifier from the request.
     pub push_id: PushId,
@@ -331,7 +335,8 @@ pub struct PushExecutionResult {
     pub completed_stages: Vec<PushStage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PushExecutionAction {
     /// The validation/diff/confirmation pipeline has not approved remote apply.
     NotReady { pipeline_action: PushPipelineAction },
@@ -339,7 +344,7 @@ pub enum PushExecutionAction {
     Reconciled,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemotePrecondition {
     pub remote_id: RemoteId,
     pub remote_edited_at: Option<String>,

@@ -20,6 +20,20 @@ The boundary keeps responsibilities sharp:
 - `afsd` executes jobs and is the only layer that advances durable sync state or
   mutates the local projection.
 
+## Foreground Daemon
+
+`afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`
+or `~/.afs/afsd.sock`. CLI `pull` and `push` try this daemon first and fall
+back to the same in-process executor when the socket is unavailable. Setting
+`AFS_DAEMON_DISABLE=1` forces the fallback path, which is useful for tests and
+recovery.
+
+The socket accept loop does not run connector calls directly. Each request is
+handled on a worker thread, so a slow Notion enumerate/fetch/apply call does not
+block the daemon from accepting other requests or responding to health checks.
+The stricter per-mount scheduling policy can be layered behind the same IPC
+request types as the background strategy work matures.
+
 ## Push Execution
 
 `afsd::push::execute_push_job` prepares an explicit push job from the target

@@ -6,12 +6,12 @@
 use std::path::Path;
 
 use afs_connector::Connector;
+use afs_core::AfsResult;
 use afs_core::journal::{JournalStatus, JournalStore};
 use afs_core::model::RemoteId;
 use afs_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
-use afs_core::{AfsError, AfsResult};
 use afs_store::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
-use afsd::execution::{PushJob, PushJobReport};
+use afsd::execution::{PushJob, PushJobError, PushJobReport};
 use afsd::hydration::HydrationSource;
 use afsd::push::{PushJobAction, execute_push_job};
 use serde::Serialize;
@@ -87,7 +87,7 @@ pub struct PushReport {
 }
 
 impl PushReport {
-    fn from_daemon(report: PushJobReport) -> Self {
+    pub fn from_daemon(report: PushJobReport) -> Self {
         let PushJobReport {
             target_path,
             mount_id,
@@ -137,7 +137,7 @@ impl PushReport {
         } else if let Some(error) = error {
             cli_report.ok = false;
             cli_report.push_id = push_id.map(|push_id| push_id.0);
-            cli_report.message = Some(error.to_string());
+            cli_report.message = Some(error.message);
         } else {
             cli_report.ok = cli_report.action == "noop";
         }
@@ -222,13 +222,13 @@ pub fn push_report_exit_code(report: &PushReport) -> i32 {
 fn daemon_action_name<'a>(
     action: &PushJobAction,
     pipeline_action: &'a str,
-    error: Option<&AfsError>,
+    error: Option<&PushJobError>,
 ) -> &'a str {
     match action {
         PushJobAction::NotReady => pipeline_action,
         PushJobAction::Reconciled => "reconciled",
         PushJobAction::Failed => match error {
-            Some(AfsError::NotImplemented(_)) => "apply_not_implemented",
+            Some(error) if error.code == "not_implemented" => "apply_not_implemented",
             _ => "apply_failed",
         },
     }

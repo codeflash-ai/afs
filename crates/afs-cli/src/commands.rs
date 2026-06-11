@@ -5,7 +5,10 @@ use afs_core::AfsError;
 use afs_core::model::{MountId, RemoteId};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::SqliteStateStore;
+use afsd::execution::PushJobReport;
+use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::diff::{DiffError, run_diff};
 use crate::history::{
@@ -133,7 +136,34 @@ fn pull(args: &[String], json: bool) -> i32 {
         );
     };
 
-    let mut store = match SqliteStateStore::open(default_state_root()) {
+    let state_root = default_state_root();
+    match run_daemon_report::<PullReport>(
+        &state_root,
+        &DaemonRequest::Pull {
+            path: PathBuf::from(path),
+        },
+    ) {
+        DaemonReport::Report(report) if json => {
+            let exit_code = pull_report_exit_code(&report);
+            print_json(&report);
+            return exit_code;
+        }
+        DaemonReport::Report(report) => {
+            let exit_code = pull_report_exit_code(&report);
+            print_pull_report(&report);
+            return exit_code;
+        }
+        DaemonReport::Unavailable => {}
+        DaemonReport::Error(error) => {
+            return command_error(
+                json,
+                CommandError::new("pull", error.code, error.message),
+                error.exit_code,
+            );
+        }
+    }
+
+    let mut store = match SqliteStateStore::open(state_root) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -268,7 +298,43 @@ fn push(args: &[String], json: bool) -> i32 {
         );
     };
 
-    let mut store = match SqliteStateStore::open(default_state_root()) {
+    let options = PushOptions {
+        assume_yes: has_flag(args, "-y") || has_flag(args, "--yes"),
+        confirm_dangerous: has_flag(args, "--confirm"),
+    };
+    let state_root = default_state_root();
+
+    match run_daemon_report::<PushJobReport>(
+        &state_root,
+        &DaemonRequest::Push {
+            path: PathBuf::from(path),
+            assume_yes: options.assume_yes,
+            confirm_dangerous: options.confirm_dangerous,
+        },
+    ) {
+        DaemonReport::Report(report) if json => {
+            let report = PushReport::from_daemon(report);
+            let exit_code = push_report_exit_code(&report);
+            print_json(&report);
+            return exit_code;
+        }
+        DaemonReport::Report(report) => {
+            let report = PushReport::from_daemon(report);
+            let exit_code = push_report_exit_code(&report);
+            print_push_report(&report);
+            return exit_code;
+        }
+        DaemonReport::Unavailable => {}
+        DaemonReport::Error(error) => {
+            return command_error(
+                json,
+                CommandError::new("push", error.code, error.message),
+                error.exit_code,
+            );
+        }
+    }
+
+    let mut store = match SqliteStateStore::open(state_root) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -277,11 +343,6 @@ fn push(args: &[String], json: bool) -> i32 {
                 EXIT_INTERNAL,
             );
         }
-    };
-
-    let options = PushOptions {
-        assume_yes: has_flag(args, "-y") || has_flag(args, "--yes"),
-        confirm_dangerous: has_flag(args, "--confirm"),
     };
 
     let connector = default_notion_connector();
@@ -544,6 +605,74 @@ fn print_diff_report_fields(
     );
 }
 
+enum DaemonReport<T> {
+    Report(T),
+    Unavailable,
+    Error(DaemonCommandError),
+}
+
+struct DaemonCommandError {
+    code: String,
+    message: String,
+    exit_code: i32,
+}
+
+fn run_daemon_report<T>(state_root: &std::path::Path, request: &DaemonRequest) -> DaemonReport<T>
+where
+    T: DeserializeOwned,
+{
+    if std::env::var("AFS_DAEMON_DISABLE").is_ok() {
+        return DaemonReport::Unavailable;
+    }
+
+    let response = match send_request(state_root, request) {
+        Ok(response) => response,
+        Err(DaemonClientError::NotAvailable(_)) => return DaemonReport::Unavailable,
+        Err(error) => {
+            return DaemonReport::Error(DaemonCommandError {
+                code: "daemon_error".to_string(),
+                message: error.message().to_string(),
+                exit_code: EXIT_INTERNAL,
+            });
+        }
+    };
+
+    if let Some(error) = response.error {
+        let exit_code = daemon_error_exit_code(&error.code);
+        return DaemonReport::Error(DaemonCommandError {
+            code: error.code,
+            message: error.message,
+            exit_code,
+        });
+    }
+
+    let Some(payload) = response.payload else {
+        return DaemonReport::Error(DaemonCommandError {
+            code: "daemon_protocol_error".to_string(),
+            message: "daemon returned no payload".to_string(),
+            exit_code: EXIT_INTERNAL,
+        });
+    };
+
+    match serde_json::from_value(payload) {
+        Ok(report) => DaemonReport::Report(report),
+        Err(error) => DaemonReport::Error(DaemonCommandError {
+            code: "daemon_protocol_error".to_string(),
+            message: error.to_string(),
+            exit_code: EXIT_INTERNAL,
+        }),
+    }
+}
+
+fn daemon_error_exit_code(code: &str) -> i32 {
+    match code {
+        "mount_not_found" | "entity_path_missing" => EXIT_USAGE,
+        "validation_failed" => EXIT_VALIDATION,
+        "not_implemented" => 5,
+        _ => EXIT_INTERNAL,
+    }
+}
+
 fn command_error(json: bool, error: CommandError, exit_code: i32) -> i32 {
     if json {
         print_json(&error);
@@ -738,16 +867,16 @@ fn escape_json_string(value: &str) -> String {
 struct CommandError {
     ok: bool,
     command: &'static str,
-    code: &'static str,
+    code: String,
     message: String,
 }
 
 impl CommandError {
-    fn new(command: &'static str, code: &'static str, message: impl Into<String>) -> Self {
+    fn new(command: &'static str, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             ok: false,
             command,
-            code,
+            code: code.into(),
             message: message.into(),
         }
     }
