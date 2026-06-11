@@ -429,6 +429,7 @@ fn rendered_entity(body: &str) -> HydratedEntity {
         ),
         shadow: shadow(&body),
         remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+        assets: Vec::new(),
     }
 }
 

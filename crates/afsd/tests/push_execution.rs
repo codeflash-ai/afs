@@ -273,6 +273,7 @@ fn rendered_entity(remote_id: &str, plain_body: &str) -> HydratedEntity {
         document,
         shadow: shadow(remote_id, plain_body),
         remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+        assets: Vec::new(),
     }
 }
 

@@ -1,5 +1,7 @@
 //! Render Notion page bundles to AgentFS canonical Markdown and shadows.
 
+use std::path::PathBuf;
+
 use afs_connector::NativeEntity;
 use afs_core::model::{CanonicalDocument, RemoteId};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
@@ -10,25 +12,55 @@ use crate::dto::{
     BlockDto, BlockTreeDto, DateMentionDto, EquationBlockDto, FileBlockDto, LinkToPageBlockDto,
     MeetingNotesBlockDto, NotionPageBundle, PageDto, PagePropertyDto, RichTextBlockDto,
     RichTextDto, SyncedBlockDto, TableBlockDto, TableRowBlockDto, UrlBlockDto,
+    VerificationPropertyDto,
 };
+use crate::media::{MediaAsset, media_local_path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionRenderedEntity {
     pub document: CanonicalDocument,
     pub shadow: ShadowDocument,
+    pub media_assets: Vec<MediaAsset>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    page_path: Option<PathBuf>,
+}
+
+impl RenderOptions {
+    pub fn with_page_path(page_path: impl Into<PathBuf>) -> Self {
+        Self {
+            page_path: Some(page_path.into()),
+        }
+    }
 }
 
 pub fn render_native_entity(entity: &NativeEntity) -> AfsResult<NotionRenderedEntity> {
+    render_native_entity_with_options(entity, &RenderOptions::default())
+}
+
+pub fn render_native_entity_with_options(
+    entity: &NativeEntity,
+    options: &RenderOptions,
+) -> AfsResult<NotionRenderedEntity> {
     let bundle = serde_json::from_slice::<NotionPageBundle>(&entity.raw)
         .map_err(|error| AfsError::Io(format!("notion native decode failed: {error}")))?;
-    render_page_bundle(&bundle)
+    render_page_bundle_with_options(&bundle, options)
 }
 
 pub fn render_page_bundle(bundle: &NotionPageBundle) -> AfsResult<NotionRenderedEntity> {
+    render_page_bundle_with_options(bundle, &RenderOptions::default())
+}
+
+pub fn render_page_bundle_with_options(
+    bundle: &NotionPageBundle,
+    options: &RenderOptions,
+) -> AfsResult<NotionRenderedEntity> {
     let title = page_title(&bundle.page);
     let frontmatter = page_frontmatter(&bundle.page, &title);
     let mut rendered_blocks = Vec::new();
-    render_block_trees(&bundle.blocks, &mut rendered_blocks);
+    render_block_trees(&bundle.blocks, options, &mut rendered_blocks);
 
     let body = rendered_blocks
         .iter()
@@ -58,6 +90,10 @@ pub fn render_page_bundle(bundle: &NotionPageBundle) -> AfsResult<NotionRendered
     Ok(NotionRenderedEntity {
         document: CanonicalDocument::new(frontmatter, body),
         shadow,
+        media_assets: rendered_blocks
+            .into_iter()
+            .filter_map(|block| block.media_asset)
+            .collect(),
     })
 }
 
@@ -66,6 +102,7 @@ struct RenderedBlock {
     markdown: String,
     shadow_id: Option<RemoteId>,
     metadata: RenderedBlockMetadata,
+    media_asset: Option<MediaAsset>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -79,7 +116,11 @@ enum RenderedBlockMetadata {
     },
 }
 
-fn render_block_trees(trees: &[BlockTreeDto], out: &mut Vec<RenderedBlock>) {
+fn render_block_trees(
+    trees: &[BlockTreeDto],
+    options: &RenderOptions,
+    out: &mut Vec<RenderedBlock>,
+) {
     for tree in trees {
         if tree.block.kind == "table"
             && let Some(rendered) = render_table_tree(tree)
@@ -88,12 +129,12 @@ fn render_block_trees(trees: &[BlockTreeDto], out: &mut Vec<RenderedBlock>) {
             continue;
         }
 
-        out.push(render_block(&tree.block));
-        render_block_trees(&tree.children, out);
+        out.push(render_block(&tree.block, options));
+        render_block_trees(&tree.children, options, out);
     }
 }
 
-fn render_block(block: &BlockDto) -> RenderedBlock {
+fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
     let shadow_id = Some(RemoteId::new(block.id.clone()));
     match block.kind.as_str() {
         "paragraph" => rich_text_block(
@@ -145,11 +186,7 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
                 if text.trim().is_empty() {
                     directive_block(block, "empty_to_do", None)
                 } else {
-                    RenderedBlock {
-                        markdown: format!("- [{marker}] {text}"),
-                        shadow_id,
-                        metadata: RenderedBlockMetadata::None,
-                    }
+                    rendered_block(format!("- [{marker}] {text}"), shadow_id)
                 }
             }
             None => directive_block(block, "malformed_to_do", None),
@@ -169,23 +206,18 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
         "code" => match &block.code {
             Some(code) => {
                 let language = code.language.as_deref().unwrap_or_default();
-                RenderedBlock {
-                    markdown: format!(
+                rendered_block(
+                    format!(
                         "```{}\n{}\n```",
                         language,
                         rich_text_plain_text(&code.rich_text)
                     ),
                     shadow_id,
-                    metadata: RenderedBlockMetadata::None,
-                }
+                )
             }
             None => directive_block(block, "malformed_code", None),
         },
-        "divider" => RenderedBlock {
-            markdown: "---".to_string(),
-            shadow_id,
-            metadata: RenderedBlockMetadata::None,
-        },
+        "divider" => rendered_block("---".to_string(), shadow_id),
         "child_page" => directive_block(
             block,
             "child_page",
@@ -212,11 +244,11 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
         "embed" => url_directive_block(block, "embed", block.embed.as_ref()),
         "bookmark" => url_directive_block(block, "bookmark", block.bookmark.as_ref()),
         "link_preview" => url_directive_block(block, "link_preview", block.link_preview.as_ref()),
-        "image" => file_directive_block(block, "image", block.image.as_ref()),
-        "video" => file_directive_block(block, "video", block.video.as_ref()),
-        "file" => file_directive_block(block, "file", block.file.as_ref()),
-        "pdf" => file_directive_block(block, "pdf", block.pdf.as_ref()),
-        "audio" => file_directive_block(block, "audio", block.audio.as_ref()),
+        "image" => file_directive_block(block, "image", block.image.as_ref(), options),
+        "video" => file_directive_block(block, "video", block.video.as_ref(), options),
+        "file" => file_directive_block(block, "file", block.file.as_ref(), options),
+        "pdf" => file_directive_block(block, "pdf", block.pdf.as_ref(), options),
+        "audio" => file_directive_block(block, "audio", block.audio.as_ref(), options),
         "synced_block" => synced_block_directive(block, block.synced_block.as_ref()),
         "link_to_page" => link_to_page_directive(block, block.link_to_page.as_ref()),
         "table_of_contents" => directive_block_with_attrs(
@@ -241,7 +273,7 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
         ),
         "meeting_notes" => titled_directive(block, "meeting_notes", block.meeting_notes.as_ref()),
         "transcription" => titled_directive(block, "transcription", block.transcription.as_ref()),
-        "tab" | "ai_block" | "custom_block" => directive_block(block, &block.kind, None),
+        "tab" | "ai_block" | "custom_block" | "button" => directive_block(block, &block.kind, None),
         "unsupported" => directive_block(block, "unsupported", None),
         other => directive_block(block, &format!("unsupported_{other}"), None),
     }
@@ -261,11 +293,7 @@ fn rich_text_block(
     if text.trim().is_empty() {
         directive_block(block, empty_directive_type, None)
     } else {
-        RenderedBlock {
-            markdown: render(&text),
-            shadow_id: Some(RemoteId::new(block.id.clone())),
-            metadata: RenderedBlockMetadata::None,
-        }
+        rendered_block(render(&text), Some(RemoteId::new(block.id.clone())))
     }
 }
 
@@ -277,11 +305,10 @@ fn equation_block(block: &BlockDto, equation: Option<&EquationBlockDto>) -> Rend
         return directive_block(block, "malformed_equation", None);
     };
 
-    RenderedBlock {
-        markdown: format!("$$\n{expression}\n$$"),
-        shadow_id: Some(RemoteId::new(block.id.clone())),
-        metadata: RenderedBlockMetadata::None,
-    }
+    rendered_block(
+        format!("$$\n{expression}\n$$"),
+        Some(RemoteId::new(block.id.clone())),
+    )
 }
 
 fn url_directive_block(
@@ -304,16 +331,33 @@ fn file_directive_block(
     block: &BlockDto,
     directive_type: &'static str,
     payload: Option<&FileBlockDto>,
+    options: &RenderOptions,
 ) -> RenderedBlock {
-    let attrs = payload
-        .map(|payload| {
-            directive_attrs(
-                rich_text_list_title(&payload.caption).map(|title| ("title", title)),
-                file_url(payload).map(|url| ("url", url)),
-            )
-        })
-        .unwrap_or_default();
-    directive_block_with_attrs(block, directive_type, attrs)
+    let mut attrs = Vec::new();
+    let mut media_asset = None;
+
+    if let Some(payload) = payload {
+        if let Some(title) = rich_text_list_title(&payload.caption) {
+            attrs.push(("title", title));
+        }
+        if let Some(url) = file_url(payload) {
+            if let Some(page_path) = options.page_path.as_deref() {
+                let local_path = media_local_path(page_path, &block.id, directive_type, &url);
+                attrs.push(("local", local_path.display().to_string()));
+                media_asset = Some(MediaAsset {
+                    block_id: block.id.clone(),
+                    kind: directive_type.to_string(),
+                    source_url: url.clone(),
+                    local_path,
+                });
+            }
+            attrs.push(("url", url));
+        }
+    }
+
+    let mut rendered = directive_block_with_attrs(block, directive_type, attrs);
+    rendered.media_asset = media_asset;
+    rendered
 }
 
 fn synced_block_directive(block: &BlockDto, payload: Option<&SyncedBlockDto>) -> RenderedBlock {
@@ -374,6 +418,16 @@ fn directive_block_with_attrs(
         markdown,
         shadow_id: None,
         metadata: RenderedBlockMetadata::None,
+        media_asset: None,
+    }
+}
+
+fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBlock {
+    RenderedBlock {
+        markdown,
+        shadow_id,
+        metadata: RenderedBlockMetadata::None,
+        media_asset: None,
     }
 }
 
@@ -423,6 +477,7 @@ fn render_table_tree(tree: &BlockTreeDto) -> Option<RenderedBlock> {
             has_column_header: table.has_column_header,
             has_row_header: table.has_row_header,
         },
+        media_asset: None,
     })
 }
 
@@ -806,6 +861,9 @@ fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterV
         "url" => Some(optional_string(property.url.as_deref())),
         "email" => Some(optional_string(property.email.as_deref())),
         "phone_number" => Some(optional_string(property.phone_number.as_deref())),
+        "files" => Some(FrontmatterValue::List(
+            property.files.iter().map(file_property_label).collect(),
+        )),
         "people" => Some(FrontmatterValue::List(
             property
                 .people
@@ -825,6 +883,9 @@ fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterV
         "created_by" => Some(optional_user(property.created_by.as_ref())),
         "last_edited_by" => Some(optional_user(property.last_edited_by.as_ref())),
         "formula" => property.formula.as_ref().and_then(formula_value),
+        "rollup" => property.rollup.as_ref().map(rollup_value),
+        "unique_id" => Some(unique_id_value(property.unique_id.as_ref())),
+        "verification" => Some(verification_value(property.verification.as_ref())),
         _ => None,
     }
 }
@@ -876,6 +937,23 @@ fn optional_user(value: Option<&crate::dto::UserMentionDto>) -> FrontmatterValue
         .unwrap_or(FrontmatterValue::Null)
 }
 
+fn file_property_label(file: &crate::dto::FilePropertyDto) -> String {
+    let url = file
+        .external
+        .as_ref()
+        .map(|external| external.url.as_str())
+        .or_else(|| file.file.as_ref().map(|hosted| hosted.url.as_str()))
+        .unwrap_or_default();
+    let name = file.name.as_deref().unwrap_or_default();
+
+    match (name.is_empty(), url.is_empty()) {
+        (false, false) => format!("{name} <{url}>"),
+        (false, true) => name.to_string(),
+        (true, false) => url.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
 fn formula_value(value: &Value) -> Option<FrontmatterValue> {
     let kind = value.get("type").and_then(Value::as_str)?;
     match kind {
@@ -889,8 +967,66 @@ fn formula_value(value: &Value) -> Option<FrontmatterValue> {
             .and_then(Value::as_bool)
             .map(FrontmatterValue::Bool),
         "date" => value.get("date").map(json_date_value),
-        _ => None,
+        _ => Some(json_value(value)),
     }
+}
+
+fn rollup_value(value: &Value) -> FrontmatterValue {
+    let kind = value.get("type").and_then(Value::as_str);
+    match kind {
+        Some("number") => value
+            .get("number")
+            .and_then(Value::as_f64)
+            .map(|number| FrontmatterValue::Scalar(number.to_string()))
+            .unwrap_or(FrontmatterValue::Null),
+        Some("date") => value
+            .get("date")
+            .map(json_date_value)
+            .unwrap_or(FrontmatterValue::Null),
+        Some("array") => FrontmatterValue::List(
+            value
+                .get("array")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().map(compact_json).collect())
+                .unwrap_or_default(),
+        ),
+        _ => json_value(value),
+    }
+}
+
+fn unique_id_value(value: Option<&crate::dto::UniqueIdPropertyDto>) -> FrontmatterValue {
+    let Some(value) = value else {
+        return FrontmatterValue::Null;
+    };
+    let Some(number) = value.number else {
+        return FrontmatterValue::Null;
+    };
+
+    match value.prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => FrontmatterValue::Scalar(yaml_string(&format!("{prefix}-{number}"))),
+        None => FrontmatterValue::Scalar(number.to_string()),
+    }
+}
+
+fn verification_value(value: Option<&VerificationPropertyDto>) -> FrontmatterValue {
+    let Some(value) = value else {
+        return FrontmatterValue::Null;
+    };
+
+    let mut fields = Vec::new();
+    if let Some(state) = value.state.as_deref() {
+        fields.push(("state".to_string(), yaml_string(state)));
+    }
+    if let Some(user) = value.verified_by.as_ref() {
+        fields.push((
+            "verified_by".to_string(),
+            yaml_string(user.name.as_deref().unwrap_or(user.id.as_str())),
+        ));
+    }
+    if let Some(date) = value.date.as_ref() {
+        fields.push(("date".to_string(), yaml_string(&date_mention_label(date))));
+    }
+    FrontmatterValue::Map(fields)
 }
 
 fn json_date_value(value: &Value) -> FrontmatterValue {
@@ -911,6 +1047,14 @@ fn json_date_value(value: &Value) -> FrontmatterValue {
         fields.push(("time_zone".to_string(), yaml_string(time_zone)));
     }
     FrontmatterValue::Map(fields)
+}
+
+fn json_value(value: &Value) -> FrontmatterValue {
+    FrontmatterValue::Scalar(yaml_string(&compact_json(value)))
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
 fn write_frontmatter_value(out: &mut String, key: &str, value: FrontmatterValue) {

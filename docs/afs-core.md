@@ -97,7 +97,9 @@ The push execution layer starts only from `ProceedToApply`. It is connector-neut
 
 Execution prepares the journal before any remote mutation, moves status through `Prepared`, `Applying`, `Applied`, and `Reconciled`, and marks `Failed` on concurrency, apply, or reconcile errors. Non-approved pipeline actions return `NotReady` without touching the journal or connector hooks.
 
-Each approved operation also receives a deterministic `PushOperationId` derived from the push ID, operation index, operation kind, and target remote ID. Connectors return operation-level `JournalApplyEffect` values after apply. Those effects record durable facts such as updated blocks, archived blocks, and created remote block/entity IDs so resume and undo do not have to infer what happened from the remote alone.
+Each approved operation also receives a deterministic `PushOperationId` derived from the push ID, operation index, operation kind, and target remote ID. Connectors return operation-level `JournalApplyEffect` values after apply. Those effects record durable facts such as updated blocks, archived blocks, and created remote block/entity IDs so resume, reconcile, and undo do not have to infer what happened from the remote alone.
+
+`CreateEntity` is the connector-neutral shape for local file creation. For the filesystem projection it carries the parent remote ID, user title, initial property values, initial body, and the source path that produced the create request. Connectors assign the real remote ID and return a `CreatedEntity` apply effect; reconciliation then reads the created remote entity back, materializes the canonical projected path, saves the shadow, and lets undo archive the created entity by ID.
 
 ## Undo Contract
 

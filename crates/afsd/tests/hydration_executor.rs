@@ -13,7 +13,8 @@ use afs_store::{
     ShadowRepository,
 };
 use afsd::hydration::{
-    HydratedEntity, HydrationExecutor, HydrationOutcome, HydrationQueue, HydrationSource,
+    HydratedAsset, HydratedEntity, HydrationExecutor, HydrationOutcome, HydrationQueue,
+    HydrationSource,
 };
 
 #[test]
@@ -75,6 +76,50 @@ fn executor_replaces_clean_hydrated_file() {
             .body_hash,
         new.shadow.body_hash
     );
+}
+
+#[test]
+fn executor_writes_hydrated_assets_under_mount_root() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let mut rendered = rendered_entity("Remote body.");
+    rendered.assets.push(HydratedAsset {
+        path: PathBuf::from("media/Roadmap/image-1.png"),
+        bytes: b"image-bytes".to_vec(),
+    });
+    let source = FakeHydrationSource::with_entity("page-1", rendered);
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(
+        fs::read(fixture.root.join("media/Roadmap/image-1.png")).expect("asset"),
+        b"image-bytes"
+    );
+}
+
+#[test]
+fn executor_rejects_hydrated_assets_outside_mount_root() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let mut rendered = rendered_entity("Remote body.");
+    rendered.assets.push(HydratedAsset {
+        path: PathBuf::from("media/../outside.png"),
+        bytes: b"image-bytes".to_vec(),
+    });
+    let source = FakeHydrationSource::with_entity("page-1", rendered);
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let error = executor
+        .hydrate_request(fixture.request())
+        .expect_err("unsafe asset path should fail");
+
+    assert!(matches!(error, AfsError::InvalidState(_)));
+    assert!(!fixture.root.join("outside.png").exists());
 }
 
 #[test]
@@ -332,5 +377,6 @@ fn rendered_entity_for(remote_id: &str, body: &str) -> HydratedEntity {
         document,
         shadow,
         remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+        assets: Vec::new(),
     }
 }

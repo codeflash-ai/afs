@@ -405,6 +405,8 @@ pub struct PushReconcileRequest<'a> {
     pub plan: &'a PushPlan,
     /// Remote entities changed by apply.
     pub changed_remote_ids: &'a [RemoteId],
+    /// Durable operation-level effects returned by apply.
+    pub apply_effects: &'a [JournalApplyEffect],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -520,6 +522,7 @@ where
         mount_id: &request.mount_id,
         plan: &plan,
         changed_remote_ids: &apply_result.changed_remote_ids,
+        apply_effects: &apply_result.effects,
     }) {
         Ok(result) => result,
         Err(error) => {

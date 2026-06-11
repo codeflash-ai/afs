@@ -233,7 +233,10 @@ where
         })
         .map_err(PullError::Connector)?;
     let rendered = connector
-        .render_native_entity(&native)
+        .render_native_entity_for_path(&native, &entity.path)
+        .map_err(PullError::Connector)?;
+    connector
+        .download_rendered_media(&rendered, &mount.root)
         .map_err(PullError::Connector)?;
     let markdown = render_canonical_markdown(&rendered.document);
 

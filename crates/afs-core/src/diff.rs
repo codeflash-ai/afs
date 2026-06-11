@@ -181,7 +181,7 @@ fn property_diff_operations(
             updates.insert(
                 key.clone(),
                 edited_value
-                    .map(frontmatter_property_value)
+                    .map(property_value_from_frontmatter)
                     .unwrap_or(PropertyValue::Null),
             );
         }
@@ -197,7 +197,7 @@ fn property_diff_operations(
     }
 }
 
-fn frontmatter_property_value(value: &Value) -> PropertyValue {
+pub fn property_value_from_frontmatter(value: &Value) -> PropertyValue {
     match value {
         Value::Null => PropertyValue::Null,
         Value::Bool(value) => PropertyValue::Bool(*value),
@@ -214,11 +214,11 @@ fn frontmatter_property_value(value: &Value) -> PropertyValue {
                 .iter()
                 .filter_map(|(key, value)| {
                     simple_frontmatter_string(key)
-                        .map(|key| (key, frontmatter_property_value(value)))
+                        .map(|key| (key, property_value_from_frontmatter(value)))
                 })
                 .collect(),
         ),
-        Value::Tagged(tagged) => frontmatter_property_value(&tagged.value),
+        Value::Tagged(tagged) => property_value_from_frontmatter(&tagged.value),
     }
 }
 

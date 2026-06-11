@@ -235,6 +235,7 @@ impl HydrationSource for FakeHydrationSource {
             document,
             shadow,
             remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+            assets: Vec::new(),
         })
     }
 }

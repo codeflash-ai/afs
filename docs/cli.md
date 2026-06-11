@@ -35,7 +35,7 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 `afs mount notion <path> --root-page <page-id>` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. The current auth path is still developer-oriented: the Notion connector reads its bearer token from `NOTION_TOKEN` until OAuth/keychain support is implemented.
 
-`afs pull <mount-root>` enumerates the configured Notion root page, writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, and persists the root page shadow snapshot. `afs pull <page-file>` hydrates one known entity. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
+`afs pull <mount-root>` enumerates the configured Notion root page, writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
 
 The JSON report includes `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts.
 
@@ -55,7 +55,7 @@ Human output lists only non-clean entries and ends with a compact summary, or pr
 
 ## Initial `afs diff --json` Shape
 
-The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. The JSON report includes:
+The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. The JSON report includes:
 
 - `validation`: machine-readable issues with file, line, message, and suggested fix;
 - `plan.summary`: block/entity/property counts;
@@ -81,7 +81,7 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_not_implemented`;
 - `apply_failed`.
 
-Reports also include `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset through the live API; unsupported connector boundaries still return `apply_not_implemented` or `apply_failed` after the journal is marked failed.
+Reports also include `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset plus new database-row creation through the live API; unsupported connector boundaries still return `apply_not_implemented` or `apply_failed` after the journal is marked failed.
 
 ## Initial `afs log --json` Shape
 

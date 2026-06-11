@@ -144,6 +144,9 @@ fn create_entity_reverses_to_archive_created_entity_when_effect_is_journaled() {
     let mut entry = journal_entry(vec![PushOperation::CreateEntity {
         parent_id: RemoteId::new("page-1"),
         title: "New page".to_string(),
+        properties: Default::default(),
+        body: String::new(),
+        source_path: "new-page.md".into(),
     }]);
     entry.apply_effects = vec![JournalApplyEffect::CreatedEntity {
         operation_id: PushOperationId::for_operation(&entry.push_id, 0, &entry.plan.operations[0]),

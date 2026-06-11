@@ -76,6 +76,12 @@ pub enum PushOperation {
     CreateEntity {
         parent_id: RemoteId,
         title: String,
+        #[serde(default)]
+        properties: BTreeMap<String, PropertyValue>,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        source_path: std::path::PathBuf,
     },
 }
 

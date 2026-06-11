@@ -10,7 +10,8 @@ use afs_core::push::RemotePrecondition;
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, DateMentionDto, EquationBlockDto, LinkDto, MentionRichTextDto, PageDto,
+    BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
+    DatabaseDto, DateMentionDto, EquationBlockDto, LinkDto, MentionRichTextDto, PageDto,
     PageListDto, PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto,
     RichTextDto, SelectOptionDto, TextRichTextDto,
 };
@@ -510,6 +511,122 @@ fn apply_updates_supported_page_properties() {
 }
 
 #[test]
+fn apply_creates_database_row_with_properties_and_children() {
+    let api = Arc::new(RecordingNotionApi::with_data_source_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([
+            ("Name".to_string(), data_source_property("title")),
+            ("Status".to_string(), data_source_property("select")),
+            ("Tags".to_string(), data_source_property("multi_select")),
+            ("Done".to_string(), data_source_property("checkbox")),
+            ("Points".to_string(), data_source_property("number")),
+        ]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("database-1")],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("database-1"),
+            title: "New task".to_string(),
+            properties: [
+                (
+                    "Status".to_string(),
+                    PropertyValue::String("In progress".to_string()),
+                ),
+                (
+                    "Tags".to_string(),
+                    PropertyValue::List(vec!["Backend".to_string(), "Docs".to_string()]),
+                ),
+                ("Done".to_string(), PropertyValue::Bool(false)),
+                ("Points".to_string(), PropertyValue::Number("5".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            body: "# Notes\n\n- [ ] Wire create".to_string(),
+            source_path: "tasks/new-task.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    assert_eq!(
+        result.changed_remote_ids,
+        vec![RemoteId::new("created-page-1")]
+    );
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::CreatedEntity {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new("database-1"),
+            entity_id: RemoteId::new("created-page-1"),
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::CreatePage {
+            body: json!({
+                "parent": {
+                    "type": "data_source_id",
+                    "data_source_id": "source-1",
+                },
+                "properties": {
+                    "Name": {
+                        "title": rich_text_json("New task"),
+                    },
+                    "Status": {
+                        "select": {
+                            "name": "In progress",
+                        },
+                    },
+                    "Tags": {
+                        "multi_select": [
+                            { "name": "Backend" },
+                            { "name": "Docs" },
+                        ],
+                    },
+                    "Done": {
+                        "checkbox": false,
+                    },
+                    "Points": {
+                        "number": 5.0,
+                    },
+                },
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "heading_1",
+                        "heading_1": {
+                            "rich_text": rich_text_json("Notes"),
+                        },
+                    },
+                    {
+                        "object": "block",
+                        "type": "to_do",
+                        "to_do": {
+                            "rich_text": rich_text_json("Wire create"),
+                            "checked": false,
+                        },
+                    },
+                ],
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_rejects_legacy_property_update_without_values() {
     let api = Arc::new(RecordingNotionApi::with_page_properties(
         "2026-06-10T00:00:00.000Z",
@@ -551,6 +668,8 @@ fn operation_ids(push_id: &PushId, plan: &PushPlan) -> Vec<PushOperationId> {
 #[derive(Debug)]
 struct RecordingNotionApi {
     page: PageDto,
+    database: DatabaseDto,
+    data_source: DataSourceDto,
     children: BTreeMap<(String, Option<String>), BlockListDto>,
     writes: Mutex<Vec<WriteCall>>,
     append_count: Mutex<usize>,
@@ -597,6 +716,28 @@ impl RecordingNotionApi {
         Self::with_page_and_children(page, rich_text("Old paragraph."))
     }
 
+    fn with_data_source_properties(
+        last_edited_time: &str,
+        properties: BTreeMap<String, DataSourcePropertyDto>,
+    ) -> Self {
+        let mut api = Self::new(last_edited_time, false);
+        api.database = DatabaseDto {
+            id: "database-1".to_string(),
+            data_sources: vec![DataSourceSummaryDto {
+                id: "source-1".to_string(),
+                name: Some("Tasks".to_string()),
+            }],
+            ..Default::default()
+        };
+        api.data_source = DataSourceDto {
+            id: "source-1".to_string(),
+            name: Some("Tasks".to_string()),
+            properties,
+            ..Default::default()
+        };
+        api
+    }
+
     fn with_blocks(last_edited_time: &str, blocks: Vec<BlockDto>) -> Self {
         let page = PageDto {
             id: "page-1".to_string(),
@@ -630,6 +771,20 @@ impl RecordingNotionApi {
         )]);
         Self {
             page,
+            database: DatabaseDto {
+                id: "database-1".to_string(),
+                data_sources: vec![DataSourceSummaryDto {
+                    id: "source-1".to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+                ..Default::default()
+            },
+            data_source: DataSourceDto {
+                id: "source-1".to_string(),
+                name: Some("Tasks".to_string()),
+                properties: BTreeMap::new(),
+                ..Default::default()
+            },
             children,
             writes: Mutex::new(Vec::new()),
             append_count: Mutex::new(0),
@@ -641,8 +796,37 @@ impl NotionApi for RecordingNotionApi {
     fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto> {
         if page_id == self.page.id {
             Ok(self.page.clone())
+        } else if page_id == "created-page-1" {
+            Ok(PageDto {
+                id: "created-page-1".to_string(),
+                created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                archived: false,
+                in_trash: false,
+                properties: BTreeMap::from([("Name".to_string(), page_property("title"))]),
+            })
         } else {
             Err(AfsError::InvalidState(format!("missing page {page_id}")))
+        }
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> AfsResult<DatabaseDto> {
+        if database_id == self.database.id {
+            Ok(self.database.clone())
+        } else {
+            Err(AfsError::InvalidState(format!(
+                "missing database {database_id}"
+            )))
+        }
+    }
+
+    fn retrieve_data_source(&self, data_source_id: &str) -> AfsResult<DataSourceDto> {
+        if data_source_id == self.data_source.id {
+            Ok(self.data_source.clone())
+        } else {
+            Err(AfsError::InvalidState(format!(
+                "missing data source {data_source_id}"
+            )))
         }
     }
 
@@ -675,6 +859,21 @@ impl NotionApi for RecordingNotionApi {
                 body,
             });
         Ok(self.page.clone())
+    }
+
+    fn create_page(&self, body: Value) -> AfsResult<PageDto> {
+        self.writes
+            .lock()
+            .expect("writes")
+            .push(WriteCall::CreatePage { body });
+        Ok(PageDto {
+            id: "created-page-1".to_string(),
+            created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            archived: false,
+            in_trash: false,
+            properties: BTreeMap::new(),
+        })
     }
 
     fn update_block(&self, block_id: &str, body: Value) -> AfsResult<BlockDto> {
@@ -714,6 +913,7 @@ impl NotionApi for RecordingNotionApi {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WriteCall {
     UpdatePage { page_id: String, body: Value },
+    CreatePage { body: Value },
     Update { block_id: String, body: Value },
     Append { block_id: String, body: Value },
     Delete { block_id: String },
@@ -736,6 +936,14 @@ fn page_property(kind: &str) -> PagePropertyDto {
         _ => {}
     }
     property
+}
+
+fn data_source_property(kind: &str) -> DataSourcePropertyDto {
+    DataSourcePropertyDto {
+        id: format!("{kind}-id"),
+        kind: kind.to_string(),
+        ..Default::default()
+    }
 }
 
 fn block(id: &str, kind: &str) -> BlockDto {
