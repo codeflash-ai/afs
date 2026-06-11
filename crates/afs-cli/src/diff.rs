@@ -108,11 +108,17 @@ where
     let shadow = store
         .load_shadow(&mount.mount_id, &entity.remote_id)
         .map_err(DiffError::Store)?;
-    let output = plan_push_pipeline(
-        PushPipelineRequest::new(relative_path, &parsed, &shadow)
-            .with_approval(options.approval)
-            .read_only(mount.read_only),
-    );
+    let schema_validation =
+        notion_changed_row_schema_validation(store, mount, &relative_path, &parsed, &shadow)?;
+    let output = if schema_validation.is_clean() {
+        plan_push_pipeline(
+            PushPipelineRequest::new(relative_path, &parsed, &shadow)
+                .with_approval(options.approval)
+                .read_only(mount.read_only),
+        )
+    } else {
+        validation_pipeline(schema_validation)
+    };
 
     let report = DiffReport::from_pipeline(
         options.command,
@@ -178,8 +184,16 @@ where
         }
     };
 
-    let pipeline =
-        create_entity_pipeline(&relative_path, &parsed, &parent, mount, options.approval);
+    let schema_validation =
+        notion_create_row_schema_validation(mount, &parent, &relative_path, &parsed);
+    let pipeline = create_entity_pipeline(
+        &relative_path,
+        &parsed,
+        &parent,
+        mount,
+        options.approval,
+        schema_validation,
+    );
     let report = DiffReport::from_pipeline(
         options.command,
         absolute_path,
@@ -233,6 +247,7 @@ fn create_entity_pipeline(
     parent: &EntityRecord,
     mount: &MountConfig,
     approval: PushApproval,
+    schema_validation: ValidationReport,
 ) -> PushPipelineResult {
     if mount.read_only {
         return PushPipelineResult {
@@ -245,6 +260,7 @@ fn create_entity_pipeline(
     }
 
     let mut validation = ValidationReport::clean();
+    validation.extend(schema_validation);
     if parsed.remote_id().is_some() {
         validation.push(ValidationIssue::new(
             "create_entity_has_remote_id",
@@ -355,6 +371,124 @@ fn create_entity_pipeline(
         guardrail,
         action,
         completed_stages,
+    }
+}
+
+fn notion_changed_row_schema_validation<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+    parsed: &ParsedCanonicalDocument,
+    shadow: &ShadowDocument,
+) -> Result<ValidationReport, DiffError>
+where
+    S: EntityRepository,
+{
+    if mount.read_only {
+        return Ok(ValidationReport::clean());
+    }
+    let Some(parent) = notion_database_parent(store, mount, relative_path)? else {
+        return Ok(ValidationReport::clean());
+    };
+    Ok(
+        match notion_schema_yaml_or_issue(mount, &parent, relative_path) {
+            Ok(schema) => afs_notion::schema::validate_changed_row_frontmatter(
+                &schema,
+                shadow,
+                parsed,
+                relative_path,
+            ),
+            Err(report) => report,
+        },
+    )
+}
+
+fn notion_create_row_schema_validation(
+    mount: &MountConfig,
+    parent: &EntityRecord,
+    relative_path: &Path,
+    parsed: &ParsedCanonicalDocument,
+) -> ValidationReport {
+    if !is_notion_database(mount, parent) {
+        return ValidationReport::clean();
+    }
+
+    match notion_schema_yaml_or_issue(mount, parent, relative_path) {
+        Ok(schema) => {
+            afs_notion::schema::validate_create_row_frontmatter(&schema, parsed, relative_path)
+        }
+        Err(report) => report,
+    }
+}
+
+fn notion_database_parent<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<Option<EntityRecord>, DiffError>
+where
+    S: EntityRepository,
+{
+    if mount.connector != "notion" {
+        return Ok(None);
+    }
+    let Some(parent_path) = relative_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let parent = store
+        .find_entity_by_path(&mount.mount_id, parent_path)
+        .map_err(DiffError::Store)?;
+    Ok(parent.filter(|entity| entity.kind == EntityKind::Database))
+}
+
+fn is_notion_database(mount: &MountConfig, entity: &EntityRecord) -> bool {
+    mount.connector == "notion" && entity.kind == EntityKind::Database
+}
+
+fn notion_schema_yaml_or_issue(
+    mount: &MountConfig,
+    database: &EntityRecord,
+    relative_path: &Path,
+) -> Result<String, ValidationReport> {
+    let schema_path = mount.root.join(&database.path).join("_schema.yaml");
+    match std::fs::read_to_string(&schema_path) {
+        Ok(schema) => Ok(schema),
+        Err(error) => {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                "notion_schema_missing"
+            } else {
+                "notion_schema_unreadable"
+            };
+            let mut report = ValidationReport::clean();
+            report.push(ValidationIssue::new(
+                code,
+                relative_path,
+                Some(1),
+                format!(
+                    "Notion database row writes require readable schema file `{}`",
+                    schema_path.display()
+                ),
+                Some(
+                    "run `afs pull` on the database directory to regenerate `_schema.yaml`"
+                        .to_string(),
+                ),
+            ));
+            Err(report)
+        }
+    }
+}
+
+fn validation_pipeline(validation: ValidationReport) -> PushPipelineResult {
+    PushPipelineResult {
+        validation,
+        plan: None,
+        guardrail: GuardrailDecision::Proceed,
+        action: PushPipelineAction::FixValidation,
+        completed_stages: vec![PushStage::ParseAndValidate],
     }
 }
 

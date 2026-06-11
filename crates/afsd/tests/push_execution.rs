@@ -90,6 +90,101 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
     assert_eq!(journal[0].status, JournalStatus::Reconciled);
 }
 
+#[test]
+fn daemon_push_job_blocks_database_row_schema_violation_before_apply() {
+    let fixture = PushFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("row-1"),
+                EntityKind::Page,
+                "Existing task",
+                "Tasks/existing-task.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save row");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("row-1"),
+                "# Notes\n\nExisting body.\n",
+                9,
+                [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(row_frontmatter("Todo")),
+        )
+        .expect("save shadow");
+    fs::create_dir_all(fixture.root.join("Tasks")).expect("tasks dir");
+    fs::write(fixture.root.join("Tasks/_schema.yaml"), tasks_schema()).expect("schema");
+    fs::write(
+        fixture.root.join("Tasks/existing-task.md"),
+        format!(
+            "---\n{}---\n# Notes\n\nExisting body.\n",
+            row_frontmatter("Blocked")
+        ),
+    )
+    .expect("row file");
+    let mut supervisor = DaemonSupervisor::new(
+        store,
+        RecordingWatcher::default(),
+        HydrationQueue::new(),
+        PullScheduler::new(Default::default()),
+    );
+    supervisor.start().expect("start supervisor");
+    let source = FakePushSource::default();
+
+    let report = supervisor
+        .execute_push(
+            PushJob {
+                target_path: fixture.root.join("Tasks/existing-task.md"),
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+            &source,
+        )
+        .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert_eq!(
+        report.pipeline.action,
+        afs_core::push::PushPipelineAction::FixValidation
+    );
+    assert_eq!(
+        report.pipeline.validation.issues[0].code,
+        "notion_schema_option_unknown"
+    );
+    assert_eq!(source.applied_count(), 0);
+    assert!(
+        supervisor
+            .store()
+            .list_journal()
+            .expect("journal")
+            .is_empty()
+    );
+}
+
 struct PushFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -289,4 +384,31 @@ fn shadow(remote_id: &str, body: &str) -> ShadowDocument {
 
 fn markdown_body(body: &str) -> String {
     format!("# Roadmap\n\n{body}\n")
+}
+
+fn row_frontmatter(status: &str) -> String {
+    format!(
+        "afs:\n  id: row-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Existing task\nStatus: {status}\n"
+    )
+}
+
+fn tasks_schema() -> &'static str {
+    r#"afs:
+  type: notion_database_schema
+  database_id: "database-1"
+title: "Tasks"
+data_sources:
+  - id: "source-1"
+    name: "Tasks"
+    properties:
+      Name:
+        id: "name-id"
+        type: "title"
+      Status:
+        id: "status-id"
+        type: "select"
+        options:
+          - name: "Todo"
+            id: "todo-id"
+"#
 }

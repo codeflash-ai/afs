@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ApplyPlanRequest, Connector, FetchRequest};
+use afs_core::canonical::parse_canonical_markdown;
 use afs_core::journal::{PushId, PushOperationId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
 use afs_notion::client::{DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION};
 use afs_notion::dto::{DatabaseDto, NotionPageBundle, PageDto};
+use afs_notion::schema::validate_create_row_frontmatter;
 use afs_notion::{NotionConfig, NotionConnector};
 use reqwest::blocking::Client;
 use serde::Serialize;
@@ -213,6 +215,27 @@ fn live_database_row_property_create_edit_verify_integrity() {
     let database =
         cleanup.create_database(&scratch.id, &format!("AFS live rows {}", unique_suffix()));
     let database_id = RemoteId::new(database.id.clone());
+    let schema_yaml = connector
+        .database_schema_yaml(&database_id)
+        .expect("live schema");
+    let valid_row = parse_canonical_markdown(
+        "---\ntitle: AFS created row\nNotes: Rich row notes\nPoints: 42\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\n  - Beta\nDone: false\nDue: \"2026-06-10\"\nURL: https://example.com/afs-live\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\n---\n# Row body\n",
+    )
+    .expect("valid row frontmatter");
+    assert!(validate_create_row_frontmatter(&schema_yaml, &valid_row, "Rows/valid.md").is_clean());
+    let invalid_row = parse_canonical_markdown(
+        "---\ntitle: AFS created row\nStatus: Not a real status\n---\n# Row body\n",
+    )
+    .expect("invalid row frontmatter");
+    let invalid_report =
+        validate_create_row_frontmatter(&schema_yaml, &invalid_row, "Rows/invalid.md");
+    assert!(
+        invalid_report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "notion_schema_option_unknown"),
+        "{invalid_report:?}"
+    );
 
     let plan = PushPlan::new(
         vec![database_id.clone()],

@@ -62,6 +62,7 @@ fn diff_plans_new_database_row_file_as_create_entity() {
             "Tasks",
         ))
         .expect("save database");
+    fixture.write_tasks_schema();
     let path = fixture.write_raw(
         "Tasks/new-task.md",
         "---\ntitle: New task\nStatus: Todo\nTags:\n  - Backend\nDone: false\nPoints: 5\n---\n# Notes\n\n- [ ] Wire create\n",
@@ -100,6 +101,88 @@ fn diff_plans_new_database_row_file_as_create_entity() {
         }
         operation => panic!("unexpected operation {operation:?}"),
     }
+}
+
+#[test]
+fn diff_rejects_new_database_row_property_outside_schema() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    fixture.write_tasks_schema();
+    let path = fixture.write_raw(
+        "Tasks/new-task.md",
+        "---\ntitle: New task\nStatus: Todo\nUnexpected: value\n---\n# Notes\n",
+    );
+
+    let report = run_diff(&store, &path).expect("diff report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "fix_validation");
+    assert!(report.plan.is_none());
+    assert_eq!(report.validation[0].code, "notion_schema_property_unknown");
+    assert_eq!(report.validation[0].file, "Tasks/new-task.md");
+}
+
+#[test]
+fn diff_rejects_existing_database_row_invalid_select_option() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("row-1"),
+                EntityKind::Page,
+                "Existing task",
+                "Tasks/existing-task.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save row");
+    fixture.write_tasks_schema();
+    let body = "# Notes\n\nExisting body.";
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("row-1"),
+                body,
+                9,
+                [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(row_frontmatter("Todo")),
+        )
+        .expect("save shadow");
+    let path = fixture.write_raw(
+        "Tasks/existing-task.md",
+        &format!("---\n{}---\n{body}", row_frontmatter("Blocked")),
+    );
+
+    let report = run_diff(&store, &path).expect("diff report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "fix_validation");
+    assert!(report.plan.is_none());
+    assert_eq!(report.validation[0].code, "notion_schema_option_unknown");
+    assert_eq!(report.validation[0].line, Some(8));
 }
 
 #[test]
@@ -262,6 +345,10 @@ impl DiffFixture {
         fs::write(&path, contents).expect("fixture file");
         path
     }
+
+    fn write_tasks_schema(&self) {
+        self.write_raw("Tasks/_schema.yaml", tasks_schema());
+    }
 }
 
 impl Drop for DiffFixture {
@@ -284,6 +371,45 @@ fn shadow(body: &str) -> ShadowDocument {
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
     )
     .expect("shadow")
+}
+
+fn row_frontmatter(status: &str) -> String {
+    format!(
+        "afs:\n  id: row-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Existing task\nStatus: {status}\n"
+    )
+}
+
+fn tasks_schema() -> &'static str {
+    r#"afs:
+  type: notion_database_schema
+  database_id: "database-1"
+title: "Tasks"
+data_sources:
+  - id: "source-1"
+    name: "Tasks"
+    properties:
+      Name:
+        id: "name-id"
+        type: "title"
+      Status:
+        id: "status-id"
+        type: "select"
+        options:
+          - name: "Todo"
+            id: "todo-id"
+      Tags:
+        id: "tags-id"
+        type: "multi_select"
+        options:
+          - name: "Backend"
+            id: "backend-id"
+      Done:
+        id: "done-id"
+        type: "checkbox"
+      Points:
+        id: "points-id"
+        type: "number"
+"#
 }
 
 trait OperationOutputExt {

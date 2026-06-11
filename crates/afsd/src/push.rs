@@ -16,7 +16,7 @@ use afs_core::canonical::{
 use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
-use afs_core::model::HydrationState;
+use afs_core::model::{EntityKind, HydrationState};
 use afs_core::planner::GuardrailDecision;
 use afs_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushApproval, PushConcurrencyCheck,
@@ -163,14 +163,20 @@ where
     let shadow = store
         .load_shadow(&mount.mount_id, &entity.remote_id)
         .map_err(AfsError::from)?;
-    let pipeline = plan_push_pipeline(
-        PushPipelineRequest::new(relative_path, &parsed, &shadow)
-            .with_approval(PushApproval {
-                assume_yes: job.assume_yes,
-                confirm_dangerous: job.confirm_dangerous,
-            })
-            .read_only(mount.read_only),
-    );
+    let schema_validation =
+        notion_changed_row_schema_validation(store, &mount, &relative_path, &parsed, &shadow)?;
+    let pipeline = if schema_validation.is_clean() {
+        plan_push_pipeline(
+            PushPipelineRequest::new(relative_path, &parsed, &shadow)
+                .with_approval(PushApproval {
+                    assume_yes: job.assume_yes,
+                    confirm_dangerous: job.confirm_dangerous,
+                })
+                .read_only(mount.read_only),
+        )
+    } else {
+        validation_report_pipeline(schema_validation)
+    };
 
     Ok(PreparedPush {
         absolute_path,
@@ -353,12 +359,103 @@ fn afs_error_code(error: &AfsError) -> &'static str {
 fn validation_pipeline(issue: ValidationIssue) -> PushPipelineResult {
     let mut validation = ValidationReport::clean();
     validation.push(issue);
+    validation_report_pipeline(validation)
+}
+
+fn validation_report_pipeline(validation: ValidationReport) -> PushPipelineResult {
     PushPipelineResult {
         validation,
         plan: None,
         guardrail: GuardrailDecision::Proceed,
         action: PushPipelineAction::FixValidation,
         completed_stages: vec![PushStage::ParseAndValidate],
+    }
+}
+
+fn notion_changed_row_schema_validation<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+    parsed: &afs_core::canonical::ParsedCanonicalDocument,
+    shadow: &ShadowDocument,
+) -> AfsResult<ValidationReport>
+where
+    S: EntityRepository,
+{
+    if mount.read_only {
+        return Ok(ValidationReport::clean());
+    }
+    let Some(parent) = notion_database_parent(store, mount, relative_path)? else {
+        return Ok(ValidationReport::clean());
+    };
+
+    Ok(
+        match notion_schema_yaml_or_issue(mount, &parent, relative_path) {
+            Ok(schema) => afs_notion::schema::validate_changed_row_frontmatter(
+                &schema,
+                shadow,
+                parsed,
+                relative_path,
+            ),
+            Err(report) => report,
+        },
+    )
+}
+
+fn notion_database_parent<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> AfsResult<Option<EntityRecord>>
+where
+    S: EntityRepository,
+{
+    if mount.connector != "notion" {
+        return Ok(None);
+    }
+    let Some(parent_path) = relative_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let parent = store
+        .find_entity_by_path(&mount.mount_id, parent_path)
+        .map_err(AfsError::from)?;
+    Ok(parent.filter(|entity| entity.kind == EntityKind::Database))
+}
+
+fn notion_schema_yaml_or_issue(
+    mount: &MountConfig,
+    database: &EntityRecord,
+    relative_path: &Path,
+) -> Result<String, ValidationReport> {
+    let schema_path = mount.root.join(&database.path).join("_schema.yaml");
+    match std::fs::read_to_string(&schema_path) {
+        Ok(schema) => Ok(schema),
+        Err(error) => {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                "notion_schema_missing"
+            } else {
+                "notion_schema_unreadable"
+            };
+            let mut report = ValidationReport::clean();
+            report.push(ValidationIssue::new(
+                code,
+                relative_path,
+                Some(1),
+                format!(
+                    "Notion database row writes require readable schema file `{}`",
+                    schema_path.display()
+                ),
+                Some(
+                    "run `afs pull` on the database directory to regenerate `_schema.yaml`"
+                        .to_string(),
+                ),
+            ));
+            Err(report)
+        }
     }
 }
 
