@@ -16,6 +16,7 @@ use crate::pull::{PullError, PullReport, run_pull};
 use crate::push::{
     NotionPushReconciler, PushOptions, PushReport, push_report_exit_code, run_push_with_executor,
 };
+use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
@@ -36,7 +37,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     match args[0].as_str() {
         "connect" => stub("connect", json),
         "mount" => mount(&args[1..], json),
-        "status" => stub("status", json),
+        "status" => status(&args[1..], json),
         "pull" => pull(&args[1..], json),
         "push" => push(&args[1..], json),
         "diff" => diff(&args[1..], json),
@@ -157,6 +158,35 @@ fn pull(args: &[String], json: bool) -> i32 {
             exit_code
         }
         Err(error) => pull_command_error(json, error),
+    }
+}
+
+fn status(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("status", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = StatusOptions {
+        path: first_positional(args).map(PathBuf::from),
+    };
+
+    match run_status(&store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_status_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => status_command_error(json, error, state_root),
     }
 }
 
@@ -427,6 +457,55 @@ fn print_pull_report(report: &PullReport) {
     }
 }
 
+fn print_status_report(report: &StatusReport) {
+    if report.mounts.is_empty() {
+        println!("no mounts");
+        return;
+    }
+
+    let mut printed_entries = 0;
+    for mount in &report.mounts {
+        for entry in &mount.entries {
+            let line_state = if entry.failed_journal_count > 0 {
+                "failed_journal"
+            } else if entry.pending_journal_count > 0 {
+                "pending_journal"
+            } else {
+                entry.state.as_str()
+            };
+
+            if line_state == "clean" {
+                continue;
+            }
+
+            printed_entries += 1;
+            println!("{line_state} {} {}", mount.mount_id, entry.path);
+        }
+    }
+
+    if printed_entries == 0 {
+        println!(
+            "status clean: {} tracked entr{}",
+            report.summary.total,
+            if report.summary.total == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+    } else {
+        println!(
+            "summary: {} clean, {} stub, {} dirty, {} conflicted, {} missing, {} error",
+            report.summary.clean,
+            report.summary.stub,
+            report.summary.dirty,
+            report.summary.conflicted,
+            report.summary.missing,
+            report.summary.error
+        );
+    }
+}
+
 fn default_notion_connector() -> NotionConnector {
     NotionConnector::new(NotionConfig::default())
 }
@@ -513,6 +592,29 @@ fn pull_command_error(json: bool, error: PullError) -> i32 {
     command_error(
         json,
         CommandError::new("pull", error.code(), error.message()),
+        exit_code,
+    )
+}
+
+fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> i32 {
+    let exit_code = match &error {
+        StatusError::MountNotFound(_)
+        | StatusError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        StatusError::CurrentDir(_) | StatusError::Store(_) => EXIT_INTERNAL,
+    };
+    let message = match &error {
+        StatusError::MountNotFound(_) => {
+            format!(
+                "{} in state dir `{}`",
+                error.message(),
+                state_root.display()
+            )
+        }
+        _ => error.message(),
+    };
+    command_error(
+        json,
+        CommandError::new("status", error.code(), message),
         exit_code,
     )
 }

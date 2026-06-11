@@ -39,6 +39,20 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 The JSON report includes `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts.
 
+## Initial `afs status --json` Shape
+
+`afs status [path]` inspects local mount state only. It resolves the target path through the stored mount/entity mapping, compares hydrated page bodies against their stored shadow snapshots, reports stubs and missing/conflicted projections, and includes pending or failed push journals touching each entity. It does not call remote connectors.
+
+The production state directory defaults to `~/.afs`; `AFS_STATE_DIR` is a developer/test override for isolated runs. When no path is supplied, `afs status` first checks the current working directory: inside a mount it scopes to that subtree, and outside all mounts it reports every registered mount in the active state directory.
+
+The JSON report includes:
+
+- `clean`: false when any entry is stubbed, dirty, conflicted, missing, errored, or has pending/failed journals;
+- `summary`: counts by state plus pending/failed journal counts;
+- `mounts[].entries[]`: path, entity ID, kind, title, hydration state, status state, issues, and journal counts.
+
+Human output lists only non-clean entries and ends with a compact summary, or prints a clean line when every tracked entry is clean.
+
 ## Initial `afs diff --json` Shape
 
 The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. The JSON report includes:
