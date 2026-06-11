@@ -13,15 +13,18 @@ use afs_core::shadow::ShadowDocument;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    ConnectionId, ConnectionRecord, EntityRecord, MountConfig, ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, EntityRecord, HydrationJobRecord, MountConfig,
+    ShadowSnapshotRecord,
 };
 use crate::repository::{
-    ConnectionRepository, EntityRepository, JournalRepository, MountRepository, ShadowRepository,
+    ConnectionRepository, EntityRepository, HydrationJobRepository, JournalRepository,
+    MountRepository, ShadowRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
 type PathKey = (MountId, PathBuf);
 type ShadowKey = (MountId, RemoteId);
+type HydrationJobKey = (MountId, RemoteId);
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
@@ -30,6 +33,7 @@ pub struct InMemoryStateStore {
     entities: BTreeMap<EntityKey, EntityRecord>,
     entities_by_path: BTreeMap<PathKey, RemoteId>,
     shadows: BTreeMap<ShadowKey, ShadowSnapshotRecord>,
+    hydration_jobs: BTreeMap<HydrationJobKey, HydrationJobRecord>,
     journals: BTreeMap<String, JournalEntry>,
 }
 
@@ -48,6 +52,10 @@ impl InMemoryStateStore {
 
     fn shadow_key(mount_id: &MountId, entity_id: &RemoteId) -> ShadowKey {
         (mount_id.clone(), entity_id.clone())
+    }
+
+    fn hydration_job_key(mount_id: &MountId, remote_id: &RemoteId) -> HydrationJobKey {
+        (mount_id.clone(), remote_id.clone())
     }
 }
 
@@ -180,6 +188,52 @@ impl ShadowRepository for InMemoryStateStore {
             .shadows
             .get(&Self::shadow_key(mount_id, entity_id))
             .cloned())
+    }
+}
+
+impl HydrationJobRepository for InMemoryStateStore {
+    fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()> {
+        let key = Self::hydration_job_key(&job.mount_id, &job.remote_id);
+        if let Some(existing) = self.hydration_jobs.get_mut(&key) {
+            existing.path = job.path;
+            existing.target_state = job.target_state;
+            existing.reason = job.reason;
+        } else {
+            self.hydration_jobs.insert(key, job);
+        }
+
+        Ok(())
+    }
+
+    fn list_hydration_jobs(&self) -> StoreResult<Vec<HydrationJobRecord>> {
+        Ok(self.hydration_jobs.values().cloned().collect())
+    }
+
+    fn delete_hydration_job(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()> {
+        self.hydration_jobs
+            .remove(&Self::hydration_job_key(mount_id, remote_id));
+        Ok(())
+    }
+
+    fn record_hydration_job_failure(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+        message: String,
+    ) -> StoreResult<()> {
+        if let Some(job) = self
+            .hydration_jobs
+            .get_mut(&Self::hydration_job_key(mount_id, remote_id))
+        {
+            job.attempts = job.attempts.saturating_add(1);
+            job.last_error = Some(message);
+        }
+
+        Ok(())
     }
 }
 

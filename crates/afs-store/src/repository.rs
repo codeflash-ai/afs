@@ -12,7 +12,8 @@ use afs_core::shadow::ShadowDocument;
 
 use crate::error::StoreResult;
 use crate::records::{
-    ConnectionId, ConnectionRecord, EntityRecord, MountConfig, ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, EntityRecord, HydrationJobRecord, MountConfig,
+    ShadowSnapshotRecord,
 };
 
 pub trait MountRepository {
@@ -42,6 +43,19 @@ pub trait EntityRepository {
         path: &Path,
     ) -> StoreResult<Option<EntityRecord>>;
     fn list_entities(&self, mount_id: &MountId) -> StoreResult<Vec<EntityRecord>>;
+}
+
+pub trait HydrationJobRepository {
+    fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()>;
+    fn list_hydration_jobs(&self) -> StoreResult<Vec<HydrationJobRecord>>;
+    fn delete_hydration_job(&mut self, mount_id: &MountId, remote_id: &RemoteId)
+    -> StoreResult<()>;
+    fn record_hydration_job_failure(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+        message: String,
+    ) -> StoreResult<()>;
 }
 
 pub trait ShadowRepository {

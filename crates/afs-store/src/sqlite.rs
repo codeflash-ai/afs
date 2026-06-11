@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use afs_core::AfsResult;
+use afs_core::hydration::HydrationReason;
 use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
@@ -19,15 +20,16 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    ConnectionId, ConnectionRecord, EntityRecord, MountConfig, ProjectionMode, ShadowBlockRecord,
-    ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, EntityRecord, HydrationJobRecord, MountConfig, ProjectionMode,
+    ShadowBlockRecord, ShadowSnapshotRecord,
 };
 use crate::repository::{
-    ConnectionRepository, EntityRepository, JournalRepository, MountRepository, ShadowRepository,
+    ConnectionRepository, EntityRepository, HydrationJobRepository, JournalRepository,
+    MountRepository, ShadowRepository,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -50,7 +52,7 @@ impl SqliteStateStore {
         connection.execute_batch(
             "
             PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
+            PRAGMA busy_timeout = 10000;
             PRAGMA synchronous = NORMAL;
             ",
         )?;
@@ -315,6 +317,80 @@ impl EntityRepository for SqliteStateStore {
     }
 }
 
+impl HydrationJobRepository for SqliteStateStore {
+    fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO hydration_jobs (
+                mount_id,
+                remote_id,
+                path,
+                target_state_json,
+                reason_json,
+                attempts,
+                last_error
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+                path = excluded.path,
+                target_state_json = excluded.target_state_json,
+                reason_json = excluded.reason_json",
+            params![
+                job.mount_id.0,
+                job.remote_id.0,
+                path_to_text(&job.path),
+                to_json(&job.target_state)?,
+                to_json(&job.reason)?,
+                i64::from(job.attempts),
+                job.last_error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_hydration_jobs(&self) -> StoreResult<Vec<HydrationJobRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT mount_id, remote_id, path, target_state_json, reason_json, attempts, last_error
+             FROM hydration_jobs
+             ORDER BY attempts, mount_id, remote_id",
+        )?;
+        let rows = statement.query_map([], hydration_job_row)?;
+
+        rows.map(|row| hydration_job_from_row(row?)).collect()
+    }
+
+    fn delete_hydration_job(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM hydration_jobs WHERE mount_id = ?1 AND remote_id = ?2",
+            params![mount_id.0, remote_id.0],
+        )?;
+        Ok(())
+    }
+
+    fn record_hydration_job_failure(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+        message: String,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE hydration_jobs
+             SET attempts = attempts + 1,
+                 last_error = ?3
+             WHERE mount_id = ?1 AND remote_id = ?2",
+            params![mount_id.0, remote_id.0, message],
+        )?;
+        Ok(())
+    }
+}
+
 impl ShadowRepository for SqliteStateStore {
     fn save_shadow(&mut self, mount_id: &MountId, shadow: ShadowDocument) -> StoreResult<()> {
         let connection = self.connection()?;
@@ -542,6 +618,7 @@ type EntityRow = (
     Option<String>,
     Option<String>,
 );
+type HydrationJobRow = (String, String, String, String, String, i64, Option<String>);
 type ShadowRow = (String, String, String, String, String, String);
 type JournalRow = (String, String, String, String, String, String, String);
 
@@ -612,6 +689,18 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             rendered_body TEXT NOT NULL,
             blocks_json TEXT NOT NULL,
             PRIMARY KEY (mount_id, entity_id),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS hydration_jobs (
+            mount_id TEXT NOT NULL,
+            remote_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            target_state_json TEXT NOT NULL,
+            reason_json TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            PRIMARY KEY (mount_id, remote_id),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
@@ -686,6 +775,22 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 expires_at TEXT
+            );",
+        )?;
+    }
+
+    if user_version < 8 {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hydration_jobs (
+                mount_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                target_state_json TEXT NOT NULL,
+                reason_json TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                PRIMARY KEY (mount_id, remote_id),
+                FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
             );",
         )?;
     }
@@ -770,6 +875,33 @@ fn entity_from_row(row: EntityRow) -> StoreResult<EntityRecord> {
         hydration: from_json::<HydrationState>(&row.5)?,
         content_hash: row.6,
         remote_edited_at: row.7,
+    })
+}
+
+fn hydration_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HydrationJobRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn hydration_job_from_row(row: HydrationJobRow) -> StoreResult<HydrationJobRecord> {
+    let attempts = u32::try_from(row.5)
+        .map_err(|_| StoreError::Database(format!("invalid hydration attempt count {}", row.5)))?;
+
+    Ok(HydrationJobRecord {
+        mount_id: MountId(row.0),
+        remote_id: RemoteId(row.1),
+        path: PathBuf::from(row.2),
+        target_state: from_json::<HydrationState>(&row.3)?,
+        reason: from_json::<HydrationReason>(&row.4)?,
+        attempts,
+        last_error: row.6,
     })
 }
 

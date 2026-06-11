@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, SourceSpan, TreeEntry};
 use afs_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,47 @@ impl From<EntityRecord> for TreeEntry {
             remote_edited_at: value.remote_edited_at,
             stub_frontmatter: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydrationJobRecord {
+    pub mount_id: MountId,
+    pub remote_id: RemoteId,
+    pub path: PathBuf,
+    pub target_state: HydrationState,
+    pub reason: HydrationReason,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+impl HydrationJobRecord {
+    pub fn new(request: HydrationRequest) -> Self {
+        Self {
+            mount_id: request.mount_id,
+            remote_id: request.remote_id,
+            path: request.path,
+            target_state: request.target_state,
+            reason: request.reason,
+            attempts: 0,
+            last_error: None,
+        }
+    }
+
+    pub fn into_request(self) -> HydrationRequest {
+        HydrationRequest {
+            mount_id: self.mount_id,
+            remote_id: self.remote_id,
+            path: self.path,
+            target_state: self.target_state,
+            reason: self.reason,
+        }
+    }
+}
+
+impl From<HydrationRequest> for HydrationJobRecord {
+    fn from(value: HydrationRequest) -> Self {
+        Self::new(value)
     }
 }
 

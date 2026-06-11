@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::{HydrationState, MountId, RemoteId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,7 +27,7 @@ impl Default for HydrationPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HydrationRequest {
     pub mount_id: MountId,
     pub remote_id: RemoteId,
@@ -52,7 +54,8 @@ impl HydrationRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HydrationReason {
     ExplicitPull,
     FileOpen,

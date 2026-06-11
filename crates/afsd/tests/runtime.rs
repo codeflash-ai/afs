@@ -11,8 +11,8 @@ use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, Re
 use afs_core::pull::PullMode;
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
-    SqliteStateStore,
+    EntityRecord, EntityRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
+    MountRepository, ShadowRepository, SqliteStateStore,
 };
 use afsd::DaemonConfig;
 use afsd::execution::{DaemonEventReport, PushJob};
@@ -333,6 +333,57 @@ fn runtime_drains_hydration_queued_by_read_event() {
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
     assert_eq!(request.reason, HydrationReason::StubRead);
     runtime.shutdown();
+}
+
+#[test]
+fn runtime_drains_persisted_hydration_on_startup() {
+    let config = relay_config("persisted-hydration");
+    let mount_root = temp_root("persisted-hydration-mount");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            mount_root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            mount_id: MountId::new("notion-main"),
+            remote_id: RemoteId::new("page-1"),
+            path: mount_root.join("Roadmap.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::Policy,
+            attempts: 0,
+            last_error: None,
+        })
+        .expect("save hydration job");
+    drop(store);
+
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config.clone(),
+        ReadHydrationRunner {
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    let request = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("persisted hydration drained");
+    assert_eq!(request.mount_id, MountId::new("notion-main"));
+    assert_eq!(request.remote_id, RemoteId::new("page-1"));
+    assert_eq!(request.reason, HydrationReason::Policy);
+    runtime.shutdown();
+
+    let store = SqliteStateStore::open(config.state_root).expect("reopen store");
+    assert!(
+        store
+            .list_hydration_jobs()
+            .expect("list hydration jobs")
+            .is_empty()
+    );
 }
 
 #[derive(Clone)]

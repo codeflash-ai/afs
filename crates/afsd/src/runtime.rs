@@ -18,8 +18,8 @@ use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId};
 use afs_core::pull::PullMode;
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
-    SqliteStateStore, open_credential_store,
+    EntityRecord, EntityRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
+    MountRepository, ShadowRepository, SqliteStateStore, open_credential_store,
 };
 use serde_json::json;
 
@@ -28,7 +28,7 @@ use crate::execution::{DaemonEventReport, PushJob};
 use crate::file_provider::{
     file_provider_children, file_provider_item, materialize_file_provider_item,
 };
-use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome};
+use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use crate::notion::{
     ResolvedNotionSource, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
@@ -105,6 +105,7 @@ impl DaemonRuntime {
         Runner: RuntimeJobRunner,
     {
         std::fs::create_dir_all(&config.state_root)?;
+        SqliteStateStore::open(config.state_root.clone()).map_err(AfsError::from)?;
         let (sender, receiver) = mpsc::channel();
         let handle = DaemonRuntimeHandle {
             sender: sender.clone(),
@@ -401,7 +402,7 @@ struct RuntimeState {
     runner: Arc<dyn RuntimeJobRunner>,
     sender: Sender<RuntimeMessage>,
     pending_requests: VecDeque<MutatingRequest>,
-    hydration: crate::hydration::HydrationQueue,
+    hydration: HydrationQueue,
     deferred_hydration: Vec<HydrationRequest>,
     next_hydration_retry: Option<Instant>,
     pending_scheduled_tick: Option<PullSchedulerTick>,
@@ -416,6 +417,8 @@ impl RuntimeState {
         runner: Arc<dyn RuntimeJobRunner>,
         sender: Sender<RuntimeMessage>,
     ) -> Self {
+        let hydration = load_persisted_hydrations(&config.state_root);
+
         Self {
             scheduler: PullScheduler::new(config.pull_scheduler.clone()),
             last_scheduler_advance: Instant::now(),
@@ -423,7 +426,7 @@ impl RuntimeState {
             runner,
             sender,
             pending_requests: VecDeque::new(),
-            hydration: crate::hydration::HydrationQueue::new(),
+            hydration,
             deferred_hydration: Vec::new(),
             next_hydration_retry: None,
             pending_scheduled_tick: None,
@@ -549,24 +552,26 @@ impl RuntimeState {
             JobCompletion::ScheduledPull(result) => match result {
                 Ok(result) => {
                     for request in result.queued_hydrations {
-                        self.hydration.queue_request(request);
+                        self.queue_hydration(request);
                     }
                 }
                 Err(error) => eprintln!("afsd scheduled pull failed: {error}"),
             },
-            JobCompletion::Hydration { request, result } => {
-                if let Err(error) = result {
+            JobCompletion::Hydration { request, result } => match result {
+                Ok(_) => self.delete_hydration_job(&request),
+                Err(error) => {
                     eprintln!(
                         "afsd hydration failed for `{}`: {error}",
                         request.path.display()
                     );
+                    self.record_hydration_failure(&request, error.to_string());
                     self.defer_hydration_retry(request);
                 }
-            }
+            },
             JobCompletion::FileEvent(result) => match result {
                 Ok(result) => {
                     for request in result.queued_hydrations {
-                        self.hydration.queue_request(request);
+                        self.queue_hydration(request);
                     }
                 }
                 Err(error) => eprintln!("afsd file event failed: {error}"),
@@ -585,8 +590,9 @@ impl RuntimeState {
             .next_hydration_retry
             .is_some_and(|retry_at| now >= retry_at)
         {
-            for request in self.deferred_hydration.drain(..) {
-                self.hydration.queue_request(request);
+            let retry_requests = std::mem::take(&mut self.deferred_hydration);
+            for request in retry_requests {
+                self.queue_hydration(request);
             }
             self.next_hydration_retry = None;
         }
@@ -650,6 +656,35 @@ impl RuntimeState {
         );
     }
 
+    fn queue_hydration(&mut self, request: HydrationRequest) {
+        self.hydration.queue_request(request.clone());
+
+        match SqliteStateStore::open(self.config.state_root.clone())
+            .and_then(|mut store| store.upsert_hydration_job(HydrationJobRecord::from(request)))
+        {
+            Ok(()) => {}
+            Err(error) => eprintln!("afsd failed to persist hydration request: {error}"),
+        }
+    }
+
+    fn delete_hydration_job(&self, request: &HydrationRequest) {
+        match SqliteStateStore::open(self.config.state_root.clone())
+            .and_then(|mut store| store.delete_hydration_job(&request.mount_id, &request.remote_id))
+        {
+            Ok(()) => {}
+            Err(error) => eprintln!("afsd failed to remove completed hydration request: {error}"),
+        }
+    }
+
+    fn record_hydration_failure(&self, request: &HydrationRequest, message: String) {
+        match SqliteStateStore::open(self.config.state_root.clone()).and_then(|mut store| {
+            store.record_hydration_job_failure(&request.mount_id, &request.remote_id, message)
+        }) {
+            Ok(()) => {}
+            Err(error) => eprintln!("afsd failed to record hydration failure: {error}"),
+        }
+    }
+
     fn status(&self) -> DaemonRuntimeStatus {
         DaemonRuntimeStatus {
             active_job: self.active_job,
@@ -678,6 +713,20 @@ impl RuntimeState {
                 .unwrap_or(u64::MAX),
         }
     }
+}
+
+fn load_persisted_hydrations(state_root: &PathBuf) -> HydrationQueue {
+    let mut queue = HydrationQueue::new();
+    match SqliteStateStore::open(state_root.clone()).and_then(|store| store.list_hydration_jobs()) {
+        Ok(jobs) => {
+            for job in jobs {
+                queue.queue_request(job.into_request());
+            }
+        }
+        Err(error) => eprintln!("afsd failed to load persisted hydration requests: {error}"),
+    }
+
+    queue
 }
 
 fn run_job(
