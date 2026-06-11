@@ -303,10 +303,14 @@ impl PushReconciler for NotionPushReconciler {
             let native = self.connector.fetch(FetchRequest {
                 remote_id: remote_id.clone(),
             })?;
-            let rendered = self.connector.render_native_entity(&native)?;
+            let rendered = self
+                .connector
+                .render_native_entity_for_path(&native, &entity.path)?;
             let bundle = serde_json::from_slice::<NotionPageBundle>(&native.raw)
                 .map_err(|error| AfsError::Io(format!("notion native decode failed: {error}")))?;
 
+            self.connector
+                .download_rendered_media(&rendered, &mount.root)?;
             write_atomic(
                 &mount.root.join(&entity.path),
                 render_canonical_markdown(&rendered.document),
@@ -353,12 +357,16 @@ impl NotionPushReconciler {
         let native = self.connector.fetch(FetchRequest {
             remote_id: entity_id.clone(),
         })?;
-        let rendered = self.connector.render_native_entity(&native)?;
         let bundle = serde_json::from_slice::<NotionPageBundle>(&native.raw)
             .map_err(|error| AfsError::Io(format!("notion native decode failed: {error}")))?;
         let target_path =
             self.created_entity_path(mount_id, &mount.root, &parent.path, title, entity_id)?;
+        let rendered = self
+            .connector
+            .render_native_entity_for_path(&native, &target_path)?;
         let target_abs = mount.root.join(&target_path);
+        self.connector
+            .download_rendered_media(&rendered, &mount.root)?;
         write_atomic(&target_abs, render_canonical_markdown(&rendered.document))?;
 
         let source_abs = mount.root.join(source_path);

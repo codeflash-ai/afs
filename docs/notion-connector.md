@@ -40,6 +40,17 @@ cargo test -p afs-notion live_fetch_and_render_page_from_environment -- --ignore
 
 The token must have access to the target page. Live tests are ignored by default; fixture-backed tests cover normal CI.
 
+The broader live integrity suite creates and archives scratch content under a writable parent page. `AFS_NOTION_LIVE_PARENT_PAGE` may be a page ID or a Notion page URL. `AFS_NOTION_LIVE_DIR` is optional and controls where local media artifacts are downloaded:
+
+```sh
+export NOTION_TOKEN='secret_...'
+export AFS_NOTION_LIVE_PARENT_PAGE='https://app.notion.com/...'
+export AFS_NOTION_LIVE_DIR=/tmp/afs-notion-live
+cargo test -p afs-notion --test live_integrity -- --ignored
+```
+
+Those tests cover rich block rendering, supported block edits/appends, image download, database row creation, supported property writes, and read-back verification against the live API. They require the integration to have insert, read, and update content capabilities for the parent page.
+
 ## Initial Block Rendering
 
 The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, and display equations as Markdown. It renders child pages/databases, toggles, media, embeds, bookmarks, synced blocks, column layouts, tabs, table of contents, breadcrumbs, link-to-page blocks, meeting notes, AI/custom blocks, and unknown future blocks as anchored directives.
@@ -69,6 +80,18 @@ The first Notion apply path is intentionally conservative:
 - after apply, the CLI reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
 
 This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is schema-backed property validation for edits and row creation before journal/apply, then widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
+
+## Local Media
+
+When a caller renders a Notion page for a known filesystem path, media blocks keep their remote `url` directive attribute and add a local `local` attribute. Image blocks are downloaded to a mount-level media tree:
+
+```text
+media/
+  roadmap ~aaaaaa/
+    image-0123456789ab.png
+```
+
+The media tree mirrors the Markdown page path without the `.md` extension. This keeps binary files out of content directories while giving agents a stable local file they can open. The first downloader fetches image blocks only; other file-like blocks still retain their remote URL in the directive until size and retention policy are designed.
 
 ## Path Projection
 

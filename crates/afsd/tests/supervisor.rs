@@ -198,6 +198,10 @@ impl HydrationSource for FakeHydrationSource {
         )
         .expect("shadow");
 
-        Ok(HydratedEntity { document, shadow })
+        Ok(HydratedEntity {
+            document,
+            shadow,
+            assets: Vec::new(),
+        })
     }
 }

@@ -9,9 +9,11 @@ pub mod database;
 pub mod dto;
 pub mod fetch;
 pub mod mapping;
+pub mod media;
 pub mod projection;
 pub mod render;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use afs_connector::{
@@ -25,8 +27,11 @@ use afs_core::{AfsError, AfsResult};
 use crate::apply::{apply_plan, apply_undo, check_concurrency};
 use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use crate::fetch::fetch_page_bundle;
+use crate::media::{MediaDownloadReport, download_media_assets};
 use crate::projection::{enumerate_root_page_tree, enumerate_shared_pages};
-use crate::render::{NotionRenderedEntity, render_native_entity};
+use crate::render::{
+    NotionRenderedEntity, RenderOptions, render_native_entity, render_native_entity_with_options,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionConfig {
@@ -91,6 +96,25 @@ impl NotionConnector {
 
     pub fn render_native_entity(&self, entity: &NativeEntity) -> AfsResult<NotionRenderedEntity> {
         render_native_entity(entity)
+    }
+
+    pub fn render_native_entity_for_path(
+        &self,
+        entity: &NativeEntity,
+        page_path: impl AsRef<Path>,
+    ) -> AfsResult<NotionRenderedEntity> {
+        render_native_entity_with_options(
+            entity,
+            &RenderOptions::with_page_path(page_path.as_ref()),
+        )
+    }
+
+    pub fn download_rendered_media(
+        &self,
+        rendered: &NotionRenderedEntity,
+        mount_root: impl AsRef<Path>,
+    ) -> AfsResult<MediaDownloadReport> {
+        download_media_assets(mount_root.as_ref(), &rendered.media_assets)
     }
 
     pub fn database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<String> {

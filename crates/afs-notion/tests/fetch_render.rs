@@ -335,6 +335,46 @@ fn render_malformed_table_as_directives() {
 }
 
 #[test]
+fn render_media_blocks_with_local_paths_when_page_path_is_available() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block: file_block(
+                "0123456789abcdef",
+                "image",
+                "https://example.com/image.PNG?download=1",
+                "Image caption",
+            ),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle_with_options(
+        &bundle,
+        &afs_notion::render::RenderOptions::with_page_path("Docs/Coverage ~page1.md"),
+    )
+    .expect("render");
+
+    assert_eq!(rendered.media_assets.len(), 1);
+    assert_eq!(
+        rendered.media_assets[0].local_path,
+        Path::new("media/Docs/Coverage ~page1/image-0123456789ab.png")
+    );
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("local=\"media/Docs/Coverage ~page1/image-0123456789ab.png\"")
+    );
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("url=\"https://example.com/image.PNG?download=1\"")
+    );
+}
+
+#[test]
 fn render_rich_text_annotations_links_mentions_and_equations() {
     let mut bold = rich_text("Bold");
     bold.annotations.bold = true;
