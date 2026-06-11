@@ -49,8 +49,26 @@ one mutating worker at a time, and the worker opens the durable store for that
 transaction, runs the connector call, and reports completion back to the runtime.
 That keeps the current SQLite-backed implementation simple while preserving the
 important invariant: daemon-managed mutations are serialized through one queue.
-The future per-mount scheduler and watcher integrations can use the same job
-types without creating new store mutation paths.
+Watcher events use the same queue, so local filesystem changes cannot race
+remote pull, hydration, or push reconciliation.
+
+## File Watching
+
+The foreground daemon starts a `notify` watcher for every mount loaded from the
+SQLite store at startup. Create and modify notifications are normalized to
+`Write` events, while remove and rename notifications are delivered but ignored
+until delete/rename planning is wired.
+
+Write events for hydrated pages are resolved back to stored entities inside the
+runtime. If the file body still matches the stored shadow, the event is treated
+as a daemon-authored projection write and ignored. If the body differs from the
+shadow, the entity transitions to `dirty`. This suppresses feedback from
+hydration, scheduled pull, and explicit pull without relying on fragile timing
+windows or global path ignore lists.
+
+Read/open notifications are intentionally not part of this portable watcher
+slice. Lazy read hydration should be implemented with OS-specific open/read
+signals next, then routed into the same runtime event path.
 
 ## Push Execution
 
@@ -153,7 +171,8 @@ stateful operations:
   strategy-selected hydration;
 - queued hydration can be drained through a source-specific executor;
 - push jobs can apply connector mutations, refresh shadows, and advance journals;
-- writing a `hydrated` entity marks it `dirty` in the store;
+- writing a `hydrated` entity marks it `dirty` when the file body differs from
+  the stored shadow;
 - remove and rename events are ignored until conflict/delete planning is wired.
 
 Conflict materialization remains a later daemon stage.

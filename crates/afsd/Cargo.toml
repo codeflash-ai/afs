@@ -19,5 +19,6 @@ afs-core.workspace = true
 afs-store.workspace = true
 afs-connector.workspace = true
 afs-notion.workspace = true
+notify = "8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

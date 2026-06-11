@@ -13,13 +13,18 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use afs_core::AfsError;
+use afs_core::canonical::parse_canonical_markdown;
 use afs_core::hydration::{HydrationPolicy, HydrationRequest};
+use afs_core::model::HydrationState;
 use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::{MountRepository, SqliteStateStore};
+use afs_store::{
+    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
+    SqliteStateStore,
+};
 use serde_json::json;
 
 use crate::DaemonConfig;
-use crate::execution::PushJob;
+use crate::execution::{DaemonEventReport, PushJob};
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome};
 use crate::ipc::{DaemonRequest, DaemonResponse};
 use crate::pull::run_pull;
@@ -28,6 +33,7 @@ use crate::reconcile::{
     DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull,
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
+use crate::watcher::{FileEvent, FileEventKind};
 
 #[derive(Clone)]
 pub struct DaemonRuntimeHandle {
@@ -55,7 +61,16 @@ impl DaemonRuntimeHandle {
             )
         })
     }
+
+    pub fn file_event(&self, event: FileEvent) -> Result<(), RuntimeSendError> {
+        self.sender
+            .send(RuntimeMessage::FileEvent(event))
+            .map_err(|_| RuntimeSendError)
+    }
 }
+
+#[derive(Debug)]
+pub struct RuntimeSendError;
 
 pub struct DaemonRuntime {
     handle: DaemonRuntimeHandle,
@@ -127,6 +142,16 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         state_root: PathBuf,
         request: HydrationRequest,
     ) -> afs_core::AfsResult<HydrationOutcome>;
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        _event: FileEvent,
+    ) -> afs_core::AfsResult<DaemonEventReport> {
+        Err(AfsError::Unsupported(
+            "runtime runner does not handle file events",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +230,15 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let mut executor = HydrationExecutor::new(&mut store, &connector);
         executor.hydrate_request(request)
     }
+
+    fn run_file_event(
+        &self,
+        state_root: PathBuf,
+        event: FileEvent,
+    ) -> afs_core::AfsResult<DaemonEventReport> {
+        let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
+        execute_file_event(&mut store, event)
+    }
 }
 
 #[derive(Default)]
@@ -273,6 +307,7 @@ impl RuntimeState {
                     request,
                     respond_to,
                 }) => self.handle_request(request, respond_to),
+                Ok(RuntimeMessage::FileEvent(event)) => self.handle_file_event(event),
                 Ok(RuntimeMessage::JobFinished(completion)) => self.handle_completion(completion),
                 Ok(RuntimeMessage::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => self.handle_timeout(),
@@ -308,6 +343,12 @@ impl RuntimeState {
         }
     }
 
+    fn handle_file_event(&mut self, event: FileEvent) {
+        self.pending_requests
+            .push_back(MutatingRequest::FileEvent { event });
+        self.maybe_start_next_job();
+    }
+
     fn handle_completion(&mut self, completion: JobCompletion) {
         self.active_job = false;
 
@@ -337,6 +378,11 @@ impl RuntimeState {
                         request.path.display()
                     );
                     self.defer_hydration_retry(request);
+                }
+            }
+            JobCompletion::FileEvent(result) => {
+                if let Err(error) = result {
+                    eprintln!("afsd file event failed: {error}");
                 }
             }
         }
@@ -434,6 +480,9 @@ fn run_job(
             response: runner.run_push(state_root, job),
             respond_to,
         },
+        MutatingJob::Request(MutatingRequest::FileEvent { event }) => {
+            JobCompletion::FileEvent(runner.run_file_event(state_root, event))
+        }
         MutatingJob::ScheduledPull { tick } => {
             JobCompletion::ScheduledPull(runner.run_scheduled_pull(state_root, tick, policy))
         }
@@ -449,6 +498,7 @@ enum RuntimeMessage {
         request: DaemonRequest,
         respond_to: Sender<DaemonResponse>,
     },
+    FileEvent(FileEvent),
     JobFinished(JobCompletion),
     Shutdown,
 }
@@ -461,6 +511,9 @@ enum MutatingRequest {
     Push {
         job: PushJob,
         respond_to: Sender<DaemonResponse>,
+    },
+    FileEvent {
+        event: FileEvent,
     },
 }
 
@@ -484,6 +537,129 @@ enum JobCompletion {
         request: HydrationRequest,
         result: afs_core::AfsResult<HydrationOutcome>,
     },
+    FileEvent(afs_core::AfsResult<DaemonEventReport>),
+}
+
+fn execute_file_event<S>(store: &mut S, event: FileEvent) -> afs_core::AfsResult<DaemonEventReport>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    let mut report = DaemonEventReport::default();
+    let Some((mount, entity)) = resolve_event_entity(store, &event.path)? else {
+        report.ignored_events = 1;
+        return Ok(report);
+    };
+
+    match event.kind {
+        FileEventKind::Write => handle_write_event(store, mount, entity, event.path, &mut report)?,
+        FileEventKind::Read | FileEventKind::Rename | FileEventKind::Remove => {
+            report.ignored_events = 1;
+        }
+    }
+
+    Ok(report)
+}
+
+fn handle_write_event<S>(
+    store: &mut S,
+    mount: MountConfig,
+    mut entity: EntityRecord,
+    event_path: PathBuf,
+    report: &mut DaemonEventReport,
+) -> afs_core::AfsResult<()>
+where
+    S: EntityRepository + ShadowRepository,
+{
+    if entity.hydration != HydrationState::Hydrated {
+        report.ignored_events = 1;
+        return Ok(());
+    }
+
+    if hydrated_file_matches_shadow(store, &mount, &entity, &event_path)? {
+        report.ignored_events = 1;
+        return Ok(());
+    }
+
+    entity.hydration = HydrationState::Dirty;
+    store.save_entity(entity).map_err(AfsError::from)?;
+    report.marked_dirty = 1;
+    Ok(())
+}
+
+fn hydrated_file_matches_shadow<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    event_path: &std::path::Path,
+) -> afs_core::AfsResult<bool>
+where
+    S: ShadowRepository,
+{
+    let contents = match std::fs::read_to_string(event_path) {
+        Ok(contents) => contents,
+        Err(_) => return Ok(false),
+    };
+    let parsed = match parse_canonical_markdown(&contents) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(false),
+    };
+    let shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+        Ok(shadow) => shadow,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(parsed.document.frontmatter == shadow.frontmatter
+        && parsed.document.body == shadow.rendered_body)
+}
+
+fn resolve_event_entity<S>(
+    store: &S,
+    event_path: &std::path::Path,
+) -> afs_core::AfsResult<Option<(MountConfig, EntityRecord)>>
+where
+    S: MountRepository + EntityRepository,
+{
+    let mounts = store.load_mounts().map_err(AfsError::from)?;
+    for mount in &mounts {
+        let Some(relative_path) = event_relative_path(&mount.root, event_path) else {
+            continue;
+        };
+        if relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        if let Some(entity) = store
+            .find_entity_by_path(&mount.mount_id, &relative_path)
+            .map_err(AfsError::from)?
+        {
+            return Ok(Some((mount.clone(), entity)));
+        }
+    }
+
+    if mounts.len() == 1
+        && event_path.is_relative()
+        && let Some(mount) = mounts.first()
+        && let Some(entity) = store
+            .find_entity_by_path(&mount.mount_id, event_path)
+            .map_err(AfsError::from)?
+    {
+        return Ok(Some((mount.clone(), entity)));
+    }
+
+    Ok(None)
+}
+
+fn event_relative_path(root: &std::path::Path, event_path: &std::path::Path) -> Option<PathBuf> {
+    if let Ok(relative) = event_path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let canonical_event_path = std::fs::canonicalize(event_path).ok()?;
+    canonical_event_path
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn default_notion_connector() -> NotionConnector {
