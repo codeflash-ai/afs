@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod daemon;
 pub mod diff;
 pub mod history;
 pub mod info;
