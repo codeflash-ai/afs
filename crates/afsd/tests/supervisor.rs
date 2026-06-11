@@ -198,6 +198,10 @@ impl HydrationSource for FakeHydrationSource {
         )
         .expect("shadow");
 
-        Ok(HydratedEntity { document, shadow })
+        Ok(HydratedEntity {
+            document,
+            shadow,
+            remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+        })
     }
 }

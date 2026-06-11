@@ -9,6 +9,9 @@ use afs_store::{EntityRecord, EntityRepository, MountConfig, MountRepository, Sh
 use crate::hydration::{
     HydrationDrainReport, HydrationEngine, HydrationExecutor, HydrationQueue, HydrationSource,
 };
+use crate::reconcile::{
+    FetchScheduleStrategy, ScheduledPullReport, ScheduledPullSource, reconcile_scheduled_pull,
+};
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 
@@ -92,6 +95,43 @@ where
 
     pub fn tick_scheduler(&mut self, elapsed: Duration) -> AfsResult<PullSchedulerTick> {
         self.scheduler.advance_by(elapsed)
+    }
+
+    pub fn run_scheduled_pull<Source, Strategy>(
+        &mut self,
+        tick: &PullSchedulerTick,
+        source: &Source,
+        strategy: &Strategy,
+    ) -> AfsResult<ScheduledPullReport>
+    where
+        Source: ScheduledPullSource + ?Sized,
+        Strategy: FetchScheduleStrategy + ?Sized,
+    {
+        let mounts = self.mounts.clone();
+        let policy = self.scheduler.config.hydration_policy.clone();
+        reconcile_scheduled_pull(
+            &mut self.store,
+            &mut self.hydration,
+            &mounts,
+            tick,
+            source,
+            strategy,
+            &policy,
+        )
+    }
+
+    pub fn advance_scheduled_pull<Source, Strategy>(
+        &mut self,
+        elapsed: Duration,
+        source: &Source,
+        strategy: &Strategy,
+    ) -> AfsResult<ScheduledPullReport>
+    where
+        Source: ScheduledPullSource + ?Sized,
+        Strategy: FetchScheduleStrategy + ?Sized,
+    {
+        let tick = self.tick_scheduler(elapsed)?;
+        self.run_scheduled_pull(&tick, source, strategy)
     }
 
     pub fn store(&self) -> &S {

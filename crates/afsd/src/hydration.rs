@@ -23,6 +23,7 @@ pub trait HydrationSource {
 pub struct HydratedEntity {
     pub document: CanonicalDocument,
     pub shadow: ShadowDocument,
+    pub remote_edited_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -80,7 +81,11 @@ where
             .save_shadow(&mount.mount_id, rendered.shadow.clone())
             .map_err(AfsError::from)?;
         self.store
-            .save_entity(hydrated_record(entity, &rendered.shadow))
+            .save_entity(hydrated_record(
+                entity,
+                &rendered.shadow,
+                rendered.remote_edited_at,
+            ))
             .map_err(AfsError::from)?;
 
         Ok(HydrationOutcome::Hydrated)
@@ -335,9 +340,16 @@ where
         })
 }
 
-fn hydrated_record(mut entity: EntityRecord, shadow: &ShadowDocument) -> EntityRecord {
+fn hydrated_record(
+    mut entity: EntityRecord,
+    shadow: &ShadowDocument,
+    remote_edited_at: Option<String>,
+) -> EntityRecord {
     entity.hydration = HydrationState::Hydrated;
     entity.content_hash = Some(shadow.body_hash.clone());
+    if remote_edited_at.is_some() {
+        entity.remote_edited_at = remote_edited_at;
+    }
     entity
 }
 

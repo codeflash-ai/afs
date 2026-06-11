@@ -47,6 +47,32 @@ the queue so a later daemon tick can retry.
 Notion connector's fetch path and `render_native_entity` method so daemon
 hydration persists the same shadow snapshot that CLI pull uses.
 
+## Scheduled Pull Reconciliation
+
+`reconcile_scheduled_pull` is the daemon-side counterpart to `afs pull` for
+background refresh. It executes a strategy decision rather than owning scheduling
+policy itself:
+
+- `ScheduledPullSource` enumerates a mount and supplies connector-specific
+  projection data such as database schemas;
+- `FetchScheduleStrategy` decides per mount whether a scheduler tick should
+  enumerate, and per entity whether the resulting projection should enqueue
+  hydration;
+- the reconciler upserts entity records, writes page stubs, refreshes database
+  schemas, and queues hydration requests, then returns a structured report.
+
+The default strategy is intentionally conservative: due scheduler ticks
+enumerate mounts, remote-root pages hydrate so the mounted entry point stays
+usable, small eager-sync workspaces can hydrate through `HydrationPolicy`, and
+already hydrated pages with changed remote timestamps are queued for refresh.
+Project- or mount-specific strategies can dispatch on `MountConfig` without
+changing the reconciliation mechanics.
+
+For hydrated, dirty, or conflicted entities, enumeration preserves the stored
+remote timestamp until hydration writes a new shadow. That timestamp is the push
+precondition for the current local file, so it must advance with the shadow, not
+with a metadata-only poll.
+
 ## Supervisor Events
 
 `DaemonSupervisor` currently handles the safe local state transitions that do not
@@ -54,8 +80,10 @@ need connector I/O:
 
 - startup loads mounts from the store and registers each root with the watcher;
 - reading a `virtual` or `stub` entity queues hydration to `hydrated`;
+- scheduled pull ticks can enumerate mounts, refresh projections, and queue
+  strategy-selected hydration;
 - queued hydration can be drained through a source-specific executor;
 - writing a `hydrated` entity marks it `dirty` in the store;
 - remove and rename events are ignored until conflict/delete planning is wired.
 
-Remote polling and conflict materialization remain later daemon stages.
+Conflict materialization remains a later daemon stage.

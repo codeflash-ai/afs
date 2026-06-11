@@ -44,7 +44,8 @@ fn executor_hydrates_stub_file_and_persists_shadow() {
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Hydrated);
-    assert_eq!(entity.content_hash, Some(rendered.shadow.body_hash));
+    assert_eq!(entity.content_hash, Some(rendered.shadow.body_hash.clone()));
+    assert_eq!(entity.remote_edited_at, rendered.remote_edited_at);
 }
 
 #[test]
@@ -327,5 +328,9 @@ fn rendered_entity_for(remote_id: &str, body: &str) -> HydratedEntity {
     )
     .expect("shadow");
 
-    HydratedEntity { document, shadow }
+    HydratedEntity {
+        document,
+        shadow,
+        remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+    }
 }

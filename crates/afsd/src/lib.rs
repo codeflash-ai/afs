@@ -1,5 +1,6 @@
 pub mod hydration;
 pub mod notion;
+pub mod reconcile;
 pub mod scheduler;
 pub mod supervisor;
 pub mod watcher;
