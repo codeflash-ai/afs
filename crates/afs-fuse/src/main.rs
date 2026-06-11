@@ -698,7 +698,7 @@ impl PathFilesystem for AgentFuse {
             .parent()
             .and_then(|path| self.resolve_path(path).ok())
             .map(|item| attr_for_item(&item))
-            .unwrap_or_else(|| parent_attr.clone());
+            .unwrap_or(parent_attr);
         let children = self.client.children(&item.identifier)?;
         let mut entries = Vec::new();
         entries.push(DirectoryEntryPlus {
@@ -808,6 +808,7 @@ fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
         atime: now,
         mtime: now,
         ctime: now,
+        crtime: now,
         kind: file_type(item),
         perm: if item.kind == VirtualFsItemKind::Folder {
             0o755
@@ -822,6 +823,7 @@ fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         rdev: 0,
+        flags: 0,
         blksize: 4096,
     }
 }

@@ -1,4 +1,3 @@
-use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -1795,6 +1794,7 @@ fn afs_fuse_helper_path() -> Option<PathBuf> {
     find_on_path("afs-fuse")
 }
 
+#[cfg(target_os = "linux")]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -2114,14 +2114,14 @@ fn run_local_oauth_authorization(
         println!("authorization URL: {authorize_url}");
     }
     if !no_browser
-        && let Err(error) = open_browser(&authorize_url)
+        && let Err(error) = open_browser(authorize_url)
         && !json
     {
         eprintln!("afs connect: failed to open browser: {error}");
         eprintln!("open the authorization URL manually");
     }
 
-    wait_for_oauth_callback(&listener, &redirect.callback_path, &state)
+    wait_for_oauth_callback(&listener, &redirect.callback_path, state)
 }
 
 fn wait_for_oauth_callback(

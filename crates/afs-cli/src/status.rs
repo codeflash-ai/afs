@@ -605,7 +605,7 @@ where
         };
     }
 
-    let parsed = match parse_canonical_markdown(&contents) {
+    let parsed = match parse_canonical_markdown(contents) {
         Ok(parsed) => parsed,
         Err(error) => {
             return (
