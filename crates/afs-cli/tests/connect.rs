@@ -72,7 +72,7 @@ fn connect_notion_oauth_stores_oauth_bundle_and_metadata() {
             client_id: "client-id".to_string(),
             client_secret: "client-secret".to_string(),
             code: "oauth-code".to_string(),
-            redirect_uri: "http://127.0.0.1:8757/oauth/notion/callback".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/notion/callback".to_string(),
         },
         &exchange,
     )

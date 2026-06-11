@@ -41,7 +41,7 @@ afs connect notion --name work
 ```
 
 The Notion public integration must register the callback URI, which defaults to
-`http://127.0.0.1:8757/oauth/notion/callback`. For development and CI, the
+`http://localhost:8757/oauth/notion/callback`. For development and CI, the
 explicit PAT fallback remains available:
 
 ```sh

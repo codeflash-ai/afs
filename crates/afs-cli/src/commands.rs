@@ -1593,7 +1593,7 @@ fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandE
     let redirect_uri = flag_value(args, "--redirect-uri")
         .map(str::to_string)
         .or_else(|| env_first(&["AFS_NOTION_OAUTH_REDIRECT_URI", "NOTION_OAUTH_REDIRECT_URI"]))
-        .unwrap_or_else(|| "http://127.0.0.1:8757/oauth/notion/callback".to_string());
+        .unwrap_or_else(|| "http://localhost:8757/oauth/notion/callback".to_string());
 
     local_redirect(&redirect_uri).map_err(|message| {
         CommandError::new("connect", "invalid_redirect_uri", message)
@@ -1806,7 +1806,7 @@ fn local_redirect(uri: &str) -> Result<LocalRedirect, String> {
         .parse::<u16>()
         .map_err(|_| "Notion OAuth redirect URI has an invalid port".to_string())?;
     Ok(LocalRedirect {
-        bind_addr: format!("127.0.0.1:{port}"),
+        bind_addr: format!("{host}:{port}"),
         callback_path,
     })
 }
@@ -2506,7 +2506,16 @@ mod tests {
     }
 
     #[test]
-    fn local_redirect_accepts_loopback_callback_uri() {
+    fn local_redirect_defaults_to_localhost_callback_uri() {
+        let redirect =
+            local_redirect("http://localhost:8757/oauth/notion/callback").expect("redirect");
+
+        assert_eq!(redirect.bind_addr, "localhost:8757");
+        assert_eq!(redirect.callback_path, "/oauth/notion/callback");
+    }
+
+    #[test]
+    fn local_redirect_accepts_explicit_loopback_ip_callback_uri() {
         let redirect =
             local_redirect("http://127.0.0.1:8757/oauth/notion/callback").expect("redirect");
 
@@ -2534,7 +2543,7 @@ mod tests {
     fn notion_authorize_url_encodes_redirect_and_state() {
         let url = notion_authorize_url(
             "client id",
-            "http://127.0.0.1:8757/oauth/notion/callback",
+            "http://localhost:8757/oauth/notion/callback",
             "state+value",
         );
 
@@ -2542,7 +2551,7 @@ mod tests {
         assert!(url.contains("response_type=code"));
         assert!(url.contains("owner=user"));
         assert!(
-            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8757%2Foauth%2Fnotion%2Fcallback")
+            url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8757%2Foauth%2Fnotion%2Fcallback")
         );
         assert!(url.contains("state=state%2Bvalue"));
     }

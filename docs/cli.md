@@ -42,7 +42,7 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 ## Provider Connections
 
-`afs connect notion [--name <id>]` creates a local provider connection. OAuth is preferred. The command reads `AFS_NOTION_OAUTH_CLIENT_ID` and `AFS_NOTION_OAUTH_CLIENT_SECRET` (or `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET`), opens a Notion authorization URL, listens for the localhost callback, exchanges the authorization code, stores the OAuth credential bundle in the credential store, and stores only metadata in SQLite. The default callback is `http://127.0.0.1:8757/oauth/notion/callback`; override it with `--redirect-uri <uri>` or `AFS_NOTION_OAUTH_REDIRECT_URI`. The redirect URI must be registered on the Notion public integration.
+`afs connect notion [--name <id>]` creates a local provider connection. OAuth is preferred. The command reads `AFS_NOTION_OAUTH_CLIENT_ID` and `AFS_NOTION_OAUTH_CLIENT_SECRET` (or `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET`), opens a Notion authorization URL, listens for the localhost callback, exchanges the authorization code, stores the OAuth credential bundle in the credential store, and stores only metadata in SQLite. The default callback is `http://localhost:8757/oauth/notion/callback`; override it with `--redirect-uri <uri>` or `AFS_NOTION_OAUTH_REDIRECT_URI`. The redirect URI must be registered on the Notion public integration.
 
 `--no-browser` prints the authorization URL but does not try to open it. `--token-stdin` is the explicit personal-access-token fallback for local development and CI:
 
