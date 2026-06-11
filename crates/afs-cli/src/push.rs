@@ -3,13 +3,15 @@
 //! This push surface runs validation, diff, plan, guardrail, and the journaled
 //! connector-apply spine.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{Connector, FetchRequest};
 use afs_core::canonical::render_canonical_markdown;
-use afs_core::journal::{JournalPreimage, JournalStatus, JournalStore, PushId};
-use afs_core::model::{HydrationState, RemoteId};
+use afs_core::journal::{JournalApplyEffect, JournalPreimage, JournalStatus, JournalStore, PushId};
+use afs_core::model::{EntityKind, HydrationState, RemoteId};
+use afs_core::planner::PushOperation;
 use afs_core::push::{
     PushApproval, PushExecutionAction, PushExecutionRequest, PushExecutionResult,
     PushReconcileRequest, PushReconcileResult, PushReconciler, RemotePrecondition,
@@ -18,8 +20,10 @@ use afs_core::push::{
 use afs_core::{AfsError, AfsResult};
 use afs_notion::NotionConnector;
 use afs_notion::dto::NotionPageBundle;
+use afs_notion::projection::allocate_page_path;
 use afs_store::{
-    EntityRepository, JournalRepository, MountRepository, ShadowRepository, SqliteStateStore,
+    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
+    ShadowRepository, SqliteStateStore,
 };
 use serde::Serialize;
 
@@ -76,21 +80,26 @@ where
         return Ok(report);
     }
 
-    let (Some(mount), Some(entity), Some(shadow), Some(pipeline)) = (
-        artifacts.mount,
-        artifacts.entity,
-        artifacts.shadow,
-        artifacts.pipeline,
-    ) else {
+    let (Some(mount), Some(pipeline)) = (artifacts.mount, artifacts.pipeline) else {
         return Ok(report);
     };
     let push_id = generate_push_id();
-    let execution_request = PushExecutionRequest::new(push_id.clone(), mount.mount_id, pipeline)
-        .with_preimages(vec![JournalPreimage::from_shadow(shadow)])
-        .with_remote_preconditions(vec![RemotePrecondition {
+    let preimages = artifacts
+        .shadow
+        .map(JournalPreimage::from_shadow)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let remote_preconditions = artifacts
+        .entity
+        .map(|entity| RemotePrecondition {
             remote_id: entity.remote_id,
             remote_edited_at: entity.remote_edited_at,
-        }]);
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let execution_request = PushExecutionRequest::new(push_id.clone(), mount.mount_id, pipeline)
+        .with_preimages(preimages)
+        .with_remote_preconditions(remote_preconditions);
 
     match execute_journaled_push(store, concurrency, applier, reconciler, execution_request) {
         Ok(result) => Ok(PushReport::from_execution(report, result)),
@@ -246,8 +255,42 @@ impl PushReconciler for NotionPushReconciler {
             AfsError::InvalidState(format!("missing mount {}", request.mount_id.0))
         })?;
         let mut reconciled_remote_ids = Vec::new();
+        let mut created_remote_ids = BTreeSet::new();
+
+        for effect in request.apply_effects {
+            let JournalApplyEffect::CreatedEntity {
+                operation_index,
+                parent_id,
+                entity_id,
+                ..
+            } = effect
+            else {
+                continue;
+            };
+            let Some(PushOperation::CreateEntity {
+                title, source_path, ..
+            }) = request.plan.operations.get(*operation_index)
+            else {
+                return Err(AfsError::InvalidState(format!(
+                    "created entity effect referenced non-create operation {operation_index}"
+                )));
+            };
+            self.reconcile_created_entity(
+                request.mount_id,
+                &mount,
+                parent_id,
+                entity_id,
+                title,
+                source_path,
+            )?;
+            created_remote_ids.insert(entity_id.clone());
+            reconciled_remote_ids.push(entity_id.clone());
+        }
 
         for remote_id in request.changed_remote_ids {
+            if created_remote_ids.contains(remote_id) {
+                continue;
+            }
             let mut entity = self
                 .store
                 .get_entity(request.mount_id, remote_id)?
@@ -281,6 +324,97 @@ impl PushReconciler for NotionPushReconciler {
         Ok(PushReconcileResult {
             reconciled_remote_ids,
         })
+    }
+}
+
+impl NotionPushReconciler {
+    fn reconcile_created_entity(
+        &mut self,
+        mount_id: &afs_core::model::MountId,
+        mount: &MountConfig,
+        parent_id: &RemoteId,
+        entity_id: &RemoteId,
+        title: &str,
+        source_path: &Path,
+    ) -> AfsResult<()> {
+        let parent = self.store.get_entity(mount_id, parent_id)?.ok_or_else(|| {
+            AfsError::InvalidState(format!(
+                "missing parent entity `{}` in mount `{}`",
+                parent_id.0, mount_id.0
+            ))
+        })?;
+        if parent.kind != EntityKind::Database {
+            return Err(AfsError::InvalidState(format!(
+                "created entity parent `{}` is not a database",
+                parent_id.0
+            )));
+        }
+
+        let native = self.connector.fetch(FetchRequest {
+            remote_id: entity_id.clone(),
+        })?;
+        let rendered = self.connector.render_native_entity(&native)?;
+        let bundle = serde_json::from_slice::<NotionPageBundle>(&native.raw)
+            .map_err(|error| AfsError::Io(format!("notion native decode failed: {error}")))?;
+        let target_path =
+            self.created_entity_path(mount_id, &mount.root, &parent.path, title, entity_id)?;
+        let target_abs = mount.root.join(&target_path);
+        write_atomic(&target_abs, render_canonical_markdown(&rendered.document))?;
+
+        let source_abs = mount.root.join(source_path);
+        if source_path != target_path && source_abs.exists() {
+            std::fs::remove_file(&source_abs)?;
+        }
+
+        self.store.save_shadow(mount_id, rendered.shadow.clone())?;
+        let mut entity = EntityRecord::new(
+            mount_id.clone(),
+            entity_id.clone(),
+            EntityKind::Page,
+            title,
+            target_path,
+        )
+        .with_hydration(HydrationState::Hydrated)
+        .with_content_hash(rendered.shadow.body_hash);
+        entity.remote_edited_at = bundle.page.last_edited_time;
+        self.store.save_entity(entity)?;
+
+        Ok(())
+    }
+
+    fn created_entity_path(
+        &self,
+        mount_id: &afs_core::model::MountId,
+        mount_root: &Path,
+        parent_path: &Path,
+        title: &str,
+        entity_id: &RemoteId,
+    ) -> AfsResult<PathBuf> {
+        let mut used_paths = BTreeSet::new();
+        for entity in self.store.list_entities(mount_id)? {
+            used_paths.insert(entity.path.clone());
+            if entity.kind == EntityKind::Page {
+                used_paths.insert(entity.path.with_extension(""));
+            }
+        }
+        let parent_abs = mount_root.join(parent_path);
+        match std::fs::read_dir(&parent_abs) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    used_paths.insert(parent_path.join(entry.file_name()));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        Ok(allocate_page_path(
+            parent_path,
+            title,
+            entity_id.as_str(),
+            &mut used_paths,
+        ))
     }
 }
 

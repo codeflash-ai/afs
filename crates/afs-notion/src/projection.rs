@@ -233,7 +233,7 @@ fn database_title(database: &DatabaseDto) -> Option<String> {
     }
 }
 
-fn allocate_page_path(
+pub fn allocate_page_path(
     parent_dir: &Path,
     title: &str,
     remote_id: &str,

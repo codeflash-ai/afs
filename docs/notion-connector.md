@@ -23,7 +23,8 @@ The current implementation is a live-capable read, pull, and narrow write projec
   retain remote identity and useful metadata such as title, URL, source block ID, or target page ID
   when the API exposes it.
 - `afs push -y` can update, append, and archive simple Notion blocks, update supported page
-  properties, and reconcile by reading the changed page back into the local shadow.
+  properties, create new rows in single-data-source databases, and reconcile by reading the changed
+  or created page back into the local shadow.
 
 The generic connector `render` method still returns only `CanonicalDocument`. The Notion connector exposes `render_native_entity` for callers that need the shadow in the same pass. A future connector SDK revision can lift that richer return type into the generic trait once another connector validates the shape.
 
@@ -57,16 +58,17 @@ Nested children are fetched recursively and rendered after their parent, except 
 
 The first Notion apply path is intentionally conservative:
 
-- supported operations: block update, block append, and block archive;
+- supported operations: block update, block append, block archive, supported page property update, and database row creation;
 - supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, code fences, dividers, and display equations;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, `afs://` page links, and unchanged preimage mentions such as dates;
 - supported page property writes: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone;
-- unsupported write forms fail before API mutation, including tables, page/database creation, database row creation, block moves, computed/read-only properties, and rich inline shapes that cannot be represented by the current Markdown parser;
+- new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;
+- unsupported write forms fail before API mutation, including tables, page/database creation outside database-row files, block moves, computed/read-only properties, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
-- after apply, the CLI reconciler fetches the changed page, rewrites the local file atomically, saves the refreshed shadow, and updates the entity's `remote_edited_at`.
+- after apply, the CLI reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
 
-This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover additional mention types, nested annotation/link combinations, relative-file link resolution, and schema-backed property validation.
+This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is schema-backed property validation for edits and row creation before journal/apply, then widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
 
 ## Path Projection
 
@@ -92,4 +94,4 @@ roadmap ~aaaaaa/
     fix-login-bug ~eeeeee.md
 ```
 
-Row files are normal page files. Their stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. `_view.csv` and row creation remain future work; property writes now flow through the row file frontmatter for the supported writable property classes.
+Row files are normal page files. Their stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. Creating a row is creating a new `.md` file in the database directory with YAML frontmatter and no `afs.id`; `afs push -y` creates the Notion page, reads it back, saves the durable entity/shadow rows, and replaces the temporary filename with the canonical projected filename. `_view.csv` remains future work.

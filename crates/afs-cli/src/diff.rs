@@ -4,20 +4,24 @@
 //! `afs-store`, reads the canonical file from disk, and delegates validation,
 //! diffing, and guardrail evaluation to `afs-core`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use afs_core::canonical::{CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown};
-use afs_core::model::RemoteId;
+use afs_core::canonical::{
+    CanonicalParseError, CanonicalParseErrorKind, ParsedCanonicalDocument, parse_canonical_markdown,
+};
+use afs_core::diff::property_value_from_frontmatter;
+use afs_core::model::{EntityKind, RemoteId};
 use afs_core::planner::{
-    GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary, PropertyValue,
-    PushOperation, PushPlan,
+    GuardrailDecision, GuardrailPolicy, PlanDegradation, PlanDegradationKind, PlanSummary,
+    PropertyValue, PushOperation, PushPlan,
 };
 use afs_core::push::{
     PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult, PushStage,
-    plan_push_pipeline,
+    evaluate_guardrails, plan_push_pipeline,
 };
 use afs_core::shadow::ShadowDocument;
-use afs_core::validation::ValidationIssue;
+use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
@@ -57,17 +61,15 @@ where
     let relative_path = relative_entity_path(mount, &absolute_path)?;
     let entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
-        .map_err(DiffError::Store)?
-        .ok_or_else(|| {
-            DiffError::Store(StoreError::EntityPathMissing {
-                mount_id: mount.mount_id.clone(),
-                path: relative_path.clone(),
-            })
-        })?;
+        .map_err(DiffError::Store)?;
     let file = std::fs::read_to_string(&absolute_path).map_err(|error| DiffError::ReadFile {
         path: absolute_path.clone(),
         message: error.to_string(),
     })?;
+
+    let Some(entity) = entity else {
+        return create_entity_preview(store, absolute_path, mount, relative_path, file, options);
+    };
 
     let parsed = match parse_canonical_markdown(&file) {
         Ok(parsed) => parsed,
@@ -128,6 +130,232 @@ where
         shadow: Some(shadow),
         pipeline: Some(output),
     })
+}
+
+fn create_entity_preview<S>(
+    store: &S,
+    absolute_path: PathBuf,
+    mount: &MountConfig,
+    relative_path: PathBuf,
+    file: String,
+    options: PreviewOptions,
+) -> Result<PreviewArtifacts, DiffError>
+where
+    S: EntityRepository,
+{
+    let parent = create_parent_entity(store, mount, &relative_path)?;
+    if parent.kind != EntityKind::Database {
+        let report = DiffReport::validation_failure(
+            options.command,
+            absolute_path,
+            mount,
+            parent.remote_id.clone(),
+            vec![ValidationIssue::new(
+                "create_entity_parent_not_database",
+                relative_path,
+                None,
+                "new files can currently be pushed only as rows inside a projected database directory",
+                Some(
+                    "move the file into a database directory or pull the target page first"
+                        .to_string(),
+                ),
+            )],
+        );
+        return Ok(PreviewArtifacts::report_only(report));
+    }
+
+    let parsed = match parse_canonical_markdown(&file) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let report = DiffReport::validation_failure(
+                options.command,
+                absolute_path,
+                mount,
+                parent.remote_id.clone(),
+                vec![parse_error_issue(&relative_path, error)],
+            );
+            return Ok(PreviewArtifacts::report_only(report));
+        }
+    };
+
+    let pipeline =
+        create_entity_pipeline(&relative_path, &parsed, &parent, mount, options.approval);
+    let report = DiffReport::from_pipeline(
+        options.command,
+        absolute_path,
+        mount,
+        parent.remote_id.clone(),
+        pipeline.clone(),
+    );
+
+    Ok(PreviewArtifacts {
+        report,
+        mount: Some(mount.clone()),
+        entity_id: Some(parent.remote_id.clone()),
+        entity: None,
+        shadow: None,
+        pipeline: Some(pipeline),
+    })
+}
+
+fn create_parent_entity<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<EntityRecord, DiffError>
+where
+    S: EntityRepository,
+{
+    let Some(parent_path) = relative_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Err(DiffError::Store(StoreError::EntityPathMissing {
+            mount_id: mount.mount_id.clone(),
+            path: relative_path.to_path_buf(),
+        }));
+    };
+
+    store
+        .find_entity_by_path(&mount.mount_id, parent_path)
+        .map_err(DiffError::Store)?
+        .ok_or_else(|| {
+            DiffError::Store(StoreError::EntityPathMissing {
+                mount_id: mount.mount_id.clone(),
+                path: relative_path.to_path_buf(),
+            })
+        })
+}
+
+fn create_entity_pipeline(
+    relative_path: &Path,
+    parsed: &ParsedCanonicalDocument,
+    parent: &EntityRecord,
+    mount: &MountConfig,
+    approval: PushApproval,
+) -> PushPipelineResult {
+    if mount.read_only {
+        return PushPipelineResult {
+            validation: ValidationReport::clean(),
+            plan: None,
+            guardrail: GuardrailDecision::Proceed,
+            action: PushPipelineAction::ReadOnlyBlocked,
+            completed_stages: Vec::new(),
+        };
+    }
+
+    let mut validation = ValidationReport::clean();
+    if parsed.remote_id().is_some() {
+        validation.push(ValidationIssue::new(
+            "create_entity_has_remote_id",
+            relative_path,
+            Some(1),
+            "new row files must not carry an existing `afs.id`",
+            Some(
+                "remove the generated `afs.id`, or pull the existing row before editing"
+                    .to_string(),
+            ),
+        ));
+    }
+    if parsed
+        .frontmatter
+        .afs
+        .as_ref()
+        .and_then(|afs| afs.entity_type.as_ref())
+        .is_some_and(|kind| kind != &EntityKind::Page)
+    {
+        validation.push(ValidationIssue::new(
+            "create_entity_type_not_page",
+            relative_path,
+            Some(1),
+            "database row creation requires `afs.type: page` when an `afs` block is present",
+            Some("remove the `afs` block or set `afs.type` to `page`".to_string()),
+        ));
+    }
+    if parsed
+        .frontmatter
+        .title
+        .as_ref()
+        .is_none_or(|title| title.trim().is_empty())
+    {
+        validation.push(ValidationIssue::new(
+            "create_entity_missing_title",
+            relative_path,
+            Some(1),
+            "new row files require a non-empty `title` frontmatter value",
+            Some("add `title: \"...\"` to the YAML frontmatter".to_string()),
+        ));
+    }
+    if parsed.is_stub() {
+        validation.push(ValidationIssue::new(
+            "create_entity_stub_body",
+            relative_path,
+            None,
+            "new row files cannot use the generated AFS stub marker as their body",
+            Some("replace the stub marker with the row body, or leave the body empty".to_string()),
+        ));
+    }
+    for directive in &parsed.directives {
+        validation.push(ValidationIssue::new(
+            "create_entity_directive_unsupported",
+            relative_path,
+            Some(directive.line),
+            "new row creation does not support pre-seeded AFS directive blocks",
+            Some(
+                "remove the directive and create only directly supported Markdown blocks"
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let mut completed_stages = vec![PushStage::ParseAndValidate];
+    if !validation.is_clean() {
+        return PushPipelineResult {
+            validation,
+            plan: None,
+            guardrail: GuardrailDecision::Proceed,
+            action: PushPipelineAction::FixValidation,
+            completed_stages,
+        };
+    }
+
+    let properties = parsed
+        .frontmatter
+        .properties
+        .iter()
+        .map(|(key, value)| (key.clone(), property_value_from_frontmatter(value)))
+        .collect::<BTreeMap<_, _>>();
+    let plan = PushPlan::new(
+        vec![parent.remote_id.clone()],
+        vec![PushOperation::CreateEntity {
+            parent_id: parent.remote_id.clone(),
+            title: parsed.frontmatter.title.clone().unwrap_or_default(),
+            properties,
+            body: parsed.document.body.clone(),
+            source_path: relative_path.to_path_buf(),
+        }],
+    );
+    completed_stages.push(PushStage::Diff);
+
+    let guardrail = evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
+    completed_stages.push(PushStage::PlanAndConfirm);
+
+    let action = match &guardrail {
+        GuardrailDecision::Proceed if approval.assume_yes => PushPipelineAction::ProceedToApply,
+        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
+        GuardrailDecision::ConfirmRequired { .. } if approval.confirm_dangerous => {
+            PushPipelineAction::ProceedToApply
+        }
+        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
+    };
+
+    PushPipelineResult {
+        validation,
+        plan: Some(plan),
+        guardrail,
+        action,
+        completed_stages,
+    }
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, DiffError> {
@@ -427,6 +655,10 @@ pub enum PushOperationOutput {
     CreateEntity {
         parent_id: String,
         title: String,
+        keys: Vec<String>,
+        properties: Vec<PropertyUpdateOutput>,
+        body: String,
+        source_path: String,
     },
 }
 
@@ -470,9 +702,25 @@ impl From<PushOperation> for PushOperationOutput {
                     })
                     .collect(),
             },
-            PushOperation::CreateEntity { parent_id, title } => Self::CreateEntity {
+            PushOperation::CreateEntity {
+                parent_id,
+                title,
+                properties,
+                body,
+                source_path,
+            } => Self::CreateEntity {
                 parent_id: parent_id.0,
                 title,
+                keys: properties.keys().cloned().collect(),
+                properties: properties
+                    .into_iter()
+                    .map(|(key, value)| PropertyUpdateOutput {
+                        key,
+                        value: PropertyValueOutput::from(value),
+                    })
+                    .collect(),
+                body,
+                source_path: source_path.display().to_string(),
             },
         }
     }

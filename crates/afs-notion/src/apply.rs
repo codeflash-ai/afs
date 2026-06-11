@@ -6,20 +6,21 @@
 //! lossy request.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult};
 use afs_core::journal::JournalApplyEffect;
 use afs_core::model::RemoteId;
 use afs_core::planner::{PropertyValue, PushOperation};
+use afs_core::shadow::segment_markdown_body;
 use afs_core::undo::{UndoOperation, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
 use serde_json::{Map, Value, json};
 
 use crate::client::NotionApi;
 use crate::dto::{
-    BlockDto, BlockTreeDto, NotionPageBundle, PageDto, PagePropertyDto, RichTextAnnotationsDto,
-    RichTextDto,
+    BlockDto, BlockTreeDto, DataSourceDto, NotionPageBundle, PageDto, PagePropertyDto,
+    RichTextAnnotationsDto, RichTextDto,
 };
 use crate::fetch::fetch_page_bundle;
 
@@ -51,7 +52,8 @@ pub fn apply_plan(
     request: ApplyPlanRequest<'_>,
 ) -> AfsResult<ApplyPlanResult> {
     validate_operation_ids(&request)?;
-    let bundles = fetch_affected_bundles(api, &request.plan.affected_entities)?;
+    let create_parent_ids = create_parent_ids(&request.plan.operations);
+    let bundles = fetch_affected_bundles(api, &request.plan.affected_entities, &create_parent_ids)?;
     let current_blocks = block_map(&bundles);
     let mut changed_remote_ids = Vec::new();
     let mut effects = Vec::new();
@@ -119,6 +121,26 @@ pub fn apply_plan(
                     keys: properties.keys().cloned().collect(),
                 });
             }
+            PushOperation::CreateEntity {
+                parent_id,
+                title,
+                properties,
+                body,
+                ..
+            } => {
+                let request_body = create_page_body(api, parent_id, title, properties, body)?;
+                let created = api.create_page(request_body)?;
+                let created_id = RemoteId::new(created.id);
+                if !changed_remote_ids.contains(&created_id) {
+                    changed_remote_ids.push(created_id.clone());
+                }
+                effects.push(JournalApplyEffect::CreatedEntity {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    parent_id: parent_id.clone(),
+                    entity_id: created_id,
+                });
+            }
             unsupported => {
                 return Err(AfsError::Unsupported(unsupported_operation_name(
                     unsupported,
@@ -128,7 +150,7 @@ pub fn apply_plan(
     }
 
     for remote_id in &request.plan.affected_entities {
-        if !changed_remote_ids.contains(remote_id) {
+        if !create_parent_ids.contains(remote_id) && !changed_remote_ids.contains(remote_id) {
             changed_remote_ids.push(remote_id.clone());
         }
     }
@@ -182,12 +204,24 @@ fn validate_operation_ids(request: &ApplyPlanRequest<'_>) -> AfsResult<()> {
     Ok(())
 }
 
+fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::CreateEntity { parent_id, .. } => Some(parent_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn fetch_affected_bundles(
     api: &dyn NotionApi,
     affected_entities: &[RemoteId],
+    create_parent_ids: &BTreeSet<RemoteId>,
 ) -> AfsResult<Vec<NotionPageBundle>> {
     affected_entities
         .iter()
+        .filter(|remote_id| !create_parent_ids.contains(*remote_id))
         .map(|remote_id| fetch_page_bundle(api, remote_id.as_str()))
         .collect()
 }
@@ -266,6 +300,107 @@ fn update_properties_body(
     Ok(json!({ "properties": Value::Object(payload) }))
 }
 
+fn create_page_body(
+    api: &dyn NotionApi,
+    parent_id: &RemoteId,
+    title: &str,
+    properties: &BTreeMap<String, PropertyValue>,
+    body: &str,
+) -> AfsResult<Value> {
+    let database = api.retrieve_database(parent_id.as_str())?;
+    let [data_source] = database.data_sources.as_slice() else {
+        return Err(AfsError::Unsupported(
+            "creating Notion rows requires a database with exactly one data source",
+        ));
+    };
+    let data_source = api.retrieve_data_source(&data_source.id)?;
+    let mut request = json!({
+        "parent": {
+            "type": "data_source_id",
+            "data_source_id": data_source.id,
+        },
+        "properties": create_properties_body(&data_source, title, properties)?,
+    });
+    let children = create_page_children(body)?;
+    if !children.is_empty() {
+        request["children"] = Value::Array(children);
+    }
+
+    Ok(request)
+}
+
+fn create_properties_body(
+    data_source: &DataSourceDto,
+    title: &str,
+    properties: &BTreeMap<String, PropertyValue>,
+) -> AfsResult<Value> {
+    let (title_key, title_property) = data_source
+        .properties
+        .iter()
+        .find(|(_, property)| property.kind == "title")
+        .ok_or(AfsError::Unsupported(
+            "creating Notion rows requires a title property",
+        ))?;
+    let mut payload = Map::new();
+    payload.insert(
+        title_key.clone(),
+        property_value_for_kind(
+            &title_property.kind,
+            &PropertyValue::String(title.to_string()),
+            "title",
+        )?,
+    );
+
+    for (key, value) in properties {
+        let (notion_key, property) = if key == "title" {
+            (title_key, title_property)
+        } else {
+            let property = data_source.properties.get(key).ok_or_else(|| {
+                AfsError::Validation(vec![property_issue(
+                    key,
+                    "notion_property_unknown",
+                    format!("Notion property `{key}` does not exist on the data source"),
+                )])
+            })?;
+            (key, property)
+        };
+        if notion_key == title_key {
+            continue;
+        }
+        payload.insert(
+            notion_key.clone(),
+            property_value_for_kind(&property.kind, value, key)?,
+        );
+    }
+
+    Ok(Value::Object(payload))
+}
+
+fn create_page_children(body: &str) -> AfsResult<Vec<Value>> {
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let blocks = segment_markdown_body(body, 1);
+    if blocks.len() > 100 {
+        return Err(AfsError::Unsupported(
+            "creating Notion pages with more than 100 initial child blocks",
+        ));
+    }
+
+    blocks
+        .iter()
+        .map(|block| {
+            if block.is_directive() {
+                return Err(AfsError::Unsupported(
+                    "creating Notion pages with AFS directive blocks",
+                ));
+            }
+            parse_supported_block(&block.text, None).map(|patch| patch.append_child())
+        })
+        .collect()
+}
+
 fn title_property(page: &PageDto) -> AfsResult<(&str, &PagePropertyDto)> {
     page.properties
         .iter()
@@ -281,7 +416,11 @@ fn property_update_value(
     value: &PropertyValue,
     key: &str,
 ) -> AfsResult<Value> {
-    match property.kind.as_str() {
+    property_value_for_kind(&property.kind, value, key)
+}
+
+fn property_value_for_kind(kind: &str, value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    match kind {
         "title" => Ok(json!({ "title": rich_text(&required_string(value, key)?) })),
         "rich_text" => Ok(json!({ "rich_text": rich_text(&required_string(value, key)?) })),
         "number" => number_property(value, key),
@@ -290,7 +429,7 @@ fn property_update_value(
         "multi_select" => multi_select_property(value, key),
         "checkbox" => bool_property(value, key),
         "date" => date_property(value, key),
-        "url" | "email" | "phone_number" => nullable_string_property(&property.kind, value, key),
+        "url" | "email" | "phone_number" => nullable_string_property(kind, value, key),
         _ => Err(AfsError::Unsupported("updating this Notion property type")),
     }
 }

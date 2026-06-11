@@ -41,7 +41,7 @@ The JSON report includes `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty
 
 ## Initial `afs diff --json` Shape
 
-The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. The JSON report includes:
+The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. The JSON report includes:
 
 - `validation`: machine-readable issues with file, line, message, and suggested fix;
 - `plan.summary`: block/entity/property counts;
@@ -67,7 +67,7 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_not_implemented`;
 - `apply_failed`.
 
-Reports also include `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset through the live API; unsupported connector boundaries still return `apply_not_implemented` or `apply_failed` after the journal is marked failed.
+Reports also include `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset plus new database-row creation through the live API; unsupported connector boundaries still return `apply_not_implemented` or `apply_failed` after the journal is marked failed.
 
 ## Initial `afs log --json` Shape
 

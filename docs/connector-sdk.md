@@ -14,7 +14,7 @@ First-party connectors compile in as Rust crates. A future third-party connector
 
 Apply requests include the core `push_id`, mount ID, approved push plan, and deterministic operation IDs aligned with `plan.operations`. Connectors should use those operation IDs as source-side idempotency keys for block-level API calls when the source supports idempotent writes.
 
-Apply results include changed remote IDs plus operation-level journal effects. Created-block and created-entity effects must include the remote IDs assigned by the source, because undo uses those IDs to reverse appends and creates safely.
+Apply results include changed remote IDs plus operation-level journal effects. Created-block and created-entity effects must include the remote IDs assigned by the source, because reconcile and undo use those IDs to read back, materialize, and reverse appends and creates safely.
 
 Undo requests include the target push ID, mount ID, and a connector-neutral complete undo plan. Connectors should fail the request rather than partially applying a plan they cannot support.
 
@@ -22,4 +22,4 @@ Undo requests include the target push ID, mount ID, and a connector-neutral comp
 
 `afs-notion` is the first connector. It owns Notion-specific block mapping, database schema translation, OAuth/API behavior, and conversion between Notion payloads and the canonical AgentFS document model.
 
-The current Notion slice is live-capable for reads and narrow block writes: it retrieves page metadata, recursively fetches paginated block children, enumerates root-page descendants and database rows into stable projected paths, stores native JSON bundles, renders canonical Markdown plus shadow snapshots, writes `_schema.yaml` for databases, and applies simple block update/append/archive plans. Reverse apply is available for the supported block effects recorded in the journal.
+The current Notion slice is live-capable for reads and narrow writes: it retrieves page metadata, recursively fetches paginated block children, enumerates root-page descendants and database rows into stable projected paths, stores native JSON bundles, renders canonical Markdown plus shadow snapshots, writes `_schema.yaml` for databases, applies simple block update/append/archive plans, updates supported page properties, and creates new database rows from new Markdown files. Reverse apply is available for the supported block/entity effects recorded in the journal.

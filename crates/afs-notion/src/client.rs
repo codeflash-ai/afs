@@ -38,6 +38,10 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         let _ = (page_id, body);
         Err(AfsError::NotImplemented("update Notion page"))
     }
+    fn create_page(&self, body: serde_json::Value) -> AfsResult<PageDto> {
+        let _ = body;
+        Err(AfsError::NotImplemented("create Notion page"))
+    }
     fn retrieve_block_children(
         &self,
         block_id: &str,
@@ -242,6 +246,10 @@ impl NotionApi for HttpNotionApi {
 
     fn update_page(&self, page_id: &str, body: serde_json::Value) -> AfsResult<PageDto> {
         self.patch_json(&format!("/v1/pages/{page_id}"), body)
+    }
+
+    fn create_page(&self, body: serde_json::Value) -> AfsResult<PageDto> {
+        self.post_json("/v1/pages", body)
     }
 
     fn update_block(&self, block_id: &str, body: serde_json::Value) -> AfsResult<BlockDto> {
