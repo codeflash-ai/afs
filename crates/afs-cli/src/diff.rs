@@ -11,7 +11,7 @@ use afs_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, ParsedCanonicalDocument, parse_canonical_markdown,
 };
 use afs_core::diff::property_value_from_frontmatter;
-use afs_core::model::{EntityKind, RemoteId};
+use afs_core::model::{EntityKind, HydrationState, RemoteId};
 use afs_core::planner::{
     GuardrailDecision, GuardrailPolicy, PlanDegradation, PlanDegradationKind, PlanSummary,
     PropertyValue, PushOperation, PushPlan,
@@ -70,6 +70,23 @@ where
     let Some(entity) = entity else {
         return create_entity_preview(store, absolute_path, mount, relative_path, file, options);
     };
+
+    if options.command == "push" && entity.hydration == HydrationState::Conflicted {
+        let report = DiffReport::validation_failure(
+            options.command,
+            absolute_path,
+            mount,
+            entity.remote_id.clone(),
+            vec![ValidationIssue::new(
+                "entity_conflicted_requires_resolve",
+                relative_path,
+                None,
+                "entity is conflicted; resolve it before pushing",
+                Some("run `afs resolve --ours|--theirs|--edited <path>` first".to_string()),
+            )],
+        );
+        return Ok(PreviewArtifacts::report_only(report));
+    }
 
     let parsed = match parse_canonical_markdown(&file) {
         Ok(parsed) => parsed,

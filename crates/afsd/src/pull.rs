@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 
 use afs_connector::{Connector, EnumerateRequest, FetchRequest};
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use afs_core::conflict::remote_variant_path;
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
 use afs_core::shadow::ShadowDocument;
 use afs_notion::NotionConnector;
+use afs_notion::render::NotionRenderedEntity;
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
     StoreError,
@@ -172,6 +174,9 @@ fn merged_entity_record(entry: &TreeEntry, existing: Option<&EntityRecord>) -> E
     if let Some(existing) = existing {
         record.hydration = existing.hydration.clone();
         record.content_hash = existing.content_hash.clone();
+        if remote_precondition_belongs_to_shadow(existing) {
+            record.remote_edited_at = existing.remote_edited_at.clone();
+        }
     }
 
     record
@@ -270,10 +275,7 @@ where
     S: EntityRepository + ShadowRepository,
 {
     let path = mount.root.join(&entity.path);
-    if !can_replace_file(store, mount, &entity, &path)? {
-        return Ok(HydrationOutcome::SkippedDirty);
-    }
-
+    let can_replace = can_replace_file(store, mount, &entity, &path)?;
     let native = connector
         .fetch(FetchRequest {
             remote_id: entity.remote_id.clone(),
@@ -285,23 +287,148 @@ where
     connector
         .download_rendered_media(&rendered, &mount.root)
         .map_err(PullError::Connector)?;
-    let markdown = render_canonical_markdown(&rendered.document);
 
-    write_atomic(&path, markdown)?;
+    if can_replace {
+        accept_remote_projection(store, mount, entity, &path, rendered)?;
+        return Ok(HydrationOutcome::Hydrated);
+    }
+
+    if should_recreate_conflict_sidecar(&entity, &path)
+        || !remote_matches_shadow(store, mount, &entity, &rendered.shadow)?
+    {
+        materialize_conflict(store, mount, entity, &path, rendered)?;
+    } else {
+        store
+            .save_entity(mark_dirty_if_allowed(entity))
+            .map_err(PullError::Store)?;
+    }
+
+    Ok(HydrationOutcome::SkippedDirty)
+}
+
+fn accept_remote_projection<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    entity: EntityRecord,
+    path: &Path,
+    rendered: NotionRenderedEntity,
+) -> Result<(), PullError>
+where
+    S: EntityRepository + ShadowRepository,
+{
+    let markdown = render_canonical_markdown(&rendered.document);
+    write_atomic(path, markdown)?;
+    remove_conflict_sidecar_if_present(path)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(PullError::Store)?;
     store
-        .save_entity(hydrated_record(entity, rendered.shadow))
+        .save_entity(hydrated_record(
+            entity,
+            rendered.shadow,
+            rendered.remote_edited_at,
+        ))
         .map_err(PullError::Store)?;
 
-    Ok(HydrationOutcome::Hydrated)
+    Ok(())
 }
 
-fn hydrated_record(mut entity: EntityRecord, shadow: ShadowDocument) -> EntityRecord {
+fn materialize_conflict<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    entity: EntityRecord,
+    path: &Path,
+    rendered: NotionRenderedEntity,
+) -> Result<(), PullError>
+where
+    S: EntityRepository + ShadowRepository,
+{
+    let remote_path = remote_variant_path(path);
+    write_atomic(&remote_path, render_canonical_markdown(&rendered.document))?;
+    store
+        .save_shadow(&mount.mount_id, rendered.shadow.clone())
+        .map_err(PullError::Store)?;
+    store
+        .save_entity(conflicted_record(
+            entity,
+            &rendered.shadow,
+            rendered.remote_edited_at,
+        ))
+        .map_err(PullError::Store)?;
+
+    Ok(())
+}
+
+fn hydrated_record(
+    mut entity: EntityRecord,
+    shadow: ShadowDocument,
+    remote_edited_at: Option<String>,
+) -> EntityRecord {
     entity.hydration = HydrationState::Hydrated;
     entity.content_hash = Some(shadow.body_hash);
+    if remote_edited_at.is_some() {
+        entity.remote_edited_at = remote_edited_at;
+    }
     entity
+}
+
+fn conflicted_record(
+    mut entity: EntityRecord,
+    shadow: &ShadowDocument,
+    remote_edited_at: Option<String>,
+) -> EntityRecord {
+    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+        entity.hydration = HydrationState::Dirty;
+    }
+    if entity.hydration.can_transition_to(&HydrationState::Conflicted) {
+        entity.hydration = HydrationState::Conflicted;
+    }
+    entity.content_hash = Some(shadow.body_hash.clone());
+    if remote_edited_at.is_some() {
+        entity.remote_edited_at = remote_edited_at;
+    }
+    entity
+}
+
+fn mark_dirty_if_allowed(mut entity: EntityRecord) -> EntityRecord {
+    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+        entity.hydration = HydrationState::Dirty;
+    }
+    entity
+}
+
+fn remote_matches_shadow<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    rendered: &ShadowDocument,
+) -> Result<bool, PullError>
+where
+    S: ShadowRepository,
+{
+    let shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+        Ok(shadow) => shadow,
+        Err(StoreError::ShadowMissing { .. }) => return Ok(false),
+        Err(error) => return Err(PullError::Store(error)),
+    };
+
+    Ok(shadow.frontmatter == rendered.frontmatter && shadow.rendered_body == rendered.rendered_body)
+}
+
+fn remove_conflict_sidecar_if_present(path: &Path) -> Result<(), PullError> {
+    let remote_path = remote_variant_path(path);
+    if !remote_path.exists() {
+        return Ok(());
+    }
+
+    std::fs::remove_file(&remote_path).map_err(|error| PullError::WriteFile {
+        path: remote_path,
+        message: error.to_string(),
+    })
+}
+
+fn should_recreate_conflict_sidecar(entity: &EntityRecord, path: &Path) -> bool {
+    entity.hydration == HydrationState::Conflicted && !remote_variant_path(path).exists()
 }
 
 fn can_replace_file<S>(
@@ -459,6 +586,13 @@ fn relative_target_path(mount: &MountConfig, absolute_path: &Path) -> Result<Pat
 
 fn yaml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn remote_precondition_belongs_to_shadow(existing: &EntityRecord) -> bool {
+    matches!(
+        existing.hydration,
+        HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

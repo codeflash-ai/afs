@@ -161,6 +161,23 @@ where
             path: relative_path.clone(),
         })
         .map_err(AfsError::from)?;
+
+    if entity.hydration == HydrationState::Conflicted {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity,
+            shadow: None,
+            pipeline: validation_pipeline(ValidationIssue::new(
+                "entity_conflicted_requires_resolve",
+                relative_path,
+                None,
+                "entity is conflicted; resolve it before pushing",
+                Some("run `afs resolve --ours|--theirs|--edited <path>` first".to_string()),
+            )),
+        });
+    }
+
     let contents = read_to_string(&absolute_path)?;
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,

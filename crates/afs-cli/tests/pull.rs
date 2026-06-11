@@ -116,6 +116,134 @@ fn pull_mount_root_renames_existing_projection_when_remote_title_changes() {
     assert_eq!(root_entity.path, PathBuf::from("strategy ~aaaaaa.md"));
 }
 
+#[test]
+fn pull_mount_root_preserves_shadow_remote_timestamp_for_non_rehydrated_pages() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    run_pull(&mut store, &fixture.connector("Roadmap"), fixture.child_file("roadmap"))
+        .expect("hydrate child");
+
+    let child_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+        .expect("get child entity")
+        .expect("child entity");
+    assert_eq!(
+        child_entity.remote_edited_at.as_deref(),
+        Some("2026-06-10T00:00:00.000Z")
+    );
+
+    run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Root body.", "2026-06-11T00:00:00.000Z"),
+        &fixture.root,
+    )
+    .expect("refresh root");
+
+    let child_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+        .expect("get child entity")
+        .expect("child entity");
+    assert_eq!(
+        child_entity.remote_edited_at.as_deref(),
+        Some("2026-06-10T00:00:00.000Z")
+    );
+}
+
+#[test]
+fn pull_file_materializes_remote_sidecar_and_marks_conflicted_when_remote_changed() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    fs::write(
+        fixture.root_file("roadmap"),
+        "---\nafs:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n",
+    )
+    .expect("dirty write");
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z"),
+        fixture.root_file("roadmap"),
+    )
+    .expect("pull conflicted file");
+
+    assert!(!report.ok);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.skipped_dirty, 1);
+    assert!(
+        fs::read_to_string(fixture.root_file("roadmap"))
+            .expect("local file")
+            .contains("Local edit.")
+    );
+    assert!(
+        fs::read_to_string(fixture.root_remote_file("roadmap"))
+            .expect("remote sidecar")
+            .contains("Remote body.")
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
+    assert_eq!(
+        entity.remote_edited_at.as_deref(),
+        Some("2026-06-11T00:00:00.000Z")
+    );
+    let shadow = store
+        .load_shadow(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("load shadow");
+    assert!(shadow.rendered_body.contains("Remote body."));
+}
+
+#[test]
+fn pull_file_recreates_missing_remote_sidecar_for_unresolved_conflict() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    fs::write(
+        fixture.root_file("roadmap"),
+        "---\nafs:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n",
+    )
+    .expect("dirty write");
+
+    let conflicted_connector =
+        fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z");
+    run_pull(
+        &mut store,
+        &conflicted_connector,
+        fixture.root_file("roadmap"),
+    )
+    .expect("pull conflicted file");
+    fs::remove_file(fixture.root_remote_file("roadmap")).expect("remove remote sidecar");
+    assert!(!fixture.root_remote_file("roadmap").exists());
+
+    let report = run_pull(
+        &mut store,
+        &conflicted_connector,
+        fixture.root_file("roadmap"),
+    )
+    .expect("pull unresolved conflict");
+
+    assert!(!report.ok);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.skipped_dirty, 1);
+    assert!(
+        fs::read_to_string(fixture.root_remote_file("roadmap"))
+            .expect("recreated remote sidecar")
+            .contains("Remote body.")
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
+}
+
 struct PullFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -162,12 +290,18 @@ impl PullFixture {
     }
 
     fn connector(&self, root_title: &str) -> NotionConnector {
+        self.connector_with(root_title, "Root body.", "2026-06-10T00:00:00.000Z")
+    }
+
+    fn connector_with(&self, root_title: &str, root_body: &str, last_edited_time: &str) -> NotionConnector {
         NotionConnector::with_api(
             NotionConfig::default(),
             Arc::new(FixtureNotionApi::new(
                 self.root_page_id.as_str(),
                 self.canonical_root_page_id.as_str(),
                 root_title,
+                root_body,
+                last_edited_time,
             )),
         )
     }
@@ -180,6 +314,10 @@ impl PullFixture {
         self.root
             .join(format!("{root_slug} ~aaaaaa"))
             .join("design-notes ~bbbbbb.md")
+    }
+
+    fn root_remote_file(&self, slug: &str) -> PathBuf {
+        self.root.join(format!("{slug} ~aaaaaa.remote.md"))
     }
 
     fn database_schema_file(&self) -> PathBuf {
@@ -213,7 +351,13 @@ struct FixtureNotionApi {
 }
 
 impl FixtureNotionApi {
-    fn new(requested_root_page_id: &str, returned_root_page_id: &str, root_title: &str) -> Self {
+    fn new(
+        requested_root_page_id: &str,
+        returned_root_page_id: &str,
+        root_title: &str,
+        root_body: &str,
+        last_edited_time: &str,
+    ) -> Self {
         let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let database_id = "cccccccccccccccccccccccccccccccc";
         let data_source_id = "dddddddddddddddddddddddddddddddd";
@@ -221,19 +365,19 @@ impl FixtureNotionApi {
         let pages = BTreeMap::from([
             (
                 requested_root_page_id.to_string(),
-                page(returned_root_page_id, root_title),
+                page(returned_root_page_id, root_title, last_edited_time),
             ),
             (
                 returned_root_page_id.to_string(),
-                page(returned_root_page_id, root_title),
+                page(returned_root_page_id, root_title, last_edited_time),
             ),
             (
                 child_page_id.to_string(),
-                page(child_page_id, "Design Notes"),
+                page(child_page_id, "Design Notes", last_edited_time),
             ),
             (
                 row_page_id.to_string(),
-                database_row_page(row_page_id, "Fix login bug"),
+                database_row_page(row_page_id, "Fix login bug", last_edited_time),
             ),
         ]);
         let children = BTreeMap::from([
@@ -241,7 +385,7 @@ impl FixtureNotionApi {
                 (returned_root_page_id.to_string(), None),
                 PaginatedListDto {
                     results: vec![
-                        paragraph_block("paragraph-1", "Root body."),
+                        paragraph_block("paragraph-1", root_body),
                         child_page_block(child_page_id, "Design Notes"),
                         child_database_block(database_id, "Tasks"),
                     ],
@@ -268,7 +412,7 @@ impl FixtureNotionApi {
                     id: data_source_id.to_string(),
                     name: Some("Tasks".to_string()),
                 }],
-                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                last_edited_time: Some(last_edited_time.to_string()),
                 ..Default::default()
             },
         )]);
@@ -298,7 +442,11 @@ impl FixtureNotionApi {
         let data_source_pages = BTreeMap::from([(
             (data_source_id.to_string(), None),
             PaginatedListDto {
-                results: vec![database_row_page(row_page_id, "Fix login bug")],
+                results: vec![database_row_page(
+                    row_page_id,
+                    "Fix login bug",
+                    last_edited_time,
+                )],
                 next_cursor: None,
                 has_more: false,
             },
@@ -392,11 +540,11 @@ impl NotionApi for FixtureNotionApi {
     }
 }
 
-fn page(id: &str, title: &str) -> PageDto {
+fn page(id: &str, title: &str, last_edited_time: &str) -> PageDto {
     PageDto {
         id: id.to_string(),
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
-        last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+        last_edited_time: Some(last_edited_time.to_string()),
         archived: false,
         in_trash: false,
         properties: BTreeMap::from([(
@@ -411,8 +559,8 @@ fn page(id: &str, title: &str) -> PageDto {
     }
 }
 
-fn database_row_page(id: &str, title: &str) -> PageDto {
-    let mut page = page(id, title);
+fn database_row_page(id: &str, title: &str, last_edited_time: &str) -> PageDto {
+    let mut page = page(id, title, last_edited_time);
     page.properties.insert(
         "Status".to_string(),
         PagePropertyDto {

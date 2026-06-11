@@ -20,6 +20,7 @@ use crate::media::{MediaAsset, media_local_path};
 pub struct NotionRenderedEntity {
     pub document: CanonicalDocument,
     pub shadow: ShadowDocument,
+    pub remote_edited_at: Option<String>,
     pub media_assets: Vec<MediaAsset>,
 }
 
@@ -90,6 +91,7 @@ pub fn render_page_bundle_with_options(
     Ok(NotionRenderedEntity {
         document: CanonicalDocument::new(frontmatter, body),
         shadow,
+        remote_edited_at: bundle.page.last_edited_time.clone(),
         media_assets: rendered_blocks
             .into_iter()
             .filter_map(|block| block.media_asset)

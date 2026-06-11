@@ -150,15 +150,15 @@ fn executor_rejects_hydrated_assets_outside_mount_root() {
 }
 
 #[test]
-fn executor_skips_dirty_file_and_marks_entity_dirty() {
+fn executor_skips_dirty_file_and_marks_entity_dirty_when_remote_matches_shadow() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Hydrated);
     let old = rendered_entity("Old body.");
     store
-        .save_shadow(&fixture.mount_id, old.shadow)
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
         .expect("save old shadow");
     fixture.write_raw("---\nafs:\n  id: page-1\n  type: page\ntitle: Roadmap\n---\nLocal edit.\n");
-    let source = FakeHydrationSource::failing("source should not be called");
+    let source = FakeHydrationSource::with_entity("page-1", old);
 
     let mut executor = HydrationExecutor::new(&mut store, &source);
     let outcome = executor
@@ -173,6 +173,83 @@ fn executor_skips_dirty_file_and_marks_entity_dirty() {
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Dirty);
+    assert!(!fixture.remote_page_path().exists());
+}
+
+#[test]
+fn executor_materializes_remote_sidecar_and_marks_entity_conflicted() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let old = rendered_entity("Old body.");
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    fixture.write_raw("---\nafs:\n  id: page-1\n  type: page\ntitle: Roadmap\n---\nLocal edit.\n");
+    let new = rendered_entity("Remote body.");
+    let source = FakeHydrationSource::with_entity("page-1", new.clone());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("materialize conflict");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    assert!(
+        fs::read_to_string(fixture.page_path())
+            .expect("local file")
+            .contains("Local edit.")
+    );
+    assert!(
+        fs::read_to_string(fixture.remote_page_path())
+            .expect("remote sidecar")
+            .contains("Remote body.")
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
+    assert_eq!(entity.remote_edited_at, new.remote_edited_at);
+    let shadow = store
+        .load_shadow(&fixture.mount_id, &fixture.remote_id)
+        .expect("load shadow");
+    assert_eq!(shadow.body_hash, new.shadow.body_hash);
+}
+
+#[test]
+fn executor_recreates_missing_remote_sidecar_for_unresolved_conflict() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let old = rendered_entity("Old body.");
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    fixture.write_raw("---\nafs:\n  id: page-1\n  type: page\ntitle: Roadmap\n---\nLocal edit.\n");
+    let new = rendered_entity("Remote body.");
+    let source = FakeHydrationSource::with_entity("page-1", new.clone());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    executor
+        .hydrate_request(fixture.request())
+        .expect("materialize conflict");
+    fs::remove_file(fixture.remote_page_path()).expect("remove remote sidecar");
+    assert!(!fixture.remote_page_path().exists());
+
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("recreate missing remote sidecar");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    assert!(
+        fs::read_to_string(fixture.remote_page_path())
+            .expect("recreated remote sidecar")
+            .contains("Remote body.")
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
 }
 
 #[test]
@@ -181,13 +258,13 @@ fn executor_skips_frontmatter_only_edit_even_when_body_matches_shadow() {
     let mut store = fixture.store(HydrationState::Hydrated);
     let old = rendered_entity("Old body.");
     store
-        .save_shadow(&fixture.mount_id, old.shadow)
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
         .expect("save old shadow");
     fixture.write_markdown(&CanonicalDocument::new(
         "afs:\n  id: page-1\n  type: page\ntitle: Updated Roadmap\n",
         old.document.body.clone(),
     ));
-    let source = FakeHydrationSource::failing("source should not be called");
+    let source = FakeHydrationSource::with_entity("page-1", old);
 
     let mut executor = HydrationExecutor::new(&mut store, &source);
     let outcome = executor
@@ -332,6 +409,10 @@ impl HydrationFixture {
 
     fn page_path(&self) -> PathBuf {
         self.root.join("Roadmap.md")
+    }
+
+    fn remote_page_path(&self) -> PathBuf {
+        self.root.join("Roadmap.remote.md")
     }
 
     fn write_stub(&self) {

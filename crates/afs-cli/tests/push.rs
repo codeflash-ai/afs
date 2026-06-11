@@ -81,6 +81,37 @@ fn push_read_only_mount_blocks_write() {
 }
 
 #[test]
+fn push_conflicted_entity_requires_resolution_first() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nRemote paragraph."))
+        .expect("save shadow");
+    let conflicted = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("get entity")
+        .expect("entity")
+        .with_hydration(HydrationState::Conflicted);
+    store.save_entity(conflicted).expect("save conflicted entity");
+
+    let report = run_push(
+        &store,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "fix_validation");
+    assert_eq!(report.validation[0].code, "entity_conflicted_requires_resolve");
+    assert_eq!(push_report_exit_code(&report), 3);
+}
+
+#[test]
 fn push_safe_plan_with_yes_stops_at_apply_boundary() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();

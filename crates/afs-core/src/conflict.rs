@@ -5,7 +5,7 @@
 //! decision is deterministic and lives here.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::model::RemoteId;
 
@@ -29,6 +29,15 @@ pub enum ConflictResolution {
     Ours,
     Theirs,
     Edited(PathBuf),
+}
+
+pub fn remote_variant_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("md") => path.with_extension("remote.md"),
+        Some(extension) => path.with_extension(format!("remote.{extension}")),
+        None => path.with_extension("remote"),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
