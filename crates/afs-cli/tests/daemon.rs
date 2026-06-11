@@ -23,6 +23,22 @@ fn daemon_status_reports_stopped_when_socket_is_absent() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn daemon_reload_requires_running_daemon() {
+    let root = temp_root("afs-cli-daemon-reload");
+
+    let args = vec![
+        "reload".to_string(),
+        "--state-dir".to_string(),
+        root.display().to_string(),
+    ];
+    let error = run_daemon_control(&args).expect_err("reload should fail");
+
+    assert_eq!(error.code(), "daemon_not_running");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn temp_root(prefix: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = SystemTime::now()

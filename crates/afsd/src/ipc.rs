@@ -14,6 +14,8 @@ pub const DEFAULT_TCP_ADDR: &str = "127.0.0.1:38567";
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Ping,
+    Status,
+    ReloadMounts,
     Pull {
         path: PathBuf,
     },
@@ -34,6 +36,39 @@ pub enum DaemonRequest {
         mount_id: String,
         identifier: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatusReport {
+    pub status: String,
+    pub runtime: DaemonRuntimeStatus,
+    pub watches: DaemonWatchStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonRuntimeStatus {
+    pub active_job: bool,
+    pub pending_requests: usize,
+    pub pending_hydrations: usize,
+    pub deferred_hydrations: usize,
+    pub pending_scheduled_pull: bool,
+    pub scheduler_mode: String,
+    pub active_interval_ms: u64,
+    pub cold_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonWatchStatus {
+    pub watched_mounts: usize,
+    pub watched_roots: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonReloadReport {
+    pub added: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+    pub watches: DaemonWatchStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

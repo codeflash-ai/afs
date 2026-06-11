@@ -35,7 +35,10 @@ management lives in `afs daemon ...`:
   development credentials and temporary test state, but it does not survive
   logout.
 - `afs daemon status` pings the daemon socket and reports the state root, socket,
-  manager, and log path.
+  manager, log path, runtime queue counts, scheduler mode, and watched mount
+  roots.
+- `afs daemon reload` asks the running daemon to reconcile file watches with the
+  current SQLite mount table.
 - `afs daemon stop` unloads the LaunchAgent or kills the session pid file when
   the CLI owns the daemon. A manually started foreground `afsd` still needs to be
   stopped directly.
@@ -144,10 +147,13 @@ state and queues policy hydration. Plain-file mounts still use the fallback
 watcher path below.
 
 The foreground daemon starts a `notify` watcher for every mount loaded from the
-SQLite store at startup. Create and modify notifications are normalized to
-`Write` events, native access/open notifications are normalized to `Read`
-events when the platform reports them, and remove/rename notifications are
-delivered but ignored until delete/rename planning is wired.
+SQLite store at startup, and `reload_mounts` reconciles those watches with the
+current mount table without restarting the process. `afs mount` calls this IPC
+after saving a mount, so persistent daemons begin watching newly mounted
+directories immediately. Create and modify notifications are normalized to
+`Write` events, native access/open notifications are normalized to `Read` events
+when the platform reports them, and remove/rename notifications are delivered
+but ignored until delete/rename planning is wired.
 
 Write events for hydrated pages are resolved back to stored entities inside the
 runtime. If the file body still matches the stored shadow, the event is treated

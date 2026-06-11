@@ -14,7 +14,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs status [path] [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
-- `afs daemon start|stop|status|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
+- `afs daemon start|stop|status|reload|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
 - `afs diff [path] [--json]`
 - `afs restore <path> [--force] [--json]`
 - `afs undo [push-id] [--json]`
@@ -92,6 +92,7 @@ Useful forms:
 afs daemon start
 afs daemon start --session
 afs daemon status
+afs daemon reload
 afs daemon stop
 afs daemon restart
 ```
@@ -201,19 +202,27 @@ afs status ~/afs/notion
 
 ## `afs daemon status`
 
-`afs daemon status [--json]` checks the configured Unix socket and sends `DaemonRequest::Ping` when a socket is present.
+`afs daemon status [--json]` checks the configured Unix socket and, when the daemon is running, requests a daemon status snapshot. JSON output includes process-manager state, runtime queue counts, scheduler mode, watched mount count, and watched roots.
+
+`afs daemon reload [--json]` tells a running daemon to reconcile its watched mount roots with the current SQLite mount table. `afs mount` sends the same IPC request after saving a new mount, so a persistent daemon starts watching newly mounted directories without a restart.
 
 Human output:
 
 ```text
-daemon running  socket=/Users/alice/.afs/afsd.sock  ping=ok
+daemon running
+  state: running
+  manager: launchd
+  watched mounts: 2
+  jobs: active=false, pending=0, hydration=0
+  scheduler: polling
 ```
 
 or:
 
 ```text
-daemon stopped  socket=/Users/alice/.afs/afsd.sock
-  hint: run `afsd` in another terminal
+daemon stopped
+  state: stopped
+  socket: /Users/alice/.afs/afsd.sock
 ```
 
 ## Initial `afs log --json` Shape

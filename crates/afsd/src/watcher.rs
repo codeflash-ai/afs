@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
@@ -28,10 +28,17 @@ pub enum FileEventKind {
 
 pub trait FileWatcher {
     fn watch_mount(&mut self, root: PathBuf) -> AfsResult<()>;
+    fn unwatch_mount(&mut self, _root: &Path) -> AfsResult<()> {
+        Ok(())
+    }
+    fn watched_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 pub struct NotifyFileWatcher {
     watcher: RecommendedWatcher,
+    watched_roots: BTreeSet<PathBuf>,
 }
 
 impl NotifyFileWatcher {
@@ -46,15 +53,34 @@ impl NotifyFileWatcher {
         })
         .map_err(watcher_error)?;
 
-        Ok(Self { watcher })
+        Ok(Self {
+            watcher,
+            watched_roots: BTreeSet::new(),
+        })
     }
 }
 
 impl FileWatcher for NotifyFileWatcher {
     fn watch_mount(&mut self, root: PathBuf) -> AfsResult<()> {
+        if self.watched_roots.contains(&root) {
+            return Ok(());
+        }
         self.watcher
             .watch(&root, RecursiveMode::Recursive)
-            .map_err(watcher_error)
+            .map_err(watcher_error)?;
+        self.watched_roots.insert(root);
+        Ok(())
+    }
+
+    fn unwatch_mount(&mut self, root: &Path) -> AfsResult<()> {
+        if !self.watched_roots.remove(root) {
+            return Ok(());
+        }
+        self.watcher.unwatch(root).map_err(watcher_error)
+    }
+
+    fn watched_roots(&self) -> Vec<PathBuf> {
+        self.watched_roots.iter().cloned().collect()
     }
 }
 
@@ -100,6 +126,21 @@ impl FileWatcher for PollingStubReadWatcher {
         let mut roots = self.watched_roots.lock().expect("stub read watcher roots");
         roots.insert(root);
         Ok(())
+    }
+
+    fn unwatch_mount(&mut self, root: &Path) -> AfsResult<()> {
+        let mut roots = self.watched_roots.lock().expect("stub read watcher roots");
+        roots.remove(root);
+        Ok(())
+    }
+
+    fn watched_roots(&self) -> Vec<PathBuf> {
+        self.watched_roots
+            .lock()
+            .expect("stub read watcher roots")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 

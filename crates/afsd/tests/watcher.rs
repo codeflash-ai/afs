@@ -49,6 +49,21 @@ fn notify_watcher_reports_file_writes_under_mount_root() {
     );
 }
 
+#[test]
+fn notify_watcher_tracks_and_unwatches_roots() {
+    let root = temp_root("notify-unwatch");
+    let mut watcher = NotifyFileWatcher::new(move |_| {}).expect("create watcher");
+
+    watcher.watch_mount(root.clone()).expect("watch mount");
+    watcher
+        .watch_mount(root.clone())
+        .expect("watch mount again");
+    assert_eq!(watcher.watched_roots(), vec![root.clone()]);
+
+    watcher.unwatch_mount(&root).expect("unwatch mount");
+    assert!(watcher.watched_roots().is_empty());
+}
+
 fn temp_root(name: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);

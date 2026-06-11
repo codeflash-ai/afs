@@ -421,7 +421,8 @@ fn restore(args: &[String], json: bool) -> i32 {
         );
     };
 
-    let mut store = match SqliteStateStore::open(default_state_root()) {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -495,7 +496,8 @@ fn mount(args: &[String], json: bool) -> i32 {
         }
     };
 
-    let mut store = match SqliteStateStore::open(default_state_root()) {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -526,10 +528,12 @@ fn mount(args: &[String], json: bool) -> i32 {
 
     match run_mount(&mut store, options) {
         Ok(report) if json => {
+            notify_daemon_mounts_changed(&state_root);
             print_json(&report);
             EXIT_SUCCESS
         }
         Ok(report) => {
+            notify_daemon_mounts_changed(&state_root);
             print_mount_report(&report);
             EXIT_SUCCESS
         }
@@ -1185,6 +1189,22 @@ fn print_daemon_report(report: &DaemonControlReport) {
     println!("  manager: {}", report.manager.as_str());
     println!("  state root: {}", report.state_root);
     println!("  socket: {}", report.socket);
+    if let Some(reload) = &report.reload {
+        println!(
+            "  reload: +{} -{} unchanged {}",
+            reload.added, reload.removed, reload.unchanged
+        );
+    }
+    if let Some(status) = &report.daemon_status {
+        println!("  watched mounts: {}", status.watches.watched_mounts);
+        println!(
+            "  jobs: active={}, pending={}, hydration={}",
+            status.runtime.active_job,
+            status.runtime.pending_requests,
+            status.runtime.pending_hydrations
+        );
+        println!("  scheduler: {}", status.runtime.scheduler_mode);
+    }
     if let Some(log) = &report.stderr_log {
         println!("  log: {log}");
     }
@@ -1560,6 +1580,26 @@ where
             message: error.to_string(),
             exit_code: EXIT_INTERNAL,
         }),
+    }
+}
+
+fn notify_daemon_mounts_changed(state_root: &std::path::Path) {
+    if std::env::var("AFS_DAEMON_DISABLE").is_ok() {
+        return;
+    }
+
+    match send_request(state_root, &DaemonRequest::ReloadMounts) {
+        Ok(response) if response.ok => {}
+        Ok(response) => {
+            if let Some(error) = response.error {
+                eprintln!(
+                    "afs mount: daemon mount reload failed: {}: {}",
+                    error.code, error.message
+                );
+            }
+        }
+        Err(DaemonClientError::NotAvailable(_)) => {}
+        Err(error) => eprintln!("afs mount: daemon mount reload failed: {}", error.message()),
     }
 }
 

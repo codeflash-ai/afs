@@ -16,6 +16,7 @@ use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId};
+use afs_core::pull::PullMode;
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
     SqliteStateStore, open_credential_store,
@@ -28,7 +29,7 @@ use crate::file_provider::{
     file_provider_children, file_provider_item, materialize_file_provider_item,
 };
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome};
-use crate::ipc::{DaemonRequest, DaemonResponse};
+use crate::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use crate::notion::{
     ResolvedNotionSource, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
 };
@@ -71,6 +72,15 @@ impl DaemonRuntimeHandle {
         self.sender
             .send(RuntimeMessage::FileEvent(event))
             .map_err(|_| RuntimeSendError)
+    }
+
+    pub fn status(&self) -> Result<DaemonRuntimeStatus, RuntimeSendError> {
+        let (respond_to, response) = mpsc::channel();
+        self.sender
+            .send(RuntimeMessage::Status { respond_to })
+            .map_err(|_| RuntimeSendError)?;
+
+        response.recv().map_err(|_| RuntimeSendError)
     }
 }
 
@@ -429,6 +439,9 @@ impl RuntimeState {
                     respond_to,
                 }) => self.handle_request(request, respond_to),
                 Ok(RuntimeMessage::FileEvent(event)) => self.handle_file_event(event),
+                Ok(RuntimeMessage::Status { respond_to }) => {
+                    let _ = respond_to.send(self.status());
+                }
                 Ok(RuntimeMessage::JobFinished(completion)) => self.handle_completion(completion),
                 Ok(RuntimeMessage::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => self.handle_timeout(),
@@ -440,6 +453,15 @@ impl RuntimeState {
         match request {
             DaemonRequest::Ping => {
                 let _ = respond_to.send(DaemonResponse::ok(json!({ "status": "ok" })));
+            }
+            DaemonRequest::Status => {
+                let _ = respond_to.send(DaemonResponse::ok(self.status()));
+            }
+            DaemonRequest::ReloadMounts => {
+                let _ = respond_to.send(DaemonResponse::error(
+                    "unsupported",
+                    "mount reload is handled by the daemon server",
+                ));
             }
             DaemonRequest::Pull { path } => {
                 self.pending_requests
@@ -627,6 +649,35 @@ impl RuntimeState {
                 .map_or(retry_at, |current| current.min(retry_at)),
         );
     }
+
+    fn status(&self) -> DaemonRuntimeStatus {
+        DaemonRuntimeStatus {
+            active_job: self.active_job,
+            pending_requests: self.pending_requests.len(),
+            pending_hydrations: self.hydration.len(),
+            deferred_hydrations: self.deferred_hydration.len(),
+            pending_scheduled_pull: self.pending_scheduled_tick.is_some(),
+            scheduler_mode: match self.scheduler.config.mode {
+                PullMode::Polling => "polling",
+                PullMode::Relay => "relay",
+            }
+            .to_string(),
+            active_interval_ms: self
+                .scheduler
+                .config
+                .active_interval
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            cold_interval_ms: self
+                .scheduler
+                .config
+                .cold_interval
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        }
+    }
 }
 
 fn run_job(
@@ -687,6 +738,9 @@ enum RuntimeMessage {
         respond_to: Sender<DaemonResponse>,
     },
     FileEvent(FileEvent),
+    Status {
+        respond_to: Sender<DaemonRuntimeStatus>,
+    },
     JobFinished(JobCompletion),
     Shutdown,
 }

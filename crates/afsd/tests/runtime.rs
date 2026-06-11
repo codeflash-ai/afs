@@ -17,7 +17,7 @@ use afs_store::{
 use afsd::DaemonConfig;
 use afsd::execution::{DaemonEventReport, PushJob};
 use afsd::hydration::HydrationOutcome;
-use afsd::ipc::{DaemonRequest, DaemonResponse};
+use afsd::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use afsd::runtime::{
     DaemonRuntime, DefaultRuntimeJobRunner, FileEventRuntimeReport, RuntimeJobRunner,
     ScheduledPullRuntimeReport,
@@ -145,6 +145,30 @@ fn runtime_routes_file_events_through_worker_queue() {
         .expect("file event ran");
     assert_eq!(event.path, PathBuf::from("Roadmap.md"));
     assert_eq!(event.kind, FileEventKind::Write);
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_reports_status_snapshot() {
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("status-snapshot"),
+        EventRunner {
+            event_tx: mpsc::channel().0,
+        },
+    )
+    .expect("spawn runtime");
+
+    let status = runtime.handle().status().expect("runtime status");
+    assert!(!status.active_job);
+    assert_eq!(status.pending_requests, 0);
+    assert_eq!(status.pending_hydrations, 0);
+    assert_eq!(status.scheduler_mode, "relay");
+
+    let response = runtime.handle().request(DaemonRequest::Status);
+    assert!(response.ok);
+    let payload = response.payload.expect("status payload");
+    let from_ipc: DaemonRuntimeStatus = serde_json::from_value(payload).expect("decode status");
+    assert_eq!(from_ipc, status);
     runtime.shutdown();
 }
 

@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
+use afsd::ipc::{
+    DaemonClientError, DaemonReloadReport, DaemonRequest, DaemonStatusReport, send_request,
+};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const LABEL: &str = "ai.codeflash.afs.afsd";
@@ -53,6 +56,8 @@ pub struct DaemonControlReport {
     pub pid_file: Option<String>,
     pub stdout_log: Option<String>,
     pub stderr_log: Option<String>,
+    pub daemon_status: Option<DaemonStatusReport>,
+    pub reload: Option<DaemonReloadReport>,
     pub message: String,
 }
 
@@ -95,6 +100,7 @@ enum DaemonAction {
     Start,
     Stop,
     Status,
+    Reload,
     Restart,
 }
 
@@ -104,6 +110,7 @@ impl DaemonAction {
             "start" => Some(Self::Start),
             "stop" => Some(Self::Stop),
             "status" => Some(Self::Status),
+            "reload" => Some(Self::Reload),
             "restart" => Some(Self::Restart),
             _ => None,
         }
@@ -114,6 +121,7 @@ impl DaemonAction {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Status => "status",
+            Self::Reload => "reload",
             Self::Restart => "restart",
         }
     }
@@ -168,6 +176,7 @@ pub fn run_daemon_control(args: &[String]) -> Result<DaemonControlReport, Daemon
         DaemonAction::Start => start_daemon(&options, &paths),
         DaemonAction::Stop => stop_daemon(&options, &paths),
         DaemonAction::Status => Ok(status_report(options.action, &options, &paths)),
+        DaemonAction::Reload => reload_daemon(&options, &paths),
         DaemonAction::Restart => {
             if let Err(error) = stop_daemon(&options, &paths)
                 && is_running(&paths)
@@ -189,7 +198,7 @@ fn parse_options(args: &[String]) -> Result<DaemonOptions, DaemonControlError> {
         .ok_or_else(|| {
             DaemonControlError::new(
                 "usage",
-                "usage: afs daemon start|stop|status|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>]",
+                "usage: afs daemon start|stop|status|reload|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>]",
             )
         })?;
 
@@ -346,7 +355,41 @@ fn status_report(
         DaemonManager::Unknown
     };
     let message = format!("daemon {}", state.as_str());
-    report(action, state, manager, options, paths, None, message)
+    let daemon_status = if state == DaemonRunState::Running {
+        send_daemon_report::<DaemonStatusReport>(paths, &DaemonRequest::Status).ok()
+    } else {
+        None
+    };
+    let mut report = report(action, state, manager, options, paths, None, message);
+    report.daemon_status = daemon_status;
+    report
+}
+
+fn reload_daemon(
+    options: &DaemonOptions,
+    paths: &DaemonPaths,
+) -> Result<DaemonControlReport, DaemonControlError> {
+    if !is_running(paths) {
+        return Err(DaemonControlError::new(
+            "daemon_not_running",
+            "daemon is not running",
+        ));
+    }
+    let reload = send_daemon_report::<DaemonReloadReport>(paths, &DaemonRequest::ReloadMounts)?;
+    let daemon_status =
+        send_daemon_report::<DaemonStatusReport>(paths, &DaemonRequest::Status).ok();
+    let mut report = report(
+        DaemonAction::Reload,
+        DaemonRunState::Running,
+        detected_manager(paths),
+        options,
+        paths,
+        None,
+        "daemon watches reloaded",
+    );
+    report.reload = Some(reload);
+    report.daemon_status = daemon_status;
+    Ok(report)
 }
 
 fn report(
@@ -392,8 +435,39 @@ fn report(
         pid_file: Some(paths.pid_file.display().to_string()),
         stdout_log: Some(paths.stdout_log.display().to_string()),
         stderr_log: Some(paths.stderr_log.display().to_string()),
+        daemon_status: None,
+        reload: None,
         message: message.into(),
     }
+}
+
+fn send_daemon_report<T>(
+    paths: &DaemonPaths,
+    request: &DaemonRequest,
+) -> Result<T, DaemonControlError>
+where
+    T: DeserializeOwned,
+{
+    let response = send_request(&paths.state_root, request).map_err(|error| {
+        DaemonControlError::new(
+            "daemon_error",
+            format!("daemon request failed: {}", error.message()),
+        )
+    })?;
+    if let Some(error) = response.error {
+        return Err(DaemonControlError::new(
+            "daemon_error",
+            format!("{}: {}", error.code, error.message),
+        ));
+    }
+    let Some(payload) = response.payload else {
+        return Err(DaemonControlError::new(
+            "daemon_protocol_error",
+            "daemon returned no payload",
+        ));
+    };
+    serde_json::from_value(payload)
+        .map_err(|error| DaemonControlError::new("daemon_protocol_error", error.to_string()))
 }
 
 fn write_metadata(
