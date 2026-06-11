@@ -20,6 +20,7 @@ pub mod planner;
 pub mod pull;
 pub mod push;
 pub mod shadow;
+pub mod special;
 pub mod sync;
 pub mod undo;
 pub mod validation;

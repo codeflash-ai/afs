@@ -8,6 +8,7 @@ use afs_core::canonical::parse_canonical_markdown;
 use afs_core::journal::{PushId, PushOperationId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
+use afs_core::special::{StructuredWriteTarget, TableRowUpdate};
 use afs_notion::client::{DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION};
 use afs_notion::dto::{DatabaseDto, NotionPageBundle, PageDto};
 use afs_notion::schema::validate_create_row_frontmatter;
@@ -79,6 +80,8 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
 
     let bundle: NotionPageBundle = serde_json::from_slice(&native.raw).expect("native bundle");
     let paragraph_id = first_block_id(&bundle, "paragraph");
+    let table_id = first_block_id(&bundle, "table");
+    let editable_table_row_id = first_table_row_id(&bundle, &table_id, 1);
     let last_block_id = bundle
         .blocks
         .last()
@@ -138,6 +141,15 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
                 block_id: RemoteId::new(first_block_id(&bundle, "equation")),
                 content: "$$\na^2+b^2=c^2\n$$".to_string(),
             },
+            PushOperation::UpdateStructuredBlock {
+                block_id: RemoteId::new(table_id),
+                target: StructuredWriteTarget::TableRows {
+                    rows: vec![TableRowUpdate {
+                        row_id: RemoteId::new(editable_table_row_id),
+                        cells: vec!["A".to_string(), "Edited table cell".to_string()],
+                    }],
+                },
+            },
             PushOperation::AppendBlock {
                 parent_id: page_id.clone(),
                 after: Some(RemoteId::new(last_block_id)),
@@ -191,6 +203,12 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     assert!(verified_render.document.body.contains("> Edited quote"));
     assert!(verified_render.document.body.contains("fn edited() {}"));
     assert!(verified_render.document.body.contains("a^2+b^2=c^2"));
+    assert!(
+        verified_render
+            .document
+            .body
+            .contains("| A | Edited table cell |")
+    );
     assert!(
         verified_render
             .document
@@ -818,6 +836,16 @@ fn first_block_id(bundle: &NotionPageBundle, kind: &str) -> String {
         .find(|tree| tree.block.kind == kind)
         .map(|tree| tree.block.id.clone())
         .unwrap_or_else(|| panic!("missing {kind} block"))
+}
+
+fn first_table_row_id(bundle: &NotionPageBundle, table_id: &str, row_index: usize) -> String {
+    bundle
+        .blocks
+        .iter()
+        .find(|tree| tree.block.id == table_id)
+        .and_then(|tree| tree.children.get(row_index))
+        .map(|tree| tree.block.id.clone())
+        .unwrap_or_else(|| panic!("missing row {row_index} for table {table_id}"))
 }
 
 fn rich_text(content: &str) -> Vec<Value> {

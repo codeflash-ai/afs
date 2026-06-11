@@ -17,7 +17,7 @@ use afs_core::undo::{
 use afs_store::{EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError};
 use serde::Serialize;
 
-use crate::diff::PlanSummaryOutput;
+use crate::diff::{PlanSummaryOutput, StructuredWriteTargetOutput};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogOptions {
@@ -312,6 +312,10 @@ pub enum UndoOperationOutput {
         block_id: String,
         content: String,
     },
+    RestoreStructuredBlock {
+        block_id: String,
+        target: StructuredWriteTargetOutput,
+    },
     MoveBlock {
         block_id: String,
         after: Option<String>,
@@ -337,6 +341,12 @@ impl From<UndoOperation> for UndoOperationOutput {
                 block_id: block_id.0,
                 content,
             },
+            UndoOperation::RestoreStructuredBlock { block_id, target } => {
+                Self::RestoreStructuredBlock {
+                    block_id: block_id.0,
+                    target: StructuredWriteTargetOutput::from(target),
+                }
+            }
             UndoOperation::MoveBlock { block_id, after } => Self::MoveBlock {
                 block_id: block_id.0,
                 after: after.map(|remote_id| remote_id.0),

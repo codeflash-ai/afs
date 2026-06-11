@@ -21,6 +21,7 @@ use afs_core::push::{
     evaluate_guardrails, plan_push_pipeline,
 };
 use afs_core::shadow::ShadowDocument;
+use afs_core::special::{StructuredWriteTarget, TableRowUpdate};
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
@@ -766,6 +767,10 @@ pub enum PushOperationOutput {
         block_id: String,
         content: String,
     },
+    UpdateStructuredBlock {
+        block_id: String,
+        target: StructuredWriteTargetOutput,
+    },
     AppendBlock {
         parent_id: String,
         after: Option<String>,
@@ -803,6 +808,12 @@ impl From<PushOperation> for PushOperationOutput {
                 block_id: block_id.0,
                 content,
             },
+            PushOperation::UpdateStructuredBlock { block_id, target } => {
+                Self::UpdateStructuredBlock {
+                    block_id: block_id.0,
+                    target: StructuredWriteTargetOutput::from(target),
+                }
+            }
             PushOperation::AppendBlock {
                 parent_id,
                 after,
@@ -856,6 +867,37 @@ impl From<PushOperation> for PushOperationOutput {
                 body,
                 source_path: source_path.display().to_string(),
             },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StructuredWriteTargetOutput {
+    TableRows { rows: Vec<TableRowUpdateOutput> },
+}
+
+impl From<StructuredWriteTarget> for StructuredWriteTargetOutput {
+    fn from(value: StructuredWriteTarget) -> Self {
+        match value {
+            StructuredWriteTarget::TableRows { rows } => Self::TableRows {
+                rows: rows.into_iter().map(TableRowUpdateOutput::from).collect(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TableRowUpdateOutput {
+    pub row_id: String,
+    pub cells: Vec<String>,
+}
+
+impl From<TableRowUpdate> for TableRowUpdateOutput {
+    fn from(value: TableRowUpdate) -> Self {
+        Self {
+            row_id: value.row_id.0,
+            cells: value.cells,
         }
     }
 }

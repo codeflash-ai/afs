@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::model::RemoteId;
+use crate::special::StructuredWriteTarget;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +53,10 @@ pub enum PushOperation {
     UpdateBlock {
         block_id: RemoteId,
         content: String,
+    },
+    UpdateStructuredBlock {
+        block_id: RemoteId,
+        target: StructuredWriteTarget,
     },
     AppendBlock {
         parent_id: RemoteId,
@@ -103,6 +108,9 @@ impl PlanSummary {
         for operation in operations {
             match operation {
                 PushOperation::UpdateBlock { .. } => summary.blocks_updated += 1,
+                PushOperation::UpdateStructuredBlock { target, .. } => {
+                    summary.blocks_updated += target.updated_block_count();
+                }
                 PushOperation::AppendBlock { .. } => summary.blocks_created += 1,
                 PushOperation::MoveBlock { .. } => summary.blocks_moved += 1,
                 PushOperation::ArchiveBlock { .. } => summary.blocks_archived += 1,

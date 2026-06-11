@@ -25,6 +25,7 @@
 | `push` | Explicit push pipeline request/output types, validation/diff/guardrail orchestration, journaled execution hooks, and guardrail evaluation. |
 | `pull` | Polling/relay pull scheduler configuration. |
 | `shadow` | Shadow document snapshots, Markdown block segmentation, stable block hashes, and source spans. |
+| `special` | Connector-neutral structured write targets for Markdown surfaces that map to nested remote structures, starting with table row updates. |
 | `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents. |
 | `journal` | Push journal entry and status contracts. |
 | `undo` | Connector-neutral reverse-plan derivation from journaled preimage snapshots. |
@@ -61,7 +62,7 @@ The shadow layer stores the synced body text plus a block tree:
 - each shadow block has a remote block ID, kind, source span, stable content hash, and rendered text;
 - directive blocks get their remote ID from the visible directive line;
 - clean Markdown blocks get their remote IDs from connector-rendered shadow metadata;
-- table blocks can carry row-level remote IDs as shadow metadata for future table-aware apply;
+- table blocks can carry row-level remote IDs as shadow metadata for table-aware apply;
 - stable hashes use a deterministic in-process hash, not randomized runtime hashing.
 
 The first planner is deliberately conservative:
@@ -72,6 +73,14 @@ The first planner is deliberately conservative:
 - ambiguous residual alignment adds an explicit degradation note to the plan;
 - directive edits fail validation instead of becoming lossy updates;
 - directive moves are represented as block moves.
+
+Structured blocks are planned through `UpdateStructuredBlock` instead of being
+forced through a plain text `UpdateBlock`. The first target is `TableRows`,
+which lets a connector update only changed remote row blocks while the local
+surface stays a normal Markdown table. The core currently permits cell-only
+edits when row count and column count are unchanged. Row or column structural
+edits fail validation until the planner and connector can represent safe row
+creation, deletion, and column-width changes.
 
 This is not the final Notion-grade diff engine from `plan.md`; it is the first correct contract surface. Later exact/structural/residual passes can improve the internals while preserving the same `ShadowDocument -> PushPlan` boundary.
 
@@ -106,6 +115,8 @@ Each approved operation also receives a deterministic `PushOperationId` derived 
 Journal entries now include shadow preimages for affected entities. The undo planner uses those preimages to derive reverse operations without guessing:
 
 - block updates reverse to the previous block text;
+- structured block updates reverse to the previous structured target extracted
+  from the journaled shadow preimage;
 - block moves reverse to the previous sibling position;
 - archived blocks reverse to a restore operation with original content and position;
 - appends reverse to archiving the created block when apply journaled the created block ID;

@@ -17,6 +17,7 @@ use crate::planner::{
 use crate::shadow::{
     MarkdownBlockKind, SegmentedBlock, ShadowBlock, ShadowDocument, segment_markdown_body,
 };
+use crate::special::{StructuredWriteTarget, plan_table_row_updates};
 use crate::validation::{ValidationIssue, ValidationReport};
 use crate::{AfsError, AfsResult};
 
@@ -103,10 +104,17 @@ pub fn plan_block_diff(
                 }
 
                 if shadow_block.content_hash != edited_block.content_hash {
-                    operations.push(PushOperation::UpdateBlock {
-                        block_id: shadow_block.remote_id.clone(),
-                        content: edited_block.text.clone(),
-                    });
+                    if let Some(target) = structured_block_update(shadow_block, edited_block)? {
+                        operations.push(PushOperation::UpdateStructuredBlock {
+                            block_id: shadow_block.remote_id.clone(),
+                            target,
+                        });
+                    } else {
+                        operations.push(PushOperation::UpdateBlock {
+                            block_id: shadow_block.remote_id.clone(),
+                            content: edited_block.text.clone(),
+                        });
+                    }
                 }
 
                 previous_existing_id = Some(shadow_block.remote_id.clone());
@@ -194,6 +202,38 @@ fn property_diff_operations(
             entity_id: shadow.entity_id.clone(),
             properties: updates,
         }])
+    }
+}
+
+fn structured_block_update(
+    shadow_block: &ShadowBlock,
+    edited_block: &SegmentedBlock,
+) -> AfsResult<Option<StructuredWriteTarget>> {
+    match &shadow_block.kind {
+        MarkdownBlockKind::TableWithRows {
+            row_ids,
+            has_column_header,
+            ..
+        } => {
+            let rows = plan_table_row_updates(
+                row_ids,
+                *has_column_header,
+                &shadow_block.text,
+                &edited_block.text,
+            )
+            .map_err(|error| {
+                AfsError::Validation(vec![ValidationIssue::new(
+                    error.code,
+                    PathBuf::new(),
+                    Some(edited_block.source_span.start_line),
+                    error.message,
+                    Some(error.suggestion.to_string()),
+                )])
+            })?;
+
+            Ok((!rows.is_empty()).then_some(StructuredWriteTarget::TableRows { rows }))
+        }
+        _ => Ok(None),
     }
 }
 

@@ -7,13 +7,14 @@ use afs_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
 use afs_core::push::RemotePrecondition;
+use afs_core::special::{StructuredWriteTarget, TableRowUpdate};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
     DatabaseDto, DateMentionDto, EquationBlockDto, LinkDto, MentionRichTextDto, PageDto,
     PageListDto, PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto,
-    RichTextDto, SelectOptionDto, TextRichTextDto,
+    RichTextDto, SelectOptionDto, TableBlockDto, TableRowBlockDto, TextRichTextDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -391,6 +392,83 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
 }
 
 #[test]
+fn apply_updates_structured_table_rows() {
+    let api = Arc::new(RecordingNotionApi::with_table(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            ("row-1", vec![rich_text("Decision"), rich_text("Choice")]),
+            ("row-2", vec![rich_text("Owner"), rich_text("AFS")]),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateStructuredBlock {
+            block_id: RemoteId::new("table-1"),
+            target: StructuredWriteTarget::TableRows {
+                rows: vec![TableRowUpdate {
+                    row_id: RemoteId::new("row-2"),
+                    cells: vec!["Owner".to_string(), "**AgentFS**".to_string()],
+                }],
+            },
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::UpdatedBlock {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            block_id: RemoteId::new("table-1"),
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "row-2".to_string(),
+            body: json!({
+                "table_row": {
+                    "cells": [
+                        rich_text_json("Owner"),
+                        [
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": "AgentFS",
+                                },
+                                "annotations": {
+                                    "bold": true,
+                                    "italic": false,
+                                    "strikethrough": false,
+                                    "underline": false,
+                                    "code": false,
+                                    "color": "default",
+                                },
+                            },
+                        ],
+                    ],
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_updates_supported_page_properties() {
     let api = Arc::new(RecordingNotionApi::with_page_properties(
         "2026-06-10T00:00:00.000Z",
@@ -750,6 +828,65 @@ impl RecordingNotionApi {
         Self::with_page_and_block_results(page, blocks)
     }
 
+    fn with_table(last_edited_time: &str, rows: Vec<(&str, Vec<Vec<RichTextDto>>)>) -> Self {
+        let page = PageDto {
+            id: "page-1".to_string(),
+            created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            last_edited_time: Some(last_edited_time.to_string()),
+            archived: false,
+            in_trash: false,
+            properties: BTreeMap::new(),
+        };
+        let width = rows
+            .first()
+            .map(|(_, cells)| cells.len())
+            .and_then(|width| u16::try_from(width).ok())
+            .unwrap_or_default();
+        let row_blocks = rows
+            .into_iter()
+            .map(|(id, cells)| table_row_block(id, cells))
+            .collect::<Vec<_>>();
+        let children = BTreeMap::from([
+            (
+                ("page-1".to_string(), None),
+                PaginatedListDto {
+                    results: vec![table_block("table-1", width, true)],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                ("table-1".to_string(), None),
+                PaginatedListDto {
+                    results: row_blocks,
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+        ]);
+
+        Self {
+            page,
+            database: DatabaseDto {
+                id: "database-1".to_string(),
+                data_sources: vec![DataSourceSummaryDto {
+                    id: "source-1".to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+                ..Default::default()
+            },
+            data_source: DataSourceDto {
+                id: "source-1".to_string(),
+                name: Some("Tasks".to_string()),
+                properties: BTreeMap::new(),
+                ..Default::default()
+            },
+            children,
+            writes: Mutex::new(Vec::new()),
+            append_count: Mutex::new(0),
+        }
+    }
+
     fn with_page_and_children(page: PageDto, rich_text: Vec<RichTextDto>) -> Self {
         Self::with_page_and_block_results(
             page,
@@ -984,6 +1121,23 @@ fn equation_block(id: &str, expression: &str) -> BlockDto {
     block.equation = Some(EquationBlockDto {
         expression: expression.to_string(),
     });
+    block
+}
+
+fn table_block(id: &str, width: u16, has_column_header: bool) -> BlockDto {
+    let mut block = block(id, "table");
+    block.has_children = true;
+    block.table = Some(TableBlockDto {
+        table_width: width,
+        has_column_header,
+        has_row_header: false,
+    });
+    block
+}
+
+fn table_row_block(id: &str, cells: Vec<Vec<RichTextDto>>) -> BlockDto {
+    let mut block = block(id, "table_row");
+    block.table_row = Some(TableRowBlockDto { cells });
     block
 }
 

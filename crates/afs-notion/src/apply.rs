@@ -13,6 +13,7 @@ use afs_core::journal::JournalApplyEffect;
 use afs_core::model::RemoteId;
 use afs_core::planner::{PropertyValue, PushOperation};
 use afs_core::shadow::segment_markdown_body;
+use afs_core::special::{StructuredWriteTarget, TableRowUpdate};
 use afs_core::undo::{UndoOperation, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
 use serde_json::{Map, Value, json};
@@ -66,6 +67,14 @@ pub fn apply_plan(
                 let patch = parse_supported_block(content, current_block_rich_text(current)?)?;
                 ensure_update_supported(current, &patch)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
+                effects.push(JournalApplyEffect::UpdatedBlock {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    block_id: block_id.clone(),
+                });
+            }
+            PushOperation::UpdateStructuredBlock { block_id, target } => {
+                apply_structured_block_update(api, Some((&current_blocks, block_id)), target)?;
                 effects.push(JournalApplyEffect::UpdatedBlock {
                     operation_id: request.operation_ids[operation_index].clone(),
                     operation_index,
@@ -177,6 +186,9 @@ pub fn apply_undo(
                 let patch = parse_supported_block(content, None)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
             }
+            UndoOperation::RestoreStructuredBlock { target, .. } => {
+                apply_structured_block_update(api, None, target)?;
+            }
             UndoOperation::ArchiveCreatedBlock { block_id } => {
                 api.delete_block(block_id.as_str())?;
             }
@@ -251,6 +263,79 @@ fn current_block<'a>(
             block_id.0
         ))
     })
+}
+
+fn apply_structured_block_update(
+    api: &dyn NotionApi,
+    current: Option<(&BTreeMap<RemoteId, &BlockDto>, &RemoteId)>,
+    target: &StructuredWriteTarget,
+) -> AfsResult<()> {
+    match target {
+        StructuredWriteTarget::TableRows { rows } => {
+            if let Some((blocks, table_id)) = current {
+                let table = current_block(blocks, table_id)?;
+                if table.kind != "table" {
+                    return Err(AfsError::Unsupported("updating a non-table as a table"));
+                }
+            }
+
+            for row in rows {
+                apply_table_row_update(api, current.map(|(blocks, _)| blocks), row)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn apply_table_row_update(
+    api: &dyn NotionApi,
+    current_blocks: Option<&BTreeMap<RemoteId, &BlockDto>>,
+    row: &TableRowUpdate,
+) -> AfsResult<()> {
+    let current_cells = match current_blocks {
+        Some(blocks) => {
+            let current = current_block(blocks, &row.row_id)?;
+            if current.kind != "table_row" {
+                return Err(AfsError::Unsupported(
+                    "updating a non-table-row as a table row",
+                ));
+            }
+            let table_row = current.table_row.as_ref().ok_or_else(|| {
+                AfsError::InvalidState(format!(
+                    "notion table row `{}` is missing its table_row payload",
+                    row.row_id.0
+                ))
+            })?;
+            if table_row.cells.len() != row.cells.len() {
+                return Err(AfsError::Unsupported("changing Notion table row width"));
+            }
+            Some(table_row.cells.as_slice())
+        }
+        None => None,
+    };
+
+    let cells = row
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| {
+            let preimage = current_cells
+                .and_then(|cells| cells.get(index))
+                .map(Vec::as_slice);
+            rich_text_payload(cell, preimage)
+        })
+        .collect::<AfsResult<Vec<_>>>()?;
+
+    api.update_block(
+        row.row_id.as_str(),
+        json!({
+            "table_row": {
+                "cells": cells,
+            },
+        }),
+    )?;
+
+    Ok(())
 }
 
 fn current_page<'a>(bundles: &'a [NotionPageBundle], page_id: &RemoteId) -> AfsResult<&'a PageDto> {
@@ -1596,6 +1681,7 @@ fn unsupported_operation_name(operation: &PushOperation) -> &'static str {
         PushOperation::ArchiveEntity { .. } => "archiving Notion pages",
         PushOperation::CreateEntity { .. } => "creating Notion pages",
         PushOperation::UpdateBlock { .. }
+        | PushOperation::UpdateStructuredBlock { .. }
         | PushOperation::AppendBlock { .. }
         | PushOperation::UpdateProperties { .. }
         | PushOperation::ArchiveBlock { .. } => "unsupported Notion push operation",
@@ -1607,6 +1693,7 @@ fn unsupported_undo_name(operation: &UndoOperation) -> &'static str {
         UndoOperation::MoveBlock { .. } => "undoing Notion block moves",
         UndoOperation::RestoreArchivedBlock { .. } => "restoring archived Notion blocks",
         UndoOperation::RestoreBlockContent { .. }
+        | UndoOperation::RestoreStructuredBlock { .. }
         | UndoOperation::ArchiveCreatedBlock { .. }
         | UndoOperation::ArchiveCreatedEntity { .. } => "unsupported Notion undo operation",
     }

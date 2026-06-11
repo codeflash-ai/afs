@@ -3,7 +3,8 @@ use afs_core::journal::{
 };
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
-use afs_core::shadow::ShadowDocument;
+use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
+use afs_core::special::{StructuredWriteTarget, TableRowUpdate};
 use afs_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
 
 #[test]
@@ -167,6 +168,38 @@ fn create_entity_reverses_to_archive_created_entity_when_effect_is_journaled() {
 }
 
 #[test]
+fn structured_table_update_reverses_to_preimage_cells() {
+    let entry = journal_entry_with_shadow(
+        vec![PushOperation::UpdateStructuredBlock {
+            block_id: RemoteId::new("table-1"),
+            target: StructuredWriteTarget::TableRows {
+                rows: vec![TableRowUpdate {
+                    row_id: RemoteId::new("row-2"),
+                    cells: vec!["First connector".to_string(), "AFS".to_string()],
+                }],
+            },
+        }],
+        table_shadow(),
+    );
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::RestoreStructuredBlock {
+            block_id: RemoteId::new("table-1"),
+            target: StructuredWriteTarget::TableRows {
+                rows: vec![TableRowUpdate {
+                    row_id: RemoteId::new("row-2"),
+                    cells: vec!["First connector".to_string(), "Notion".to_string()],
+                }],
+            },
+        }]
+    );
+}
+
+#[test]
 fn mixed_plan_reports_partial_undo() {
     let entry = journal_entry(vec![
         PushOperation::UpdateBlock {
@@ -242,4 +275,20 @@ fn multi_block_shadow() -> ShadowDocument {
         ],
     )
     .expect("shadow")
+}
+
+fn table_shadow() -> ShadowDocument {
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "| Decision | Choice |\n| --- | --- |\n| First connector | Notion |",
+        9,
+        [RemoteId::new("table-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: vec![RemoteId::new("row-1"), RemoteId::new("row-2")],
+        has_column_header: true,
+        has_row_header: false,
+    };
+    shadow
 }

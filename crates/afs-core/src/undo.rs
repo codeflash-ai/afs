@@ -10,6 +10,7 @@ use crate::journal::{JournalApplyEffect, JournalEntry, PushId};
 use crate::model::{MountId, RemoteId};
 use crate::planner::PushOperation;
 use crate::shadow::{ShadowBlock, ShadowDocument};
+use crate::special::{StructuredWriteTarget, restore_structured_target};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +37,10 @@ pub enum UndoOperation {
     RestoreBlockContent {
         block_id: RemoteId,
         content: String,
+    },
+    RestoreStructuredBlock {
+        block_id: RemoteId,
+        target: StructuredWriteTarget,
     },
     MoveBlock {
         block_id: RemoteId,
@@ -84,6 +89,22 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                         block_id: block_id.clone(),
                         content: block.text.clone(),
                     }),
+                    None => unsupported.push(missing_block_preimage(operation_index, block_id)),
+                }
+            }
+            PushOperation::UpdateStructuredBlock { block_id, target } => {
+                match find_preimage_block(entry, block_id) {
+                    Some((_, block)) => match restore_structured_target(block, target) {
+                        Ok(target) => operations.push(UndoOperation::RestoreStructuredBlock {
+                            block_id: block_id.clone(),
+                            target,
+                        }),
+                        Err(error) => unsupported.push(UnsupportedUndoOperation::new(
+                            operation_index,
+                            "structured_preimage_invalid",
+                            error.message,
+                        )),
+                    },
                     None => unsupported.push(missing_block_preimage(operation_index, block_id)),
                 }
             }

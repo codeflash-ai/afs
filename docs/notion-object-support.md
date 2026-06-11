@@ -42,8 +42,8 @@ Sources used for the baseline:
 | `code` | Native fenced code | Yes | fixture, live | Language is preserved on simple code fences. |
 | `divider` | Native Markdown rule | Yes | fixture, live | `---`. |
 | `equation` | Native display math | Yes | fixture, live | `$$ ... $$`. |
-| `table` | Native Markdown table | No | fixture, live read | Row-level write planning is future work. |
-| `table_row` | Structural inside tables | No | fixture | Standalone/malformed rows render as directives. |
+| `table` | Native Markdown table | Cell edits only | fixture, live read | AFS plans changed cells as structured row updates. Adding/removing rows or columns is still blocked. |
+| `table_row` | Structural inside tables | Cell edits through parent table | fixture | Standalone/malformed rows render as directives. |
 | `child_page` | Directive and structural enumeration | No direct block write | fixture, live read | New child pages are created through page/entity creation, not block edits. |
 | `child_database` | Directive and structural enumeration | No direct block write | fixture, live read | Databases are created through the database API, not Markdown block writes. |
 | `toggle` | Directive wrapper; children render below it | No | fixture, live read | Toggle wrapper state is anchored to avoid flattening nested content. |
@@ -117,8 +117,9 @@ Sources used for the baseline:
 
 - Media upload and non-image downloads are deferred until AFS has size limits,
   retention rules, and local path ownership semantics.
-- Table writes are deferred until the planner can produce row-level operations
-  instead of replacing the whole table.
+- Table row and column structural edits are deferred until the planner can
+  represent row creation/deletion and column-width changes without replacing
+  the whole table.
 - Layout and generated blocks (`column_*`, `breadcrumb`, `table_of_contents`,
   tabs) stay as directives because Markdown cannot represent their semantics.
 - Comments are not mounted because they need a separate thread model and push

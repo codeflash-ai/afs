@@ -3,6 +3,7 @@ use afs_core::diff::{BlockDiffEngine, DiffEngine};
 use afs_core::model::{CanonicalDocument, RemoteId};
 use afs_core::planner::{PlanDegradationKind, PushOperation};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument, segment_markdown_body};
+use afs_core::special::{StructuredWriteTarget, TableRowUpdate};
 
 #[test]
 fn segments_common_markdown_blocks_with_source_spans() {
@@ -158,6 +159,108 @@ fn ambiguous_residual_alignment_is_explicitly_degraded() {
     );
 }
 
+#[test]
+fn editing_table_cells_produces_structured_row_updates() {
+    let shadow = table_shadow(
+        "| Decision | Choice |\n| --- | --- |\n| First connector | Notion |",
+        ["row-1", "row-2"],
+        true,
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "| Decision | Choice |\n| --- | --- |\n| First connector | AFS |",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateStructuredBlock {
+            block_id: RemoteId::new("table-1"),
+            target: StructuredWriteTarget::TableRows {
+                rows: vec![TableRowUpdate {
+                    row_id: RemoteId::new("row-2"),
+                    cells: vec!["First connector".to_string(), "AFS".to_string()],
+                }],
+            },
+        }]
+    );
+    assert_eq!(plan.summary.blocks_updated, 1);
+}
+
+#[test]
+fn table_without_column_header_skips_synthetic_header_row() {
+    let shadow = table_shadow(
+        "|  |  |\n| --- | --- |\n| First connector | Notion |",
+        ["row-1"],
+        false,
+    );
+    let edited = CanonicalDocument::new("", "|  |  |\n| --- | --- |\n| First connector | AFS |");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateStructuredBlock {
+            block_id: RemoteId::new("table-1"),
+            target: StructuredWriteTarget::TableRows {
+                rows: vec![TableRowUpdate {
+                    row_id: RemoteId::new("row-1"),
+                    cells: vec!["First connector".to_string(), "AFS".to_string()],
+                }],
+            },
+        }]
+    );
+}
+
+#[test]
+fn table_row_count_changes_fail_before_apply() {
+    let shadow = table_shadow(
+        "| Decision | Choice |\n| --- | --- |\n| First connector | Notion |",
+        ["row-1", "row-2"],
+        true,
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "| Decision | Choice |\n| --- | --- |\n| First connector | Notion |\n| Second connector | Linear |",
+    );
+
+    let error = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect_err("row add");
+
+    let AfsError::Validation(issues) = error else {
+        panic!("expected validation error");
+    };
+    assert_eq!(issues[0].code, "table_row_count_changed");
+}
+
+#[test]
+fn editing_synthetic_table_header_fails_before_apply() {
+    let shadow = table_shadow(
+        "|  |  |\n| --- | --- |\n| First connector | Notion |",
+        ["row-1"],
+        false,
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "| Label | Value |\n| --- | --- |\n| First connector | Notion |",
+    );
+
+    let error = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect_err("synthetic header edit");
+
+    let AfsError::Validation(issues) = error else {
+        panic!("expected validation error");
+    };
+    assert_eq!(issues[0].code, "table_synthetic_header_edited");
+}
+
 fn shadow<const N: usize>(body: &str, ids: [&str; N]) -> ShadowDocument {
     ShadowDocument::from_synced_body(
         RemoteId::new("page-1"),
@@ -166,4 +269,24 @@ fn shadow<const N: usize>(body: &str, ids: [&str; N]) -> ShadowDocument {
         ids.into_iter().map(RemoteId::new),
     )
     .expect("shadow")
+}
+
+fn table_shadow<const N: usize>(
+    body: &str,
+    row_ids: [&str; N],
+    has_column_header: bool,
+) -> ShadowDocument {
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        body,
+        1,
+        [RemoteId::new("table-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: row_ids.into_iter().map(RemoteId::new).collect(),
+        has_column_header,
+        has_row_header: false,
+    };
+    shadow
 }
