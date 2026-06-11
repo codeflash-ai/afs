@@ -28,11 +28,29 @@ back to the same in-process executor when the socket is unavailable. Setting
 `AFS_DAEMON_DISABLE=1` forces the fallback path, which is useful for tests and
 recovery.
 
-The socket accept loop does not run connector calls directly. Each request is
-handled on a worker thread, so a slow Notion enumerate/fetch/apply call does not
-block the daemon from accepting other requests or responding to health checks.
-The stricter per-mount scheduling policy can be layered behind the same IPC
-request types as the background strategy work matures.
+The socket accept loop does not run connector calls directly. It reads one JSON
+request, submits it to `DaemonRuntime`, and waits for the runtime response.
+Health checks are answered by the runtime control loop, while mutating jobs are
+queued behind a single active worker. A slow Notion enumerate/fetch/apply call
+therefore does not block the daemon from accepting other requests or responding
+to pings, and two pull/push/hydration mutations cannot advance durable state at
+the same time.
+
+## Runtime Loop
+
+`DaemonRuntime` is the foreground daemon's control plane. It owns the scheduler
+clock, the pending IPC job queue, the hydration queue, and the retry parking lot
+for failed hydrations. User-submitted pull and push requests outrank background
+work. Queued hydrations drain before the next scheduled poll so policy refreshes
+turn into actual local files instead of accumulating indefinitely.
+
+The runtime never performs slow connector work on the control thread. It starts
+one mutating worker at a time, and the worker opens the durable store for that
+transaction, runs the connector call, and reports completion back to the runtime.
+That keeps the current SQLite-backed implementation simple while preserving the
+important invariant: daemon-managed mutations are serialized through one queue.
+The future per-mount scheduler and watcher integrations can use the same job
+types without creating new store mutation paths.
 
 ## Push Execution
 
@@ -60,7 +78,9 @@ and read-only mounts return `NotReady` without touching the journal or connector
 state. In direct polling mode, the first tick asks for both active and cold polls
 so a newly started daemon catches up immediately. Later ticks become due when
 their configured intervals elapse. Relay mode returns idle ticks because the
-future relay change feed will drive pull work directly.
+future relay change feed will drive pull work directly. `DaemonRuntime` advances
+the scheduler on its control tick and turns due ticks into serialized scheduled
+pull workers.
 
 ## Hydration Queue
 
@@ -93,8 +113,8 @@ when the hydration ladder allows it. Source or I/O failures leave the request in
 the queue so a later daemon tick can retry.
 
 `afsd::notion` wires `NotionConnector` into this source boundary. It uses the
-Notion connector's fetch path and `render_native_entity` method so daemon
-hydration persists the same shadow snapshot that CLI pull uses.
+Notion connector's fetch path and path-aware render method so daemon hydration
+persists the same shadow snapshot and media projection that CLI pull uses.
 
 ## Scheduled Pull Reconciliation
 
