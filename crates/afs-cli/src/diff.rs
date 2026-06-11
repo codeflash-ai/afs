@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use afs_core::canonical::{CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown};
 use afs_core::model::RemoteId;
 use afs_core::planner::{
-    GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary, PushOperation, PushPlan,
+    GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary, PropertyValue,
+    PushOperation, PushPlan,
 };
 use afs_core::push::{
     PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult, PushStage,
@@ -421,6 +422,7 @@ pub enum PushOperationOutput {
     UpdateProperties {
         entity_id: String,
         keys: Vec<String>,
+        properties: Vec<PropertyUpdateOutput>,
     },
     CreateEntity {
         parent_id: String,
@@ -454,14 +456,62 @@ impl From<PushOperation> for PushOperationOutput {
             PushOperation::ArchiveEntity { entity_id } => Self::ArchiveEntity {
                 entity_id: entity_id.0,
             },
-            PushOperation::UpdateProperties { entity_id, keys } => Self::UpdateProperties {
+            PushOperation::UpdateProperties {
+                entity_id,
+                properties,
+            } => Self::UpdateProperties {
                 entity_id: entity_id.0,
-                keys,
+                keys: properties.keys().cloned().collect(),
+                properties: properties
+                    .into_iter()
+                    .map(|(key, value)| PropertyUpdateOutput {
+                        key,
+                        value: PropertyValueOutput::from(value),
+                    })
+                    .collect(),
             },
             PushOperation::CreateEntity { parent_id, title } => Self::CreateEntity {
                 parent_id: parent_id.0,
                 title,
             },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PropertyUpdateOutput {
+    pub key: String,
+    pub value: PropertyValueOutput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PropertyValueOutput {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    List(Vec<String>),
+    Object(Vec<PropertyUpdateOutput>),
+}
+
+impl From<PropertyValue> for PropertyValueOutput {
+    fn from(value: PropertyValue) -> Self {
+        match value {
+            PropertyValue::Null => Self::Null,
+            PropertyValue::Bool(value) => Self::Bool(value),
+            PropertyValue::Number(value) => Self::Number(value),
+            PropertyValue::String(value) => Self::String(value),
+            PropertyValue::List(value) => Self::List(value),
+            PropertyValue::Object(value) => Self::Object(
+                value
+                    .into_iter()
+                    .map(|(key, value)| PropertyUpdateOutput {
+                        key,
+                        value: PropertyValueOutput::from(value),
+                    })
+                    .collect(),
+            ),
         }
     }
 }

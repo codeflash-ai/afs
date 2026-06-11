@@ -7,8 +7,9 @@ use afs_core::{AfsError, AfsResult};
 use serde_json::Value;
 
 use crate::dto::{
-    BlockDto, BlockTreeDto, DateMentionDto, NotionPageBundle, PageDto, PagePropertyDto,
-    RichTextBlockDto, RichTextDto, TableBlockDto, TableRowBlockDto,
+    BlockDto, BlockTreeDto, DateMentionDto, EquationBlockDto, FileBlockDto, LinkToPageBlockDto,
+    MeetingNotesBlockDto, NotionPageBundle, PageDto, PagePropertyDto, RichTextBlockDto,
+    RichTextDto, SyncedBlockDto, TableBlockDto, TableRowBlockDto, UrlBlockDto,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,7 +51,8 @@ pub fn render_page_bundle(bundle: &NotionPageBundle) -> AfsResult<NotionRendered
         body_start_line,
         shadow_ids,
     )
-    .map_err(|error| AfsError::InvalidState(format!("notion shadow build failed: {error}")))?;
+    .map_err(|error| AfsError::InvalidState(format!("notion shadow build failed: {error}")))?
+    .with_frontmatter(frontmatter.clone());
     apply_shadow_metadata(&mut shadow, &rendered_blocks);
 
     Ok(NotionRenderedEntity {
@@ -117,6 +119,12 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
             block.heading_3.as_ref(),
             |text| format!("### {text}"),
             "heading_3",
+        ),
+        "heading_4" => rich_text_block(
+            block,
+            block.heading_4.as_ref(),
+            |text| format!("#### {text}"),
+            "heading_4",
         ),
         "bulleted_list_item" => rich_text_block(
             block,
@@ -191,6 +199,50 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
                 .as_ref()
                 .map(|child| child.title.as_str()),
         ),
+        "toggle" => directive_block(
+            block,
+            "toggle",
+            block
+                .toggle
+                .as_ref()
+                .and_then(rich_text_block_title)
+                .as_deref(),
+        ),
+        "equation" => equation_block(block, block.equation.as_ref()),
+        "embed" => url_directive_block(block, "embed", block.embed.as_ref()),
+        "bookmark" => url_directive_block(block, "bookmark", block.bookmark.as_ref()),
+        "link_preview" => url_directive_block(block, "link_preview", block.link_preview.as_ref()),
+        "image" => file_directive_block(block, "image", block.image.as_ref()),
+        "video" => file_directive_block(block, "video", block.video.as_ref()),
+        "file" => file_directive_block(block, "file", block.file.as_ref()),
+        "pdf" => file_directive_block(block, "pdf", block.pdf.as_ref()),
+        "audio" => file_directive_block(block, "audio", block.audio.as_ref()),
+        "synced_block" => synced_block_directive(block, block.synced_block.as_ref()),
+        "link_to_page" => link_to_page_directive(block, block.link_to_page.as_ref()),
+        "table_of_contents" => directive_block_with_attrs(
+            block,
+            "table_of_contents",
+            block
+                .table_of_contents
+                .as_ref()
+                .and_then(|table| table.color.clone())
+                .map(|color| vec![("color", color)])
+                .unwrap_or_default(),
+        ),
+        "breadcrumb" | "column_list" | "column" => directive_block(block, &block.kind, None),
+        "template" => directive_block(
+            block,
+            "template",
+            block
+                .template
+                .as_ref()
+                .and_then(rich_text_block_title)
+                .as_deref(),
+        ),
+        "meeting_notes" => titled_directive(block, "meeting_notes", block.meeting_notes.as_ref()),
+        "transcription" => titled_directive(block, "transcription", block.transcription.as_ref()),
+        "tab" | "ai_block" | "custom_block" => directive_block(block, &block.kind, None),
+        "unsupported" => directive_block(block, "unsupported", None),
         other => directive_block(block, &format!("unsupported_{other}"), None),
     }
 }
@@ -217,21 +269,140 @@ fn rich_text_block(
     }
 }
 
-fn directive_block(block: &BlockDto, directive_type: &str, title: Option<&str>) -> RenderedBlock {
-    let title = title.map(escape_directive_value);
-    let markdown = match title {
-        Some(title) => format!(
-            "::afs{{id={} type={} title=\"{}\"}}",
-            block.id, directive_type, title
-        ),
-        None => format!("::afs{{id={} type={}}}", block.id, directive_type),
+fn equation_block(block: &BlockDto, equation: Option<&EquationBlockDto>) -> RenderedBlock {
+    let Some(expression) = equation
+        .map(|equation| equation.expression.trim())
+        .filter(|expression| !expression.is_empty())
+    else {
+        return directive_block(block, "malformed_equation", None);
     };
 
+    RenderedBlock {
+        markdown: format!("$$\n{expression}\n$$"),
+        shadow_id: Some(RemoteId::new(block.id.clone())),
+        metadata: RenderedBlockMetadata::None,
+    }
+}
+
+fn url_directive_block(
+    block: &BlockDto,
+    directive_type: &'static str,
+    payload: Option<&UrlBlockDto>,
+) -> RenderedBlock {
+    let attrs = payload
+        .map(|payload| {
+            directive_attrs(
+                rich_text_list_title(&payload.caption).map(|title| ("title", title)),
+                Some(("url", payload.url.clone())),
+            )
+        })
+        .unwrap_or_default();
+    directive_block_with_attrs(block, directive_type, attrs)
+}
+
+fn file_directive_block(
+    block: &BlockDto,
+    directive_type: &'static str,
+    payload: Option<&FileBlockDto>,
+) -> RenderedBlock {
+    let attrs = payload
+        .map(|payload| {
+            directive_attrs(
+                rich_text_list_title(&payload.caption).map(|title| ("title", title)),
+                file_url(payload).map(|url| ("url", url)),
+            )
+        })
+        .unwrap_or_default();
+    directive_block_with_attrs(block, directive_type, attrs)
+}
+
+fn synced_block_directive(block: &BlockDto, payload: Option<&SyncedBlockDto>) -> RenderedBlock {
+    let attrs = payload
+        .and_then(|payload| payload.synced_from.as_ref())
+        .and_then(|synced_from| synced_from.block_id.clone())
+        .map(|block_id| vec![("source_block_id", block_id)])
+        .unwrap_or_default();
+    directive_block_with_attrs(block, "synced_block", attrs)
+}
+
+fn link_to_page_directive(block: &BlockDto, payload: Option<&LinkToPageBlockDto>) -> RenderedBlock {
+    let attrs = payload
+        .and_then(|payload| match payload.kind.as_str() {
+            "page_id" => payload.page_id.clone().map(|id| vec![("page_id", id)]),
+            "database_id" => payload
+                .database_id
+                .clone()
+                .map(|id| vec![("database_id", id)]),
+            _ => None,
+        })
+        .unwrap_or_default();
+    directive_block_with_attrs(block, "link_to_page", attrs)
+}
+
+fn titled_directive(
+    block: &BlockDto,
+    directive_type: &str,
+    payload: Option<&MeetingNotesBlockDto>,
+) -> RenderedBlock {
+    directive_block(
+        block,
+        directive_type,
+        payload.and_then(|meeting_notes| meeting_notes.title.as_deref()),
+    )
+}
+
+fn directive_block(block: &BlockDto, directive_type: &str, title: Option<&str>) -> RenderedBlock {
+    let attrs = title
+        .map(|title| vec![("title", title.to_string())])
+        .unwrap_or_default();
+    directive_block_with_attrs(block, directive_type, attrs)
+}
+
+fn directive_block_with_attrs(
+    block: &BlockDto,
+    directive_type: &str,
+    attrs: Vec<(&'static str, String)>,
+) -> RenderedBlock {
+    let mut parts = vec![format!("id={}", block.id), format!("type={directive_type}")];
+    for (key, value) in attrs {
+        if !value.is_empty() {
+            parts.push(format!("{key}=\"{}\"", escape_directive_value(&value)));
+        }
+    }
+    let markdown = format!("::afs{{{}}}", parts.join(" "));
     RenderedBlock {
         markdown,
         shadow_id: None,
         metadata: RenderedBlockMetadata::None,
     }
+}
+
+fn directive_attrs(
+    first: Option<(&'static str, String)>,
+    second: Option<(&'static str, String)>,
+) -> Vec<(&'static str, String)> {
+    first.into_iter().chain(second).collect()
+}
+
+fn rich_text_block_title(block: &RichTextBlockDto) -> Option<String> {
+    rich_text_list_title(&block.rich_text)
+}
+
+fn rich_text_list_title(rich_text: &[RichTextDto]) -> Option<String> {
+    let title = rich_text_plain_text(rich_text);
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn file_url(file: &FileBlockDto) -> Option<String> {
+    file.external
+        .as_ref()
+        .map(|external| external.url.clone())
+        .or_else(|| file.file.as_ref().map(|file| file.url.clone()))
+        .filter(|url| !url.is_empty())
 }
 
 fn render_table_tree(tree: &BlockTreeDto) -> Option<RenderedBlock> {

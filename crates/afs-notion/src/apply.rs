@@ -11,13 +11,16 @@ use std::collections::BTreeMap;
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult};
 use afs_core::journal::JournalApplyEffect;
 use afs_core::model::RemoteId;
-use afs_core::planner::PushOperation;
+use afs_core::planner::{PropertyValue, PushOperation};
 use afs_core::undo::{UndoOperation, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
 use serde_json::{Map, Value, json};
 
 use crate::client::NotionApi;
-use crate::dto::{BlockDto, BlockTreeDto, NotionPageBundle, RichTextAnnotationsDto, RichTextDto};
+use crate::dto::{
+    BlockDto, BlockTreeDto, NotionPageBundle, PageDto, PagePropertyDto, RichTextAnnotationsDto,
+    RichTextDto,
+};
 use crate::fetch::fetch_page_bundle;
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
@@ -100,6 +103,20 @@ pub fn apply_plan(
                     operation_id: request.operation_ids[operation_index].clone(),
                     operation_index,
                     block_id: block_id.clone(),
+                });
+            }
+            PushOperation::UpdateProperties {
+                entity_id,
+                properties,
+            } => {
+                let page = current_page(&bundles, entity_id)?;
+                let body = update_properties_body(page, properties)?;
+                api.update_page(entity_id.as_str(), body)?;
+                effects.push(JournalApplyEffect::UpdatedProperties {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    entity_id: entity_id.clone(),
+                    keys: properties.keys().cloned().collect(),
                 });
             }
             unsupported => {
@@ -202,6 +219,213 @@ fn current_block<'a>(
     })
 }
 
+fn current_page<'a>(bundles: &'a [NotionPageBundle], page_id: &RemoteId) -> AfsResult<&'a PageDto> {
+    bundles
+        .iter()
+        .find(|bundle| bundle.page.id == page_id.0)
+        .map(|bundle| &bundle.page)
+        .ok_or_else(|| {
+            AfsError::InvalidState(format!(
+                "push referenced page `{}` that is absent from current Notion content",
+                page_id.0
+            ))
+        })
+}
+
+fn update_properties_body(
+    page: &PageDto,
+    properties: &BTreeMap<String, PropertyValue>,
+) -> AfsResult<Value> {
+    if properties.is_empty() {
+        return Err(AfsError::Unsupported(
+            "applying legacy Notion property updates without values",
+        ));
+    }
+
+    let mut payload = Map::new();
+
+    for (key, value) in properties {
+        let (notion_key, property) = if key == "title" {
+            title_property(page)?
+        } else {
+            let property = page.properties.get(key).ok_or_else(|| {
+                AfsError::Validation(vec![property_issue(
+                    key,
+                    "notion_property_unknown",
+                    format!("Notion property `{key}` does not exist on the page"),
+                )])
+            })?;
+            (key.as_str(), property)
+        };
+        payload.insert(
+            notion_key.to_string(),
+            property_update_value(property, value, key)?,
+        );
+    }
+
+    Ok(json!({ "properties": Value::Object(payload) }))
+}
+
+fn title_property(page: &PageDto) -> AfsResult<(&str, &PagePropertyDto)> {
+    page.properties
+        .iter()
+        .find(|(_, property)| property.kind == "title")
+        .map(|(key, property)| (key.as_str(), property))
+        .ok_or(AfsError::Unsupported(
+            "updating Notion title without a title property",
+        ))
+}
+
+fn property_update_value(
+    property: &PagePropertyDto,
+    value: &PropertyValue,
+    key: &str,
+) -> AfsResult<Value> {
+    match property.kind.as_str() {
+        "title" => Ok(json!({ "title": rich_text(&required_string(value, key)?) })),
+        "rich_text" => Ok(json!({ "rich_text": rich_text(&required_string(value, key)?) })),
+        "number" => number_property(value, key),
+        "select" => option_property("select", value, key),
+        "status" => option_property("status", value, key),
+        "multi_select" => multi_select_property(value, key),
+        "checkbox" => bool_property(value, key),
+        "date" => date_property(value, key),
+        "url" | "email" | "phone_number" => nullable_string_property(&property.kind, value, key),
+        _ => Err(AfsError::Unsupported("updating this Notion property type")),
+    }
+}
+
+fn number_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    match value {
+        PropertyValue::Null => Ok(json!({ "number": Value::Null })),
+        PropertyValue::Number(value) | PropertyValue::String(value) => {
+            let number = value.parse::<f64>().map_err(|_| {
+                AfsError::Validation(vec![property_issue(
+                    key,
+                    "notion_property_number_invalid",
+                    "Notion number properties must be numeric",
+                )])
+            })?;
+            Ok(json!({ "number": number }))
+        }
+        _ => Err(property_type_error(key, "number")),
+    }
+}
+
+fn option_property(kind: &str, value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    match value {
+        PropertyValue::Null => Ok(single_property(kind, Value::Null)),
+        PropertyValue::String(value) if value.trim().is_empty() => {
+            Ok(single_property(kind, Value::Null))
+        }
+        PropertyValue::String(value) => Ok(single_property(kind, json!({ "name": value }))),
+        _ => Err(property_type_error(key, "string or null")),
+    }
+}
+
+fn multi_select_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    match value {
+        PropertyValue::Null => Ok(json!({ "multi_select": [] })),
+        PropertyValue::List(values) => Ok(json!({
+            "multi_select": values
+                .iter()
+                .map(|value| json!({ "name": value }))
+                .collect::<Vec<_>>()
+        })),
+        PropertyValue::String(value) if value.trim().is_empty() => {
+            Ok(json!({ "multi_select": [] }))
+        }
+        _ => Err(property_type_error(key, "list")),
+    }
+}
+
+fn bool_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    match value {
+        PropertyValue::Bool(value) => Ok(json!({ "checkbox": value })),
+        _ => Err(property_type_error(key, "boolean")),
+    }
+}
+
+fn date_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    match value {
+        PropertyValue::Null => Ok(json!({ "date": Value::Null })),
+        PropertyValue::String(value) if value.trim().is_empty() => {
+            Ok(json!({ "date": Value::Null }))
+        }
+        PropertyValue::String(value) => Ok(json!({ "date": { "start": value } })),
+        PropertyValue::Object(fields) => {
+            let start = match fields.get("start") {
+                Some(PropertyValue::String(value)) => value,
+                _ => return Err(property_type_error(key, "date object with string start")),
+            };
+            let mut date = json!({ "start": start });
+            if let Some(end) = fields.get("end").and_then(property_string) {
+                date["end"] = json!(end);
+            }
+            if let Some(time_zone) = fields.get("time_zone").and_then(property_string) {
+                date["time_zone"] = json!(time_zone);
+            }
+            Ok(json!({ "date": date }))
+        }
+        _ => Err(property_type_error(key, "date string or object")),
+    }
+}
+
+fn nullable_string_property(kind: &str, value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    match value {
+        PropertyValue::Null => Ok(single_property(kind, Value::Null)),
+        PropertyValue::String(value) if value.trim().is_empty() => {
+            Ok(single_property(kind, Value::Null))
+        }
+        PropertyValue::String(value) => Ok(single_property(kind, json!(value))),
+        _ => Err(property_type_error(key, "string or null")),
+    }
+}
+
+fn single_property(kind: &str, value: Value) -> Value {
+    let mut object = Map::new();
+    object.insert(kind.to_string(), value);
+    Value::Object(object)
+}
+
+fn required_string(value: &PropertyValue, key: &str) -> AfsResult<String> {
+    match value {
+        PropertyValue::String(value) => Ok(value.clone()),
+        _ => Err(property_type_error(key, "string")),
+    }
+}
+
+fn property_string(value: &PropertyValue) -> Option<&str> {
+    match value {
+        PropertyValue::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn property_type_error(key: &str, expected: &str) -> AfsError {
+    AfsError::Validation(vec![property_issue(
+        key,
+        "notion_property_type_mismatch",
+        format!("Notion property `{key}` must be {expected}"),
+    )])
+}
+
+fn property_issue(
+    key: &str,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> afs_core::validation::ValidationIssue {
+    afs_core::validation::ValidationIssue::new(
+        code,
+        "",
+        None,
+        message,
+        Some(format!(
+            "restore `{key}` to a value compatible with the database schema"
+        )),
+    )
+}
+
 fn ensure_update_supported(current: &BlockDto, patch: &NotionBlockPatch) -> AfsResult<()> {
     if current.kind != patch.kind {
         return Err(AfsError::Unsupported("changing Notion block type"));
@@ -228,6 +452,10 @@ fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>
             .heading_3
             .as_ref()
             .map(|block| block.rich_text.as_slice()),
+        "heading_4" => block
+            .heading_4
+            .as_ref()
+            .map(|block| block.rich_text.as_slice()),
         "bulleted_list_item" => block
             .bulleted_list_item
             .as_ref()
@@ -239,7 +467,7 @@ fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>
         "quote" => block.quote.as_ref().map(|block| block.rich_text.as_slice()),
         "to_do" => block.to_do.as_ref().map(|block| block.rich_text.as_slice()),
         "code" => block.code.as_ref().map(|block| block.rich_text.as_slice()),
-        "divider" => return Ok(None),
+        "divider" | "equation" => return Ok(None),
         _ => return Ok(None),
     }
     .ok_or_else(|| {
@@ -305,12 +533,20 @@ fn parse_supported_block(
         return Ok(NotionBlockPatch::new("divider", json!({})));
     }
 
+    if let Some(expression) = parse_display_equation(trimmed) {
+        return Ok(NotionBlockPatch::new(
+            "equation",
+            json!({ "expression": expression }),
+        ));
+    }
+
     if let Some((level, text)) = parse_heading(trimmed) {
         let kind = match level {
             1 => "heading_1",
             2 => "heading_2",
             3 => "heading_3",
-            _ => return Err(AfsError::Unsupported("Notion heading levels above 3")),
+            4 => "heading_4",
+            _ => return Err(AfsError::Unsupported("Notion heading levels above 4")),
         };
         return Ok(NotionBlockPatch::new(
             kind,
@@ -365,7 +601,9 @@ fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
             "children": [child],
             "position": {
                 "type": "after_block",
-                "after_block": after.0,
+                "after_block": {
+                    "id": after.0,
+                },
             },
         }),
         None => json!({
@@ -1127,6 +1365,20 @@ fn parse_code_fence(markdown: &str) -> Option<(String, String)> {
     Some((language.to_string(), body.join("\n")))
 }
 
+fn parse_display_equation(markdown: &str) -> Option<String> {
+    let trimmed = markdown.trim();
+    if !trimmed.starts_with("$$") || !trimmed.ends_with("$$") || trimmed.len() < 4 {
+        return None;
+    }
+
+    let expression = trimmed[2..trimmed.len() - 2].trim_matches('\n').trim();
+    if expression.is_empty() {
+        None
+    } else {
+        Some(expression.to_string())
+    }
+}
+
 fn parse_heading(markdown: &str) -> Option<(usize, &str)> {
     let trimmed = markdown.trim_start();
     let level = trimmed.chars().take_while(|ch| *ch == '#').count();
@@ -1203,10 +1455,10 @@ fn unsupported_operation_name(operation: &PushOperation) -> &'static str {
     match operation {
         PushOperation::MoveBlock { .. } => "moving Notion blocks",
         PushOperation::ArchiveEntity { .. } => "archiving Notion pages",
-        PushOperation::UpdateProperties { .. } => "updating Notion properties",
         PushOperation::CreateEntity { .. } => "creating Notion pages",
         PushOperation::UpdateBlock { .. }
         | PushOperation::AppendBlock { .. }
+        | PushOperation::UpdateProperties { .. }
         | PushOperation::ArchiveBlock { .. } => "unsupported Notion push operation",
     }
 }

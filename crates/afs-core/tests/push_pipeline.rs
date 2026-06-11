@@ -1,10 +1,15 @@
+use std::collections::BTreeMap;
+
 use afs_core::canonical::{ParsedCanonicalDocument, parse_canonical_markdown};
 use afs_core::model::RemoteId;
-use afs_core::planner::{GuardrailDecision, GuardrailPolicy, PlanDegradationKind, PushOperation};
+use afs_core::planner::{
+    GuardrailDecision, GuardrailPolicy, PlanDegradationKind, PropertyValue, PushOperation,
+};
 use afs_core::push::{
     PushApproval, PushPipelineAction, PushPipelineRequest, PushStage, plan_push_pipeline,
 };
 use afs_core::shadow::ShadowDocument;
+use serde_json::json;
 
 #[test]
 fn clean_noop_push_finishes_without_apply() {
@@ -209,6 +214,66 @@ fn update_append_and_delete_plans_are_wrapped() {
                 block_id: RemoteId::new("media-1"),
             },
         ]
+    );
+}
+
+#[test]
+fn frontmatter_property_edits_plan_property_update() {
+    let parsed = parse_canonical_markdown(
+        "---\nafs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n\"Status\": \"Done\"\n\"Points\": 3\n---\nSame body.",
+    )
+    .expect("canonical document");
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "Same body.",
+        10,
+        [RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
+    .with_frontmatter(
+        "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n\"Status\": \"Todo\"\n\"Points\": 2\n",
+    );
+
+    let output = plan_push_pipeline(request(&parsed, &shadow).with_approval(PushApproval {
+        assume_yes: true,
+        confirm_dangerous: false,
+    }));
+    let plan = output.plan.expect("plan");
+
+    assert_eq!(output.action, PushPipelineAction::ProceedToApply);
+    assert_eq!(plan.summary.properties_updated, 2);
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateProperties {
+            entity_id: RemoteId::new("page-1"),
+            properties: [
+                ("Points".to_string(), PropertyValue::Number("3".to_string())),
+                (
+                    "Status".to_string(),
+                    PropertyValue::String("Done".to_string())
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }]
+    );
+}
+
+#[test]
+fn legacy_property_update_operation_json_stays_readable() {
+    let operation: PushOperation = serde_json::from_value(json!({
+        "type": "update_properties",
+        "entity_id": "page-1",
+        "keys": ["Status"],
+    }))
+    .expect("legacy operation");
+
+    assert_eq!(
+        operation,
+        PushOperation::UpdateProperties {
+            entity_id: RemoteId::new("page-1"),
+            properties: BTreeMap::new(),
+        }
     );
 }
 

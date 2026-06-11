@@ -424,23 +424,7 @@ fn block(id: &str, kind: &str) -> BlockDto {
     BlockDto {
         id: id.to_string(),
         kind: kind.to_string(),
-        has_children: false,
-        archived: false,
-        in_trash: false,
-        paragraph: None,
-        heading_1: None,
-        heading_2: None,
-        heading_3: None,
-        bulleted_list_item: None,
-        numbered_list_item: None,
-        to_do: None,
-        quote: None,
-        callout: None,
-        code: None,
-        table: None,
-        table_row: None,
-        child_page: None,
-        child_database: None,
+        ..Default::default()
     }
 }
 

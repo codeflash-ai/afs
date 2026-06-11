@@ -7,11 +7,13 @@ use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::shadow::MarkdownBlockKind;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, BlockTreeDto, DataSourceDto, DataSourcePropertyDto,
-    DataSourceSummaryDto, DatabaseDto, DateMentionDto, EquationRichTextDto, IdRefDto, LinkDto,
+    BlockDto, BlockListDto, BlockTreeDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
+    DataSourceSummaryDto, DatabaseDto, DateMentionDto, EquationBlockDto, EquationRichTextDto,
+    ExternalFileDto, FileBlockDto, IdRefDto, LinkDto, LinkToPageBlockDto, MeetingNotesBlockDto,
     MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
     RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
-    SelectPropertySchemaDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
+    SelectPropertySchemaDto, SyncedBlockDto, SyncedFromDto, TableBlockDto, TableRowBlockDto,
+    TextRichTextDto, TitleBlockDto, UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 
@@ -89,7 +91,7 @@ fn fetch_does_not_inline_child_page_or_database_content_into_parent_body() {
 fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
     let page = page("page-1", "Roadmap");
     let block = BlockTreeDto {
-        block: unsupported_block("bookmark-1", "bookmark"),
+        block: unsupported_block("future-1", "future_block"),
         children: Vec::new(),
     };
     let bundle = afs_notion::dto::NotionPageBundle {
@@ -111,17 +113,137 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
 
     assert_eq!(
         rendered.document.body,
-        "::afs{id=bookmark-1 type=unsupported_bookmark}\n"
+        "::afs{id=future-1 type=unsupported_future_block}\n"
     );
     assert_eq!(rendered.shadow.blocks.len(), 1);
     assert_eq!(
         rendered.shadow.blocks[0].remote_id,
-        RemoteId::new("bookmark-1")
+        RemoteId::new("future-1")
     );
     assert!(matches!(
         rendered.shadow.blocks[0].kind,
         MarkdownBlockKind::Directive { .. }
     ));
+}
+
+#[test]
+fn render_richer_notion_block_coverage() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![
+            BlockTreeDto {
+                block: rich_text_block("heading-4", "heading_4", "Heading four"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: toggle_block("toggle-1", "Toggle summary"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: equation_block("equation-1", "E=mc^2"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: url_block(
+                    "embed-1",
+                    "embed",
+                    "https://example.com/embed",
+                    "Embed caption",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: url_block(
+                    "bookmark-1",
+                    "bookmark",
+                    "https://example.com/bookmark",
+                    "Bookmark caption",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "image-1",
+                    "image",
+                    "https://example.com/image.png",
+                    "Image caption",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: synced_block("synced-1", "source-block-1"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: link_to_page_block("link-to-page-1", "target-page-1"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: table_of_contents_block("toc-1"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: block("breadcrumb-1", "breadcrumb"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: block("column-list-1", "column_list"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: block("column-1", "column"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: meeting_notes_block("meeting-1", "Weekly sync"),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        concat!(
+            "#### Heading four\n\n",
+            "::afs{id=toggle-1 type=toggle title=\"Toggle summary\"}\n\n",
+            "$$\nE=mc^2\n$$\n\n",
+            "::afs{id=embed-1 type=embed title=\"Embed caption\" url=\"https://example.com/embed\"}\n\n",
+            "::afs{id=bookmark-1 type=bookmark title=\"Bookmark caption\" url=\"https://example.com/bookmark\"}\n\n",
+            "::afs{id=image-1 type=image title=\"Image caption\" url=\"https://example.com/image.png\"}\n\n",
+            "::afs{id=synced-1 type=synced_block source_block_id=\"source-block-1\"}\n\n",
+            "::afs{id=link-to-page-1 type=link_to_page page_id=\"target-page-1\"}\n\n",
+            "::afs{id=toc-1 type=table_of_contents color=\"default\"}\n\n",
+            "::afs{id=breadcrumb-1 type=breadcrumb}\n\n",
+            "::afs{id=column-list-1 type=column_list}\n\n",
+            "::afs{id=column-1 type=column}\n\n",
+            "::afs{id=meeting-1 type=meeting_notes title=\"Weekly sync\"}\n"
+        )
+    );
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "heading-4",
+            "toggle-1",
+            "equation-1",
+            "embed-1",
+            "bookmark-1",
+            "image-1",
+            "synced-1",
+            "link-to-page-1",
+            "toc-1",
+            "breadcrumb-1",
+            "column-list-1",
+            "column-1",
+            "meeting-1",
+        ]
+    );
 }
 
 #[test]
@@ -740,6 +862,7 @@ fn rich_text_block(id: &str, kind: &str, text: &str) -> BlockDto {
         "heading_1" => block.heading_1 = value,
         "heading_2" => block.heading_2 = value,
         "heading_3" => block.heading_3 = value,
+        "heading_4" => block.heading_4 = value,
         _ => panic!("unsupported fixture rich text kind: {kind}"),
     }
 
@@ -783,24 +906,95 @@ fn block(id: &str, kind: &str) -> BlockDto {
     BlockDto {
         id: id.to_string(),
         kind: kind.to_string(),
-        has_children: false,
-        archived: false,
-        in_trash: false,
-        paragraph: None,
-        heading_1: None,
-        heading_2: None,
-        heading_3: None,
-        bulleted_list_item: None,
-        numbered_list_item: None,
-        to_do: None,
-        quote: None,
-        callout: None,
-        code: None,
-        table: None,
-        table_row: None,
-        child_page: None,
-        child_database: None,
+        ..Default::default()
     }
+}
+
+fn toggle_block(id: &str, text: &str) -> BlockDto {
+    let mut block = block(id, "toggle");
+    block.toggle = Some(rich_text_block_content(vec![rich_text(text)]));
+    block
+}
+
+fn equation_block(id: &str, expression: &str) -> BlockDto {
+    let mut block = block(id, "equation");
+    block.equation = Some(EquationBlockDto {
+        expression: expression.to_string(),
+    });
+    block
+}
+
+fn url_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = block(id, kind);
+    let payload = Some(UrlBlockDto {
+        url: url.to_string(),
+        caption: vec![rich_text(caption)],
+    });
+    match kind {
+        "embed" => block.embed = payload,
+        "bookmark" => block.bookmark = payload,
+        "link_preview" => block.link_preview = payload,
+        _ => panic!("unsupported fixture url block kind: {kind}"),
+    }
+    block
+}
+
+fn file_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = block(id, kind);
+    let payload = Some(FileBlockDto {
+        kind: "external".to_string(),
+        external: Some(ExternalFileDto {
+            url: url.to_string(),
+        }),
+        file: None,
+        caption: vec![rich_text(caption)],
+    });
+    match kind {
+        "image" => block.image = payload,
+        "video" => block.video = payload,
+        "file" => block.file = payload,
+        "pdf" => block.pdf = payload,
+        "audio" => block.audio = payload,
+        _ => panic!("unsupported fixture file block kind: {kind}"),
+    }
+    block
+}
+
+fn synced_block(id: &str, source_block_id: &str) -> BlockDto {
+    let mut block = block(id, "synced_block");
+    block.synced_block = Some(SyncedBlockDto {
+        synced_from: Some(SyncedFromDto {
+            kind: "block_id".to_string(),
+            block_id: Some(source_block_id.to_string()),
+        }),
+    });
+    block
+}
+
+fn link_to_page_block(id: &str, page_id: &str) -> BlockDto {
+    let mut block = block(id, "link_to_page");
+    block.link_to_page = Some(LinkToPageBlockDto {
+        kind: "page_id".to_string(),
+        page_id: Some(page_id.to_string()),
+        database_id: None,
+    });
+    block
+}
+
+fn table_of_contents_block(id: &str) -> BlockDto {
+    let mut block = block(id, "table_of_contents");
+    block.table_of_contents = Some(ColorOnlyBlockDto {
+        color: Some("default".to_string()),
+    });
+    block
+}
+
+fn meeting_notes_block(id: &str, title: &str) -> BlockDto {
+    let mut block = block(id, "meeting_notes");
+    block.meeting_notes = Some(MeetingNotesBlockDto {
+        title: Some(title.to_string()),
+    });
+    block
 }
 
 fn table_block(id: &str, width: u16, has_column_header: bool) -> BlockDto {

@@ -18,8 +18,6 @@ use afs_store::{
 };
 use afsd::hydration::{HydrationExecutor, HydrationOutcome};
 
-const CODEFLASH_HOME_PAGE_ID: &str = "37b3ac0ebb8880d3a863fba3a5e41915";
-
 #[test]
 fn notion_connector_hydrates_stub_through_daemon_executor() {
     let fixture = NotionHydrationFixture::new();
@@ -70,8 +68,7 @@ fn notion_connector_hydrates_stub_through_daemon_executor() {
 #[test]
 #[ignore = "requires NOTION_TOKEN and access to the target Notion page"]
 fn live_notion_hydration_source_fetches_codeflash_home_page() {
-    let page_id =
-        std::env::var("AFS_NOTION_PAGE_ID").unwrap_or_else(|_| CODEFLASH_HOME_PAGE_ID.to_string());
+    let page_id = std::env::var("AFS_NOTION_PAGE_ID").expect("AFS_NOTION_PAGE_ID");
     let request = HydrationRequest::new(
         MountId::new("notion-live"),
         RemoteId::new(page_id),

@@ -123,6 +123,8 @@ impl From<EntityRecord> for TreeEntry {
 pub struct ShadowSnapshotRecord {
     pub mount_id: MountId,
     pub entity_id: RemoteId,
+    #[serde(default)]
+    pub frontmatter: String,
     pub body_hash: String,
     pub rendered_body: String,
     pub blocks: Vec<ShadowBlockRecord>,
@@ -133,6 +135,7 @@ impl ShadowSnapshotRecord {
         Self {
             mount_id,
             entity_id: document.entity_id.clone(),
+            frontmatter: document.frontmatter.clone(),
             body_hash: document.body_hash.clone(),
             rendered_body: document.rendered_body.clone(),
             blocks: document
@@ -147,6 +150,7 @@ impl ShadowSnapshotRecord {
     pub fn into_document(self) -> ShadowDocument {
         ShadowDocument {
             entity_id: self.entity_id,
+            frontmatter: self.frontmatter,
             body_hash: self.body_hash,
             rendered_body: self.rendered_body,
             blocks: self.blocks.into_iter().map(ShadowBlock::from).collect(),

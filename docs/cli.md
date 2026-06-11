@@ -67,7 +67,7 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_not_implemented`;
 - `apply_failed`.
 
-Reports also include `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector still reports `apply_not_implemented` because its API mutation methods are stubs, but the CLI now writes a journal first and marks it failed if a connector boundary returns `NotImplemented`.
+Reports also include `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset through the live API; unsupported connector boundaries still return `apply_not_implemented` or `apply_failed` after the journal is marked failed.
 
 ## Initial `afs log --json` Shape
 

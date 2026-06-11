@@ -26,6 +26,7 @@ name = "afs-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "yaml_serde",
 ]
 
