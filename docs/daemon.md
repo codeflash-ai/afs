@@ -53,12 +53,15 @@ storage instead of plist environment variables.
 
 `afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`
 or `~/.afs/afsd.sock`, plus a localhost TCP listener at `127.0.0.1:38567` by
-default. CLI `pull` and `push` try the Unix socket first and fall back to the
-same in-process executor when the socket is unavailable. The macOS File
-Provider extension uses the TCP listener because the extension is sandboxed.
-Set `AFS_DAEMON_TCP_ADDR=off` to disable TCP, or set it to `host:port` to move
-the listener. Setting `AFS_DAEMON_DISABLE=1` forces the CLI fallback path,
-which is useful for tests and recovery.
+default. CLI `pull` and `push` try the Unix socket first. If the socket is
+unavailable, they fall back to the same in-process executor; if the daemon
+accepts a request but does not answer within the CLI timeout, `pull` falls back
+to direct execution while `push` fails closed to avoid duplicate remote writes.
+The macOS File Provider extension uses the TCP listener because the extension is
+sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to disable TCP, or set it to
+`host:port` to move the listener. Setting `AFS_DAEMON_DISABLE=1` forces the CLI
+fallback path, which is useful for tests and recovery. Set
+`AFS_DAEMON_REQUEST_TIMEOUT_MS` to tune the CLI daemon request timeout.
 
 The socket accept loop does not run connector calls directly. It reads one JSON
 request, submits it to `DaemonRuntime`, and waits for the runtime response.
@@ -109,6 +112,15 @@ daemon stopped  socket=/Users/alice/.afs/afsd.sock
 afsd not running; executing pull directly (start afsd for background hydration)
 ```
 
+If a `pull` request times out after being submitted, the CLI also falls back and
+prints:
+
+```text
+afsd did not respond within 5000ms; executing pull directly
+```
+
+Timed-out `push` requests do not fall back because the daemon may already own an
+in-flight remote mutation. Stop or recover the daemon before retrying the push.
 Set `AFS_DAEMON_DISABLE=1` to force direct execution without the fallback warning.
 
 ## Runtime Loop
@@ -125,7 +137,9 @@ transaction, runs the connector call, and reports completion back to the runtime
 That keeps the current SQLite-backed implementation simple while preserving the
 important invariant: daemon-managed mutations are serialized through one queue.
 Watcher events use the same queue, so local filesystem changes cannot race
-remote pull, hydration, or push reconciliation.
+remote pull, hydration, or push reconciliation. Runtime status includes the
+current active job kind, target, start time, and elapsed time so wedged workers
+are visible through `afs daemon status`.
 
 ## Virtual Filesystem Projections
 

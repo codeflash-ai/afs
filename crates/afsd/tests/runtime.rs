@@ -52,6 +52,12 @@ fn runtime_answers_ping_while_pull_worker_is_blocked() {
     let ping = runtime.handle().request(DaemonRequest::Ping);
     assert_eq!(ping, DaemonResponse::ok(json!({ "status": "ok" })));
 
+    let status = runtime.handle().status().expect("runtime status");
+    assert!(status.active_job);
+    let active = status.active_job_detail.expect("active job detail");
+    assert_eq!(active.kind, "pull");
+    assert_eq!(active.target.as_deref(), Some("Roadmap.md"));
+
     release_blocked_runner(&release);
     let pull = pull_thread.join().expect("pull thread");
     assert!(pull.ok);

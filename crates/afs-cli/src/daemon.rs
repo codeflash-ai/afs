@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 
 use afsd::ipc::{
-    DaemonClientError, DaemonReloadReport, DaemonRequest, DaemonStatusReport, send_request,
+    DaemonClientError, DaemonReloadReport, DaemonRequest, DaemonStatusReport,
+    send_request_with_timeout,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 const LABEL: &str = "ai.codeflash.afs.afsd";
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const DAEMON_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonControlError {
@@ -448,12 +450,14 @@ fn send_daemon_report<T>(
 where
     T: DeserializeOwned,
 {
-    let response = send_request(&paths.state_root, request).map_err(|error| {
-        DaemonControlError::new(
-            "daemon_error",
-            format!("daemon request failed: {}", error.message()),
-        )
-    })?;
+    let response =
+        send_request_with_timeout(&paths.state_root, request, DAEMON_CONTROL_REQUEST_TIMEOUT)
+            .map_err(|error| {
+                DaemonControlError::new(
+                    "daemon_error",
+                    format!("daemon request failed: {}", error.message()),
+                )
+            })?;
     if let Some(error) = response.error {
         return Err(DaemonControlError::new(
             "daemon_error",
@@ -676,9 +680,14 @@ fn stop_session(paths: &DaemonPaths) -> Result<(), DaemonControlError> {
 }
 
 fn is_running(paths: &DaemonPaths) -> bool {
-    match send_request(&paths.state_root, &DaemonRequest::Ping) {
+    match send_request_with_timeout(
+        &paths.state_root,
+        &DaemonRequest::Ping,
+        DAEMON_CONTROL_REQUEST_TIMEOUT,
+    ) {
         Ok(response) => response.ok,
         Err(DaemonClientError::NotAvailable(_))
+        | Err(DaemonClientError::TimedOut(_))
         | Err(DaemonClientError::Io(_))
         | Err(DaemonClientError::Protocol(_)) => false,
     }
