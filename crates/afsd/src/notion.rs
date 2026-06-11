@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{Connector, FetchRequest};
 use afs_core::model::MountId;
@@ -8,10 +9,11 @@ use afs_core::{AfsError, AfsResult};
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use afs_notion::dto::NotionPageBundle;
 use afs_notion::media::fetch_media_assets;
+use afs_notion::oauth::{HttpNotionOAuthClient, NotionOAuthRefresh, StoredNotionCredential};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
-    ConnectionRecord, ConnectionRepository, CredentialError, CredentialStore, MountConfig,
-    MountRepository,
+    ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
+    CredentialStore, MountConfig, MountRepository,
 };
 
 use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
@@ -34,6 +36,10 @@ pub enum ConnectorResolveError {
         connection_id: String,
         suggested_command: String,
     },
+    AuthProfileUnavailable {
+        profile_id: String,
+        suggested_command: String,
+    },
     CredentialStoreUnavailable(String),
 }
 
@@ -45,6 +51,7 @@ impl ConnectorResolveError {
             Self::MissingConnection { .. } => "missing_connection",
             Self::AuthRequired { .. } => "auth_required",
             Self::ConnectionRevoked { .. } => "connection_revoked",
+            Self::AuthProfileUnavailable { .. } => "auth_profile_unavailable",
             Self::CredentialStoreUnavailable(_) => "credential_store_unavailable",
         }
     }
@@ -62,6 +69,9 @@ impl ConnectorResolveError {
             Self::ConnectionRevoked { connection_id, .. } => {
                 format!("connection `{connection_id}` is revoked")
             }
+            Self::AuthProfileUnavailable { profile_id, .. } => {
+                format!("connector profile `{profile_id}` is unavailable")
+            }
             Self::CredentialStoreUnavailable(message) => message.clone(),
         }
     }
@@ -75,6 +85,9 @@ impl ConnectorResolveError {
                 suggested_command, ..
             }
             | Self::ConnectionRevoked {
+                suggested_command, ..
+            }
+            | Self::AuthProfileUnavailable {
                 suggested_command, ..
             } => Some(suggested_command),
             _ => None,
@@ -94,7 +107,7 @@ pub fn resolve_notion_connector_for_path<S>(
     path: impl AsRef<Path>,
 ) -> Result<NotionConnector, ConnectorResolveError>
 where
-    S: MountRepository + ConnectionRepository,
+    S: MountRepository + ConnectionRepository + ConnectorProfileRepository,
 {
     let target = absolute_path(path.as_ref()).map_err(ConnectorResolveError::MountMissing)?;
     let mounts = store
@@ -111,7 +124,7 @@ pub fn resolve_notion_connector_for_mount_id<S>(
     mount_id: &MountId,
 ) -> Result<NotionConnector, ConnectorResolveError>
 where
-    S: MountRepository + ConnectionRepository,
+    S: MountRepository + ConnectionRepository + ConnectorProfileRepository,
 {
     let mount = store
         .get_mount(mount_id)
@@ -126,7 +139,7 @@ pub fn resolve_notion_connector_for_mount<S>(
     mount: &MountConfig,
 ) -> Result<NotionConnector, ConnectorResolveError>
 where
-    S: ConnectionRepository,
+    S: ConnectionRepository + ConnectorProfileRepository,
 {
     if mount.connector != "notion" {
         return Err(ConnectorResolveError::UnsupportedConnector(
@@ -142,11 +155,13 @@ where
                 message: format!("connection `{}` was not found", connection_id.0),
                 suggested_command: "afs connect notion".to_string(),
             })?;
+        validate_connection_profile(store, &connection)?;
         return connector_from_connection(credentials, mount, &connection);
     }
 
     let active = active_notion_connections(store)?;
     if active.len() == 1 {
+        validate_connection_profile(store, &active[0])?;
         return connector_from_connection(credentials, mount, &active[0]);
     }
 
@@ -181,7 +196,7 @@ impl ResolvedNotionSource {
         mounts: &[MountConfig],
     ) -> Result<Self, ConnectorResolveError>
     where
-        S: ConnectionRepository,
+        S: ConnectionRepository + ConnectorProfileRepository,
     {
         let mut connectors = BTreeMap::new();
         for mount in mounts {
@@ -226,9 +241,7 @@ fn connector_from_connection(
         });
     }
 
-    let token = credentials
-        .get(&connection.secret_ref)
-        .map_err(|error| credential_error(connection, error))?;
+    let token = connection_access_token(credentials, connection)?;
     let config = NotionConfig {
         workspace_id: connection.workspace_id.clone(),
         root_page_id: mount.remote_root_id.clone(),
@@ -236,6 +249,50 @@ fn connector_from_connection(
         token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
     };
     Ok(NotionConnector::new(config))
+}
+
+fn connection_access_token(
+    credentials: &dyn CredentialStore,
+    connection: &ConnectionRecord,
+) -> Result<String, ConnectorResolveError> {
+    let secret = credentials
+        .get(&connection.secret_ref)
+        .map_err(|error| credential_error(connection, error))?;
+    if connection.auth_kind != "oauth" {
+        return Ok(secret);
+    }
+
+    let mut stored = serde_json::from_str::<StoredNotionCredential>(&secret)
+        .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?;
+    if stored.expires_soon(timestamp_secs()) {
+        let (Some(client_id), Some(client_secret), Some(refresh_token)) = (
+            stored.oauth_client_id.clone(),
+            stored.oauth_client_secret.clone(),
+            stored.refresh_token.clone(),
+        ) else {
+            return Err(ConnectorResolveError::AuthRequired {
+                connection_id: connection.connection_id.0.clone(),
+                suggested_command: "afs connect notion".to_string(),
+            });
+        };
+        let refreshed = HttpNotionOAuthClient::new()
+            .refresh_token(&NotionOAuthRefresh {
+                client_id,
+                client_secret,
+                refresh_token,
+            })
+            .map_err(|error| {
+                ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
+            })?;
+        stored = stored.refreshed(refreshed, timestamp_secs());
+        let secret = serde_json::to_string(&stored).map_err(|error| {
+            ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
+        })?;
+        credentials
+            .put(&connection.secret_ref, &secret)
+            .map_err(|error| credential_error(connection, error))?;
+    }
+    Ok(stored.access_token)
 }
 
 fn credential_error(
@@ -253,6 +310,13 @@ fn credential_error(
     }
 }
 
+fn timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 fn active_notion_connections<S>(store: &S) -> Result<Vec<ConnectionRecord>, ConnectorResolveError>
 where
     S: ConnectionRepository,
@@ -264,6 +328,35 @@ where
         .into_iter()
         .filter(|connection| connection.connector == "notion" && connection.status == "active")
         .collect())
+}
+
+fn validate_connection_profile<S>(
+    store: &S,
+    connection: &ConnectionRecord,
+) -> Result<(), ConnectorResolveError>
+where
+    S: ConnectorProfileRepository,
+{
+    let Some(profile_id) = &connection.profile_id else {
+        return Ok(());
+    };
+    let profile = store
+        .get_connector_profile(profile_id)
+        .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?
+        .ok_or_else(|| ConnectorResolveError::AuthProfileUnavailable {
+            profile_id: profile_id.0.clone(),
+            suggested_command: "afs connect notion".to_string(),
+        })?;
+    if profile.status != "active"
+        || profile.connector != connection.connector
+        || profile.auth_kind != connection.auth_kind
+    {
+        return Err(ConnectorResolveError::AuthProfileUnavailable {
+            profile_id: profile.profile_id.0,
+            suggested_command: "afs connect notion".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn warn_env_fallback_once() {

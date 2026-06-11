@@ -4,8 +4,9 @@ The `afs` command is the single supported control surface for users and coding a
 
 ## Commands
 
-- `afs connect notion [--name <id>] [--token-stdin] [--json]`
+- `afs connect notion [--name <id>] [--token-stdin|--no-browser] [--redirect-uri <uri>] [--json]`
 - `afs connections [--json]`
+- `afs profiles [--json]`
 - `afs connection show <id> [--json]`
 - `afs disconnect <id> [--json]`
 - `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--read-only] [--json]`
@@ -41,18 +42,31 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 ## Provider Connections
 
-`afs connect notion [--name <id>] [--token-stdin]` creates a local provider connection. It probes Notion with `GET /v1/users/me`, stores only metadata in SQLite, and writes the bearer token to the credential store. JSON output never includes the token or `secret_ref`.
+`afs connect notion [--name <id>]` creates a local provider connection. OAuth is preferred. The command reads `AFS_NOTION_OAUTH_CLIENT_ID` and `AFS_NOTION_OAUTH_CLIENT_SECRET` (or `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET`), opens a Notion authorization URL, listens for the localhost callback, exchanges the authorization code, stores the OAuth credential bundle in the credential store, and stores only metadata in SQLite. The default callback is `http://localhost:8757/oauth/notion/callback`; override it with `--redirect-uri <uri>` or `AFS_NOTION_OAUTH_REDIRECT_URI`. The redirect URI must be registered on the Notion public integration.
+
+`--no-browser` prints the authorization URL but does not try to open it. `--token-stdin` is the explicit personal-access-token fallback for local development and CI:
+
+```bash
+echo "$NOTION_TOKEN" | afs connect notion --token-stdin --name work
+```
+
+JSON output never includes OAuth tokens, refresh tokens, client secrets, PATs, or `secret_ref`.
+
+Connections now point at connector profiles. A profile is AgentFS's local auth-config record: connector, auth kind, scopes, enabled action classes, connector version, status, and capabilities. OAuth connections use `notion-oauth-default`; explicit PAT connections use `notion-token-default`.
 
 The default connection ID is `notion-default` when no Notion connection exists. If a Notion connection already exists, pass `--name <id>` to avoid overwriting by accident.
 
-`afs connections` and `afs connection show <id>` list metadata only. `afs disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
+`afs connections` and `afs connection show <id>` list connected-account metadata only, including the profile ID but never credentials. `afs profiles` lists connector auth profiles and contains no account secrets. `afs disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
 
 Auth error JSON uses stable codes:
 
 - `missing_connection`: no usable connection and no `NOTION_TOKEN` fallback;
 - `auth_required`: connection exists but its credential is missing;
 - `connection_revoked`: mount points at a revoked connection;
+- `auth_profile_unavailable`: connection points at a missing, inactive, or mismatched connector profile;
 - `credential_store_unavailable`: keychain or file credential store failed;
+- `missing_oauth_config`: OAuth was requested but the Notion OAuth client ID or client secret was not configured;
+- `oauth_exchange_failed`: Notion rejected the OAuth authorization code exchange;
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 
 Auth failures exit `1` and include `suggested_command` when there is an obvious recovery command.
