@@ -8,10 +8,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::canonical::ParsedCanonicalDocument;
 use crate::model::{CanonicalBlock, CanonicalDocument, EntityKind, RemoteId};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationIssue {
     pub code: String,
     pub file: PathBuf,
@@ -38,7 +40,7 @@ impl ValidationIssue {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationReport {
     pub issues: Vec<ValidationIssue>,
 }

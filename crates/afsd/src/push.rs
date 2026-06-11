@@ -32,8 +32,9 @@ use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
     ShadowRepository, StoreError,
 };
+use serde::{Deserialize, Serialize};
 
-use crate::execution::{PushJob, PushJobReport};
+use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::hydration::{HydratedEntity, HydrationSource};
 
 pub fn execute_push_job<S, Source>(
@@ -92,7 +93,7 @@ where
             execution: None,
             push_id: Some(push_id.clone()),
             journal_status: journal_status_after_error(store, &push_id),
-            error: Some(error),
+            error: Some(PushJobError::from(error)),
         }),
     }
 }
@@ -311,7 +312,8 @@ where
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PushJobAction {
     NotReady,
     Failed,
@@ -324,6 +326,27 @@ impl PushJobAction {
             afs_core::push::PushExecutionAction::NotReady { .. } => Self::NotReady,
             afs_core::push::PushExecutionAction::Reconciled => Self::Reconciled,
         }
+    }
+}
+
+impl From<AfsError> for PushJobError {
+    fn from(value: AfsError) -> Self {
+        Self {
+            code: afs_error_code(&value).to_string(),
+            message: value.to_string(),
+        }
+    }
+}
+
+fn afs_error_code(error: &AfsError) -> &'static str {
+    match error {
+        AfsError::Validation(_) => "validation_failed",
+        AfsError::Conflict(_) => "conflict",
+        AfsError::Guardrail(_) => "guardrail",
+        AfsError::InvalidState(_) => "invalid_state",
+        AfsError::Unsupported(_) => "unsupported",
+        AfsError::NotImplemented(_) => "not_implemented",
+        AfsError::Io(_) => "io_error",
     }
 }
 

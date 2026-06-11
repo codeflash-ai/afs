@@ -8,11 +8,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use afs_core::AfsResult;
 use afs_core::hydration::HydrationRequest;
 use afs_core::journal::{JournalStatus, PushId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::push::{PushExecutionResult, PushPipelineResult};
-use afs_core::{AfsError, AfsResult};
+use serde::{Deserialize, Serialize};
 
 use crate::hydration::{HydrationDrainReport, HydrationOutcome, HydrationSource};
 use crate::push::PushJobAction;
@@ -56,14 +57,14 @@ impl HydrationRequestJob {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HydrationDrainJob;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushJob {
     pub target_path: PathBuf,
     pub assume_yes: bool,
     pub confirm_dangerous: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushJobReport {
     pub target_path: PathBuf,
     pub mount_id: MountId,
@@ -73,7 +74,13 @@ pub struct PushJobReport {
     pub execution: Option<PushExecutionResult>,
     pub push_id: Option<PushId>,
     pub journal_status: Option<JournalStatus>,
-    pub error: Option<AfsError>,
+    pub error: Option<PushJobError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushJobError {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

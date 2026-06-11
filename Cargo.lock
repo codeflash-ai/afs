@@ -60,6 +60,7 @@ dependencies = [
  "afs-core",
  "afs-notion",
  "afs-store",
+ "serde",
  "serde_json",
 ]
 
