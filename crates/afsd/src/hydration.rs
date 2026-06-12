@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-use afs_core::conflict::{has_unresolved_conflict_markers, render_inline_conflict_markdown};
+use afs_core::conflict::{
+    has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
+};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
@@ -215,8 +217,18 @@ where
             write_binary_atomic(&path, &asset.bytes)?;
         }
         let local_contents = read_to_string(path)?;
-        let conflict_markdown =
-            render_inline_conflict_markdown(&local_contents, &rendered.document);
+        let base_shadow = match self.store.load_shadow(&mount.mount_id, &entity.remote_id) {
+            Ok(shadow) => Some(shadow),
+            Err(StoreError::ShadowMissing { .. }) => None,
+            Err(error) => return Err(AfsError::from(error)),
+        };
+        let conflict_markdown = render_inline_conflict_markdown_with_base(
+            &local_contents,
+            base_shadow
+                .as_ref()
+                .map(|shadow| shadow.rendered_body.as_str()),
+            &rendered.document,
+        );
         write_atomic(path, conflict_markdown)?;
         self.store
             .save_shadow(&mount.mount_id, rendered.shadow.clone())
