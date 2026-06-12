@@ -211,14 +211,16 @@ Validation:
 - existing non-empty folder: allow if it is already an AFS mount, otherwise ask
   the user to choose another folder or confirm creating `AFS/Notion 2`.
 
-### Screen 4: Prepare Workspace
+### Screen 4: Ready, Syncing In Background
 
-Goal: show that AFS is already preparing the workspace and let the user continue
-without waiting for the full workspace to be prepared.
+Goal: complete onboarding as soon as the folder and agent guidance are ready,
+while making it clear that workspace sync continues in the background. Do not
+show an intermediate checklist that appears to finish instantly or asks the user
+to wait on background preparation.
 
-Primary action: `Continue`
+Primary action: `Open Notion Folder`
 
-Secondary action: `Open Notion Folder` once the folder exists.
+Secondary actions: `Open a Notion page`, `Copy folder path`, `Copy agent prompt`
 
 Layout:
 
@@ -226,69 +228,46 @@ Layout:
 ┌──────────────────────────────────────────────────────────────┐
 │ AFS                                            4 of 4        │
 │                                                              │
-│ Preparing your Notion workspace                              │
+│  ✦  Setup complete                                           │
 │                                                              │
-│ ✓ Connected Notion                                           │
-│ ✓ Created local folder                                       │
-│ ✓ Found top-level workspace pages                            │
-│ ✓ Added agent instructions                                   │
-│ ○ Preparing workspace in the background                      │
+│ You're ready to use AFS                                      │
+│ Your Notion folder is in Documents. AFS will keep syncing the │
+│ workspace quietly in the background.                         │
 │                                                              │
-│ [ Continue ]                                                 │
-│ Open Notion Folder                                           │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ Notion folder                         [ Copy ]           │ │
+│ │ ~/Documents/AFS/Notion                                  │ │
+│ └──────────────────────────────────────────────────────────┘ │
+│                                                              │
+│ [ Open Notion Folder ]                                      │
+│                                                              │
+│ Open a Notion page                                           │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ Paste a Notion URL to get the local file path [Open Page]│ │
+│ └──────────────────────────────────────────────────────────┘ │
+│                                                              │
+│ ┌──────────────────────────────────────────────────────────┐ │
+│ │ Try this with an agent                                   │ │
+│ │ Find the Q4 launch plan and make it sharper for           │ │
+│ │ leadership review.                              [ Copy ]  │ │
+│ └──────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 Behavior:
 
-- `Continue` becomes available as soon as the mount root, agent guidance files,
-  and background process are ready.
 - AFS should begin reading accessible top-level Notion structure immediately
-  after connection, before the user sees this checkpoint screen.
+  after connection, before the user reaches this screen.
 - Do not block on full workspace enumeration.
-- If the user continues, route to the ready screen with a prominent locate
-  affordance.
-
-### Screen 5: Ready
-
-Goal: give one clear completion action and make locate available as the next
-useful workflow.
-
-Primary action: `Open Notion Folder`
-
-Secondary actions: `Open a Notion page`, `Copy folder path`
-
-Layout:
-
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ AFS                                                         │
-│                                                              │
-│ Your Notion folder is ready                                  │
-│                                                              │
-│ ~/Documents/AFS/Notion                                      │
-│                                                              │
-│ [ Open Notion Folder ]                                       │
-│                                                              │
-│ Open a Notion page                                           │
-│ ┌──────────────────────────────────────────────────────────┐ │
-│ │ Paste a Notion URL to get its local file path            │ │
-│ └──────────────────────────────────────────────────────────┘ │
-│ Copy folder path                                            │
-│                                                              │
-│ Try this with an agent: "Edit this Notion file and make the  │
-│ launch plan clearer."                                        │
-└──────────────────────────────────────────────────────────────┘
-```
-
-Notes:
-
+- Show setup success as a small celebratory status pill. Mention background
+  sync once in supporting copy, not as a task the user has to wait on.
 - There is only one primary action.
 - `Open a Notion page` should be a real text input, not a link-only action.
-- If background preparation is still running, show quiet copy: "AFS is preparing
-  the rest of your workspace in the background."
-- Include a small demo prompt that helps users understand the agent workflow:
-  copy the local path, paste it into an agent, edit the file, then review push.
+- The locate flow should prioritize the pasted page's preparation and show a
+  copyable local path when ready.
+- Include a small, human demo prompt that helps users understand the agent
+  workflow. Keep its copy button inline on the right side of the prompt so it
+  does not become another large action.
 
 ## Tray Popover
 

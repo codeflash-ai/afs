@@ -111,57 +111,50 @@
             </div>
           </article>
 
-          <article class="desktop-window onboarding-screen">
+          <article class="desktop-window onboarding-screen final-ready-screen">
             <div class="window-bar">
               <div class="traffic"><span></span><span></span><span></span></div>
               <div class="window-title">AFS Setup</div>
               <div class="step-count">4 of 4</div>
             </div>
-            <div class="setup-content">
-              <div class="setup-mark progress-mark"></div>
+            <div class="setup-content final-setup compact-final">
+              <div class="setup-mark ready-mark"></div>
+              <div class="sync-note"><span></span> Setup complete</div>
               <div>
-                <h3>Preparing your Notion workspace</h3>
+                <h3>You’re ready to use AFS</h3>
                 <p>
-                  You can continue as soon as the folder and agent instructions
-                  are ready.
+                  Your Notion folder is in Documents. AFS will keep syncing the
+                  workspace quietly in the background.
                 </p>
               </div>
-              <ol class="progress-list">
-                <li class="done">Connected Notion</li>
-                <li class="done">Created local folder</li>
-                <li class="done">Found top-level workspace pages</li>
-                <li class="done">Added agent instructions</li>
-                <li class="active">Preparing workspace in the background</li>
-              </ol>
-              <button class="primary">Continue</button>
-            </div>
-          </article>
-
-          <article class="desktop-window onboarding-screen ready-screen">
-            <div class="window-bar">
-              <div class="traffic"><span></span><span></span><span></span></div>
-              <div class="window-title">AFS Setup</div>
-              <div></div>
-            </div>
-            <div class="setup-content">
-              <div class="setup-mark ready-mark"></div>
-              <div>
-                <h3>Your Notion folder is ready</h3>
-                <p class="path-line">~/Documents/AFS/Notion</p>
+              <div class="ready-folder-card">
+                <div class="folder-glyph"></div>
+                <div>
+                  <span>Notion folder</span>
+                  <code>~/Documents/AFS/Notion</code>
+                </div>
+                <button class="secondary compact-button">Copy</button>
               </div>
               <button class="primary">Open Notion Folder</button>
-              <div class="open-page-box">
+              <div class="open-page-box final-locate">
                 <label>Open a Notion page</label>
-                <div class="url-drop">Paste a Notion URL to get its local file path</div>
+                <div class="url-drop">
+                  Paste a Notion URL to get the local file path
+                  <button class="icon-button disabled">Open</button>
+                </div>
               </div>
-              <div class="agent-demo">
-                <span>Try this with an agent</span>
-                <p>
-                  "Edit this Notion file and make the launch plan clearer."
-                </p>
-              </div>
-              <div class="inline-links">
-                <button>Copy folder path</button>
+              <div class="agent-demo-card compact-agent-demo">
+                <div class="agent-demo-heading">
+                  <span></span>
+                  Try this with an agent
+                </div>
+                <div class="agent-prompt-row">
+                  <div class="agent-prompt-card">
+                    Find the Q4 launch plan and make it sharper for leadership
+                    review.
+                  </div>
+                  <button class="secondary compact-button">Copy</button>
+                </div>
               </div>
             </div>
           </article>

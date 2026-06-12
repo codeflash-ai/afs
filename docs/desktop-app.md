@@ -104,7 +104,7 @@ begin workspace projection in the background
 open mount or continue to locate
 ```
 
-The app should show a short progress sequence with human concepts:
+The app can track setup internally with human concepts:
 
 - Connecting Notion
 - Finding top-level workspace pages
@@ -116,27 +116,32 @@ Do not show hydration queues, polling intervals, or low-level daemon concepts in
 the onboarding UI. Do not make the user wait for the full workspace projection
 or initial sync to finish before moving forward. Once Notion is connected, AFS
 should begin prefetching top-level directories and files so the chosen mount
-point feels populated quickly. The UI can show a simple checkpoint flow while
-the background work is already underway.
+point feels populated quickly. The UI should not show an extra checklist screen
+where most items complete instantly; once the folder and agent instructions are
+ready, route directly to the final ready screen and show background sync as a
+short supporting detail rather than a task the user waits on.
 
 ### 5. Ready
 
-The completion screen should have exactly one primary action:
+The completion screen is the final onboarding step and should have exactly one
+primary action:
 
 ```text
 Open Notion Folder
 ```
 
-Secondary actions can be lower-emphasis links:
+Secondary actions can be lower-emphasis controls:
 
 - Copy path
 - Open a Notion page
-- Open settings
-- Add another connection
+- Copy prompt
 
 Do not present Finder, editor, and terminal as three equal primary choices. The
 mount already includes `AGENTS.md` and `CLAUDE.md`, so agent guidance belongs in
-the folder rather than as a separate onboarding decision.
+the folder rather than as a separate onboarding decision. The final screen can
+include a small agent prompt example, but it should feel human and be visually
+secondary to opening the folder. Its copy action should be a compact inline
+button, not a second full-width button.
 
 After setup, the app should make it easy to continue into the locate flow. A
 user should be able to paste a Notion URL immediately into a text field with

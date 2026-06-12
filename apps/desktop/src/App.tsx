@@ -218,7 +218,7 @@ function Onboarding({
   snapshot: DesktopSnapshot;
   onComplete: () => void;
 }) {
-  const [step, setStep] = useState(1);
+  const [step, setStep] = useState(() => (window.location.hash === "#onboarding-ready" ? 4 : 1));
   const [oauthReady, setOauthReady] = useState(false);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
   const [locateUrl, setLocateUrl] = useState("");
@@ -234,6 +234,11 @@ function Onboarding({
   async function startMount() {
     await callCommand("create_workspace_mount", { path: mountPath }, { ok: true });
     setStep(4);
+  }
+
+  async function openFolderAndFinish() {
+    await callCommand("open_path", { path: mountPath }, { ok: true });
+    onComplete();
   }
 
   async function locatePage() {
@@ -264,7 +269,7 @@ function Onboarding({
   return (
     <main className="setup-shell">
       <section className="setup-window">
-        <WindowChrome title="AFS Setup" meta={step < 5 ? `${step} of 4` : ""} />
+        <WindowChrome title="AFS Setup" meta={`${step} of 4`} />
         {step === 1 && (
           <SetupContent mark={<BrandTile>AFS</BrandTile>}>
             <div>
@@ -326,36 +331,31 @@ function Onboarding({
         )}
 
         {step === 4 && (
-          <SetupContent mark={<BrandTile variant="progress" />}>
+          <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
-              <h1>Preparing your Notion workspace</h1>
-              <p>You can continue as soon as the folder and agent instructions are ready.</p>
+              <div className="sync-note">
+                <Sparkles />
+                Setup complete
+              </div>
+              <h1>You’re ready to use AFS</h1>
+              <p>
+                Your Notion folder is in Documents. AFS will keep syncing the workspace quietly in
+                the background.
+              </p>
             </div>
-            <ProgressList
-              items={[
-                { label: "Connected Notion", state: "done" },
-                { label: "Created local folder", state: "done" },
-                { label: "Found top-level workspace pages", state: "done" },
-                { label: "Added agent instructions", state: "done" },
-                { label: "Preparing workspace in the background", state: "active" },
-              ]}
-            />
-            <div className="button-row">
-              <PrimaryButton onClick={() => setStep(5)}>Continue</PrimaryButton>
-              <TextButton onClick={() => void callCommand("open_path", { path: mountPath }, { ok: true })}>
-                Open Notion Folder
-              </TextButton>
+            <div className="ready-folder">
+              <FolderOpen />
+              <div>
+                <span>Notion folder</span>
+                <code>{mountPath}</code>
+              </div>
+              <SecondaryButton compact icon={<Copy />} onClick={() => copyText(mountPath)}>
+                Copy
+              </SecondaryButton>
             </div>
-          </SetupContent>
-        )}
-
-        {step === 5 && (
-          <SetupContent mark={<BrandTile variant="ready" />}>
-            <div>
-              <h1>Your Notion folder is ready</h1>
-              <p className="path-line">{mountPath}</p>
-            </div>
-            <PrimaryButton onClick={onComplete}>Open Notion Folder</PrimaryButton>
+            <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
+              Open Notion Folder
+            </PrimaryButton>
             <LocateBox
               label="Open a Notion page"
               value={locateUrl}
@@ -364,8 +364,28 @@ function Onboarding({
               state={locateState}
             />
             {locatedItem && <LocatedPath item={locatedItem} />}
-            <AgentPrompt />
-            <TextButton onClick={() => copyText(mountPath)}>Copy folder path</TextButton>
+            <div className="agent-demo compact-agent-demo">
+              <div className="agent-demo-title">
+                <Clipboard />
+                <span>Try this with an agent</span>
+              </div>
+              <div className="agent-prompt-row">
+                <div className="agent-demo-command">
+                  Find the Q4 launch plan and make it sharper for leadership review.
+                </div>
+                <SecondaryButton
+                  compact
+                  icon={<Copy />}
+                  onClick={() =>
+                    copyText(
+                      `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`,
+                    )
+                  }
+                >
+                  Copy
+                </SecondaryButton>
+              </div>
+            </div>
           </SetupContent>
         )}
       </section>
@@ -828,9 +848,17 @@ async function windowAction(action: "hide" | "minimize" | "toggleMaximize") {
   }
 }
 
-function SetupContent({ mark, children }: { mark: React.ReactNode; children: React.ReactNode }) {
+function SetupContent({
+  mark,
+  children,
+  variant,
+}: {
+  mark: React.ReactNode;
+  children: React.ReactNode;
+  variant?: "final";
+}) {
   return (
-    <div className="setup-content">
+    <div className={`setup-content ${variant === "final" ? "final-setup" : ""}`}>
       {mark}
       {children}
     </div>

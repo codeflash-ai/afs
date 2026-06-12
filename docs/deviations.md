@@ -12,8 +12,8 @@ None.
   status reports, mounts, connections, journals, and the Notion OAuth broker.
   They still fall back to sample data when the local store cannot be opened so
   the UI remains reviewable before a first real connection.
-- Desktop onboarding still fakes its visual checkpoint progression after
-  starting the real Notion OAuth broker flow in-process. The production app
+- Desktop onboarding still uses a timer to advance from the Notion OAuth helper
+  screen after starting the real broker flow in-process. The production app
   should replace this timer with real connection-state events from the OAuth
   callback and store refresh.
 - Desktop mount creation currently creates the requested local folder only.
