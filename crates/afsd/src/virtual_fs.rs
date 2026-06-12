@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ChildContainer, Connector, ListChildrenRequest};
 use afs_core::canonical::parse_canonical_markdown;
+use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::{AfsError, AfsResult};
@@ -279,7 +280,7 @@ where
     }
 
     let path = mount.root.join(&entity.path);
-    let outcome = if entity.hydration == HydrationState::Hydrated && path.exists() {
+    let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(
@@ -388,7 +389,7 @@ where
     }
 
     let path = content_path_for_relative(content_root, &entity.path)?;
-    let outcome = if entity.hydration == HydrationState::Hydrated && path.exists() {
+    let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(
@@ -474,12 +475,6 @@ where
             "only page files can be written by the virtual filesystem",
         ));
     }
-    if entity.hydration == HydrationState::Conflicted {
-        return Err(AfsError::InvalidState(
-            "conflicted virtual filesystem files must be resolved before writing".to_string(),
-        ));
-    }
-
     let path = content_path_for_relative(content_root, &entity.path)?;
     write_binary_atomic(&path, contents)?;
 
@@ -497,14 +492,25 @@ where
         })
         .unwrap_or(false);
 
-    if matches_shadow {
+    let contains_conflict_markers = std::str::from_utf8(contents)
+        .ok()
+        .is_some_and(has_unresolved_conflict_markers);
+
+    if contains_conflict_markers {
+        if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+            entity.hydration = HydrationState::Dirty;
+        }
         if entity
             .hydration
-            .can_transition_to(&HydrationState::Hydrated)
+            .can_transition_to(&HydrationState::Conflicted)
         {
-            entity.hydration = HydrationState::Hydrated;
+            entity.hydration = HydrationState::Conflicted;
         }
-    } else if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+    } else if matches_shadow {
+        entity.hydration = HydrationState::Hydrated;
+    } else if entity.hydration == HydrationState::Conflicted
+        || entity.hydration.can_transition_to(&HydrationState::Dirty)
+    {
         entity.hydration = HydrationState::Dirty;
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
@@ -1136,12 +1142,24 @@ fn schema_item(
 }
 
 fn rewrite_item_materialized_path(content_root: &Path, item: &mut VirtualFsItem) -> AfsResult<()> {
-    if item.kind == VirtualFsItemKind::File && item.hydration == Some(HydrationState::Hydrated) {
+    if item.kind == VirtualFsItemKind::File
+        && item
+            .hydration
+            .as_ref()
+            .is_some_and(is_materialized_hydration)
+    {
         let path = content_path_for_relative(content_root, Path::new(&item.path))?;
         item.byte_size = path.metadata().ok().map(|metadata| metadata.len());
         item.materialized_path = Some(path.display().to_string());
     }
     Ok(())
+}
+
+fn is_materialized_hydration(hydration: &HydrationState) -> bool {
+    matches!(
+        hydration,
+        HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted
+    )
 }
 
 fn page_child_dir_item(
@@ -1454,6 +1472,7 @@ mod tests {
     };
     use afs_core::{
         AfsError,
+        hydration::HydrationRequest,
         model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
     };
     use afs_store::{
@@ -1461,10 +1480,14 @@ mod tests {
         ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
     };
 
+    use crate::hydration::{HydratedEntity, HydrationSource};
+
     use super::{
-        ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
-        create_virtual_fs_file, refresh_virtual_fs_children, rename_virtual_fs_item,
-        trash_virtual_fs_item, virtual_fs_children, virtual_fs_content_path, virtual_fs_item,
+        ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, VirtualFsMaterializeOutcome,
+        commit_virtual_fs_write, create_virtual_fs_file,
+        materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
+        rename_virtual_fs_item, trash_virtual_fs_item, virtual_fs_children,
+        virtual_fs_content_path, virtual_fs_item, virtual_fs_item_with_content_root,
     };
 
     #[test]
@@ -1657,6 +1680,14 @@ mod tests {
         }
     }
 
+    struct FailingHydrationSource;
+
+    impl HydrationSource for FailingHydrationSource {
+        fn fetch_render(&self, _request: &HydrationRequest) -> afs_core::AfsResult<HydratedEntity> {
+            panic!("conflicted cache should not fetch remote content")
+        }
+    }
+
     #[test]
     fn item_metadata_is_store_only_for_online_only_files() {
         let mount_id = MountId::new("notion-main");
@@ -1679,6 +1710,66 @@ mod tests {
         assert_eq!(report.item.filename, "Roadmap.md");
         assert_eq!(report.item.kind, VirtualFsItemKind::File);
         assert_eq!(report.item.materialized_path, None);
+    }
+
+    #[test]
+    fn conflicted_virtual_file_materializes_from_existing_cache_without_fetch() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let state_root = temp_root("afs-virtual-fs-conflicted-materialize");
+        let content_root = state_root.join("content/notion-main/files");
+        let conflicted_contents = b"<<<<<<< LOCAL\nlocal\n=======\nremote\n>>>>>>> REMOTE\n";
+        std::fs::create_dir_all(&content_root).expect("content root");
+        std::fs::write(content_root.join("Roadmap.md"), conflicted_contents)
+            .expect("write conflicted cache");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id,
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Conflicted),
+            )
+            .expect("save page");
+
+        let item = virtual_fs_item_with_content_root(&store, &content_root, &mount_id, "page-1")
+            .expect("item");
+        let expected_path = content_root
+            .join("Roadmap.md")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            item.item.materialized_path.as_deref(),
+            Some(expected_path.as_str())
+        );
+        assert_eq!(item.item.byte_size, Some(conflicted_contents.len() as u64));
+
+        let report = materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &FailingHydrationSource,
+            &content_root,
+            &mount_id,
+            "page-1",
+        )
+        .expect("materialize conflicted cache");
+
+        assert_eq!(
+            report.outcome,
+            VirtualFsMaterializeOutcome::AlreadyMaterialized
+        );
+        assert_eq!(report.hydration, HydrationState::Conflicted);
+        assert_eq!(
+            std::fs::read(report.path).expect("read materialized cache"),
+            conflicted_contents
+        );
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
