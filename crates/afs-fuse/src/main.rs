@@ -808,6 +808,7 @@ fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
         atime: now,
         mtime: now,
         ctime: now,
+        #[cfg(target_os = "macos")]
         crtime: now,
         kind: file_type(item),
         perm: if item.kind == VirtualFsItemKind::Folder {
@@ -823,6 +824,7 @@ fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         rdev: 0,
+        #[cfg(target_os = "macos")]
         flags: 0,
         blksize: 4096,
     }

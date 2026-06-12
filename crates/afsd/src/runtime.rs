@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
@@ -28,7 +28,7 @@ use serde_json::json;
 use crate::DaemonConfig;
 use crate::execution::{DaemonEventReport, PushJob};
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
-use crate::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
+use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use crate::notion::{
     ResolvedNotionSource, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
 };
@@ -49,6 +49,8 @@ use crate::watcher::{FileEvent, FileEventKind};
 pub struct DaemonRuntimeHandle {
     sender: Sender<RuntimeMessage>,
 }
+
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl DaemonRuntimeHandle {
     pub fn request(&self, request: DaemonRequest) -> DaemonResponse {
@@ -84,7 +86,9 @@ impl DaemonRuntimeHandle {
             .send(RuntimeMessage::Status { respond_to })
             .map_err(|_| RuntimeSendError)?;
 
-        response.recv().map_err(|_| RuntimeSendError)
+        response
+            .recv_timeout(CONTROL_RESPONSE_TIMEOUT)
+            .map_err(|_| RuntimeSendError)
     }
 }
 
@@ -498,7 +502,50 @@ struct RuntimeState {
     pending_scheduled_tick: Option<PullSchedulerTick>,
     scheduler: PullScheduler,
     last_scheduler_advance: Instant,
-    active_job: bool,
+    active_job: Option<ActiveRuntimeJob>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveRuntimeJob {
+    kind: String,
+    target: Option<String>,
+    started_at: Instant,
+    started_at_unix_ms: u64,
+}
+
+impl ActiveRuntimeJob {
+    fn from_job(job: &MutatingJob) -> Self {
+        let (kind, target) = job.active_status_parts();
+        Self {
+            kind,
+            target,
+            started_at: Instant::now(),
+            started_at_unix_ms: unix_time_ms(),
+        }
+    }
+
+    fn status(&self) -> DaemonActiveJobStatus {
+        DaemonActiveJobStatus {
+            kind: self.kind.clone(),
+            target: self.target.clone(),
+            elapsed_ms: self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            started_at_unix_ms: self.started_at_unix_ms,
+        }
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 impl RuntimeState {
@@ -520,7 +567,7 @@ impl RuntimeState {
             deferred_hydration: Vec::new(),
             next_hydration_retry: None,
             pending_scheduled_tick: None,
-            active_job: false,
+            active_job: None,
         }
     }
 
@@ -648,7 +695,7 @@ impl RuntimeState {
     }
 
     fn handle_completion(&mut self, completion: JobCompletion) {
-        self.active_job = false;
+        self.active_job = None;
 
         match completion {
             JobCompletion::Pull {
@@ -723,7 +770,7 @@ impl RuntimeState {
     }
 
     fn maybe_start_next_job(&mut self) {
-        if self.active_job {
+        if self.active_job.is_some() {
             return;
         }
 
@@ -741,7 +788,7 @@ impl RuntimeState {
             return;
         };
 
-        self.active_job = true;
+        self.active_job = Some(ActiveRuntimeJob::from_job(&job));
         let sender = self.sender.clone();
         let runner = Arc::clone(&self.runner);
         let state_root = self.config.state_root.clone();
@@ -803,7 +850,8 @@ impl RuntimeState {
 
     fn status(&self) -> DaemonRuntimeStatus {
         DaemonRuntimeStatus {
-            active_job: self.active_job,
+            active_job: self.active_job.is_some(),
+            active_job_detail: self.active_job.as_ref().map(ActiveRuntimeJob::status),
             pending_requests: self.pending_requests.len(),
             pending_hydrations: self.hydration.len(),
             deferred_hydrations: self.deferred_hydration.len(),
@@ -1011,6 +1059,67 @@ enum MutatingJob {
     Request(MutatingRequest),
     ScheduledPull { tick: PullSchedulerTick },
     Hydration { request: HydrationRequest },
+}
+
+impl MutatingJob {
+    fn active_status_parts(&self) -> (String, Option<String>) {
+        match self {
+            Self::Request(request) => request.active_status_parts(),
+            Self::ScheduledPull { .. } => ("scheduled_pull".to_string(), None),
+            Self::Hydration { request } => (
+                "hydration".to_string(),
+                Some(request.path.display().to_string()),
+            ),
+        }
+    }
+}
+
+impl MutatingRequest {
+    fn active_status_parts(&self) -> (String, Option<String>) {
+        match self {
+            Self::Pull { path, .. } => ("pull".to_string(), Some(path.display().to_string())),
+            Self::Push { job, .. } => (
+                "push".to_string(),
+                Some(job.target_path.display().to_string()),
+            ),
+            Self::FileEvent { event } => (
+                "file_event".to_string(),
+                Some(event.path.display().to_string()),
+            ),
+            Self::VirtualFsItem {
+                mount_id,
+                identifier,
+                ..
+            } => (
+                "virtual_fs_item".to_string(),
+                Some(format!("{mount_id}:{identifier}")),
+            ),
+            Self::VirtualFsChildren {
+                mount_id,
+                container_identifier,
+                ..
+            } => (
+                "virtual_fs_children".to_string(),
+                Some(format!("{mount_id}:{container_identifier}")),
+            ),
+            Self::VirtualFsMaterialize {
+                mount_id,
+                identifier,
+                ..
+            } => (
+                "virtual_fs_materialize".to_string(),
+                Some(format!("{mount_id}:{identifier}")),
+            ),
+            Self::VirtualFsCommitWrite {
+                mount_id,
+                identifier,
+                ..
+            } => (
+                "virtual_fs_commit_write".to_string(),
+                Some(format!("{mount_id}:{identifier}")),
+            ),
+        }
+    }
 }
 
 enum JobCompletion {

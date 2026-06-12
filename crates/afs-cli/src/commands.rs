@@ -1,6 +1,7 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::Duration;
 
 use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
@@ -16,7 +17,7 @@ use afs_store::{
     open_credential_store,
 };
 use afsd::execution::PushJobReport;
-use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
+use afsd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -52,6 +53,7 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
+const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 const COMMANDS: &[&str] = &[
     "connect",
@@ -757,7 +759,7 @@ fn pull(args: &[String], json: bool) -> i32 {
             print_pull_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable => warn_daemon_fallback("pull"),
+        DaemonReport::Unavailable(reason) => warn_daemon_fallback("pull", reason),
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -992,7 +994,21 @@ fn push(args: &[String], json: bool) -> i32 {
             print_push_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable => warn_daemon_fallback("push"),
+        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "push",
+                    "daemon_timeout",
+                    format!(
+                        "afsd did not respond within {}ms after the push request was submitted; refusing direct fallback to avoid duplicate remote writes",
+                        daemon_request_timeout().as_millis()
+                    ),
+                ),
+                EXIT_INTERNAL,
+            );
+        }
+        DaemonReport::Unavailable(reason) => warn_daemon_fallback("push", reason),
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -1426,6 +1442,14 @@ fn print_daemon_report(report: &DaemonControlReport) {
             status.runtime.pending_requests,
             status.runtime.pending_hydrations
         );
+        if let Some(active) = &status.runtime.active_job_detail {
+            println!(
+                "  active job: kind={} target={} elapsed={}ms",
+                active.kind,
+                active.target.as_deref().unwrap_or("-"),
+                active.elapsed_ms
+            );
+        }
         println!("  scheduler: {}", status.runtime.scheduler_mode);
     }
     if let Some(log) = &report.stderr_log {
@@ -1616,7 +1640,7 @@ fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &s
             .arg(&mount.root)
             .output();
     }
-    let _ = fs::remove_file(&unit_path);
+    let _ = std::fs::remove_file(&unit_path);
     if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
         return command_error(json, error, EXIT_INTERNAL);
     }
@@ -1662,11 +1686,11 @@ fn write_linux_fuse_unit(
     mount: &MountConfig,
 ) -> Result<(), CommandError> {
     let log_dir = state_root.join("logs");
-    fs::create_dir_all(unit_path.parent().unwrap_or_else(|| Path::new(".")))
+    std::fs::create_dir_all(unit_path.parent().unwrap_or_else(|| Path::new(".")))
         .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-    fs::create_dir_all(&log_dir)
+    std::fs::create_dir_all(&log_dir)
         .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-    fs::create_dir_all(&mount.root)
+    std::fs::create_dir_all(&mount.root)
         .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
 
     let log_path = log_dir.join(format!(
@@ -1674,7 +1698,7 @@ fn write_linux_fuse_unit(
         sanitize_systemd_fragment(&mount.mount_id.0)
     ));
     let unit = linux_fuse_unit_contents(afs_fuse, state_root, mount, &log_path);
-    fs::write(unit_path, unit)
+    std::fs::write(unit_path, unit)
         .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))
 }
 
@@ -1724,7 +1748,10 @@ fn run_systemctl_user(args: &[&str]) -> Result<(), CommandError> {
 
 #[cfg(target_os = "linux")]
 fn daemon_is_running(state_root: &Path) -> bool {
-    matches!(send_request(state_root, &DaemonRequest::Ping), Ok(response) if response.ok)
+    matches!(
+        send_request_with_timeout(state_root, &DaemonRequest::Ping, daemon_request_timeout()),
+        Ok(response) if response.ok
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -2091,11 +2118,18 @@ fn local_oauth_command_error(error: LocalOAuthError) -> CommandError {
     }
 }
 
-fn warn_daemon_fallback(command: &str) {
+fn warn_daemon_fallback(command: &str, reason: DaemonUnavailableReason) {
     if std::env::var("AFS_DAEMON_DISABLE").is_err() {
-        eprintln!(
-            "afsd not running; executing {command} directly (start afsd for background hydration)"
-        );
+        match reason {
+            DaemonUnavailableReason::TimedOut => eprintln!(
+                "afsd did not respond within {}ms; executing {command} directly",
+                daemon_request_timeout().as_millis()
+            ),
+            DaemonUnavailableReason::NotAvailable => eprintln!(
+                "afsd not running; executing {command} directly (start afsd for background hydration)"
+            ),
+            DaemonUnavailableReason::Disabled => {}
+        }
     }
 }
 
@@ -2199,8 +2233,15 @@ fn validate_connection_profile(
 
 enum DaemonReport<T> {
     Report(T),
-    Unavailable,
+    Unavailable(DaemonUnavailableReason),
     Error(DaemonCommandError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonUnavailableReason {
+    Disabled,
+    NotAvailable,
+    TimedOut,
 }
 
 struct DaemonCommandError {
@@ -2214,12 +2255,17 @@ where
     T: DeserializeOwned,
 {
     if std::env::var("AFS_DAEMON_DISABLE").is_ok() {
-        return DaemonReport::Unavailable;
+        return DaemonReport::Unavailable(DaemonUnavailableReason::Disabled);
     }
 
-    let response = match send_request(state_root, request) {
+    let response = match send_request_with_timeout(state_root, request, daemon_request_timeout()) {
         Ok(response) => response,
-        Err(DaemonClientError::NotAvailable(_)) => return DaemonReport::Unavailable,
+        Err(DaemonClientError::NotAvailable(_)) => {
+            return DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable);
+        }
+        Err(DaemonClientError::TimedOut(_)) => {
+            return DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut);
+        }
         Err(error) => {
             return DaemonReport::Error(DaemonCommandError {
                 code: "daemon_error".to_string(),
@@ -2256,12 +2302,25 @@ where
     }
 }
 
+fn daemon_request_timeout() -> Duration {
+    std::env::var("AFS_DAEMON_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_DAEMON_REQUEST_TIMEOUT)
+}
+
 fn notify_daemon_mounts_changed(state_root: &std::path::Path) {
     if std::env::var("AFS_DAEMON_DISABLE").is_ok() {
         return;
     }
 
-    match send_request(state_root, &DaemonRequest::ReloadMounts) {
+    match send_request_with_timeout(
+        state_root,
+        &DaemonRequest::ReloadMounts,
+        daemon_request_timeout(),
+    ) {
         Ok(response) if response.ok => {}
         Ok(response) => {
             if let Some(error) = response.error {
@@ -2271,7 +2330,7 @@ fn notify_daemon_mounts_changed(state_root: &std::path::Path) {
                 );
             }
         }
-        Err(DaemonClientError::NotAvailable(_)) => {}
+        Err(DaemonClientError::NotAvailable(_) | DaemonClientError::TimedOut(_)) => {}
         Err(error) => eprintln!("afs mount: daemon mount reload failed: {}", error.message()),
     }
 }

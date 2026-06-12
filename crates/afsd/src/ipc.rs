@@ -1,6 +1,7 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -65,6 +66,7 @@ pub struct DaemonStatusReport {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonRuntimeStatus {
     pub active_job: bool,
+    pub active_job_detail: Option<DaemonActiveJobStatus>,
     pub pending_requests: usize,
     pub pending_hydrations: usize,
     pub deferred_hydrations: usize,
@@ -72,6 +74,14 @@ pub struct DaemonRuntimeStatus {
     pub scheduler_mode: String,
     pub active_interval_ms: u64,
     pub cold_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonActiveJobStatus {
+    pub kind: String,
+    pub target: Option<String>,
+    pub elapsed_ms: u64,
+    pub started_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +138,7 @@ pub struct DaemonErrorResponse {
 #[derive(Debug)]
 pub enum DaemonClientError {
     NotAvailable(String),
+    TimedOut(String),
     Io(String),
     Protocol(String),
 }
@@ -135,7 +146,10 @@ pub enum DaemonClientError {
 impl DaemonClientError {
     pub fn message(&self) -> &str {
         match self {
-            Self::NotAvailable(message) | Self::Io(message) | Self::Protocol(message) => message,
+            Self::NotAvailable(message)
+            | Self::TimedOut(message)
+            | Self::Io(message)
+            | Self::Protocol(message) => message,
         }
     }
 }
@@ -158,8 +172,26 @@ pub fn send_request(
     let path = socket_path(state_root);
     let mut stream = UnixStream::connect(&path)
         .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
-    write_json_line(&mut stream, request)
-        .map_err(|error| DaemonClientError::Io(error.to_string()))?;
+    write_json_line(&mut stream, request).map_err(daemon_io_error)?;
+    read_response(stream)
+}
+
+#[cfg(unix)]
+pub fn send_request_with_timeout(
+    state_root: &Path,
+    request: &DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse, DaemonClientError> {
+    let path = socket_path(state_root);
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(daemon_io_error)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(daemon_io_error)?;
+    write_json_line(&mut stream, request).map_err(daemon_io_error)?;
     read_response(stream)
 }
 
@@ -169,8 +201,24 @@ pub fn send_tcp_request(
 ) -> Result<DaemonResponse, DaemonClientError> {
     let mut stream = TcpStream::connect(addr)
         .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
-    write_json_line(&mut stream, request)
-        .map_err(|error| DaemonClientError::Io(error.to_string()))?;
+    write_json_line(&mut stream, request).map_err(daemon_io_error)?;
+    read_response(stream)
+}
+
+pub fn send_tcp_request_with_timeout(
+    addr: SocketAddr,
+    request: &DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse, DaemonClientError> {
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(daemon_io_error)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(daemon_io_error)?;
+    write_json_line(&mut stream, request).map_err(daemon_io_error)?;
     read_response(stream)
 }
 
@@ -182,6 +230,15 @@ pub fn send_request(
     Err(DaemonClientError::NotAvailable(
         "daemon IPC is only implemented on Unix sockets".to_string(),
     ))
+}
+
+#[cfg(not(unix))]
+pub fn send_request_with_timeout(
+    state_root: &Path,
+    request: &DaemonRequest,
+    _timeout: Duration,
+) -> Result<DaemonResponse, DaemonClientError> {
+    send_request(state_root, request)
 }
 
 pub fn read_request(stream: impl Read) -> Result<DaemonRequest, DaemonClientError> {
@@ -205,15 +262,22 @@ where
 {
     let mut line = String::new();
     let mut reader = BufReader::new(stream);
-    reader
-        .read_line(&mut line)
-        .map_err(|error| DaemonClientError::Io(error.to_string()))?;
+    reader.read_line(&mut line).map_err(daemon_io_error)?;
     if line.trim().is_empty() {
         return Err(DaemonClientError::Protocol(
             "daemon returned an empty response".to_string(),
         ));
     }
     serde_json::from_str(&line).map_err(|error| DaemonClientError::Protocol(error.to_string()))
+}
+
+fn daemon_io_error(error: io::Error) -> DaemonClientError {
+    match error.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+            DaemonClientError::TimedOut(error.to_string())
+        }
+        _ => DaemonClientError::Io(error.to_string()),
+    }
 }
 
 fn write_json_line<T>(writer: &mut impl Write, value: &T) -> std::io::Result<()>
@@ -227,7 +291,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::DaemonRequest;
+    use super::{DaemonClientError, DaemonRequest};
 
     #[test]
     fn virtual_fs_item_command_decodes_as_platform_neutral_request() {
@@ -276,5 +340,41 @@ mod tests {
                 contents_base64: "SGVsbG8=".to_string()
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_request_timeout_maps_to_timed_out_error() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::thread;
+        use std::time::Duration;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "afs-ipc-timeout-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create state root");
+        let listener = UnixListener::bind(super::socket_path(&root)).expect("bind socket");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0; 128];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let result = super::send_request_with_timeout(
+            &root,
+            &DaemonRequest::Ping,
+            Duration::from_millis(50),
+        );
+
+        assert!(matches!(result, Err(DaemonClientError::TimedOut(_))));
+        server.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
