@@ -186,8 +186,24 @@ The first diff implementation resolves a path through the store, reads the canon
 - `plan.summary`: block/entity/property counts;
 - `plan.operations`: connector-neutral planned mutations;
 - `plan.degradations`: explicit fidelity warnings from the diff planner;
+- `review`: an annotated unified diff from the synced canonical Markdown to the
+  exact local file text, with block operation context when it can be mapped
+  unambiguously;
 - `guardrail`: `proceed` or `confirm_required`;
 - `action`: the next push action, such as `noop`, `confirm_plan`, `confirm_dangerous_plan`, or `fix_validation`.
+
+The `review` object includes `old_label`, `new_label`, and `hunks`. Each hunk
+has `old_start`, `new_start`, `old_lines`, `new_lines`, `operations`, and
+`lines`. Review lines use `kind` values of `context`, `add`, or `remove`, carry
+the line text, and include `old_line`, `new_line`, `block_id`, and
+`operation_type` when available. Frontmatter/property changes are normal unified
+diff lines associated with `update_properties`; new row creation uses
+`/dev/null` as the old label. The review diff is for approval and diagnostics
+only; `plan.operations` remains the authoritative remote mutation plan.
+
+Human `afs diff <path>` output prints the plan summary, any degradation
+warnings, operation annotations such as `update_block paragraph-1`, and the
+annotated unified diff hunks.
 
 The production command path uses the SQLite store. A real diff requires persisted mount, entity, and shadow rows for the target path.
 
@@ -195,7 +211,7 @@ The production command path uses the SQLite store. A real diff requires persiste
 
 The push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `afs diff`. When the plan is approved, it enters the journaled connector-apply executor. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
 
-The JSON report has the same validation, plan, degradation, guardrail, and stage fields as `afs diff`. Its `action` is one of:
+The JSON report has the same validation, plan, review, degradation, guardrail, and stage fields as `afs diff`. Its `action` is one of:
 
 - `fix_validation`;
 - `noop`;
@@ -206,6 +222,11 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `reconciled`;
 - `apply_not_implemented`;
 - `apply_failed`.
+
+When human `afs push <path>` stops at `confirm_plan` or
+`confirm_dangerous_plan`, it prints the same review diff before the rerun
+instruction. Approved pushes with `-y`, `--yes`, or `--confirm` do not print the
+review again before applying.
 
 Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal.
 

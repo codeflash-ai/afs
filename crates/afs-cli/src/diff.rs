@@ -20,6 +20,9 @@ use afs_core::push::{
     PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult, PushStage,
     evaluate_guardrails, plan_push_pipeline,
 };
+use afs_core::review::{
+    ReviewDiff, review_diff_for_create_entity, review_diff_for_existing_document,
+};
 use afs_core::shadow::ShadowDocument;
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_store::{
@@ -137,12 +140,24 @@ where
         validation_pipeline(schema_validation)
     };
 
+    let review = output.plan.as_ref().map(|plan| {
+        review_diff_for_existing_document(
+            synced_label(&absolute_path),
+            local_label(&absolute_path),
+            &shadow,
+            &parsed.document.body,
+            parsed.body_start_line,
+            &file,
+            plan,
+        )
+    });
     let report = DiffReport::from_pipeline(
         options.command,
         absolute_path,
         mount,
         entity.remote_id.clone(),
         output.clone(),
+        review,
     );
 
     Ok(PreviewArtifacts {
@@ -211,12 +226,16 @@ where
         options.approval,
         schema_validation,
     );
+    let review = pipeline.plan.as_ref().map(|plan| {
+        review_diff_for_create_entity("/dev/null", local_label(&absolute_path), &file, plan)
+    });
     let report = DiffReport::from_pipeline(
         options.command,
         absolute_path,
         mount,
         parent.remote_id.clone(),
         pipeline.clone(),
+        review,
     );
 
     Ok(PreviewArtifacts {
@@ -552,6 +571,14 @@ fn parse_error_issue(path: &Path, error: CanonicalParseError) -> ValidationIssue
     )
 }
 
+fn synced_label(path: &Path) -> String {
+    format!("synced:{}", path.display())
+}
+
+fn local_label(path: &Path) -> String {
+    format!("local:{}", path.display())
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreviewOptions {
     pub command: &'static str,
@@ -636,6 +663,7 @@ pub struct DiffReport {
     pub entity_id: String,
     pub validation: Vec<ValidationIssueOutput>,
     pub plan: Option<PushPlanOutput>,
+    pub review: Option<ReviewDiff>,
     pub guardrail: GuardrailOutput,
     pub action: String,
     pub unsupported: Vec<String>,
@@ -663,6 +691,7 @@ impl DiffReport {
                 .map(ValidationIssueOutput::from)
                 .collect(),
             plan: None,
+            review: None,
             guardrail: GuardrailOutput::proceed(),
             action: action_name(&PushPipelineAction::FixValidation).to_string(),
             unsupported: Vec::new(),
@@ -678,6 +707,7 @@ impl DiffReport {
         mount: &MountConfig,
         entity_id: RemoteId,
         result: PushPipelineResult,
+        review: Option<ReviewDiff>,
     ) -> Self {
         let (unsupported, message, suggested_fix) = unsupported_action_fields(&result.action);
         let ok = result.validation.is_clean() && unsupported.is_empty();
@@ -694,6 +724,7 @@ impl DiffReport {
                 .map(ValidationIssueOutput::from)
                 .collect(),
             plan: result.plan.map(PushPlanOutput::from),
+            review,
             guardrail: GuardrailOutput::from(result.guardrail),
             action: action_name(&result.action).to_string(),
             unsupported,

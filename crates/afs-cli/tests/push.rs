@@ -53,6 +53,7 @@ fn push_safe_plan_requires_yes() {
     assert!(!report.ok);
     assert_eq!(report.action, "confirm_plan");
     assert_eq!(report.pipeline_action, "confirm_plan");
+    assert!(report.review.is_some());
     assert_eq!(push_report_exit_code(&report), 4);
 }
 
@@ -138,6 +139,7 @@ fn push_safe_plan_with_yes_stops_at_apply_boundary() {
     assert!(!report.ok);
     assert_eq!(report.pipeline_action, "proceed_to_apply");
     assert_eq!(report.action, "apply_not_implemented");
+    assert!(report.review.is_some());
     assert_eq!(push_report_exit_code(&report), 5);
 }
 
@@ -164,6 +166,7 @@ fn push_safe_plan_with_daemon_journals_applies_and_reconciles() {
 
     assert!(report.ok);
     assert_eq!(report.action, "reconciled");
+    assert!(report.review.is_some());
     assert!(report.push_id.is_some());
     assert_eq!(report.journal_status.as_deref(), Some("reconciled"));
     assert_eq!(report.changed_remote_ids, vec!["page-1"]);
@@ -282,6 +285,7 @@ fn push_validation_failure_returns_fix_validation() {
 
     assert!(!report.ok);
     assert_eq!(report.action, "fix_validation");
+    assert!(report.review.is_none());
     assert_eq!(report.validation[0].code, "frontmatter_missing_afs");
     assert_eq!(push_report_exit_code(&report), 3);
 }
@@ -494,22 +498,29 @@ where
 }
 
 fn canonical_markdown(remote_id: &str, body: &str) -> String {
+    format!("---\n{}---\n{body}", page_frontmatter(remote_id))
+}
+
+fn page_frontmatter(remote_id: &str) -> String {
     format!(
-        "---\nafs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\n{body}"
+        "afs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n"
     )
 }
 
 fn shadow(body: &str) -> ShadowDocument {
+    let frontmatter = page_frontmatter("page-1");
     ShadowDocument::from_synced_body(
         RemoteId::new("page-1"),
         body,
-        9,
+        frontmatter.lines().count() + 3,
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
     )
     .expect("shadow")
+    .with_frontmatter(frontmatter)
 }
 
 fn large_shadow() -> ShadowDocument {
+    let frontmatter = page_frontmatter("page-1");
     let body = (0..11)
         .map(|index| format!("Paragraph {index}."))
         .collect::<Vec<_>>()
@@ -518,5 +529,12 @@ fn large_shadow() -> ShadowDocument {
         .map(|index| RemoteId::new(format!("block-{index}")))
         .collect::<Vec<_>>();
 
-    ShadowDocument::from_synced_body(RemoteId::new("page-1"), body, 9, block_ids).expect("shadow")
+    ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        body,
+        frontmatter.lines().count() + 3,
+        block_ids,
+    )
+    .expect("shadow")
+    .with_frontmatter(frontmatter)
 }

@@ -47,6 +47,24 @@ fn diff_reports_safe_plan_as_confirmation_needed() {
     assert_eq!(report.guardrail.decision, "proceed");
     assert_eq!(plan.summary.blocks_updated, 1);
     assert_eq!(plan.operations[0].operation_type(), "update_block");
+    let review = report.review.expect("review");
+    assert!(review.hunks.iter().any(|hunk| {
+        hunk.operations.iter().any(|operation| {
+            operation.operation_type == "update_block"
+                && operation.block_id.as_deref() == Some("paragraph-1")
+        })
+    }));
+    assert!(
+        review
+            .hunks
+            .iter()
+            .any(|hunk| hunk.lines.iter().any(|line| {
+                line.kind == afs_core::review::ReviewLineKind::Add
+                    && line.text == "Changed paragraph."
+                    && line.block_id.as_deref() == Some("paragraph-1")
+                    && line.operation_type.as_deref() == Some("update_block")
+            }))
+    );
 }
 
 #[test]
@@ -101,6 +119,14 @@ fn diff_plans_new_database_row_file_as_create_entity() {
         }
         operation => panic!("unexpected operation {operation:?}"),
     }
+    let review = report.review.expect("review");
+    assert_eq!(review.old_label, "/dev/null");
+    assert!(review.hunks.iter().any(|hunk| {
+        hunk.operations.iter().any(|operation| {
+            operation.operation_type == "create_entity"
+                && operation.parent_id.as_deref() == Some("database-1")
+        })
+    }));
 }
 
 #[test]
@@ -158,17 +184,18 @@ fn diff_rejects_existing_database_row_invalid_select_option() {
         .expect("save row");
     fixture.write_tasks_schema();
     let body = "# Notes\n\nExisting body.";
+    let frontmatter = row_frontmatter("Todo");
     store
         .save_shadow(
             &fixture.mount_id,
             ShadowDocument::from_synced_body(
                 RemoteId::new("row-1"),
                 body,
-                9,
+                frontmatter.lines().count() + 3,
                 [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
             )
             .expect("shadow")
-            .with_frontmatter(row_frontmatter("Todo")),
+            .with_frontmatter(frontmatter),
         )
         .expect("save shadow");
     let path = fixture.write_raw(
@@ -199,6 +226,7 @@ fn diff_surfaces_validation_issues_without_plan() {
     assert!(!report.ok);
     assert_eq!(report.action, "fix_validation");
     assert!(report.plan.is_none());
+    assert!(report.review.is_none());
     assert_eq!(report.validation[0].code, "frontmatter_missing_afs");
     assert_eq!(report.completed_stages, vec!["parse_and_validate"]);
 }
@@ -358,19 +386,25 @@ impl Drop for DiffFixture {
 }
 
 fn canonical_markdown(remote_id: &str, body: &str) -> String {
+    format!("---\n{}---\n{body}", page_frontmatter(remote_id))
+}
+
+fn page_frontmatter(remote_id: &str) -> String {
     format!(
-        "---\nafs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\n{body}"
+        "afs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n"
     )
 }
 
 fn shadow(body: &str) -> ShadowDocument {
+    let frontmatter = page_frontmatter("page-1");
     ShadowDocument::from_synced_body(
         RemoteId::new("page-1"),
         body,
-        9,
+        frontmatter.lines().count() + 3,
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
     )
     .expect("shadow")
+    .with_frontmatter(frontmatter)
 }
 
 fn row_frontmatter(status: &str) -> String {

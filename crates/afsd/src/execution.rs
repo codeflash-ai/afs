@@ -13,6 +13,7 @@ use afs_core::hydration::HydrationRequest;
 use afs_core::journal::{JournalStatus, PushId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::push::{PushExecutionResult, PushPipelineResult};
+use afs_core::review::ReviewDiff;
 use serde::{Deserialize, Serialize};
 
 use crate::hydration::{HydrationDrainReport, HydrationOutcome, HydrationSource};
@@ -72,6 +73,7 @@ pub struct PushJobReport {
     pub pipeline: PushPipelineResult,
     pub action: PushJobAction,
     pub execution: Option<PushExecutionResult>,
+    pub review: Option<ReviewDiff>,
     pub push_id: Option<PushId>,
     pub journal_status: Option<JournalStatus>,
     pub error: Option<PushJobError>,

@@ -10,6 +10,7 @@ use afs_core::AfsResult;
 use afs_core::journal::{JournalStatus, JournalStore};
 use afs_core::model::RemoteId;
 use afs_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
+use afs_core::review::ReviewDiff;
 use afs_store::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 use afsd::execution::{PushJob, PushJobError, PushJobReport};
 use afsd::hydration::HydrationSource;
@@ -75,6 +76,7 @@ pub struct PushReport {
     pub entity_id: String,
     pub validation: Vec<ValidationIssueOutput>,
     pub plan: Option<PushPlanOutput>,
+    pub review: Option<ReviewDiff>,
     pub guardrail: GuardrailOutput,
     pub action: String,
     pub pipeline_action: String,
@@ -101,6 +103,7 @@ impl PushReport {
             push_id,
             journal_status,
             error,
+            review,
         } = report;
 
         let pipeline_action = action_name(&pipeline.action).to_string();
@@ -125,6 +128,7 @@ impl PushReport {
                 .map(ValidationIssueOutput::from)
                 .collect(),
             plan: pipeline.plan.map(PushPlanOutput::from),
+            review,
             guardrail: GuardrailOutput::from(pipeline.guardrail),
             action: daemon_action_name(&action, &pipeline_action, error.as_ref()).to_string(),
             pipeline_action,
@@ -173,6 +177,7 @@ impl PushReport {
             entity_id: preview.entity_id,
             validation: preview.validation,
             plan: preview.plan,
+            review: preview.review,
             guardrail: preview.guardrail,
             pipeline_action: preview.action,
             action,

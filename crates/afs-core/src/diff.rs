@@ -311,7 +311,7 @@ fn validate_edited_directives(
     report
 }
 
-fn align_blocks(
+pub(crate) fn align_blocks(
     shadow: &ShadowDocument,
     edited_blocks: &[SegmentedBlock],
 ) -> (Vec<Option<usize>>, Vec<PlanDegradation>) {

@@ -25,6 +25,7 @@ use afs_core::push::{
     PushReconciler, PushStage, RemotePrecondition, execute_journaled_push_with_host,
     plan_push_pipeline,
 };
+use afs_core::review::{ReviewDiff, review_diff_for_existing_document};
 use afs_core::shadow::ShadowDocument;
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
@@ -100,6 +101,7 @@ where
             push_id: Some(result.push_id.clone()),
             journal_status: result.journal_status.clone(),
             execution: Some(result),
+            review: prepared.review,
             error: None,
         }),
         Err(error) => Ok(PushJobReport {
@@ -109,6 +111,7 @@ where
             pipeline: prepared.pipeline,
             action: PushJobAction::Failed,
             execution: None,
+            review: prepared.review,
             push_id: Some(push_id.clone()),
             journal_status: journal_status_after_error(store, &push_id),
             error: Some(PushJobError::from(error)),
@@ -157,6 +160,7 @@ struct PreparedPush {
     entity: EntityRecord,
     shadow: Option<ShadowDocument>,
     pipeline: PushPipelineResult,
+    review: Option<ReviewDiff>,
 }
 
 fn prepare_push<S>(store: &S, job: &PushJob, state_root: Option<&Path>) -> AfsResult<PreparedPush>
@@ -193,6 +197,7 @@ where
                 "entity is conflicted; resolve it before pushing",
                 Some("run `afs resolve --ours|--theirs|--edited <path>` first".to_string()),
             )),
+            review: None,
         });
     }
 
@@ -207,6 +212,7 @@ where
                 entity,
                 shadow: None,
                 pipeline: validation_pipeline(parse_error_issue(&relative_path, error)),
+                review: None,
             });
         }
     };
@@ -227,6 +233,7 @@ where
                 "frontmatter `afs.id` does not match the entity mapped to this path",
                 Some("restore the generated `afs.id` for this file before pushing".to_string()),
             )),
+            review: None,
         });
     }
 
@@ -248,12 +255,25 @@ where
         validation_report_pipeline(schema_validation)
     };
 
+    let review = pipeline.plan.as_ref().map(|plan| {
+        review_diff_for_existing_document(
+            synced_label(&absolute_path),
+            local_label(&absolute_path),
+            &shadow,
+            &parsed.document.body,
+            parsed.body_start_line,
+            &contents,
+            plan,
+        )
+    });
+
     Ok(PreparedPush {
         absolute_path,
         mount,
         entity,
         shadow: Some(shadow),
         pipeline,
+        review,
     })
 }
 
@@ -270,6 +290,14 @@ fn projection_read_path(
     }
 
     Ok(absolute_path.to_path_buf())
+}
+
+fn synced_label(path: &Path) -> String {
+    format!("synced:{}", path.display())
+}
+
+fn local_label(path: &Path) -> String {
+    format!("local:{}", path.display())
 }
 
 struct DaemonPushHost<'a, S, Source: ?Sized> {

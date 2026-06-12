@@ -8,6 +8,7 @@ use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
 use afs_core::journal::PushId;
 use afs_core::model::{MountId, RemoteId};
+use afs_core::review::{ReviewDiff, ReviewLineKind};
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
@@ -1131,9 +1132,27 @@ fn print_push_report(report: &PushReport) {
             report.push_id.as_deref().unwrap_or("<unknown>"),
             report.via
         ),
-        "fix_validation" => print_diff_report_fields(&report.validation, report.plan.as_ref()),
-        "confirm_plan" => println!("push requires confirmation; rerun with -y or --yes"),
-        "confirm_dangerous_plan" => println!("dangerous push requires --confirm"),
+        "fix_validation" => print_diff_report_fields(
+            &report.validation,
+            report.plan.as_ref(),
+            report.review.as_ref(),
+        ),
+        "confirm_plan" => {
+            print_diff_report_fields(
+                &report.validation,
+                report.plan.as_ref(),
+                report.review.as_ref(),
+            );
+            println!("push requires confirmation; rerun with -y or --yes");
+        }
+        "confirm_dangerous_plan" => {
+            print_diff_report_fields(
+                &report.validation,
+                report.plan.as_ref(),
+                report.review.as_ref(),
+            );
+            println!("dangerous push requires --confirm");
+        }
         "read_only_blocked" => println!("push blocked: mount is read-only"),
         "apply_not_implemented" => {
             println!(
@@ -1932,12 +1951,17 @@ fn stub(command: &str, json: bool) -> i32 {
 }
 
 fn print_diff_report(report: &crate::diff::DiffReport) {
-    print_diff_report_fields(&report.validation, report.plan.as_ref());
+    print_diff_report_fields(
+        &report.validation,
+        report.plan.as_ref(),
+        report.review.as_ref(),
+    );
 }
 
 fn print_diff_report_fields(
     validation: &[crate::diff::ValidationIssueOutput],
     plan: Option<&crate::diff::PushPlanOutput>,
+    review: Option<&ReviewDiff>,
 ) {
     if !validation.is_empty() {
         for issue in validation {
@@ -1957,13 +1981,53 @@ fn print_diff_report_fields(
         return;
     };
 
+    print_plan_summary(plan);
+    for degradation in &plan.degradations {
+        println!("warning: {}: {}", degradation.kind, degradation.message);
+    }
+    if let Some(review) = review {
+        print_review_diff(review);
+    }
+}
+
+fn print_plan_summary(plan: &crate::diff::PushPlanOutput) {
     println!(
-        "{} blocks updated, {} created, {} moved, {} archived",
+        "plan: {} blocks updated, {} created, {} moved, {} archived; {} entities created, {} archived; {} properties updated",
         plan.summary.blocks_updated,
         plan.summary.blocks_created,
         plan.summary.blocks_moved,
-        plan.summary.blocks_archived
+        plan.summary.blocks_archived,
+        plan.summary.entities_created,
+        plan.summary.entities_archived,
+        plan.summary.properties_updated,
     );
+}
+
+fn print_review_diff(review: &ReviewDiff) {
+    if review.hunks.is_empty() {
+        println!("no text changes");
+        return;
+    }
+
+    println!("--- {}", review.old_label);
+    println!("+++ {}", review.new_label);
+    for hunk in &review.hunks {
+        for operation in &hunk.operations {
+            println!("operation: {}", operation.label());
+        }
+        println!(
+            "@@ -{},{} +{},{} @@",
+            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+        );
+        for line in &hunk.lines {
+            let prefix = match line.kind {
+                ReviewLineKind::Context => ' ',
+                ReviewLineKind::Add => '+',
+                ReviewLineKind::Remove => '-',
+            };
+            println!("{prefix}{}", line.text);
+        }
+    }
 }
 
 fn read_connect_token(args: &[String], json: bool) -> Result<String, CommandError> {
@@ -3297,6 +3361,7 @@ mod tests {
             entity_id: "page-1".to_string(),
             validation: Vec::new(),
             plan: None,
+            review: None,
             guardrail: GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
@@ -3319,6 +3384,7 @@ mod tests {
             entity_id: "page-1".to_string(),
             validation: Vec::new(),
             plan: None,
+            review: None,
             guardrail: GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
