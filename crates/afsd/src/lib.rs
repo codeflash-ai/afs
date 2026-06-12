@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use afs_core::AfsResult;
 use afs_core::pull::{PullMode, PullSchedulerConfig};
+use afs_store::default_state_root;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonConfig {
@@ -58,18 +59,6 @@ impl Daemon {
     pub fn run_foreground(&self) -> AfsResult<()> {
         server::run_foreground(&self.config)
     }
-}
-
-fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
 }
 
 fn default_tcp_addr() -> Option<SocketAddr> {

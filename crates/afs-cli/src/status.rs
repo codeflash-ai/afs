@@ -12,7 +12,7 @@ use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, Re
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
     ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
-    VirtualMutationRepository,
+    VirtualMutationRepository, default_state_root,
 };
 use afsd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
@@ -910,13 +910,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, StatusError> {
             .map(|cwd| cwd.join(path))
             .map_err(|error| StatusError::CurrentDir(error.to_string()))
     }
-}
-
-fn default_state_root() -> PathBuf {
-    std::env::var("AFS_STATE_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".afs")))
-        .unwrap_or_else(|_| PathBuf::from(".afs"))
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {

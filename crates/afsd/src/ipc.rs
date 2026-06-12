@@ -183,6 +183,19 @@ pub fn default_tcp_addr() -> SocketAddr {
         .expect("default daemon TCP address is valid")
 }
 
+#[cfg(not(unix))]
+fn client_tcp_addr() -> Result<SocketAddr, DaemonClientError> {
+    match std::env::var("AFS_DAEMON_TCP_ADDR") {
+        Ok(value) if matches!(value.as_str(), "0" | "off" | "none" | "disabled") => Err(
+            DaemonClientError::NotAvailable("daemon TCP IPC is disabled".to_string()),
+        ),
+        Ok(value) => value.parse().map_err(|error| {
+            DaemonClientError::Protocol(format!("invalid AFS_DAEMON_TCP_ADDR `{value}`: {error}"))
+        }),
+        Err(_) => Ok(default_tcp_addr()),
+    }
+}
+
 #[cfg(unix)]
 pub fn send_request(
     state_root: &Path,
@@ -244,20 +257,18 @@ pub fn send_tcp_request_with_timeout(
 #[cfg(not(unix))]
 pub fn send_request(
     _state_root: &Path,
-    _request: &DaemonRequest,
+    request: &DaemonRequest,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    Err(DaemonClientError::NotAvailable(
-        "daemon IPC is only implemented on Unix sockets".to_string(),
-    ))
+    send_tcp_request(client_tcp_addr()?, request)
 }
 
 #[cfg(not(unix))]
 pub fn send_request_with_timeout(
-    state_root: &Path,
+    _state_root: &Path,
     request: &DaemonRequest,
-    _timeout: Duration,
+    timeout: Duration,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    send_request(state_root, request)
+    send_tcp_request_with_timeout(client_tcp_addr()?, request, timeout)
 }
 
 pub fn read_request(stream: impl Read) -> Result<DaemonRequest, DaemonClientError> {

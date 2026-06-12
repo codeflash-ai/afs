@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +18,6 @@ use crate::ipc::{
 use crate::runtime::{DaemonRuntime, DaemonRuntimeHandle};
 use crate::watcher::{FileWatcher, NotifyFileWatcher, PollingStubReadWatcher};
 
-#[cfg(unix)]
 pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
     std::fs::create_dir_all(&config.state_root)?;
     let runtime = DaemonRuntime::spawn(config.clone())?;
@@ -34,45 +34,64 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
         runtime: runtime_handle.clone(),
         watch_manager: Arc::clone(&watch_manager),
     };
+    let mounts = load_mounts(config)?;
 
-    if let Some(addr) = config.tcp_addr {
+    #[cfg(not(unix))]
+    {
+        let addr = config.tcp_addr.ok_or(AfsError::Unsupported(
+            "daemon TCP IPC must be enabled on this platform",
+        ))?;
         let listener = TcpListener::bind(addr).map_err(|error| {
             AfsError::Io(format!("failed to bind daemon TCP listener: {error}"))
         })?;
-        let server = server.clone();
-        thread::spawn(move || accept_tcp_connections(listener, server));
+        print_startup_banner(&format!("tcp: {addr}"), &mounts, &reload.watches);
+        println!("afsd is running (tcp: {addr})");
+        accept_tcp_connections(listener, server);
+        return Ok(());
     }
 
-    let socket_path = crate::ipc::socket_path(&config.state_root);
-    remove_stale_socket(&socket_path)?;
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|error| AfsError::Io(format!("failed to bind daemon socket: {error}")))?;
-    let mounts = load_mounts(config)?;
-    print_startup_banner(&socket_path, &mounts, &reload.watches);
-
-    println!("afsd is running (socket: {})", socket_path.display());
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let server = server.clone();
-                thread::spawn(move || handle_connection(stream, server));
-            }
-            Err(error) => eprintln!("afsd accept failed: {error}"),
+    #[cfg(unix)]
+    {
+        if let Some(addr) = config.tcp_addr {
+            let listener = TcpListener::bind(addr).map_err(|error| {
+                AfsError::Io(format!("failed to bind daemon TCP listener: {error}"))
+            })?;
+            let server = server.clone();
+            thread::spawn(move || accept_tcp_connections(listener, server));
         }
-    }
 
-    Ok(())
+        let socket_path = crate::ipc::socket_path(&config.state_root);
+        remove_stale_socket(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)
+            .map_err(|error| AfsError::Io(format!("failed to bind daemon socket: {error}")))?;
+        print_startup_banner(
+            &format!("socket: {}", socket_path.display()),
+            &mounts,
+            &reload.watches,
+        );
+
+        println!("afsd is running (socket: {})", socket_path.display());
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let server = server.clone();
+                    thread::spawn(move || handle_connection(stream, server));
+                }
+                Err(error) => eprintln!("afsd accept failed: {error}"),
+            }
+        }
+
+        Ok(())
+    }
 }
 
-#[cfg(unix)]
 fn load_mounts(config: &DaemonConfig) -> AfsResult<Vec<MountConfig>> {
     let store = SqliteStateStore::open(config.state_root.clone()).map_err(AfsError::from)?;
     store.load_mounts().map_err(AfsError::from)
 }
 
-#[cfg(unix)]
-fn print_startup_banner(socket_path: &Path, mounts: &[MountConfig], watches: &DaemonWatchStatus) {
-    println!("afsd listening on {}", socket_path.display());
+fn print_startup_banner(endpoint: &str, mounts: &[MountConfig], watches: &DaemonWatchStatus) {
+    println!("afsd listening on {endpoint}");
     match mounts {
         [] => println!("afsd watching 0 mounts"),
         [mount] => println!("afsd watching 1 mount: {}", mount.root.display()),
@@ -91,7 +110,6 @@ fn print_startup_banner(socket_path: &Path, mounts: &[MountConfig], watches: &Da
     println!("afsd auth: {}", auth_summary(mounts));
 }
 
-#[cfg(unix)]
 fn auth_summary(mounts: &[MountConfig]) -> String {
     let mut labels = mounts
         .iter()
@@ -106,19 +124,12 @@ fn auth_summary(mounts: &[MountConfig]) -> String {
     labels.join(", ")
 }
 
-#[cfg(not(unix))]
-pub fn run_foreground(_config: &DaemonConfig) -> AfsResult<()> {
-    Err(AfsError::Unsupported("daemon IPC on non-Unix platforms"))
-}
-
-#[cfg(unix)]
 #[derive(Clone)]
 struct DaemonServerHandle {
     runtime: DaemonRuntimeHandle,
     watch_manager: Arc<Mutex<DaemonWatchManager>>,
 }
 
-#[cfg(unix)]
 fn accept_tcp_connections(listener: TcpListener, server: DaemonServerHandle) {
     for stream in listener.incoming() {
         match stream {
@@ -131,7 +142,6 @@ fn accept_tcp_connections(listener: TcpListener, server: DaemonServerHandle) {
     }
 }
 
-#[cfg(unix)]
 fn handle_connection(mut stream: impl Read + Write, server: DaemonServerHandle) {
     let response = match crate::ipc::read_request(&mut stream) {
         Ok(request) => handle_request(request, &server),
@@ -140,7 +150,6 @@ fn handle_connection(mut stream: impl Read + Write, server: DaemonServerHandle) 
     write_best_effort(&mut stream, response);
 }
 
-#[cfg(unix)]
 fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> DaemonResponse {
     match request {
         DaemonRequest::Status => match daemon_status(server) {
@@ -158,7 +167,6 @@ fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> Daemon
     }
 }
 
-#[cfg(unix)]
 fn daemon_status(server: &DaemonServerHandle) -> AfsResult<DaemonStatusReport> {
     let runtime = server
         .runtime
@@ -177,21 +185,18 @@ fn daemon_status(server: &DaemonServerHandle) -> AfsResult<DaemonStatusReport> {
     })
 }
 
-#[cfg(unix)]
 fn write_best_effort(stream: &mut impl Write, response: DaemonResponse) {
     if let Err(error) = crate::ipc::write_response(stream, &response) {
         eprintln!("afsd response failed: {}", error.message());
     }
 }
 
-#[cfg(unix)]
 struct DaemonWatchManager {
     config: DaemonConfig,
     file_watcher: NotifyFileWatcher,
     stub_read_watcher: PollingStubReadWatcher,
 }
 
-#[cfg(unix)]
 impl DaemonWatchManager {
     fn new(config: &DaemonConfig, runtime: DaemonRuntimeHandle) -> AfsResult<Self> {
         let file_watcher = NotifyFileWatcher::new({
@@ -281,7 +286,6 @@ impl DaemonWatchManager {
     }
 }
 
-#[cfg(unix)]
 fn should_watch_mount(mount: &MountConfig) -> bool {
     !mount.projection.uses_virtual_filesystem()
 }

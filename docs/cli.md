@@ -81,7 +81,7 @@ Auth failures exit `1` and include `suggested_command` when there is an obvious 
 
 Projection choices are platform-specific. Linux binaries accept `plain-files` and
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
-Windows currently accepts `plain-files` only.
+Windows accepts `plain-files` only.
 
 `afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. `--projection linux-fuse` records the equivalent Linux virtual projection for the FUSE helper. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
 
@@ -102,9 +102,13 @@ Provider helper.
 
 `afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
 
-The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
+The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and
+`skipped_dirty` counts. `via` is `daemon` when the daemon endpoint handled the
+job and `cli` when the command executed directly. On Windows, the daemon
+endpoint is the loopback TCP listener.
 
-If the daemon socket is unavailable and `AFS_DAEMON_DISABLE` is not set, pull/push print a stderr hint and continue directly:
+If the daemon endpoint is unavailable and `AFS_DAEMON_DISABLE` is not set,
+pull/push print a stderr hint and continue directly:
 
 ```text
 afsd not running; executing pull directly (start afsd for background hydration)
@@ -118,8 +122,9 @@ manager is a per-user LaunchAgent at
 `~/.afs/logs/`. The LaunchAgent uses `RunAtLoad` and `KeepAlive`, so the daemon
 starts at login and launchd restarts it if it exits. On non-macOS systems, or
 when `--session` is passed, the CLI starts a detached child process and writes
-`~/.afs/afsd.pid`; session mode inherits the current shell environment but does
-not survive logout.
+`afsd.pid` under the active state root; session mode inherits the current shell
+environment but does not survive logout. The default state root is `~/.afs` on
+Unix and `%LOCALAPPDATA%\AgentFS` on Windows. `AFS_STATE_DIR` overrides both.
 
 Useful forms:
 
@@ -157,7 +162,11 @@ Human output is a compact path summary for people and agents working in nested d
 
 `afs status [path]` inspects local mount state only. It resolves the target path through the stored mount/entity mapping, compares hydrated page bodies against their stored shadow snapshots, reports stubs, conflicted files with unresolved inline markers, dirty files, missing projections, and pending or failed push journals touching each entity. It does not call remote connectors.
 
-The production state directory defaults to `~/.afs`; `AFS_STATE_DIR` is a developer/test override for isolated runs. When no path is supplied, `afs status` first checks the current working directory: inside a mount it scopes to that subtree, and outside all mounts it reports every registered mount in the active state directory.
+The production state directory defaults to `~/.afs` on Unix and
+`%LOCALAPPDATA%\AgentFS` on Windows; `AFS_STATE_DIR` is a developer/test override
+for isolated runs. When no path is supplied, `afs status` first checks the
+current working directory: inside a mount it scopes to that subtree, and outside
+all mounts it reports every registered mount in the active state directory.
 
 The JSON report includes:
 
@@ -237,7 +246,10 @@ afs status ~/afs/notion
 
 ## `afs daemon status`
 
-`afs daemon status [--json]` checks the configured Unix socket and, when the daemon is running, requests a daemon status snapshot. JSON output includes process-manager state, runtime queue counts, scheduler mode, watched mount count, and watched roots.
+`afs daemon status [--json]` checks the configured daemon endpoint and, when the
+daemon is running, requests a daemon status snapshot. JSON output includes
+process-manager state, runtime queue counts, scheduler mode, watched mount
+count, and watched roots.
 
 `afs daemon reload [--json]` tells a running daemon to reconcile its watched mount roots with the current SQLite mount table. `afs mount` sends the same IPC request after saving a new mount, so a persistent daemon starts watching newly mounted directories without a restart.
 
@@ -258,6 +270,7 @@ or:
 daemon stopped
   state: stopped
   socket: /Users/alice/.afs/afsd.sock
+  tcp: 127.0.0.1:38567
 ```
 
 ## Initial `afs log --json` Shape

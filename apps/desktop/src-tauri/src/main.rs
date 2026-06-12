@@ -21,7 +21,7 @@ use afs_notion::oauth::{
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
     JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
-    open_credential_store,
+    default_state_root, display_path, expand_tilde, open_credential_store,
 };
 use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
@@ -622,47 +622,6 @@ fn located_item_for_entity(mount: &MountConfig, entity: &EntityRecord) -> Locate
         local_path: display_path(&mount.root.join(&entity.path)),
         state: "ready".to_string(),
     }
-}
-
-fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
-}
-
-fn expand_tilde(path: &str) -> std::io::Result<PathBuf> {
-    if path == "~" {
-        return home_dir();
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return home_dir().map(|home| home.join(rest));
-    }
-    Ok(PathBuf::from(path))
-}
-
-fn home_dir() -> std::io::Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))
-}
-
-fn display_path(path: &Path) -> String {
-    if let Ok(home) = home_dir()
-        && let Ok(relative) = path.strip_prefix(&home)
-    {
-        if relative.as_os_str().is_empty() {
-            return "~".to_string();
-        }
-        return format!("~/{}", relative.display());
-    }
-
-    path.display().to_string()
 }
 
 fn resolve_mount_root(path: &str) -> Result<PathBuf, String> {

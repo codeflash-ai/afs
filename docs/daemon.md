@@ -31,12 +31,13 @@ management lives in `afs daemon ...`:
   with `RunAtLoad` and `KeepAlive` so it starts at login and restarts after
   crashes.
 - `afs daemon start --session` starts a detached child process that inherits the
-  current shell environment and writes `~/.afs/afsd.pid`. This is useful for
+  current shell environment and writes `afsd.pid` under the active state root.
+  This is useful for
   development credentials and temporary test state, but it does not survive
   logout.
-- `afs daemon status` pings the daemon socket and reports the state root, socket,
-  manager, log path, runtime queue counts, scheduler mode, and watched mount
-  roots.
+- `afs daemon status` pings the daemon and reports the state root, socket/TCP
+  endpoints, manager, log path, runtime queue counts, scheduler mode, and
+  watched mount roots.
 - `afs daemon reload` asks the running daemon to reconcile file watches with the
   current SQLite mount table.
 - `afs daemon stop` unloads the LaunchAgent or kills the session pid file when
@@ -51,17 +52,19 @@ storage instead of plist environment variables.
 
 ## Foreground Daemon
 
-`afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`
-or `~/.afs/afsd.sock`, plus a localhost TCP listener at `127.0.0.1:38567` by
-default. CLI `pull` and `push` try the Unix socket first. If the socket is
-unavailable, they fall back to the same in-process executor; if the daemon
-accepts a request but does not answer within the CLI timeout, `pull` falls back
-to direct execution while `push` fails closed to avoid duplicate remote writes.
-The macOS File Provider extension uses the TCP listener because the extension is
-sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to disable TCP, or set it to
-`host:port` to move the listener. Setting `AFS_DAEMON_DISABLE=1` forces the CLI
-fallback path, which is useful for tests and recovery. Set
-`AFS_DAEMON_REQUEST_TIMEOUT_MS` to tune the CLI daemon request timeout.
+`afsd` runs a localhost TCP listener at `127.0.0.1:38567` by default. On Unix it
+also runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock` or
+`~/.afs/afsd.sock`; CLI `pull` and `push` use that socket first. On Windows,
+daemon IPC uses the TCP listener. If the daemon endpoint is unavailable, `pull`
+falls back to the same in-process executor; if the daemon accepts a request but
+does not answer within the CLI timeout, `pull` falls back to direct execution
+while `push` fails closed to avoid duplicate remote writes. The macOS File
+Provider extension also uses the TCP listener because the extension is
+sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to disable TCP on platforms that still
+have another IPC endpoint, or set it to `host:port` to move the listener.
+Setting `AFS_DAEMON_DISABLE=1` forces the CLI fallback path, which is useful for
+tests and recovery. Set `AFS_DAEMON_REQUEST_TIMEOUT_MS` to tune the CLI daemon
+request timeout.
 
 The socket accept loop does not run connector calls directly. It reads one JSON
 request, submits it to `DaemonRuntime`, and waits for the runtime response.
@@ -79,7 +82,7 @@ Start the daemon in the foreground:
 afsd
 ```
 
-On startup it prints the socket path, watched mounts, and auth source:
+On startup it prints the daemon endpoint, watched mounts, and auth source:
 
 ```text
 afsd listening on /Users/alice/.afs/afsd.sock
@@ -93,20 +96,25 @@ Check health from the CLI:
 afs daemon status
 ```
 
-Successful output:
+Successful Unix output:
 
 ```text
 daemon running  socket=/Users/alice/.afs/afsd.sock  ping=ok
 ```
 
-Stopped output:
+Windows status reports the TCP endpoint and the state root under
+`%LOCALAPPDATA%\AgentFS` unless `AFS_STATE_DIR` is set.
+
+Stopped Unix output:
 
 ```text
 daemon stopped  socket=/Users/alice/.afs/afsd.sock
   hint: run `afsd` in another terminal
 ```
 
-`afs pull` and `afs push` try the daemon first. Human success output includes `(via daemon)` or `(via cli)`, and JSON reports include `via`. If the socket is unavailable, the CLI falls back to direct execution and prints:
+`afs pull` and `afs push` try the daemon first. Human success output includes
+`(via daemon)` or `(via cli)`, and JSON reports include `via`. If the daemon
+endpoint is unavailable, the CLI falls back to direct execution and prints:
 
 ```text
 afsd not running; executing pull directly (start afsd for background hydration)

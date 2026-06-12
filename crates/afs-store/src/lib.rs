@@ -8,6 +8,7 @@
 pub mod credentials;
 pub mod error;
 pub mod memory;
+pub mod paths;
 pub mod records;
 pub mod repository;
 pub mod sqlite;
@@ -18,6 +19,7 @@ pub use credentials::{
 };
 pub use error::{StoreError, StoreResult};
 pub use memory::InMemoryStateStore;
+pub use paths::{default_state_root, display_path, expand_tilde, home_dir};
 pub use records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
     HydrationJobRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,

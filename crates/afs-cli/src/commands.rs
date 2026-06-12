@@ -15,7 +15,7 @@ use afs_notion::oauth::{
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
     JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
-    open_credential_store,
+    default_state_root, open_credential_store,
 };
 use afsd::execution::PushJobReport;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
@@ -2577,18 +2577,6 @@ fn takes_value(arg: &str) -> bool {
             | "--redirect-uri"
             | "--broker-url"
     )
-}
-
-fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
 }
 
 fn escape_json_string(value: &str) -> String {

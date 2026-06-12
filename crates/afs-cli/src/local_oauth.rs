@@ -283,8 +283,8 @@ fn open_browser(url: &str) -> io::Result<()> {
     };
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = ProcessCommand::new("cmd");
-        command.args(["/C", "start", "", url]);
+        let mut command = ProcessCommand::new("rundll32");
+        command.args(["url.dll,FileProtocolHandler", url]);
         command
     };
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]

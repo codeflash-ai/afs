@@ -1586,11 +1586,12 @@ function healthIconState(state: string): "default" | "review" | "reconnect" {
 }
 
 function joinMountPath(mountPath: string, relativePath: string) {
-  if (relativePath.startsWith("/") || relativePath.startsWith("~/")) {
+  if (/^(?:[a-zA-Z]:[\\/]|\\\\|\/|~[\\/])/.test(relativePath)) {
     return relativePath;
   }
 
-  return `${mountPath.replace(/\/$/, "")}/${relativePath}`;
+  const separator = mountPath.includes("\\") && !mountPath.includes("/") ? "\\" : "/";
+  return `${mountPath.replace(/[\\/]+$/, "")}${separator}${relativePath.replace(/^[\\/]+/, "")}`;
 }
 
 function copyText(value: string) {

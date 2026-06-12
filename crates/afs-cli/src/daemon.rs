@@ -1,5 +1,7 @@
 use std::env;
 use std::fs::{self, OpenOptions};
+#[cfg(windows)]
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -7,7 +9,12 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
+use afs_store::default_state_root;
+#[cfg(windows)]
+use afsd::ipc::send_tcp_request_with_timeout;
 use afsd::ipc::{
     DaemonClientError, DaemonReloadReport, DaemonRequest, DaemonStatusReport,
     send_request_with_timeout,
@@ -181,7 +188,7 @@ pub fn run_daemon_control(args: &[String]) -> Result<DaemonControlReport, Daemon
         DaemonAction::Reload => reload_daemon(&options, &paths),
         DaemonAction::Restart => {
             if let Err(error) = stop_daemon(&options, &paths)
-                && is_running(&paths)
+                && is_running(&paths, control_tcp_addr(&options, &paths).as_deref())
             {
                 return Err(error);
             }
@@ -238,7 +245,8 @@ fn start_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    if is_running(paths) {
+    let tcp_addr = control_tcp_addr(options, paths);
+    if is_running(paths, tcp_addr.as_deref()) {
         return Ok(report(
             options.action,
             DaemonRunState::Running,
@@ -265,7 +273,12 @@ fn start_daemon(
         }
     };
 
-    if !wait_for_state(paths, DaemonRunState::Running, START_TIMEOUT) {
+    if !wait_for_state(
+        paths,
+        DaemonRunState::Running,
+        START_TIMEOUT,
+        tcp_addr.as_deref(),
+    ) {
         return Err(DaemonControlError::new(
             "start_failed",
             format!(
@@ -291,7 +304,8 @@ fn stop_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    let was_running = is_running(paths);
+    let tcp_addr = control_tcp_addr(options, paths);
+    let was_running = is_running(paths, tcp_addr.as_deref());
     let mut stopped_managed_process = false;
 
     if should_use_launchd(options.mode)
@@ -312,12 +326,22 @@ fn stop_daemon(
 
     if was_running
         && !stopped_managed_process
-        && wait_for_state(paths, DaemonRunState::Stopped, Duration::from_millis(250))
+        && wait_for_state(
+            paths,
+            DaemonRunState::Stopped,
+            Duration::from_millis(250),
+            tcp_addr.as_deref(),
+        )
     {
         stopped_managed_process = true;
     }
 
-    if !wait_for_state(paths, DaemonRunState::Stopped, STOP_TIMEOUT) {
+    if !wait_for_state(
+        paths,
+        DaemonRunState::Stopped,
+        STOP_TIMEOUT,
+        tcp_addr.as_deref(),
+    ) {
         return Err(DaemonControlError::new(
             "stop_failed",
             "daemon is still responding; if it was started manually, stop the afsd process directly",
@@ -346,7 +370,8 @@ fn status_report(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> DaemonControlReport {
-    let state = if is_running(paths) {
+    let tcp_addr = control_tcp_addr(options, paths);
+    let state = if is_running(paths, tcp_addr.as_deref()) {
         DaemonRunState::Running
     } else {
         DaemonRunState::Stopped
@@ -358,7 +383,8 @@ fn status_report(
     };
     let message = format!("daemon {}", state.as_str());
     let daemon_status = if state == DaemonRunState::Running {
-        send_daemon_report::<DaemonStatusReport>(paths, &DaemonRequest::Status).ok()
+        send_daemon_report::<DaemonStatusReport>(paths, &DaemonRequest::Status, tcp_addr.as_deref())
+            .ok()
     } else {
         None
     };
@@ -371,15 +397,24 @@ fn reload_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    if !is_running(paths) {
+    let tcp_addr = control_tcp_addr(options, paths);
+    if !is_running(paths, tcp_addr.as_deref()) {
         return Err(DaemonControlError::new(
             "daemon_not_running",
             "daemon is not running",
         ));
     }
-    let reload = send_daemon_report::<DaemonReloadReport>(paths, &DaemonRequest::ReloadMounts)?;
-    let daemon_status =
-        send_daemon_report::<DaemonStatusReport>(paths, &DaemonRequest::Status).ok();
+    let reload = send_daemon_report::<DaemonReloadReport>(
+        paths,
+        &DaemonRequest::ReloadMounts,
+        tcp_addr.as_deref(),
+    )?;
+    let daemon_status = send_daemon_report::<DaemonStatusReport>(
+        paths,
+        &DaemonRequest::Status,
+        tcp_addr.as_deref(),
+    )
+    .ok();
     let mut report = report(
         DaemonAction::Reload,
         DaemonRunState::Running,
@@ -446,18 +481,21 @@ fn report(
 fn send_daemon_report<T>(
     paths: &DaemonPaths,
     request: &DaemonRequest,
+    tcp_addr: Option<&str>,
 ) -> Result<T, DaemonControlError>
 where
     T: DeserializeOwned,
 {
     let response =
-        send_request_with_timeout(&paths.state_root, request, DAEMON_CONTROL_REQUEST_TIMEOUT)
-            .map_err(|error| {
-                DaemonControlError::new(
+        match send_control_request(paths, request, DAEMON_CONTROL_REQUEST_TIMEOUT, tcp_addr) {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(DaemonControlError::new(
                     "daemon_error",
                     format!("daemon request failed: {}", error.message()),
-                )
-            })?;
+                ));
+            }
+        };
     if let Some(error) = response.error {
         return Err(DaemonControlError::new(
             "daemon_error",
@@ -472,6 +510,42 @@ where
     };
     serde_json::from_value(payload)
         .map_err(|error| DaemonControlError::new("daemon_protocol_error", error.to_string()))
+}
+
+fn send_control_request(
+    paths: &DaemonPaths,
+    request: &DaemonRequest,
+    timeout: Duration,
+    tcp_addr: Option<&str>,
+) -> Result<afsd::ipc::DaemonResponse, DaemonClientError> {
+    #[cfg(windows)]
+    {
+        if let Some(tcp_addr) = tcp_addr {
+            return send_tcp_request_with_timeout(parse_tcp_addr(tcp_addr)?, request, timeout);
+        }
+    }
+
+    let _ = tcp_addr;
+    send_request_with_timeout(&paths.state_root, request, timeout)
+}
+
+#[cfg(windows)]
+fn parse_tcp_addr(value: &str) -> Result<SocketAddr, DaemonClientError> {
+    if matches!(value, "0" | "off" | "none" | "disabled") {
+        return Err(DaemonClientError::NotAvailable(
+            "daemon TCP IPC is disabled".to_string(),
+        ));
+    }
+    value.parse().map_err(|error| {
+        DaemonClientError::Protocol(format!("invalid TCP address `{value}`: {error}"))
+    })
+}
+
+fn control_tcp_addr(options: &DaemonOptions, paths: &DaemonPaths) -> Option<String> {
+    options
+        .tcp_addr
+        .clone()
+        .or_else(|| read_metadata(paths).map(|metadata| metadata.tcp_addr))
 }
 
 fn write_metadata(
@@ -578,7 +652,14 @@ fn detach_session_process(command: &mut Command) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn detach_session_process(command: &mut Command) {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn detach_session_process(_command: &mut Command) {}
 
 #[cfg(target_os = "macos")]
@@ -673,17 +754,30 @@ fn stop_session(paths: &DaemonPaths) -> Result<(), DaemonControlError> {
         .trim()
         .to_string();
     if !pid.is_empty() {
-        let _ = Command::new("kill").arg(&pid).output();
+        stop_process(&pid);
     }
     let _ = fs::remove_file(&paths.pid_file);
     Ok(())
 }
 
-fn is_running(paths: &DaemonPaths) -> bool {
-    match send_request_with_timeout(
-        &paths.state_root,
+#[cfg(windows)]
+fn stop_process(pid: &str) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", pid, "/T", "/F"])
+        .output();
+}
+
+#[cfg(not(windows))]
+fn stop_process(pid: &str) {
+    let _ = Command::new("kill").arg(pid).output();
+}
+
+fn is_running(paths: &DaemonPaths, tcp_addr: Option<&str>) -> bool {
+    match send_control_request(
+        paths,
         &DaemonRequest::Ping,
         DAEMON_CONTROL_REQUEST_TIMEOUT,
+        tcp_addr,
     ) {
         Ok(response) => response.ok,
         Err(DaemonClientError::NotAvailable(_))
@@ -693,10 +787,15 @@ fn is_running(paths: &DaemonPaths) -> bool {
     }
 }
 
-fn wait_for_state(paths: &DaemonPaths, state: DaemonRunState, timeout: Duration) -> bool {
+fn wait_for_state(
+    paths: &DaemonPaths,
+    state: DaemonRunState,
+    timeout: Duration,
+    tcp_addr: Option<&str>,
+) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let running = is_running(paths);
+        let running = is_running(paths, tcp_addr);
         if (state == DaemonRunState::Running && running)
             || (state == DaemonRunState::Stopped && !running)
         {
@@ -994,22 +1093,9 @@ fn takes_value(arg: &str) -> bool {
     )
 }
 
-fn default_state_root() -> PathBuf {
-    if let Ok(value) = env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
-}
-
 fn home_dir() -> Result<PathBuf, DaemonControlError> {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| DaemonControlError::new("env_missing", "HOME is not set"))
+    afs_store::home_dir()
+        .ok_or_else(|| DaemonControlError::new("env_missing", "home directory is not set"))
 }
 
 #[allow(dead_code)]
