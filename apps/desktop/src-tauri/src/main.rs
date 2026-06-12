@@ -1193,7 +1193,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{notion_id_from_url, validate_mount_root};
+    use super::{notion_id_from_url, should_hide_tray_popover, validate_mount_root};
 
     #[test]
     fn extracts_id_from_notion_pretty_workspace_url() {
@@ -1246,6 +1246,22 @@ mod tests {
         let root = temp.path().join("Notion");
 
         validate_mount_root(&root, &temp.path().join(".afs")).expect("valid child path");
+    }
+
+    #[test]
+    fn tray_popover_hides_only_when_tray_window_loses_focus() {
+        assert!(should_hide_tray_popover(
+            "tray",
+            &tauri::WindowEvent::Focused(false)
+        ));
+        assert!(!should_hide_tray_popover(
+            "tray",
+            &tauri::WindowEvent::Focused(true)
+        ));
+        assert!(!should_hide_tray_popover(
+            "main",
+            &tauri::WindowEvent::Focused(false)
+        ));
     }
 
     struct TestTempDir {
@@ -1356,6 +1372,11 @@ fn sample_pending_changes() -> Vec<PendingChange> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            if should_hide_tray_popover(window.label(), event) {
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             build_tray(app)?;
             Ok(())
@@ -1376,6 +1397,10 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AFS desktop app");
+}
+
+fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> bool {
+    window_label == "tray" && matches!(event, tauri::WindowEvent::Focused(false))
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
