@@ -152,6 +152,9 @@ impl PushReport {
         } else if let Some(error) = error {
             cli_report.ok = false;
             cli_report.push_id = push_id.map(|push_id| push_id.0);
+            if cli_report.suggested_fix.is_none() {
+                cli_report.suggested_fix = push_error_suggested_fix(&error, &cli_report.path);
+            }
             if cli_report.message.is_none() {
                 cli_report.message = Some(error.message);
             }
@@ -252,6 +255,26 @@ fn daemon_action_name<'a>(
             _ => "apply_failed",
         },
     }
+}
+
+fn push_error_suggested_fix(error: &PushJobError, path: &str) -> Option<String> {
+    if error.code == "guardrail" && error.message.contains("changed since last sync") {
+        let path = shell_quote(path);
+        return Some(format!(
+            "run `afs pull {path}` to update from remote, resolve any conflicts, then rerun `afs push {path} -y`"
+        ));
+    }
+    None
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '/' | '.' | '_' | '-' | '~' | ':' | '=')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn remote_ids_to_strings(remote_ids: Vec<RemoteId>) -> Vec<String> {

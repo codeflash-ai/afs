@@ -258,6 +258,41 @@ fn push_daemon_reports_connector_not_implemented_with_failed_journal() {
 }
 
 #[test]
+fn push_daemon_suggests_pull_when_remote_changed_since_last_sync() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
+        .expect("save shadow");
+    let source = FakePushSource::with_remote(rendered_entity("Changed paragraph."))
+        .with_concurrency_failure(AfsError::Guardrail(
+            "remote entity `page-1` changed since last sync (expected remote_edited_at `old`, found `new`)"
+                .to_string(),
+        ));
+
+    let report = run_push_with_daemon(
+        &mut store,
+        &source,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "apply_failed");
+    let expected = format!(
+        "run `afs pull {}` to update from remote, resolve any conflicts, then rerun `afs push {} -y`",
+        path.display(),
+        path.display()
+    );
+    assert_eq!(report.suggested_fix.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
 fn push_dangerous_plan_requires_confirm() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();

@@ -1204,6 +1204,9 @@ fn print_push_report(report: &PushReport) {
                     .as_deref()
                     .unwrap_or("connector apply failed")
             );
+            if let Some(suggested_fix) = &report.suggested_fix {
+                println!("  suggested_fix: {suggested_fix}");
+            }
         }
         _ => println!("push stopped: {}", report.action),
     }
