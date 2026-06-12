@@ -10,7 +10,9 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::NotionConfig;
-use crate::dto::{BlockDto, BlockListDto, DataSourceDto, DatabaseDto, PageDto, PageListDto};
+use crate::dto::{
+    BlockDto, BlockListDto, DataSourceDto, DatabaseDto, DatabaseListDto, PageDto, PageListDto,
+};
 
 pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
 pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
@@ -51,6 +53,10 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         start_cursor: Option<&str>,
     ) -> AfsResult<BlockListDto>;
     fn search_pages(&self, start_cursor: Option<&str>) -> AfsResult<PageListDto>;
+    fn search_databases(&self, start_cursor: Option<&str>) -> AfsResult<DatabaseListDto> {
+        let _ = start_cursor;
+        Err(AfsError::NotImplemented("search Notion databases"))
+    }
     fn update_block(&self, block_id: &str, body: serde_json::Value) -> AfsResult<BlockDto>;
     fn move_block(
         &self,
@@ -250,6 +256,26 @@ impl NotionApi for HttpNotionApi {
             "filter": {
                 "property": "object",
                 "value": "page"
+            },
+            "sort": {
+                "direction": "descending",
+                "timestamp": "last_edited_time"
+            }
+        });
+
+        if let Some(start_cursor) = start_cursor {
+            body["start_cursor"] = json!(start_cursor);
+        }
+
+        self.post_json("/v1/search", body)
+    }
+
+    fn search_databases(&self, start_cursor: Option<&str>) -> AfsResult<DatabaseListDto> {
+        let mut body = json!({
+            "page_size": 100,
+            "filter": {
+                "property": "object",
+                "value": "database"
             },
             "sort": {
                 "direction": "descending",

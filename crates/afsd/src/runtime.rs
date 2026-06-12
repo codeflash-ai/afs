@@ -40,7 +40,7 @@ use crate::reconcile::{
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::virtual_fs::{
     commit_virtual_fs_write, materialize_virtual_fs_item_with_content_root,
-    virtual_fs_children_with_content_root, virtual_fs_content_root,
+    refresh_virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_root,
     virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
@@ -395,11 +395,22 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         mount_id: String,
         container_identifier: String,
     ) -> DaemonResponse {
-        let store = match SqliteStateStore::open(state_root.clone()) {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
             Ok(store) => store,
             Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
         };
         let mount_id = MountId::new(mount_id);
+        let credentials = open_credential_store(&state_root);
+        let connector =
+            match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+                Ok(connector) => connector,
+                Err(error) => return DaemonResponse::error(error.code(), error.message()),
+            };
+        if let Err(error) =
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, &container_identifier)
+        {
+            return DaemonResponse::error(afs_error_code(&error), error.to_string());
+        }
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         match virtual_fs_children_with_content_root(
             &store,

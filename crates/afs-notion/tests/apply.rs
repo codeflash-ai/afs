@@ -1010,6 +1010,7 @@ impl RecordingNotionApi {
         Self::with_page_and_children(
             PageDto {
                 id: "page-1".to_string(),
+                parent: None,
                 created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 last_edited_time: Some(last_edited_time.to_string()),
                 archived: false,
@@ -1026,6 +1027,7 @@ impl RecordingNotionApi {
     ) -> Self {
         let page = PageDto {
             id: "page-1".to_string(),
+            parent: None,
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             last_edited_time: Some(last_edited_time.to_string()),
             archived: false,
@@ -1060,6 +1062,7 @@ impl RecordingNotionApi {
     fn with_blocks(last_edited_time: &str, blocks: Vec<BlockDto>) -> Self {
         let page = PageDto {
             id: "page-1".to_string(),
+            parent: None,
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             last_edited_time: Some(last_edited_time.to_string()),
             archived: false,
@@ -1118,6 +1121,7 @@ impl NotionApi for RecordingNotionApi {
         } else if page_id == "created-page-1" {
             Ok(PageDto {
                 id: "created-page-1".to_string(),
+                parent: None,
                 created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 archived: false,
@@ -1187,6 +1191,7 @@ impl NotionApi for RecordingNotionApi {
             .push(WriteCall::CreatePage { body });
         Ok(PageDto {
             id: "created-page-1".to_string(),
+            parent: None,
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             archived: false,

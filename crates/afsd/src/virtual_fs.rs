@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use afs_connector::{ChildContainer, Connector, ListChildrenRequest};
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
@@ -124,18 +125,20 @@ where
     let mount = require_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
     let index = ProviderIndex::new(&entities);
-    let container_path = container_path(&entities, &index, container_identifier)?;
+    let container_path = container_path(&entities, container_identifier)?;
     let mut children = Vec::new();
 
     for entity in &entities {
         if parent_path(&entity.path) == container_path {
             children.push(entity_item(&mount, entity, &index));
-        }
-    }
-
-    for (path, remote_id) in &index.page_child_dirs {
-        if parent_path(path) == container_path && index.has_descendant(path) {
-            children.push(page_child_dir_item(&mount, path, remote_id, &index));
+            if entity.kind == EntityKind::Page {
+                children.push(page_child_dir_item(
+                    &mount,
+                    &entity.path.with_extension(""),
+                    &entity.remote_id,
+                    &index,
+                ));
+            }
         }
     }
 
@@ -167,6 +170,46 @@ where
         rewrite_item_materialized_path(content_root, child)?;
     }
     Ok(report)
+}
+
+pub fn refresh_virtual_fs_children<S, C>(
+    store: &mut S,
+    connector: &C,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> AfsResult<usize>
+where
+    S: MountRepository + EntityRepository,
+    C: Connector + ?Sized,
+{
+    let mount = require_mount(store, mount_id)?;
+    let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let parent_path = container_path(&entities, container_identifier)?;
+    if has_known_entity_child(&entities, &parent_path) {
+        return Ok(0);
+    }
+
+    let Some(container) = child_container_for_identifier(&entities, container_identifier)? else {
+        return Ok(0);
+    };
+
+    let result = connector.list_children(ListChildrenRequest {
+        mount_id: mount.mount_id.clone(),
+        container,
+        parent_path,
+    })?;
+
+    let mut saved = 0;
+    for entry in result.entries {
+        let existing = store
+            .get_entity(&entry.mount_id, &entry.remote_id)
+            .map_err(AfsError::from)?;
+        let record = refreshed_entity_record(entry, existing.as_ref());
+        store.save_entity(record).map_err(AfsError::from)?;
+        saved += 1;
+    }
+
+    Ok(saved)
 }
 
 pub fn materialize_virtual_fs_item<S, Source>(
@@ -502,11 +545,7 @@ fn path_dir_item(mount: &MountConfig, path: &Path, index: &ProviderIndex) -> Vir
     }
 }
 
-fn container_path(
-    entities: &[EntityRecord],
-    index: &ProviderIndex,
-    identifier: &str,
-) -> AfsResult<PathBuf> {
+fn container_path(entities: &[EntityRecord], identifier: &str) -> AfsResult<PathBuf> {
     if identifier == ROOT_CONTAINER_IDENTIFIER {
         return Ok(PathBuf::new());
     }
@@ -531,14 +570,60 @@ fn container_path(
     if matches!(entity.kind, EntityKind::Database | EntityKind::Directory) {
         return Ok(entity.path.clone());
     }
-    let child_path = entity.path.with_extension("");
-    if index.has_descendant(&child_path) {
-        return Ok(child_path);
+    if entity.kind == EntityKind::Page {
+        return Ok(entity.path.with_extension(""));
     }
 
     Err(AfsError::InvalidState(format!(
         "virtual filesystem item `{identifier}` is not a container"
     )))
+}
+
+fn child_container_for_identifier(
+    entities: &[EntityRecord],
+    identifier: &str,
+) -> AfsResult<Option<ChildContainer>> {
+    if identifier == ROOT_CONTAINER_IDENTIFIER {
+        return Ok(Some(ChildContainer::Root));
+    }
+
+    if let Some(remote_id) = identifier.strip_prefix(CHILDREN_PREFIX) {
+        return Ok(Some(ChildContainer::PageChildren(RemoteId::new(remote_id))));
+    }
+
+    if identifier.starts_with(PATH_PREFIX) {
+        return Ok(None);
+    }
+
+    let remote_id = RemoteId::new(identifier);
+    let Some(entity) = entities.iter().find(|entity| entity.remote_id == remote_id) else {
+        return Err(missing_identifier(identifier));
+    };
+
+    Ok(match entity.kind {
+        EntityKind::Page => Some(ChildContainer::PageChildren(remote_id)),
+        EntityKind::Database => Some(ChildContainer::DatabaseRows(remote_id)),
+        EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => None,
+    })
+}
+
+fn has_known_entity_child(entities: &[EntityRecord], parent: &Path) -> bool {
+    entities
+        .iter()
+        .any(|entity| parent_path(&entity.path) == parent)
+}
+
+fn refreshed_entity_record(
+    entry: afs_core::model::TreeEntry,
+    existing: Option<&EntityRecord>,
+) -> EntityRecord {
+    let mut record = EntityRecord::from(entry);
+    if let Some(existing) = existing {
+        record.path = existing.path.clone();
+        record.hydration = existing.hydration.clone();
+        record.content_hash = existing.content_hash.clone();
+    }
+    record
 }
 
 fn entity_identifier(identifier: &str) -> AfsResult<String> {
@@ -697,30 +782,27 @@ impl ProviderIndex {
             page_child_dirs,
         }
     }
-
-    fn has_descendant(&self, path: &Path) -> bool {
-        self.entities_by_path.keys().any(|entity_path| {
-            entity_path.starts_with(path)
-                && entity_path != path
-                && entity_path
-                    .strip_prefix(path)
-                    .is_ok_and(|suffix| suffix.components().count() > 0)
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+    use afs_connector::{
+        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
+        ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
+        ListChildrenResult, NativeEntity, ParsedEntity,
+    };
+    use afs_core::model::{
+        CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
+    };
     use afs_store::{
         EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
     };
 
     use super::{
-        ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write, virtual_fs_children,
-        virtual_fs_content_path, virtual_fs_item,
+        ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
+        refresh_virtual_fs_children, virtual_fs_children, virtual_fs_content_path, virtual_fs_item,
     };
 
     #[test]
@@ -803,12 +885,126 @@ mod tests {
         let report =
             virtual_fs_children(&store, &mount_id, "children:page-root").expect("children");
 
-        assert_eq!(report.children.len(), 1);
-        assert_eq!(report.children[0].identifier, "page-child");
+        assert_eq!(report.children.len(), 2);
+        assert_eq!(report.children[0].identifier, "children:page-child");
+        assert_eq!(report.children[0].kind, VirtualFsItemKind::Folder);
+        assert_eq!(report.children[1].identifier, "page-child");
         assert_eq!(
-            report.children[0].parent_identifier.as_deref(),
+            report.children[1].parent_identifier.as_deref(),
             Some("children:page-root")
         );
+    }
+
+    #[test]
+    fn refresh_children_fetches_missing_container_metadata_once() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                "/tmp/afs/notion",
+            ))
+            .expect("save mount");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("page-root"),
+                kind: EntityKind::Page,
+                title: "Home".to_string(),
+                path: "home ~pagero.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            ROOT_CONTAINER_IDENTIFIER,
+        )
+        .expect("refresh children");
+        assert_eq!(saved, 1);
+
+        let report = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
+            .expect("root children");
+        assert_eq!(report.children.len(), 2);
+        assert_eq!(report.children[0].identifier, "children:page-root");
+        assert_eq!(report.children[0].kind, VirtualFsItemKind::Folder);
+        assert_eq!(report.children[1].identifier, "page-root");
+        assert_eq!(report.children[1].kind, VirtualFsItemKind::File);
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            ROOT_CONTAINER_IDENTIFIER,
+        )
+        .expect("refresh cached children");
+        assert_eq!(saved, 0);
+    }
+
+    struct StaticChildrenConnector {
+        entries: Vec<TreeEntry>,
+    }
+
+    impl Connector for StaticChildrenConnector {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind("test")
+        }
+
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities {
+                supports_block_updates: false,
+                supports_databases: false,
+                supports_oauth: false,
+            }
+        }
+
+        fn enumerate(&self, _request: EnumerateRequest) -> afs_core::AfsResult<Vec<TreeEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        fn list_children(
+            &self,
+            request: ListChildrenRequest,
+        ) -> afs_core::AfsResult<ListChildrenResult> {
+            assert_eq!(request.parent_path, PathBuf::new());
+            Ok(ListChildrenResult {
+                entries: self.entries.clone(),
+            })
+        }
+
+        fn fetch(&self, request: FetchRequest) -> afs_core::AfsResult<NativeEntity> {
+            let _ = request;
+            Err(afs_core::AfsError::NotImplemented("fixture fetch"))
+        }
+
+        fn render(&self, _entity: &NativeEntity) -> afs_core::AfsResult<CanonicalDocument> {
+            Err(afs_core::AfsError::NotImplemented("fixture render"))
+        }
+
+        fn parse(&self, _document: &CanonicalDocument) -> afs_core::AfsResult<ParsedEntity> {
+            Err(afs_core::AfsError::NotImplemented("fixture parse"))
+        }
+
+        fn check_concurrency(&self, _request: ApplyPlanRequest<'_>) -> afs_core::AfsResult<()> {
+            Ok(())
+        }
+
+        fn apply(&self, _request: ApplyPlanRequest<'_>) -> afs_core::AfsResult<ApplyPlanResult> {
+            Err(afs_core::AfsError::NotImplemented("fixture apply"))
+        }
+
+        fn apply_undo(
+            &self,
+            _request: ApplyUndoRequest<'_>,
+        ) -> afs_core::AfsResult<ApplyUndoResult> {
+            Err(afs_core::AfsError::NotImplemented("fixture undo"))
+        }
     }
 
     #[test]
