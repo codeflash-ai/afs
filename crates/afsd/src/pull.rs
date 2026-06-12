@@ -34,6 +34,14 @@ pub struct PullReport {
     pub stubbed: usize,
     pub hydrated: usize,
     pub skipped_dirty: usize,
+    #[serde(default)]
+    pub conflicts: Vec<PullConflict>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullConflict {
+    pub path: String,
+    pub remote_id: String,
 }
 
 pub fn run_pull<S>(
@@ -113,6 +121,7 @@ where
 
     let mut hydrated = 0;
     let mut skipped_dirty = 0;
+    let mut conflicts = Vec::new();
     if mount.remote_root_id.is_some()
         && let Some(root_entry) = entries.first()
     {
@@ -128,6 +137,10 @@ where
         match hydrate_entity(store, connector, mount, root_entity, state_root)? {
             HydrationOutcome::Hydrated => hydrated += 1,
             HydrationOutcome::SkippedDirty => skipped_dirty += 1,
+            HydrationOutcome::Conflicted(conflict) => {
+                skipped_dirty += 1;
+                conflicts.push(conflict);
+            }
         }
     }
 
@@ -142,6 +155,7 @@ where
         stubbed,
         hydrated,
         skipped_dirty,
+        conflicts,
     })
 }
 
@@ -167,9 +181,10 @@ where
         })?;
 
     let outcome = hydrate_entity(store, connector, mount, entity, state_root)?;
-    let (hydrated, skipped_dirty) = match outcome {
-        HydrationOutcome::Hydrated => (1, 0),
-        HydrationOutcome::SkippedDirty => (0, 1),
+    let (hydrated, skipped_dirty, conflicts) = match outcome {
+        HydrationOutcome::Hydrated => (1, 0, Vec::new()),
+        HydrationOutcome::SkippedDirty => (0, 1, Vec::new()),
+        HydrationOutcome::Conflicted(conflict) => (0, 1, vec![conflict]),
     };
 
     Ok(PullReport {
@@ -183,6 +198,7 @@ where
         stubbed: 0,
         hydrated,
         skipped_dirty,
+        conflicts,
     })
 }
 
@@ -324,11 +340,15 @@ where
     }
 
     if file_has_unresolved_conflict_markers(&path)? {
+        let conflict = pull_conflict(mount, &entity);
         store
             .save_entity(mark_conflicted_if_allowed(entity))
             .map_err(PullError::Store)?;
+        return Ok(HydrationOutcome::Conflicted(conflict));
     } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
+        let conflict = pull_conflict(mount, &entity);
         materialize_conflict(store, mount, entity, &path, rendered)?;
+        return Ok(HydrationOutcome::Conflicted(conflict));
     } else {
         store
             .save_entity(mark_dirty_if_allowed(entity))
@@ -446,6 +466,13 @@ where
         .map_err(PullError::Store)?;
 
     Ok(())
+}
+
+fn pull_conflict(mount: &MountConfig, entity: &EntityRecord) -> PullConflict {
+    PullConflict {
+        path: mount.root.join(&entity.path).display().to_string(),
+        remote_id: entity.remote_id.0.clone(),
+    }
 }
 
 fn hydrated_record(
@@ -701,6 +728,7 @@ fn remote_precondition_belongs_to_shadow(existing: &EntityRecord) -> bool {
 enum HydrationOutcome {
     Hydrated,
     SkippedDirty,
+    Conflicted(PullConflict),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

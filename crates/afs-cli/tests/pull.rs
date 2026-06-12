@@ -149,6 +149,7 @@ fn pull_file_skips_dirty_hydrated_file() {
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
+    assert!(report.conflicts.is_empty());
 }
 
 #[test]
@@ -246,6 +247,15 @@ fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_cha
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(
+        report.conflicts[0].path,
+        fixture.root_file("roadmap").display().to_string()
+    );
+    assert_eq!(
+        report.conflicts[0].remote_id,
+        fixture.canonical_root_page_id.as_str()
+    );
     let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("local file");
     assert!(contents.contains("Local edit."));
     assert!(contents.contains("Remote body."));
@@ -307,6 +317,11 @@ fn pull_file_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(
+        report.conflicts[0].path,
+        fixture.root_file("roadmap").display().to_string()
+    );
     assert_eq!(
         fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file"),
         conflicted_contents

@@ -1307,7 +1307,29 @@ fn print_disconnect_report(report: &DisconnectReport) {
 }
 
 fn print_pull_report(report: &PullReport) {
-    if report.skipped_dirty > 0 {
+    if !report.conflicts.is_empty() {
+        let skipped_without_conflicts = report.skipped_dirty.saturating_sub(report.conflicts.len());
+        println!(
+            "pull completed with {} conflicted file(s); {} dirty file(s) skipped, {} hydrated, {} stubbed, {} enumerated (via {})",
+            report.conflicts.len(),
+            skipped_without_conflicts,
+            report.hydrated,
+            report.stubbed,
+            report.enumerated,
+            report.via
+        );
+        println!("  conflicted:");
+        for conflict in &report.conflicts {
+            println!("    {}", conflict.path);
+        }
+        println!("  next: resolve the conflict markers in the file(s)");
+        if report.conflicts.len() == 1 {
+            let path = shell_quote(&report.conflicts[0].path);
+            println!("  then: afs push {path} -y");
+        } else {
+            println!("  then: run `afs push <file> -y` for each resolved file");
+        }
+    } else if report.skipped_dirty > 0 {
         println!(
             "pull skipped {} dirty file(s); {} hydrated, {} stubbed, {} enumerated (via {})",
             report.skipped_dirty, report.hydrated, report.stubbed, report.enumerated, report.via
@@ -1318,6 +1340,16 @@ fn print_pull_report(report: &PullReport) {
             report.hydrated, report.stubbed, report.enumerated, report.via
         );
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '/' | '.' | '_' | '-' | '~' | ':' | '=')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn print_restore_report(report: &RestoreReport) {
