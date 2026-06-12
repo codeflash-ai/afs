@@ -284,11 +284,22 @@ function Onboarding({
   const [oauthError, setOauthError] = useState("");
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
+  const [mountPathDirty, setMountPathDirty] = useState(false);
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [mountError, setMountError] = useState("");
+
+  useEffect(() => {
+    setConnectedWorkspace(snapshot.connection.workspaceName);
+  }, [snapshot.connection.workspaceName]);
+
+  useEffect(() => {
+    if (!mountPathDirty) {
+      setMountPath(snapshot.mount.localPath);
+    }
+  }, [mountPathDirty, snapshot.mount.localPath]);
 
   async function startConnect() {
     setOauthError("");
@@ -335,6 +346,7 @@ function Onboarding({
       undefined,
       sampleSnapshot,
     );
+    setMountPathDirty(false);
     setMountPath(nextSnapshot.mount.localPath);
     setStep(4);
   }
@@ -348,6 +360,7 @@ function Onboarding({
         null,
       );
       if (selected) {
+        setMountPathDirty(true);
         setMountPath(selected.replace(/\/$/, ""));
       }
     } catch (error) {
@@ -464,7 +477,13 @@ function Onboarding({
               </p>
             </div>
             <div className="path-field">
-              <input value={mountPath} onChange={(event) => setMountPath(event.target.value)} />
+              <input
+                value={mountPath}
+                onChange={(event) => {
+                  setMountPathDirty(true);
+                  setMountPath(event.target.value);
+                }}
+              />
               <SecondaryButton compact onClick={chooseFolder}>
                 Choose
               </SecondaryButton>
