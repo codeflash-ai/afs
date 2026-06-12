@@ -260,6 +260,25 @@ where
     Ok(saved)
 }
 
+pub fn virtual_fs_children_refresh_needed<S>(
+    store: &S,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> AfsResult<bool>
+where
+    S: MountRepository + EntityRepository,
+{
+    require_virtual_mount(store, mount_id)?;
+    let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let parent_path = container_path(&entities, container_identifier)?;
+    if has_known_entity_child(&entities, &parent_path) {
+        return Ok(false);
+    }
+
+    child_container_for_identifier(&entities, container_identifier)
+        .map(|container| container.is_some())
+}
+
 pub fn materialize_virtual_fs_item<S, Source>(
     store: &mut S,
     source: &Source,

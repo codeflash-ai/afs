@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use afs_core::model::EntityKind;
-use afsd::ipc::{DaemonRequest, DaemonResponse, send_request, send_request_with_timeout};
+use afsd::ipc::{DaemonRequest, DaemonResponse, send_request_with_timeout};
 use afsd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, VirtualFsItem, VirtualFsItemKind,
     VirtualFsItemReport, VirtualFsMaterializeReport, VirtualFsMutationReport, VirtualFsWriteReport,
@@ -25,6 +25,9 @@ const ATTR_TTL: Duration = Duration::from_secs(1);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_READY_POLL: Duration = Duration::from_millis(250);
 const DAEMON_PING_TIMEOUT: Duration = Duration::from_secs(2);
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const MATERIALIZE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MUTATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ROOT_PATH: &str = "/";
 
 #[derive(Clone, Debug)]
@@ -225,24 +228,33 @@ impl VirtualFsClient for DaemonClient {
     }
 
     fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {
-        self.request(&DaemonRequest::VirtualFsItem {
-            mount_id: self.mount_id.clone(),
-            identifier: identifier.to_string(),
-        })
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsItem {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+            },
+            METADATA_REQUEST_TIMEOUT,
+        )
     }
 
     fn children(&self, container_identifier: &str) -> Result<VirtualFsChildrenReport, FuseError> {
-        self.request(&DaemonRequest::VirtualFsChildren {
-            mount_id: self.mount_id.clone(),
-            container_identifier: container_identifier.to_string(),
-        })
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsChildren {
+                mount_id: self.mount_id.clone(),
+                container_identifier: container_identifier.to_string(),
+            },
+            METADATA_REQUEST_TIMEOUT,
+        )
     }
 
     fn materialize(&self, identifier: &str) -> Result<VirtualFsMaterializeReport, FuseError> {
-        self.request(&DaemonRequest::VirtualFsMaterialize {
-            mount_id: self.mount_id.clone(),
-            identifier: identifier.to_string(),
-        })
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsMaterialize {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+            },
+            MATERIALIZE_REQUEST_TIMEOUT,
+        )
     }
 
     fn commit_write(
@@ -250,11 +262,14 @@ impl VirtualFsClient for DaemonClient {
         identifier: &str,
         bytes: Vec<u8>,
     ) -> Result<VirtualFsWriteReport, FuseError> {
-        self.request(&DaemonRequest::VirtualFsCommitWrite {
-            mount_id: self.mount_id.clone(),
-            identifier: identifier.to_string(),
-            contents_base64: BASE64.encode(bytes),
-        })
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsCommitWrite {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+                contents_base64: BASE64.encode(bytes),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
     }
 
     fn create_file(
@@ -262,11 +277,14 @@ impl VirtualFsClient for DaemonClient {
         parent_identifier: &str,
         filename: &str,
     ) -> Result<VirtualFsMutationReport, FuseError> {
-        self.request(&DaemonRequest::VirtualFsCreateFile {
-            mount_id: self.mount_id.clone(),
-            parent_identifier: parent_identifier.to_string(),
-            filename: filename.to_string(),
-        })
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsCreateFile {
+                mount_id: self.mount_id.clone(),
+                parent_identifier: parent_identifier.to_string(),
+                filename: filename.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
     }
 
     fn rename(
@@ -275,28 +293,38 @@ impl VirtualFsClient for DaemonClient {
         new_parent_identifier: &str,
         new_filename: &str,
     ) -> Result<VirtualFsMutationReport, FuseError> {
-        self.request(&DaemonRequest::VirtualFsRename {
-            mount_id: self.mount_id.clone(),
-            identifier: identifier.to_string(),
-            new_parent_identifier: new_parent_identifier.to_string(),
-            new_filename: new_filename.to_string(),
-        })
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsRename {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+                new_parent_identifier: new_parent_identifier.to_string(),
+                new_filename: new_filename.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
     }
 
     fn trash(&self, identifier: &str) -> Result<VirtualFsMutationReport, FuseError> {
-        self.request(&DaemonRequest::VirtualFsTrash {
-            mount_id: self.mount_id.clone(),
-            identifier: identifier.to_string(),
-        })
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsTrash {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
     }
 }
 
 impl DaemonClient {
-    fn request<T>(&self, request: &DaemonRequest) -> Result<T, FuseError>
+    fn request_with_timeout<T>(
+        &self,
+        request: &DaemonRequest,
+        timeout: Duration,
+    ) -> Result<T, FuseError>
     where
         T: DeserializeOwned,
     {
-        let response = send_request(&self.state_root, request)
+        let response = send_request_with_timeout(&self.state_root, request, timeout)
             .map_err(|error| FuseError::Daemon(error.message().to_string()))?;
         decode_response(response)
     }
