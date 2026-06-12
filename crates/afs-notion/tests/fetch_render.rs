@@ -64,6 +64,44 @@ fn fetch_recurses_paginated_block_children_and_render_preserves_shadow_ids() {
 }
 
 #[test]
+fn render_empty_paragraph_as_blank_line_without_shadow_marker() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![
+            BlockTreeDto {
+                block: paragraph_block("paragraph-1", vec![rich_text("First paragraph.")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("empty-paragraph", Vec::new()),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("paragraph-2", vec![rich_text("Second paragraph.")]),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "First paragraph.\n\n\n\nSecond paragraph.\n"
+    );
+    assert!(!rendered.document.body.contains("empty_paragraph"));
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["paragraph-1", "paragraph-2"]
+    );
+}
+
+#[test]
 fn fetch_does_not_inline_child_page_or_database_content_into_parent_body() {
     let api = FixtureNotionApi::parent_with_child_boundaries();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
