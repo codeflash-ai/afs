@@ -1119,9 +1119,9 @@ function ViewHeader({
 
 function WindowChrome({ title, meta }: { title: string; meta?: string }) {
   return (
-    <div className="window-chrome" data-tauri-drag-region>
+    <div className="window-chrome" onMouseDown={handleChromeMouseDown}>
       <div className="traffic">
-        <button aria-label="Hide window" className="traffic-dot close" onClick={() => void windowAction("hide")} />
+        <button aria-label="Close window" className="traffic-dot close" onClick={() => void windowAction("hide")} />
         <button aria-label="Minimize window" className="traffic-dot minimize" onClick={() => void windowAction("minimize")} />
         <button aria-label="Toggle fullscreen" className="traffic-dot zoom" onClick={() => void windowAction("toggleMaximize")} />
       </div>
@@ -1129,6 +1129,20 @@ function WindowChrome({ title, meta }: { title: string; meta?: string }) {
       <div data-tauri-drag-region>{meta}</div>
     </div>
   );
+}
+
+function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
+  if (event.button !== 0 || !isTauriRuntime()) {
+    return;
+  }
+
+  const target = event.target;
+  if (target instanceof Element && target.closest("button")) {
+    return;
+  }
+
+  event.preventDefault();
+  void getCurrentWindow().startDragging();
 }
 
 async function windowAction(action: "hide" | "minimize" | "toggleMaximize") {
