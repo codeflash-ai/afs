@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod diff;
 pub mod history;
 pub mod info;
+pub mod local_oauth;
 pub mod mount;
 pub mod pull;
 pub mod push;
