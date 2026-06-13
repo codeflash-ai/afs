@@ -11,8 +11,9 @@ use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oaut
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
 #[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
-    ensure_macos_file_provider_shortcut, macos_file_provider_domain_url,
-    open_macos_file_provider_domain, register_macos_file_provider_domain,
+    ensure_macos_file_provider_shortcut, macos_file_provider_display_name,
+    macos_file_provider_domain_url, open_macos_file_provider_domain,
+    register_macos_file_provider_domain,
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
@@ -1552,14 +1553,17 @@ fn install_macos_file_provider_shortcut(_mount: &MountConfig) -> Result<(), Stri
 
 #[cfg(target_os = "macos")]
 fn register_macos_virtual_projection(mount_id: &str, root: &str) -> Result<(), String> {
-    register_macos_file_provider_domain(mount_id, &file_provider_display_name(root))
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "Could not register macOS File Provider: {}",
-                error.message()
-            )
-        })
+    register_macos_file_provider_domain(
+        mount_id,
+        &macos_file_provider_display_name(Path::new(root), "Notion"),
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "Could not register macOS File Provider: {}",
+            error.message()
+        )
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1628,16 +1632,6 @@ fn open_macos_virtual_projection(mount_id: &str) -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn open_macos_virtual_projection(_mount_id: &str) -> Result<(), String> {
     Err("macOS File Provider mounts can only be opened on macOS.".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn file_provider_display_name(root: &str) -> String {
-    Path::new(root)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "Notion".to_string())
 }
 
 fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {

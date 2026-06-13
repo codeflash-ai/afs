@@ -41,7 +41,7 @@ body {
   min-width: 860px;
   min-height: 620px;
   overflow: hidden;
-  background: transparent;
+  background: var(--bg);
 }
 
 body[data-surface="tray"] {

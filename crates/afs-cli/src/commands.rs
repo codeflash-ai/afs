@@ -1795,13 +1795,7 @@ fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn file_provider_display_name(mount: &MountConfig) -> String {
-    mount
-        .root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| mount.mount_id.0.clone())
+    file_provider_helper::macos_file_provider_display_name(&mount.root, &mount.mount_id.0)
 }
 
 fn stub(command: &str, json: bool) -> i32 {
