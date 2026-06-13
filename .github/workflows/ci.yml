@@ -29,18 +29,22 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            sqlite3
       - name: Report Linux FUSE coverage
         run: |
           if [ -e /dev/fuse ]; then
-            echo "::notice::/dev/fuse is present. This workflow currently runs virtual filesystem behavior tests, not a real mounted FUSE smoke test."
+            echo "::notice::/dev/fuse is present. This workflow will run the real Linux FUSE mount smoke test."
           else
-            echo "::warning::/dev/fuse is not present. Real online-only FUSE mount smoke is not covered by this hosted runner."
+            echo "::error::/dev/fuse is not present. Real online-only FUSE mount smoke is not covered by this hosted runner."
+            exit 1
           fi
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
+      - name: Run real Linux FUSE smoke test
+        run: AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop
