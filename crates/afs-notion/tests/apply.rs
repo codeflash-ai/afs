@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use afs_connector::{ApplyPlanRequest, Connector};
 use afs_core::journal::{JournalApplyEffect, PushId, PushOperationId};
-use afs_core::model::{MountId, RemoteId};
+use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::{AfsError, AfsResult};
@@ -588,6 +588,39 @@ fn check_concurrency_rejects_remote_timestamp_mismatch() {
 }
 
 #[test]
+fn check_concurrency_uses_database_metadata_for_row_create_parent() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("database-1")],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("database-1"),
+            parent_kind: Some(EntityKind::Database),
+            title: "New row".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Rows/new-row.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let preconditions = vec![RemotePrecondition {
+        remote_id: RemoteId::new("database-1"),
+        remote_edited_at: Some("2026-06-10T00:00:00.000Z".to_string()),
+    }];
+
+    connector
+        .check_concurrency(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &[],
+            remote_preconditions: &preconditions,
+        })
+        .expect("database parent concurrency check");
+}
+
+#[test]
 fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
     let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
         "2026-06-10T00:00:00.000Z",
@@ -1064,6 +1097,7 @@ impl RecordingNotionApi {
                 id: "source-1".to_string(),
                 name: Some("Tasks".to_string()),
             }],
+            last_edited_time: Some(last_edited_time.to_string()),
             ..Default::default()
         };
         api.data_source = DataSourceDto {
@@ -1115,6 +1149,7 @@ impl RecordingNotionApi {
                     id: "source-1".to_string(),
                     name: Some("Tasks".to_string()),
                 }],
+                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 ..Default::default()
             },
             data_source: DataSourceDto {

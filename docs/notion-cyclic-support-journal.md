@@ -31,3 +31,18 @@ and what Markdown shape agents should expect.
 - **Edit/push cycle:** The live test creates a supported-edit page, edits each
   supported Markdown block shape locally, pushes, and verifies the rendered
   Notion content through the Notion API.
+
+### Mounted Database Row Cycles
+
+- **Projection:** A live child database is mounted as a directory with
+  `_schema.yaml`; existing rows appear as Markdown files under that directory.
+- **Read/no-op cycle:** The live test creates a database row with title,
+  rich-text, number, select, status, multi-select, checkbox, date, URL, email,
+  and phone properties. It hydrates the row file through the mount, performs a
+  no-op push, and verifies the Notion page bundle is unchanged.
+- **Edit/push cycle:** The test edits row frontmatter and body from the mounted
+  Markdown file, pushes, and verifies the expected frontmatter/body render from
+  a fresh Notion API fetch.
+- **Create cycle:** The test writes a new Markdown file under the database
+  directory, pushes it as a new Notion row, and verifies the created row's
+  properties and body through the Notion API.

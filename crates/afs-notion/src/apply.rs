@@ -25,18 +25,23 @@ use crate::dto::{
 use crate::fetch::fetch_page_bundle;
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
+    let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
     for precondition in request.remote_preconditions {
         let Some(expected) = &precondition.remote_edited_at else {
             continue;
         };
-        let page = api.retrieve_page(precondition.remote_id.as_str())?;
-        let actual = page
-            .last_edited_time
-            .as_deref()
-            .or(page.created_time.as_deref())
-            .unwrap_or("unknown");
+        let actual = if database_create_parent_ids.contains(&precondition.remote_id) {
+            api.retrieve_database(precondition.remote_id.as_str())?
+                .last_edited_time
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            let page = api.retrieve_page(precondition.remote_id.as_str())?;
+            page.last_edited_time
+                .or(page.created_time)
+                .unwrap_or_else(|| "unknown".to_string())
+        };
 
-        if actual != expected {
+        if actual != *expected {
             return Err(AfsError::Guardrail(format!(
                 "remote entity `{}` changed since last sync (expected remote_edited_at `{expected}`, found `{actual}`)",
                 precondition.remote_id.0
@@ -251,6 +256,22 @@ fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
         .iter()
         .filter_map(|operation| match operation {
             PushOperation::CreateEntity { parent_id, .. } => Some(parent_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::CreateEntity {
+                parent_id,
+                parent_kind,
+                ..
+            } if !matches!(parent_kind, Some(afs_core::model::EntityKind::Page)) => {
+                Some(parent_id.clone())
+            }
             _ => None,
         })
         .collect()

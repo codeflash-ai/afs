@@ -11,10 +11,11 @@ use afs_cli::pull::run_pull;
 use afs_cli::push::{PushOptions, run_push_with_daemon};
 use afs_cli::status::{StatusOptions, run_status};
 use afs_connector::{Connector, FetchRequest};
+use afs_core::canonical::render_canonical_markdown;
 use afs_core::model::{MountId, RemoteId};
 use afs_notion::client::{HttpNotionApi, NotionApi};
 use afs_notion::dto::{
-    BlockDto, BlockListDto, NotionPageBundle, PageDto, PageListDto, PagePropertyDto,
+    BlockDto, BlockListDto, DatabaseDto, NotionPageBundle, PageDto, PageListDto, PagePropertyDto,
     PaginatedListDto, RichTextBlockDto, RichTextDto, SyncedBlockDto, SyncedFromDto,
     TextRichTextDto,
 };
@@ -395,6 +396,224 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     }
 }
 
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS cyclic database scratch {}", unique_suffix()),
+        Vec::new(),
+    );
+    let database =
+        cleanup.create_database(&scratch.id, &format!("AFS cyclic rows {}", unique_suffix()));
+    let existing_row = cleanup.create_database_row(
+        &database,
+        &format!("AFS cyclic existing row {}", unique_suffix()),
+        database_row_properties(
+            "Initial row notes",
+            "7",
+            "Todo",
+            "Not started",
+            false,
+            "https://example.com/afs-db-row",
+        ),
+        vec![paragraph_child("Database row paragraph original.")],
+    );
+
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let connector = NotionConnector::new(NotionConfig::default());
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live database root page");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live database root page");
+
+    let schema_path = fixture.schema_file();
+    let schema = fs::read_to_string(&schema_path).expect("read live database schema");
+    for expected in [
+        "type: notion_database_schema",
+        "\"Notes\":",
+        "\"Points\":",
+        "\"Status\":",
+        "\"State\":",
+        "\"Tags\":",
+        "\"Done\":",
+        "\"Due\":",
+        "\"URL\":",
+        "\"Email\":",
+        "\"Phone\":",
+    ] {
+        assert!(schema.contains(expected), "missing {expected:?}\n{schema}");
+    }
+
+    let row_path = fixture.nested_markdown_file_containing("AFS cyclic existing row");
+    run_pull(&mut store, &connector, &row_path).expect("hydrate live database row");
+    let original = fs::read_to_string(&row_path).expect("read hydrated row markdown");
+    for expected in [
+        "title: \"AFS cyclic existing row",
+        "\"Notes\": \"Initial row notes\"",
+        "\"Points\": 7",
+        "\"Status\": \"Todo\"",
+        "\"State\": \"Not started\"",
+        "\"Done\": false",
+        "\"URL\": \"https://example.com/afs-db-row\"",
+        "Database row paragraph original.",
+    ] {
+        assert!(
+            original.contains(expected),
+            "missing {expected:?}\n{original}"
+        );
+    }
+
+    let before = live_page_snapshot(&connector, &existing_row.id);
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(row_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean row status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let noop = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("noop database row push");
+    assert!(noop.ok, "{noop:#?}");
+    assert_eq!(noop.action, "noop", "{noop:#?}");
+    assert_eq!(
+        live_page_snapshot(&connector, &existing_row.id),
+        before,
+        "read/noop database row cycle must not mutate Notion"
+    );
+
+    let edited = original
+        .replace(
+            "\"Notes\": \"Initial row notes\"",
+            "\"Notes\": \"Updated row notes\"",
+        )
+        .replace("\"Points\": 7", "\"Points\": 8")
+        .replace("\"Status\": \"Todo\"", "\"Status\": \"Done\"")
+        .replace("\"State\": \"Not started\"", "\"State\": \"In progress\"")
+        .replace("\"Done\": false", "\"Done\": true")
+        .replace(
+            "\"URL\": \"https://example.com/afs-db-row\"",
+            "\"URL\": \"https://example.com/afs-db-row-updated\"",
+        )
+        .replace(
+            "Database row paragraph original.",
+            "Database row paragraph changed.",
+        );
+    fs::write(&row_path, edited).expect("write live database row edit");
+    let dirty_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(row_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("dirty row status");
+    assert!(!dirty_status.clean, "{dirty_status:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push database row edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let verified = render_live_markdown(&connector, &existing_row.id, &row_path);
+    for expected in [
+        "\"Notes\": \"Updated row notes\"",
+        "\"Points\": 8",
+        "\"Status\": \"Done\"",
+        "\"State\": \"In progress\"",
+        "\"Done\": true",
+        "\"URL\": \"https://example.com/afs-db-row-updated\"",
+        "Database row paragraph changed.",
+    ] {
+        assert!(
+            verified.contains(expected),
+            "missing {expected:?}\n{verified}"
+        );
+    }
+
+    let database_dir = fixture.database_dir();
+    let new_row_path = database_dir.join("new-cyclic-row.md");
+    fs::write(
+        &new_row_path,
+        "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\n---\n# Created row body\n\nCreated from mounted markdown.\n",
+    )
+    .expect("write new live database row file");
+
+    let create_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &new_row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push new database row");
+    assert!(create_push.ok, "{create_push:#?}");
+    assert_eq!(create_push.action, "reconciled", "{create_push:#?}");
+    let created_row_id = create_push
+        .changed_remote_ids
+        .iter()
+        .find(|id| *id != &database.id)
+        .expect("created row id")
+        .clone();
+    cleanup.block_ids.push(created_row_id.clone());
+
+    let created = render_live_markdown(&connector, &created_row_id, &new_row_path);
+    for expected in [
+        "title: \"AFS cyclic created row\"",
+        "\"Notes\": \"Created row notes\"",
+        "\"Points\": 13",
+        "\"Status\": \"Todo\"",
+        "\"State\": \"Not started\"",
+        "\"Tags\":",
+        "\"Alpha\"",
+        "\"Done\": false",
+        "\"URL\": \"https://example.com/afs-created-row\"",
+        "\"Email\": \"cyclic@example.com\"",
+        "\"Phone\": \"+1 415 555 0199\"",
+        "Created from mounted markdown.",
+    ] {
+        assert!(
+            created.contains(expected),
+            "missing {expected:?}\n{created}"
+        );
+    }
+}
+
 struct E2eFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -428,6 +647,35 @@ impl E2eFixture {
                     && file_name(path) != "CLAUDE.md"
             })
             .expect("page file")
+    }
+
+    fn schema_file(&self) -> PathBuf {
+        collect_files(&self.root)
+            .into_iter()
+            .find(|path| file_name(path) == "_schema.yaml")
+            .expect("database schema file")
+    }
+
+    fn database_dir(&self) -> PathBuf {
+        self.schema_file()
+            .parent()
+            .expect("database schema parent")
+            .to_path_buf()
+    }
+
+    fn nested_markdown_file_containing(&self, needle: &str) -> PathBuf {
+        collect_files(&self.root)
+            .into_iter()
+            .filter(|path| {
+                path.extension().is_some_and(|extension| extension == "md")
+                    && path.parent().is_some_and(|parent| parent != self.root)
+            })
+            .find(|path| {
+                fs::read_to_string(path)
+                    .map(|content| content.contains(needle))
+                    .unwrap_or(false)
+            })
+            .expect("nested markdown file")
     }
 }
 
@@ -477,6 +725,87 @@ impl LiveCleanup {
             .api
             .create_page(body)
             .expect("create live scratch page");
+        self.block_ids.push(page.id.clone());
+        page
+    }
+
+    fn create_database(&mut self, parent_page_id: &str, title: &str) -> DatabaseDto {
+        let database = self
+            .api
+            .create_database(json!({
+                "parent": {
+                    "type": "page_id",
+                    "page_id": parent_page_id,
+                },
+                "title": rich_text_json(title),
+                "initial_data_source": {
+                    "title": rich_text_json("Rows"),
+                    "properties": {
+                        "Name": { "title": {} },
+                        "Notes": { "rich_text": {} },
+                        "Points": { "number": { "format": "number" } },
+                        "Status": {
+                            "select": {
+                                "options": [
+                                    { "name": "Todo", "color": "gray" },
+                                    { "name": "Done", "color": "green" }
+                                ]
+                            }
+                        },
+                        "State": { "status": {} },
+                        "Tags": {
+                            "multi_select": {
+                                "options": [
+                                    { "name": "Alpha", "color": "blue" },
+                                    { "name": "Beta", "color": "purple" }
+                                ]
+                            }
+                        },
+                        "Done": { "checkbox": {} },
+                        "Due": { "date": {} },
+                        "URL": { "url": {} },
+                        "Email": { "email": {} },
+                        "Phone": { "phone_number": {} },
+                        "Files": { "files": {} },
+                        "People": { "people": {} },
+                        "Unique": { "unique_id": { "prefix": "AFS" } }
+                    }
+                }
+            }))
+            .expect("create live database");
+        self.block_ids.push(database.id.clone());
+        database
+    }
+
+    fn create_database_row(
+        &mut self,
+        database: &DatabaseDto,
+        title: &str,
+        mut properties: serde_json::Map<String, Value>,
+        children: Vec<Value>,
+    ) -> PageDto {
+        let data_source = database
+            .data_sources
+            .first()
+            .expect("created database data source");
+        properties.insert(
+            "Name".to_string(),
+            json!({ "title": rich_text_json(title) }),
+        );
+        let mut body = json!({
+            "parent": {
+                "type": "data_source_id",
+                "data_source_id": data_source.id,
+            },
+            "properties": Value::Object(properties),
+        });
+        if !children.is_empty() {
+            body["children"] = Value::Array(children);
+        }
+        let page = self
+            .api
+            .create_page(body)
+            .expect("create live database row");
         self.block_ids.push(page.id.clone());
         page
     }
@@ -542,6 +871,16 @@ fn live_block_snapshot(connector: &NotionConnector, page_id: &str) -> Value {
     serde_json::to_value(bundle.blocks).expect("snapshot json")
 }
 
+fn live_page_snapshot(connector: &NotionConnector, page_id: &str) -> Value {
+    let native = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new(page_id.to_string()),
+        })
+        .expect("fetch live page snapshot");
+    let bundle: NotionPageBundle = serde_json::from_slice(&native.raw).expect("snapshot bundle");
+    serde_json::to_value(bundle).expect("snapshot json")
+}
+
 fn render_live_page(connector: &NotionConnector, page_id: &str, page_path: &Path) -> String {
     let native = connector
         .fetch(FetchRequest {
@@ -553,6 +892,19 @@ fn render_live_page(connector: &NotionConnector, page_id: &str, page_path: &Path
         .expect("render live page")
         .document
         .body
+}
+
+fn render_live_markdown(connector: &NotionConnector, page_id: &str, page_path: &Path) -> String {
+    let native = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new(page_id.to_string()),
+        })
+        .expect("fetch live page");
+    let document = connector
+        .render_native_entity_for_path(&native, page_path)
+        .expect("render live page")
+        .document;
+    render_canonical_markdown(&document)
 }
 
 fn diverse_page_children(target_page_id: &str) -> Vec<Value> {
@@ -778,6 +1130,69 @@ fn page_mention_part(label: &str, page_id: &str) -> Value {
         },
         "plain_text": label
     })
+}
+
+fn database_row_properties(
+    notes: &str,
+    points: &str,
+    status: &str,
+    state: &str,
+    done: bool,
+    url: &str,
+) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        (
+            "Notes".to_string(),
+            json!({ "rich_text": rich_text_json(notes) }),
+        ),
+        (
+            "Points".to_string(),
+            json!({ "number": points.parse::<i64>().expect("points") }),
+        ),
+        (
+            "Status".to_string(),
+            json!({ "select": { "name": status } }),
+        ),
+        ("State".to_string(), json!({ "status": { "name": state } })),
+        (
+            "Tags".to_string(),
+            json!({ "multi_select": [{ "name": "Alpha" }, { "name": "Beta" }] }),
+        ),
+        ("Done".to_string(), json!({ "checkbox": done })),
+        (
+            "Due".to_string(),
+            json!({ "date": { "start": "2026-06-13" } }),
+        ),
+        ("URL".to_string(), json!({ "url": url })),
+        (
+            "Email".to_string(),
+            json!({ "email": "cyclic@example.com" }),
+        ),
+        (
+            "Phone".to_string(),
+            json!({ "phone_number": "+1 415 555 0199" }),
+        ),
+    ])
+}
+
+fn collect_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files_into(root, &mut files);
+    files
+}
+
+fn collect_files_into(path: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_into(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
 }
 
 #[derive(Debug)]

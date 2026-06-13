@@ -45,3 +45,19 @@ the local symptom, and the fix made in the PR.
   Slugged and hyphenated Notion page IDs are still accepted.
 - **Verification:** The rich text apply test now includes an external URL with a
   UUID-shaped path and verifies it remains a normal linked text span.
+
+### Mounted Database Row Creation Fetched The Database As A Page
+
+- **Found by:** `live_cyclic_database_rows_mount_edit_create_and_verify_notion`.
+- **Symptom:** Creating a new row by writing a Markdown file under a projected
+  database directory planned correctly, then failed during push with Notion's
+  "database, not a page" validation error.
+- **Cause:** The push concurrency preflight always retrieved precondition
+  entities through the page API. For row creation, the affected entity is the
+  database parent, so the preflight must use database metadata.
+- **Fix:** Concurrency checks now route `CreateEntity` parents with database
+  semantics through `retrieve_database` and continue to use `retrieve_page` for
+  normal page entities.
+- **Verification:** Added a unit regression for database-parent concurrency
+  checks and a live mounted database test that creates a row from a new Markdown
+  file, then verifies the created row through the Notion API.

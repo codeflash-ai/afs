@@ -17,7 +17,7 @@ Sources used for the baseline:
 | Page | Read, render, edit supported blocks, edit supported properties | fixture, live | Page body is block content; page metadata/properties are frontmatter. |
 | Block | Recursive read/render; write subset | fixture, live | Unsupported/lossy blocks render as anchored directives and are protected by directive validation. |
 | Database | Read/enumerate as directory | fixture, live | Database containers project to directories. |
-| Data source | Read/query rows, render `_schema.yaml`, validate row property writes, create rows when database has exactly one data source | fixture, live | Multi-data-source row writes are intentionally blocked until path/schema selection exists. |
+| Data source | Read/query rows, render `_schema.yaml`, validate row property writes, create rows when database has exactly one data source | fixture, live, mounted live | Multi-data-source row writes are intentionally blocked until path/schema selection exists. |
 | User | Read only when embedded in mentions/properties | fixture | User objects are not mounted as standalone files in v1. |
 | Comment | Unsupported | none | Comments are not in the v1 filesystem model from `plan.md`; adding them needs a thread representation and write policy. |
 | File upload | Unsupported for upload; external/download URLs are read | fixture, live image download | Uploading files needs retention, size, dedupe, and local path ownership policy. |
@@ -89,17 +89,17 @@ Sources used for the baseline:
 
 | Property type | Read/frontmatter | Write | Tests | Notes |
 |---|---:|---:|---|---|
-| `title` | Yes | Yes | fixture, live, schema | Title is the canonical `title` frontmatter field. |
-| `rich_text` | Yes | Yes | fixture, live, schema | Written as plain rich text today. |
-| `number` | Yes | Yes | fixture, live, schema | Numeric validation happens before API call. |
-| `select` | Yes | Yes | fixture, live, schema | Option names must exist in `_schema.yaml`. |
-| `status` | Yes | Yes | fixture, live, schema | Option names must exist in `_schema.yaml`. |
-| `multi_select` | Yes | Yes | fixture, live, schema | List values must exist in `_schema.yaml`. |
-| `checkbox` | Yes | Yes | fixture, live, schema | Boolean. |
-| `date` | Yes | Yes | fixture, live, schema | String date or map with `start`/`end`/`time_zone`. |
-| `url` | Yes | Yes | fixture, live, schema | Nullable HTTP/HTTPS string. |
-| `email` | Yes | Yes | fixture, live, schema | Nullable email string. |
-| `phone_number` | Yes | Yes | fixture, live, schema | Nullable string. |
+| `title` | Yes | Yes | fixture, live, mounted live, schema | Title is the canonical `title` frontmatter field. |
+| `rich_text` | Yes | Yes | fixture, live, mounted live, schema | Written as plain rich text today. |
+| `number` | Yes | Yes | fixture, live, mounted live, schema | Numeric validation happens before API call. |
+| `select` | Yes | Yes | fixture, live, mounted live, schema | Option names must exist in `_schema.yaml`. |
+| `status` | Yes | Yes | fixture, live, mounted live, schema | Option names must exist in `_schema.yaml`. |
+| `multi_select` | Yes | Yes | fixture, live, mounted live, schema | List values must exist in `_schema.yaml`. |
+| `checkbox` | Yes | Yes | fixture, live, mounted live, schema | Boolean. |
+| `date` | Yes | Yes | fixture, live, mounted live, schema | String date or map with `start`/`end`/`time_zone`. |
+| `url` | Yes | Yes | fixture, live, mounted live, schema | Nullable HTTP/HTTPS string. |
+| `email` | Yes | Yes | fixture, live, mounted live, schema | Nullable email string. |
+| `phone_number` | Yes | Yes | fixture, live, mounted live, schema | Nullable string. |
 | `files` | Yes | No | fixture, live read-empty, schema-blocked | File upload/link ownership policy is not designed yet. |
 | `people` | Yes | No | fixture, live read-empty, schema-blocked | Needs user lookup and permission-aware validation before writes. |
 | `relation` | Yes | No | fixture, schema-blocked | Needs target data-source schema and path/ID resolution before writes. |
