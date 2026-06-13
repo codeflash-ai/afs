@@ -129,3 +129,23 @@ and what Markdown shape agents should expect.
   payloads. Schema tests validate accepted/rejected file frontmatter. The live
   mounted database cycle edits and creates rows with file properties, and the
   live direct integrity test creates and updates a file property through the API.
+
+### Relation Properties
+
+- **Notion input:** Database/page `relation` properties containing related page
+  IDs. Live fixtures create the target database first, then create a
+  single-property relation schema pointing at that target data source.
+- **Markdown output:** Relation properties render as frontmatter lists of
+  Notion page IDs, matching the current read projection.
+- **Write behavior:** Frontmatter edits can write a string or YAML list of
+  explicit Notion page IDs. Clearing with `null`, an empty string, or an empty
+  list is supported by the same writer shape. Resolving relation targets by
+  local path, row title, or workspace search remains deferred.
+- **Live finding:** Current Notion relation schema creation rejects a relation
+  with only `data_source_id`; the live fixture must include
+  `single_property: {}` or `dual_property` in the relation schema.
+- **Verification:** Fixture apply tests assert exact page update and row create
+  payloads. Schema tests validate accepted/rejected relation frontmatter. The
+  live mounted database cycle reads, creates, and verifies relation properties,
+  and the live direct integrity test creates then updates a relation property
+  through the API.

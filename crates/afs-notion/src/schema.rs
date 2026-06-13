@@ -271,6 +271,7 @@ fn validate_value_for_property(
         "email" => validate_nullable_string_shape(value, "email address", valid_email),
         "phone_number" => validate_nullable_string(value, "phone number"),
         "files" => validate_files(value),
+        "relation" => validate_relation(value),
         _ => Ok(()),
     }
 }
@@ -497,6 +498,37 @@ fn valid_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+fn validate_relation(value: &PropertyValue) -> Result<(), (&'static str, String, &'static str)> {
+    let entries = match value {
+        PropertyValue::Null => return Ok(()),
+        PropertyValue::String(value) if value.trim().is_empty() => return Ok(()),
+        PropertyValue::String(value) => vec![value.as_str()],
+        PropertyValue::List(values) => values.iter().map(String::as_str).collect(),
+        _ => {
+            return Err((
+                "notion_schema_property_type_mismatch",
+                "must be a Notion page ID string or list".to_string(),
+                "use Notion page IDs from the rendered relation property",
+            ));
+        }
+    };
+
+    if entries.iter().all(|entry| valid_notion_id(entry.trim())) {
+        Ok(())
+    } else {
+        Err((
+            "notion_schema_property_shape_invalid",
+            "must contain valid Notion page IDs".to_string(),
+            "use 32-character or hyphenated Notion page IDs",
+        ))
+    }
+}
+
+fn valid_notion_id(value: &str) -> bool {
+    let compact = value.replace('-', "");
+    compact.len() == 32 && compact.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn valid_email(value: &str) -> bool {
     let value = value.trim();
     let Some((local, domain)) = value.split_once('@') else {
@@ -596,6 +628,7 @@ impl PropertySchema {
                 | "email"
                 | "phone_number"
                 | "files"
+                | "relation"
         )
     }
 
@@ -652,7 +685,7 @@ mod tests {
     #[test]
     fn validates_create_row_against_schema_options_and_types() {
         let parsed = parse_canonical_markdown(
-            "---\ntitle: New task\nStatus: Todo\nTags:\n  - Backend\nDone: false\nPoints: 5\nDue:\n  start: \"2026-06-10\"\nURL: https://example.com/afs\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\nFiles:\n  - Spec <https://example.com/spec.pdf>\n---\n# Body\n",
+            "---\ntitle: New task\nStatus: Todo\nTags:\n  - Backend\nDone: false\nPoints: 5\nDue:\n  start: \"2026-06-10\"\nURL: https://example.com/afs\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\nFiles:\n  - Spec <https://example.com/spec.pdf>\nRelation:\n  - \"11111111111111111111111111111111\"\n---\n# Body\n",
         )
         .expect("parse row");
 
@@ -664,7 +697,7 @@ mod tests {
     #[test]
     fn rejects_unknown_options_and_read_only_properties() {
         let parsed = parse_canonical_markdown(
-            "---\ntitle: New task\nStatus: Blocked\nFormula: edited\nFiles:\n  - not-a-url\n---\n# Body\n",
+            "---\ntitle: New task\nStatus: Blocked\nFormula: edited\nFiles:\n  - not-a-url\nRelation:\n  - bad-id\n---\n# Body\n",
         )
         .expect("parse row");
 
@@ -679,6 +712,7 @@ mod tests {
             vec![
                 "notion_schema_property_shape_invalid",
                 "notion_schema_property_read_only",
+                "notion_schema_property_shape_invalid",
                 "notion_schema_option_unknown"
             ]
         );
@@ -780,6 +814,9 @@ data_sources:
       Files:
         id: "files-id"
         type: "files"
+      Relation:
+        id: "relation-id"
+        type: "relation"
       Formula:
         id: "formula-id"
         type: "formula"

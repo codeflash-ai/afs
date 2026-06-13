@@ -1046,6 +1046,7 @@ fn apply_updates_supported_page_properties() {
             ("Due".to_string(), page_property("date")),
             ("URL".to_string(), page_property("url")),
             ("Files".to_string(), page_property("files")),
+            ("Relation".to_string(), page_property("relation")),
         ]),
     ));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -1083,6 +1084,13 @@ fn apply_updates_supported_page_properties() {
                         "https://example.com/diagram.png".to_string(),
                     ]),
                 ),
+                (
+                    "Relation".to_string(),
+                    PropertyValue::List(vec![
+                        "11111111111111111111111111111111".to_string(),
+                        "22222222-2222-2222-2222-222222222222".to_string(),
+                    ]),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1114,6 +1122,7 @@ fn apply_updates_supported_page_properties() {
                 "Due".to_string(),
                 "Files".to_string(),
                 "Points".to_string(),
+                "Relation".to_string(),
                 "Status".to_string(),
                 "Tags".to_string(),
                 "URL".to_string(),
@@ -1174,6 +1183,12 @@ fn apply_updates_supported_page_properties() {
                             },
                         ],
                     },
+                    "Relation": {
+                        "relation": [
+                            { "id": "11111111111111111111111111111111" },
+                            { "id": "22222222-2222-2222-2222-222222222222" },
+                        ],
+                    },
                 },
             }),
         }]
@@ -1191,6 +1206,7 @@ fn apply_creates_database_row_with_properties_and_children() {
             ("Done".to_string(), data_source_property("checkbox")),
             ("Points".to_string(), data_source_property("number")),
             ("Files".to_string(), data_source_property("files")),
+            ("Relation".to_string(), data_source_property("relation")),
         ]),
     ));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -1216,6 +1232,10 @@ fn apply_creates_database_row_with_properties_and_children() {
                     PropertyValue::List(vec![
                         "Design <https://example.com/design.pdf>".to_string(),
                     ]),
+                ),
+                (
+                    "Relation".to_string(),
+                    PropertyValue::List(vec!["33333333333333333333333333333333".to_string()]),
                 ),
             ]
             .into_iter()
@@ -1290,6 +1310,11 @@ fn apply_creates_database_row_with_properties_and_children() {
                                     "url": "https://example.com/design.pdf",
                                 },
                             },
+                        ],
+                    },
+                    "Relation": {
+                        "relation": [
+                            { "id": "33333333333333333333333333333333" },
                         ],
                     },
                 },

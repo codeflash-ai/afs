@@ -102,7 +102,7 @@ Sources used for the baseline:
 | `phone_number` | Yes | Yes | fixture, live, mounted live, schema | Nullable string. |
 | `files` | Yes | Yes for external URLs | fixture, live read/write, schema | Frontmatter accepts `https://...` or `Name <https://...>` entries and writes Notion external file objects. Hosted/uploaded file ownership remains read-only. |
 | `people` | Yes | No | fixture, live read-empty, schema-blocked | Needs user lookup and permission-aware validation before writes. |
-| `relation` | Yes | No | fixture, schema-blocked | Needs target data-source schema and path/ID resolution before writes. |
+| `relation` | Yes | Yes for explicit page IDs | fixture, live read/write, schema | Frontmatter accepts a Notion page ID string or list of page IDs. Path/title resolution is deferred. |
 | `formula` | Yes | No | fixture, schema-blocked | Computed/read-only by Notion. |
 | `rollup` | Yes | No | fixture, schema-blocked | Computed/read-only by Notion. |
 | `created_time` | Yes | No | fixture | Read-only by Notion. |
@@ -123,8 +123,9 @@ Sources used for the baseline:
   tabs) stay as directives because Markdown cannot represent their semantics.
 - Comments are not mounted because they need a separate thread model and push
   policy.
-- People/relation writes are blocked until validation can resolve user IDs and
-  related page IDs from local references.
+- People writes are blocked until validation can resolve user IDs. Relation
+  writes currently require explicit related page IDs; path/title resolution is
+  deferred.
 
 ## Next Block Work
 

@@ -449,8 +449,27 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         &format!("AFS cyclic database scratch {}", unique_suffix()),
         Vec::new(),
     );
-    let database =
-        cleanup.create_database(&scratch.id, &format!("AFS cyclic rows {}", unique_suffix()));
+    let related_database = cleanup.create_database(
+        &scratch.id,
+        &format!("AFS cyclic related rows {}", unique_suffix()),
+    );
+    let related_data_source_id = related_database
+        .data_sources
+        .first()
+        .expect("related data source")
+        .id
+        .clone();
+    let related_row = cleanup.create_database_row(
+        &related_database,
+        &format!("AFS cyclic related row {}", unique_suffix()),
+        serde_json::Map::new(),
+        vec![paragraph_child("Related row target.")],
+    );
+    let database = cleanup.create_database_with_relation(
+        &scratch.id,
+        &format!("AFS cyclic rows {}", unique_suffix()),
+        &related_data_source_id,
+    );
     let existing_row = cleanup.create_database_row(
         &database,
         &format!("AFS cyclic existing row {}", unique_suffix()),
@@ -461,6 +480,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
             "Not started",
             false,
             "https://example.com/afs-db-row",
+            &[related_row.id.as_str()],
         ),
         vec![paragraph_child("Database row paragraph original.")],
     );
@@ -498,6 +518,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"Email\":",
         "\"Phone\":",
         "\"Files\":",
+        "\"Related\":",
     ] {
         assert!(schema.contains(expected), "missing {expected:?}\n{schema}");
     }
@@ -515,6 +536,8 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"URL\": \"https://example.com/afs-db-row\"",
         "\"Files\":",
         "\"Initial file <https://example.com/initial.pdf>\"",
+        "\"Related\":",
+        &format!("\"{}\"", related_row.id),
         "Database row paragraph original.",
     ] {
         assert!(
@@ -606,6 +629,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"Done\": true",
         "\"URL\": \"https://example.com/afs-db-row-updated\"",
         "\"Updated file <https://example.com/updated.pdf>\"",
+        &format!("\"{}\"", related_row.id),
         "Database row paragraph changed.",
     ] {
         assert!(
@@ -618,7 +642,10 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     let new_row_path = database_dir.join("new-cyclic-row.md");
     fs::write(
         &new_row_path,
-        "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\nFiles:\n  - Created file <https://example.com/created.pdf>\n---\n# Created row body\n\nCreated from mounted markdown.\n",
+        &format!(
+            "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\nFiles:\n  - Created file <https://example.com/created.pdf>\nRelated:\n  - \"{}\"\n---\n# Created row body\n\nCreated from mounted markdown.\n",
+            related_row.id
+        ),
     )
     .expect("write new live database row file");
 
@@ -656,6 +683,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"Email\": \"cyclic@example.com\"",
         "\"Phone\": \"+1 415 555 0199\"",
         "\"Created file <https://example.com/created.pdf>\"",
+        &format!("\"{}\"", related_row.id),
         "Created from mounted markdown.",
     ] {
         assert!(
@@ -701,9 +729,19 @@ impl E2eFixture {
     }
 
     fn schema_file(&self) -> PathBuf {
-        collect_files(&self.root)
+        let schemas = collect_files(&self.root)
             .into_iter()
-            .find(|path| file_name(path) == "_schema.yaml")
+            .filter(|path| file_name(path) == "_schema.yaml")
+            .collect::<Vec<_>>();
+        schemas
+            .iter()
+            .find(|path| {
+                fs::read_to_string(path)
+                    .map(|content| content.contains("\"Related\":"))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .or_else(|| schemas.into_iter().next())
             .expect("database schema file")
     }
 
@@ -781,7 +819,82 @@ impl LiveCleanup {
     }
 
     fn create_database(&mut self, parent_page_id: &str, title: &str) -> DatabaseDto {
+        self.create_database_with_optional_relation(parent_page_id, title, None)
+    }
+
+    fn create_database_with_relation(
+        &mut self,
+        parent_page_id: &str,
+        title: &str,
+        related_data_source_id: &str,
+    ) -> DatabaseDto {
+        self.create_database_with_optional_relation(
+            parent_page_id,
+            title,
+            Some(related_data_source_id),
+        )
+    }
+
+    fn create_database_with_optional_relation(
+        &mut self,
+        parent_page_id: &str,
+        title: &str,
+        related_data_source_id: Option<&str>,
+    ) -> DatabaseDto {
         let unique_prefix = unique_id_prefix();
+        let mut properties = serde_json::Map::from_iter([
+            ("Name".to_string(), json!({ "title": {} })),
+            ("Notes".to_string(), json!({ "rich_text": {} })),
+            (
+                "Points".to_string(),
+                json!({ "number": { "format": "number" } }),
+            ),
+            (
+                "Status".to_string(),
+                json!({
+                    "select": {
+                        "options": [
+                            { "name": "Todo", "color": "gray" },
+                            { "name": "Done", "color": "green" }
+                        ]
+                    }
+                }),
+            ),
+            ("State".to_string(), json!({ "status": {} })),
+            (
+                "Tags".to_string(),
+                json!({
+                    "multi_select": {
+                        "options": [
+                            { "name": "Alpha", "color": "blue" },
+                            { "name": "Beta", "color": "purple" }
+                        ]
+                    }
+                }),
+            ),
+            ("Done".to_string(), json!({ "checkbox": {} })),
+            ("Due".to_string(), json!({ "date": {} })),
+            ("URL".to_string(), json!({ "url": {} })),
+            ("Email".to_string(), json!({ "email": {} })),
+            ("Phone".to_string(), json!({ "phone_number": {} })),
+            ("Files".to_string(), json!({ "files": {} })),
+            ("People".to_string(), json!({ "people": {} })),
+            (
+                "Unique".to_string(),
+                json!({ "unique_id": { "prefix": unique_prefix } }),
+            ),
+        ]);
+        if let Some(data_source_id) = related_data_source_id {
+            properties.insert(
+                "Related".to_string(),
+                json!({
+                    "relation": {
+                        "data_source_id": data_source_id,
+                        "single_property": {},
+                    }
+                }),
+            );
+        }
         let database = self
             .api
             .create_database(json!({
@@ -792,36 +905,7 @@ impl LiveCleanup {
                 "title": rich_text_json(title),
                 "initial_data_source": {
                     "title": rich_text_json("Rows"),
-                    "properties": {
-                        "Name": { "title": {} },
-                        "Notes": { "rich_text": {} },
-                        "Points": { "number": { "format": "number" } },
-                        "Status": {
-                            "select": {
-                                "options": [
-                                    { "name": "Todo", "color": "gray" },
-                                    { "name": "Done", "color": "green" }
-                                ]
-                            }
-                        },
-                        "State": { "status": {} },
-                        "Tags": {
-                            "multi_select": {
-                                "options": [
-                                    { "name": "Alpha", "color": "blue" },
-                                    { "name": "Beta", "color": "purple" }
-                                ]
-                            }
-                        },
-                        "Done": { "checkbox": {} },
-                        "Due": { "date": {} },
-                        "URL": { "url": {} },
-                        "Email": { "email": {} },
-                        "Phone": { "phone_number": {} },
-                        "Files": { "files": {} },
-                        "People": { "people": {} },
-                        "Unique": { "unique_id": { "prefix": unique_prefix } }
-                    }
+                    "properties": Value::Object(properties)
                 }
             }))
             .expect("create live database");
@@ -1239,8 +1323,9 @@ fn database_row_properties(
     state: &str,
     done: bool,
     url: &str,
+    related_page_ids: &[&str],
 ) -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([
+    let mut properties = serde_json::Map::from_iter([
         (
             "Notes".to_string(),
             json!({ "rich_text": rich_text_json(notes) }),
@@ -1286,7 +1371,19 @@ fn database_row_properties(
                 ]
             }),
         ),
-    ])
+    ]);
+    if !related_page_ids.is_empty() {
+        properties.insert(
+            "Related".to_string(),
+            json!({
+                "relation": related_page_ids
+                    .iter()
+                    .map(|id| json!({ "id": id }))
+                    .collect::<Vec<_>>()
+            }),
+        );
+    }
+    properties
 }
 
 fn collect_files(root: &Path) -> Vec<PathBuf> {
@@ -1565,8 +1662,12 @@ fn unique_id_prefix() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    let first_alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut prefix = String::new();
+    let first_index = (value % first_alphabet.len() as u128) as usize;
+    prefix.push(first_alphabet[first_index] as char);
+    value /= first_alphabet.len() as u128;
     for _ in 0..6 {
         let index = (value % alphabet.len() as u128) as usize;
         prefix.push(alphabet[index] as char);
