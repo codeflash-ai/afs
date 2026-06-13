@@ -33,7 +33,7 @@ build-desktop: ## Build the desktop frontend assets.
 
 .PHONY: build-tauri
 build-tauri: ## Build the packaged Tauri desktop app.
-	$(DESKTOP_NPM) run tauri -- build
+	$(DESKTOP_NPM) run build:mac
 
 .PHONY: prepare-macos-file-provider
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
