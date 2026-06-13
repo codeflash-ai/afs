@@ -22,7 +22,7 @@ The current implementation is a live-capable read, pull, and narrow write projec
   AI/custom blocks, URL-less media payloads, and unsupported or lossy blocks render as `::afs{...}` directives so they
   retain remote identity and useful metadata such as title, URL, source block ID, or target page ID
   when the API exposes it.
-- bookmark/embed URL blocks render as ordinary Markdown links.
+- bookmark/embed/link-preview URL blocks render as ordinary Markdown links.
 - media blocks with a Notion URL render as ordinary Markdown image or link syntax, while still
   keeping local media download metadata in the rendered entity for filesystem-aware callers.
 - `afs push -y` can update, append, and archive simple Notion blocks, update supported page
@@ -94,7 +94,7 @@ GitHub Actions has a manual `notion-live-e2e` workflow for these tests. The work
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed URL blocks, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 

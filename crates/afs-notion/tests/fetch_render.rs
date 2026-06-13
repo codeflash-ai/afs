@@ -552,7 +552,7 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "$$\nE=mc^2\n$$",
         "[Embed](https://example.com/embed)",
         "[Bookmark](https://example.com/bookmark)",
-        "::afs{id=link-preview-1 type=link_preview title=\"Preview\" url=\"https://example.com/preview\"}",
+        "[Preview](https://example.com/preview)",
         "![Image](https://example.com/image.png)",
         "[Video](https://example.com/video.mp4)",
         "[File](https://example.com/file.txt)",

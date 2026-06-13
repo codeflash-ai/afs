@@ -259,7 +259,7 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
         "equation" => equation_block(block, block.equation.as_ref()),
         "embed" => url_markdown_block(block, "embed", block.embed.as_ref()),
         "bookmark" => url_markdown_block(block, "bookmark", block.bookmark.as_ref()),
-        "link_preview" => url_directive_block(block, "link_preview", block.link_preview.as_ref()),
+        "link_preview" => url_markdown_block(block, "link_preview", block.link_preview.as_ref()),
         "image" => file_media_block(block, "image", block.image.as_ref(), options),
         "video" => file_media_block(block, "video", block.video.as_ref(), options),
         "file" => file_media_block(block, "file", block.file.as_ref(), options),
@@ -325,22 +325,6 @@ fn equation_block(block: &BlockDto, equation: Option<&EquationBlockDto>) -> Rend
         format!("$$\n{expression}\n$$"),
         Some(RemoteId::new(block.id.clone())),
     )
-}
-
-fn url_directive_block(
-    block: &BlockDto,
-    directive_type: &'static str,
-    payload: Option<&UrlBlockDto>,
-) -> RenderedBlock {
-    let attrs = payload
-        .map(|payload| {
-            directive_attrs(
-                rich_text_list_title(&payload.caption).map(|title| ("title", title)),
-                Some(("url", payload.url.clone())),
-            )
-        })
-        .unwrap_or_default();
-    directive_block_with_attrs(block, directive_type, attrs)
 }
 
 fn url_markdown_block(
@@ -519,13 +503,6 @@ fn indent_rendered_block(mut block: RenderedBlock, indent_level: usize) -> Rende
         .collect::<Vec<_>>()
         .join("\n");
     block
-}
-
-fn directive_attrs(
-    first: Option<(&'static str, String)>,
-    second: Option<(&'static str, String)>,
-) -> Vec<(&'static str, String)> {
-    first.into_iter().chain(second).collect()
 }
 
 fn rich_text_block_title(block: &RichTextBlockDto) -> Option<String> {

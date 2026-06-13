@@ -49,7 +49,7 @@ Sources used for the baseline:
 | `toggle` | Directive wrapper; children render below it | No | fixture, live read | Toggle wrapper state is anchored to avoid flattening nested content. |
 | `embed` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing embed block. |
 | `bookmark` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing bookmark block. |
-| `link_preview` | Directive | No | fixture | URL preserved when returned by the API; the current create-page API rejected it as a child block in live testing. |
+| `link_preview` | Markdown link | Read only | fixture | Renders as a normal link when the API returns a URL; the current create-page API rejected it as a child block in live testing, so writes stay blocked. |
 | `image` | Markdown image plus local image download | Yes for existing URL blocks | fixture, live read/write/download | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. URL-less payloads fall back to directives. |
 | `video` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
 | `file` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |

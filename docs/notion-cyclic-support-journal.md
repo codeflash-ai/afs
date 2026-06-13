@@ -78,3 +78,17 @@ and what Markdown shape agents should expect.
   media payload shape and sent `type: external` during block updates. The live
   Notion update endpoint rejected that field, so the update payload now sends
   only the nested `external.url` and `caption` fields for media block updates.
+
+### Link Preview Blocks
+
+- **Notion input:** `link_preview` blocks with a returned URL and optional
+  caption/title text.
+- **Markdown output:** Link previews render as normal Markdown links, matching
+  bookmark/embed readability without exposing an AFS directive for URL-shaped
+  content:
+  - `[Preview](https://example.com/preview)`
+- **Write behavior:** Link preview writes remain blocked. Live create-page
+  testing rejected `link_preview` as a child block, so AFS does not yet have a
+  safe write or append contract for this block type.
+- **Verification:** Fixture render coverage asserts that a returned
+  `link_preview` block renders to Markdown link syntax.
