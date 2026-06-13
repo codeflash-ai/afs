@@ -944,11 +944,7 @@ fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterV
             property.files.iter().map(file_property_label).collect(),
         )),
         "people" => Some(FrontmatterValue::List(
-            property
-                .people
-                .iter()
-                .map(|user| user.name.as_deref().unwrap_or(user.id.as_str()).to_string())
-                .collect(),
+            property.people.iter().map(user_property_label).collect(),
         )),
         "relation" => Some(FrontmatterValue::List(
             property
@@ -1029,6 +1025,17 @@ fn file_property_label(file: &crate::dto::FilePropertyDto) -> String {
         (false, false) => format!("{name} <{url}>"),
         (false, true) => name.to_string(),
         (true, false) => url.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
+fn user_property_label(user: &crate::dto::UserMentionDto) -> String {
+    let id = user.id.as_str();
+    let name = user.name.as_deref().unwrap_or_default();
+    match (name.is_empty(), id.is_empty()) {
+        (false, false) => format!("{name} <{id}>"),
+        (false, true) => name.to_string(),
+        (true, false) => id.to_string(),
         (true, true) => String::new(),
     }
 }

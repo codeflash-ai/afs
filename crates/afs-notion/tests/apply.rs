@@ -1046,6 +1046,7 @@ fn apply_updates_supported_page_properties() {
             ("Due".to_string(), page_property("date")),
             ("URL".to_string(), page_property("url")),
             ("Files".to_string(), page_property("files")),
+            ("People".to_string(), page_property("people")),
             ("Relation".to_string(), page_property("relation")),
         ]),
     ));
@@ -1085,6 +1086,12 @@ fn apply_updates_supported_page_properties() {
                     ]),
                 ),
                 (
+                    "People".to_string(),
+                    PropertyValue::List(vec![
+                        "Ada <aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa>".to_string(),
+                    ]),
+                ),
+                (
                     "Relation".to_string(),
                     PropertyValue::List(vec![
                         "11111111111111111111111111111111".to_string(),
@@ -1121,6 +1128,7 @@ fn apply_updates_supported_page_properties() {
                 "Done".to_string(),
                 "Due".to_string(),
                 "Files".to_string(),
+                "People".to_string(),
                 "Points".to_string(),
                 "Relation".to_string(),
                 "Status".to_string(),
@@ -1183,6 +1191,11 @@ fn apply_updates_supported_page_properties() {
                             },
                         ],
                     },
+                    "People": {
+                        "people": [
+                            { "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
+                        ],
+                    },
                     "Relation": {
                         "relation": [
                             { "id": "11111111111111111111111111111111" },
@@ -1206,6 +1219,7 @@ fn apply_creates_database_row_with_properties_and_children() {
             ("Done".to_string(), data_source_property("checkbox")),
             ("Points".to_string(), data_source_property("number")),
             ("Files".to_string(), data_source_property("files")),
+            ("People".to_string(), data_source_property("people")),
             ("Relation".to_string(), data_source_property("relation")),
         ]),
     ));
@@ -1232,6 +1246,10 @@ fn apply_creates_database_row_with_properties_and_children() {
                     PropertyValue::List(vec![
                         "Design <https://example.com/design.pdf>".to_string(),
                     ]),
+                ),
+                (
+                    "People".to_string(),
+                    PropertyValue::List(vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()]),
                 ),
                 (
                     "Relation".to_string(),
@@ -1310,6 +1328,11 @@ fn apply_creates_database_row_with_properties_and_children() {
                                     "url": "https://example.com/design.pdf",
                                 },
                             },
+                        ],
+                    },
+                    "People": {
+                        "people": [
+                            { "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
                         ],
                     },
                     "Relation": {

@@ -444,6 +444,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
     let mut cleanup = LiveCleanup::new(api);
+    let people_user_id = cleanup.current_user_id();
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("AFS cyclic database scratch {}", unique_suffix()),
@@ -480,6 +481,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
             "Not started",
             false,
             "https://example.com/afs-db-row",
+            &[],
             &[related_row.id.as_str()],
         ),
         vec![paragraph_child("Database row paragraph original.")],
@@ -518,6 +520,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"Email\":",
         "\"Phone\":",
         "\"Files\":",
+        "\"People\":",
         "\"Related\":",
     ] {
         assert!(schema.contains(expected), "missing {expected:?}\n{schema}");
@@ -536,6 +539,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"URL\": \"https://example.com/afs-db-row\"",
         "\"Files\":",
         "\"Initial file <https://example.com/initial.pdf>\"",
+        "\"People\": []",
         "\"Related\":",
         &format!("\"{}\"", related_row.id),
         "Database row paragraph original.",
@@ -593,6 +597,10 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
             "\"Updated file <https://example.com/updated.pdf>\"",
         )
         .replace(
+            "\"People\": []",
+            &format!("\"People\":\n  - \"{}\"", people_user_id),
+        )
+        .replace(
             "Database row paragraph original.",
             "Database row paragraph changed.",
         );
@@ -629,6 +637,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"Done\": true",
         "\"URL\": \"https://example.com/afs-db-row-updated\"",
         "\"Updated file <https://example.com/updated.pdf>\"",
+        &people_user_id,
         &format!("\"{}\"", related_row.id),
         "Database row paragraph changed.",
     ] {
@@ -643,8 +652,8 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     fs::write(
         &new_row_path,
         &format!(
-            "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\nFiles:\n  - Created file <https://example.com/created.pdf>\nRelated:\n  - \"{}\"\n---\n# Created row body\n\nCreated from mounted markdown.\n",
-            related_row.id
+            "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\nFiles:\n  - Created file <https://example.com/created.pdf>\nPeople:\n  - \"{}\"\nRelated:\n  - \"{}\"\n---\n# Created row body\n\nCreated from mounted markdown.\n",
+            people_user_id, related_row.id
         ),
     )
     .expect("write new live database row file");
@@ -683,6 +692,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"Email\": \"cyclic@example.com\"",
         "\"Phone\": \"+1 415 555 0199\"",
         "\"Created file <https://example.com/created.pdf>\"",
+        &people_user_id,
         &format!("\"{}\"", related_row.id),
         "Created from mounted markdown.",
     ] {
@@ -816,6 +826,16 @@ impl LiveCleanup {
             .expect("create live scratch page");
         self.block_ids.push(page.id.clone());
         page
+    }
+
+    fn current_user_id(&self) -> String {
+        self.api
+            .retrieve_current_user()
+            .expect("retrieve current Notion user")
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("current Notion user id")
+            .to_string()
     }
 
     fn create_database(&mut self, parent_page_id: &str, title: &str) -> DatabaseDto {
@@ -1323,6 +1343,7 @@ fn database_row_properties(
     state: &str,
     done: bool,
     url: &str,
+    people_user_ids: &[&str],
     related_page_ids: &[&str],
 ) -> serde_json::Map<String, Value> {
     let mut properties = serde_json::Map::from_iter([
@@ -1377,6 +1398,17 @@ fn database_row_properties(
             "Related".to_string(),
             json!({
                 "relation": related_page_ids
+                    .iter()
+                    .map(|id| json!({ "id": id }))
+                    .collect::<Vec<_>>()
+            }),
+        );
+    }
+    if !people_user_ids.is_empty() {
+        properties.insert(
+            "People".to_string(),
+            json!({
+                "people": people_user_ids
                     .iter()
                     .map(|id| json!({ "id": id }))
                     .collect::<Vec<_>>()

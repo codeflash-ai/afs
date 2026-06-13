@@ -1189,7 +1189,7 @@ fn render_all_supported_page_property_values_as_frontmatter() {
         "\"Email\": \"agentfs@example.com\"",
         "\"Phone\": \"+1 415 555 0100\"",
         "\"Files\":\n  - \"Spec <https://example.com/spec.pdf>\"\n  - \"https://example.com/hosted.png\"",
-        "\"People\":\n  - \"Ada\"",
+        "\"People\":\n  - \"Ada <user-1>\"",
         "\"Relation\":\n  - \"related-page-1\"",
         "\"Created Time\": \"2026-06-10T00:00:00.000Z\"",
         "\"Last Edited Time\": \"2026-06-11T00:00:00.000Z\"",

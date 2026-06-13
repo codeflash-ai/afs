@@ -18,7 +18,7 @@ Sources used for the baseline:
 | Block | Recursive read/render; write subset | fixture, live | Unsupported/lossy blocks render as anchored directives and are protected by directive validation. |
 | Database | Read/enumerate as directory | fixture, live | Database containers project to directories. |
 | Data source | Read/query rows, render `_schema.yaml`, validate row property writes, create rows when database has exactly one data source | fixture, live, mounted live | Multi-data-source row writes are intentionally blocked until path/schema selection exists. |
-| User | Read only when embedded in mentions/properties | fixture | User objects are not mounted as standalone files in v1. |
+| User | Read when embedded in mentions/properties; writable by explicit ID in people properties | fixture, live property write | User objects are not mounted as standalone files in v1. |
 | Comment | Unsupported | none | Comments are not in the v1 filesystem model from `plan.md`; adding them needs a thread representation and write policy. |
 | File upload | Unsupported for upload; external/download URLs are read and external file properties are writable | fixture, live image download, live property write | Uploading local files still needs retention, size, dedupe, and local path ownership policy. |
 | View | Unsupported | none | Views are database presentation state, not row/page content. |
@@ -101,7 +101,7 @@ Sources used for the baseline:
 | `email` | Yes | Yes | fixture, live, mounted live, schema | Nullable email string. |
 | `phone_number` | Yes | Yes | fixture, live, mounted live, schema | Nullable string. |
 | `files` | Yes | Yes for external URLs | fixture, live read/write, schema | Frontmatter accepts `https://...` or `Name <https://...>` entries and writes Notion external file objects. Hosted/uploaded file ownership remains read-only. |
-| `people` | Yes | No | fixture, live read-empty, schema-blocked | Needs user lookup and permission-aware validation before writes. |
+| `people` | Yes | Yes for explicit user IDs | fixture, live read/write, schema | Frontmatter accepts a Notion user ID string, `Name <user-id>`, or a list. User lookup by name/email is deferred. |
 | `relation` | Yes | Yes for explicit page IDs | fixture, live read/write, schema | Frontmatter accepts a Notion page ID string or list of page IDs. Path/title resolution is deferred. |
 | `formula` | Yes | No | fixture, schema-blocked | Computed/read-only by Notion. |
 | `rollup` | Yes | No | fixture, schema-blocked | Computed/read-only by Notion. |
@@ -123,9 +123,9 @@ Sources used for the baseline:
   tabs) stay as directives because Markdown cannot represent their semantics.
 - Comments are not mounted because they need a separate thread model and push
   policy.
-- People writes are blocked until validation can resolve user IDs. Relation
-  writes currently require explicit related page IDs; path/title resolution is
-  deferred.
+- People writes currently require explicit user IDs; name/email resolution is
+  deferred. Relation writes currently require explicit related page IDs;
+  path/title resolution is deferred.
 
 ## Next Block Work
 

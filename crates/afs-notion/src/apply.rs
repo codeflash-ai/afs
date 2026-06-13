@@ -657,6 +657,7 @@ fn property_value_for_kind(kind: &str, value: &PropertyValue, key: &str) -> AfsR
         "date" => date_property(value, key),
         "url" | "email" | "phone_number" => nullable_string_property(kind, value, key),
         "files" => files_property(value, key),
+        "people" => people_property(value, key),
         "relation" => relation_property(value, key),
         _ => Err(AfsError::Unsupported("updating this Notion property type")),
     }
@@ -821,6 +822,35 @@ fn valid_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+fn people_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    let entries = match value {
+        PropertyValue::Null => Vec::new(),
+        PropertyValue::String(value) if value.trim().is_empty() => Vec::new(),
+        PropertyValue::String(value) => vec![value.as_str()],
+        PropertyValue::List(values) => values.iter().map(String::as_str).collect(),
+        _ => return Err(property_type_error(key, "Notion user ID string or list")),
+    };
+
+    let people = entries
+        .into_iter()
+        .map(|entry| people_property_value(entry, key))
+        .collect::<AfsResult<Vec<_>>>()?;
+    Ok(json!({ "people": people }))
+}
+
+fn people_property_value(entry: &str, key: &str) -> AfsResult<Value> {
+    let id = parse_named_id_entry(entry).trim();
+    if !valid_notion_id(id) {
+        return Err(AfsError::Validation(vec![property_issue(
+            key,
+            "notion_property_people_id_invalid",
+            "Notion people properties must contain user IDs",
+        )]));
+    }
+
+    Ok(json!({ "id": id }))
+}
+
 fn relation_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
     let entries = match value {
         PropertyValue::Null => Vec::new(),
@@ -838,7 +868,7 @@ fn relation_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
 }
 
 fn relation_property_value(entry: &str, key: &str) -> AfsResult<Value> {
-    let id = entry.trim();
+    let id = parse_named_id_entry(entry).trim();
     if !valid_notion_id(id) {
         return Err(AfsError::Validation(vec![property_issue(
             key,
@@ -848,6 +878,16 @@ fn relation_property_value(entry: &str, key: &str) -> AfsResult<Value> {
     }
 
     Ok(json!({ "id": id }))
+}
+
+fn parse_named_id_entry(entry: &str) -> &str {
+    let trimmed = entry.trim();
+    if let Some(without_close) = trimmed.strip_suffix('>')
+        && let Some((_, id)) = without_close.rsplit_once(" <")
+    {
+        return id;
+    }
+    trimmed
 }
 
 fn valid_notion_id(value: &str) -> bool {

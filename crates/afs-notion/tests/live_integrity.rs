@@ -243,6 +243,7 @@ fn live_database_row_property_create_edit_verify_integrity() {
     let api = Arc::new(LiveNotion::new(env.token.clone()));
     let mut cleanup = LiveCleanup::new(api.clone());
     let connector = NotionConnector::new(NotionConfig::default());
+    let people_user_id = cleanup.current_user_id();
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("AFS live database scratch {}", unique_suffix()),
@@ -281,8 +282,8 @@ fn live_database_row_property_create_edit_verify_integrity() {
         .expect("live schema");
     let valid_row = parse_canonical_markdown(
         &format!(
-            "---\ntitle: AFS created row\nNotes: Rich row notes\nPoints: 42\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\n  - Beta\nDone: false\nDue: \"2026-06-10\"\nURL: https://example.com/afs-live\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\nFiles:\n  - Spec <https://example.com/spec.pdf>\nRelated:\n  - \"{}\"\n---\n# Row body\n",
-            related_row_initial.id
+            "---\ntitle: AFS created row\nNotes: Rich row notes\nPoints: 42\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\n  - Beta\nDone: false\nDue: \"2026-06-10\"\nURL: https://example.com/afs-live\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\nFiles:\n  - Spec <https://example.com/spec.pdf>\nPeople:\n  - \"{}\"\nRelated:\n  - \"{}\"\n---\n# Row body\n",
+            people_user_id, related_row_initial.id
         ),
     )
     .expect("valid row frontmatter");
@@ -350,6 +351,10 @@ fn live_database_row_property_create_edit_verify_integrity() {
                     PropertyValue::List(vec!["Spec <https://example.com/spec.pdf>".to_string()]),
                 ),
                 (
+                    "People".to_string(),
+                    PropertyValue::List(vec![people_user_id.clone()]),
+                ),
+                (
                     "Related".to_string(),
                     PropertyValue::List(vec![related_row_initial.id.clone()]),
                 ),
@@ -404,6 +409,7 @@ fn live_database_row_property_create_edit_verify_integrity() {
             .frontmatter
             .contains("\"Spec <https://example.com/spec.pdf>\"")
     );
+    assert!(rendered.document.frontmatter.contains(&people_user_id));
     assert!(
         rendered
             .document
@@ -435,6 +441,7 @@ fn live_database_row_property_create_edit_verify_integrity() {
                         "Spec updated <https://example.com/spec-updated.pdf>".to_string(),
                     ]),
                 ),
+                ("People".to_string(), PropertyValue::List(Vec::new())),
                 (
                     "Related".to_string(),
                     PropertyValue::List(vec![related_row_updated.id.clone()]),
@@ -479,6 +486,18 @@ fn live_database_row_property_create_edit_verify_integrity() {
             .document
             .frontmatter
             .contains("\"Spec updated <https://example.com/spec-updated.pdf>\"")
+    );
+    assert!(
+        verified_render
+            .document
+            .frontmatter
+            .contains("\"People\": []")
+    );
+    assert!(
+        !verified_render
+            .document
+            .frontmatter
+            .contains(&people_user_id)
     );
     assert!(
         verified_render
@@ -548,6 +567,12 @@ impl LiveCleanup {
         let page = self.api.create_page(body).expect("create live page");
         self.block_ids.push(page.id.clone());
         page
+    }
+
+    fn current_user_id(&self) -> String {
+        self.api
+            .current_user_id()
+            .expect("retrieve current user id")
     }
 
     fn create_database(&mut self, parent_page_id: &str, title: &str) -> DatabaseDto {
@@ -704,6 +729,14 @@ impl LiveNotion {
 
     fn create_database(&self, body: Value) -> Result<DatabaseDto, String> {
         self.send_json(reqwest::Method::POST, "/v1/databases", Some(body))
+    }
+
+    fn current_user_id(&self) -> Result<String, String> {
+        let user = self.send_json::<Value, Value>(reqwest::Method::GET, "/v1/users/me", None)?;
+        user.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "current Notion user response had no id".to_string())
     }
 
     fn archive_block(&self, block_id: &str) -> Result<Value, String> {

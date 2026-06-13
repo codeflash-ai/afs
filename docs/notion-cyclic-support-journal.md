@@ -149,3 +149,21 @@ and what Markdown shape agents should expect.
   live mounted database cycle reads, creates, and verifies relation properties,
   and the live direct integrity test creates then updates a relation property
   through the API.
+
+### People Properties
+
+- **Notion input:** Database/page `people` properties containing user objects.
+  The live PAT test uses the token's bot user ID from `/v1/users/me`.
+- **Markdown output:** People properties render as frontmatter lists. Entries
+  with both display name and ID use `Name <user-id>`; ID-only entries render as
+  the ID string.
+- **Write behavior:** Frontmatter edits can write a string or YAML list of
+  explicit Notion user IDs. `Name <user-id>` is accepted so the rendered shape
+  can round-trip. Clearing with `null`, an empty string, or an empty list is
+  supported by the same writer shape. Name/email lookup remains deferred.
+- **Verification:** Fixture apply tests assert exact page update and row create
+  payloads. Schema tests validate accepted/rejected people frontmatter. The
+  live mounted database cycle starts with an empty people property, writes the
+  bot user through a mounted Markdown edit, and verifies the rendered Notion
+  result. The live direct integrity test creates a people value and then clears
+  it through the API writer.
