@@ -349,23 +349,23 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         )
         .replace(
             "![Editable image](https://www.w3.org/Icons/w3c_home.png)",
-            "![Editable image changed](https://www.w3.org/Icons/w3c_home.png)",
+            "![Editable image changed](https://www.w3.org/assets/logos/w3c-2025-transitional/w3c-72x48.png)",
         )
         .replace(
             "[Editable video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
-            "[Editable video changed](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
+            "[Editable video changed](https://www.youtube.com/watch?v=oHg5SJYRHA0)",
         )
         .replace(
             "[Editable file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
-            "[Editable file changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+            "[Editable file changed](https://www.orimi.com/pdf-test.pdf)",
         )
         .replace(
             "[Editable PDF](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
-            "[Editable PDF changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+            "[Editable PDF changed](https://www.orimi.com/pdf-test.pdf)",
         )
         .replace(
             "[Editable audio](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)",
-            "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)",
+            "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3)",
         )
         .replace("fn editable() {}", "fn editable_changed() {}")
         .replace("x+y=z", "x-y=z");
@@ -418,11 +418,11 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "> [!NOTE]\n> Editable callout changed",
         "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
         "[Editable embed changed](https://example.com/editable-embed-changed)",
-        "![Editable image changed](https://www.w3.org/Icons/w3c_home.png)",
-        "[Editable video changed](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
-        "[Editable file changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
-        "[Editable PDF changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
-        "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)",
+        "![Editable image changed](https://www.w3.org/assets/logos/w3c-2025-transitional/w3c-72x48.png)",
+        "[Editable video changed](https://www.youtube.com/watch?v=oHg5SJYRHA0)",
+        "[Editable file changed](https://www.orimi.com/pdf-test.pdf)",
+        "[Editable PDF changed](https://www.orimi.com/pdf-test.pdf)",
+        "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3)",
         "fn editable_changed() {}",
         "x-y=z",
     ] {
