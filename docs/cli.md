@@ -296,8 +296,8 @@ Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently inc
 Ignored live test:
 
 ```bash
-NOTION_TOKEN=... AFS_NOTION_PAGE_ID=... \
-  cargo test -p afs-cli --test e2e_push_workflow live_mid_page_insert_push_reconciles -- --ignored
+NOTION_TOKEN=... AFS_NOTION_LIVE_PARENT_PAGE=... \
+  cargo test -p afs-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact
 ```
 
-The test mounts a temporary Notion projection, pulls the root page, inserts a paragraph, pushes with confirmation, and expects the push to reconcile.
+The test creates a scratch page under the configured live parent, mounts a temporary Notion projection, pulls the root page, edits the local Markdown file, verifies pending status, pushes with confirmation, verifies the edit through the Notion API, and archives the scratch page.

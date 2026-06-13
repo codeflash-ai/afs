@@ -81,6 +81,16 @@ cargo test -p afs-notion --test live_integrity -- --ignored
 
 Those tests cover broad block rendering, supported block edits/appends, image download, database row creation, supported property writes, and read-back verification against the live API. They require the integration to have insert, read, and update content capabilities for the parent page. The current support contract is tracked in [notion-object-support.md](notion-object-support.md).
 
+The product-level mounted workflow test uses the same parent page, but exercises the AFS user path instead of only the connector boundary. It creates a scratch page, mounts it as plain files, pulls it locally, edits the Markdown file, verifies `afs status` reports pending changes, pushes the edit, fetches the page from Notion, and archives the scratch page:
+
+```sh
+export NOTION_TOKEN='secret_...'
+export AFS_NOTION_LIVE_PARENT_PAGE='https://app.notion.com/...'
+cargo test -p afs-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact
+```
+
+GitHub Actions has a manual `notion-live-e2e` workflow for these tests. The workflow should be backed by a disposable Notion workspace/account and secrets named `NOTION_TOKEN` and `AFS_NOTION_LIVE_PARENT_PAGE`.
+
 ## Initial Block Rendering
 
 The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, embeds, bookmarks, synced blocks, column layouts, tabs, table of contents, breadcrumbs, link-to-page blocks, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.

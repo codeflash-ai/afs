@@ -10,15 +10,19 @@ use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::run_pull;
 use afs_cli::push::{PushOptions, run_push_with_daemon};
 use afs_cli::status::{StatusOptions, run_status};
+use afs_connector::{Connector, FetchRequest};
 use afs_core::model::{MountId, RemoteId};
-use afs_notion::client::NotionApi;
+use afs_notion::client::{HttpNotionApi, NotionApi};
 use afs_notion::dto::{
     BlockDto, BlockListDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
     RichTextBlockDto, RichTextDto, SyncedBlockDto, SyncedFromDto, TextRichTextDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{ConnectionId, InMemoryStateStore, ProjectionMode};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+const LIVE_PARENT_ENV: &str = "AFS_NOTION_LIVE_PARENT_PAGE";
+const TOKEN_ENV: &str = "NOTION_TOKEN";
 
 #[test]
 fn mount_pull_mid_page_insert_push_and_status_clean() {
@@ -101,10 +105,35 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and AFS_NOTION_PAGE_ID; mutates the target page"]
-fn live_mid_page_insert_push_reconciles() {
-    let page_id = std::env::var("AFS_NOTION_PAGE_ID").expect("AFS_NOTION_PAGE_ID");
-    std::env::var("NOTION_TOKEN").expect("NOTION_TOKEN");
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_scratch_page_mount_edit_push_verifies_notion() {
+    std::env::var(TOKEN_ENV).expect("NOTION_TOKEN");
+    let parent_page = normalize_notion_id(
+        &std::env::var(LIVE_PARENT_ENV)
+            .unwrap_or_else(|_| panic!("set {LIVE_PARENT_ENV} to a writable page ID or URL")),
+    );
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let marker = format!("AFS live mounted edit {}", unique_suffix());
+    let scratch = cleanup.create_page(
+        &parent_page,
+        &format!("AFS mounted e2e {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": "Original paragraph created by the mounted AFS live e2e test."
+                        }
+                    }
+                ]
+            }
+        })],
+    );
+
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
     let connector = NotionConnector::new(NotionConfig::default());
@@ -115,7 +144,7 @@ fn live_mid_page_insert_push_reconciles() {
             mount_id: fixture.mount_id.clone(),
             connector: "notion".to_string(),
             root: fixture.root.clone(),
-            remote_root_id: Some(RemoteId::new(page_id)),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
@@ -125,11 +154,23 @@ fn live_mid_page_insert_push_reconciles() {
     run_pull(&mut store, &connector, &fixture.root).expect("pull");
     let page_path = fixture.page_file();
     let original = fs::read_to_string(&page_path).expect("read pulled page");
-    fs::write(
-        &page_path,
-        insert_after_frontmatter(&original, "Live AgentFS ignored test paragraph.\n\n"),
+    assert!(original.contains("Original paragraph created by the mounted AFS live e2e test."));
+    fs::write(&page_path, format!("{original}\n\n{marker}\n")).expect("write local edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff");
+    let plan = diff.plan.as_ref().expect("plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert!(plan.summary.blocks_created >= 1, "{plan:#?}");
+
+    let dirty_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
     )
-    .expect("write local edit");
+    .expect("dirty status");
+    assert!(!dirty_status.clean, "{dirty_status:#?}");
 
     let push = run_push_with_daemon(
         &mut store,
@@ -142,6 +183,30 @@ fn live_mid_page_insert_push_reconciles() {
     )
     .expect("push");
     assert!(push.ok, "{push:#?}");
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let verified = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new(scratch.id),
+        })
+        .expect("verify fetch");
+    let verified_render = connector
+        .render_native_entity_for_path(&verified, &page_path)
+        .expect("verify render");
+    assert!(
+        verified_render.document.body.contains(&marker),
+        "{}",
+        verified_render.document.body
+    );
 }
 
 struct E2eFixture {
@@ -183,6 +248,59 @@ impl E2eFixture {
 impl Drop for E2eFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[derive(Debug)]
+struct LiveCleanup {
+    api: HttpNotionApi,
+    block_ids: Vec<String>,
+}
+
+impl LiveCleanup {
+    fn new(api: HttpNotionApi) -> Self {
+        Self {
+            api,
+            block_ids: Vec::new(),
+        }
+    }
+
+    fn create_page(&mut self, parent_page_id: &str, title: &str, children: Vec<Value>) -> PageDto {
+        let mut body = json!({
+            "parent": {
+                "type": "page_id",
+                "page_id": parent_page_id,
+            },
+            "properties": {
+                "title": {
+                    "title": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": title,
+                            }
+                        }
+                    ]
+                },
+            },
+        });
+        if !children.is_empty() {
+            body["children"] = Value::Array(children);
+        }
+        let page = self
+            .api
+            .create_page(body)
+            .expect("create live scratch page");
+        self.block_ids.push(page.id.clone());
+        page
+    }
+}
+
+impl Drop for LiveCleanup {
+    fn drop(&mut self) {
+        for block_id in self.block_ids.iter().rev() {
+            let _ = self.api.delete_block(block_id);
+        }
     }
 }
 
@@ -409,19 +527,32 @@ fn body_text(body: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn insert_after_frontmatter(document: &str, insertion: &str) -> String {
-    if let Some(rest) = document.strip_prefix("---\n")
-        && let Some(end) = rest.find("\n---\n")
-    {
-        let body_start = 4 + end + 5;
-        let mut edited = String::with_capacity(document.len() + insertion.len());
-        edited.push_str(&document[..body_start]);
-        edited.push_str(insertion);
-        edited.push_str(&document[body_start..]);
-        return edited;
+fn normalize_notion_id(input: &str) -> String {
+    let trimmed = input.trim().trim_end_matches('/');
+    let candidate = trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed);
+    let hex = candidate
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>();
+    if hex.len() >= 32 {
+        hex[hex.len() - 32..].to_string()
+    } else {
+        candidate.to_string()
     }
+}
 
-    format!("{insertion}{document}")
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
 }
 
 fn file_name(path: &Path) -> &str {
