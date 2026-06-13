@@ -1124,6 +1124,156 @@ fn apply_updates_simple_table_rows_from_markdown_table() {
 }
 
 #[test]
+fn apply_adds_table_rows_from_markdown_table() {
+    let api = Arc::new(RecordingNotionApi::with_table(
+        "2026-06-10T00:00:00.000Z",
+        table_block("table-1", 2, true),
+        vec![
+            table_row_block("row-1", &["Name", "Status"]),
+            table_row_block("row-2", &["Old task", "Todo"]),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("table-1"),
+            content: "| Name | Status |\n| --- | --- |\n| New task | Done |\n| Added task | Next |"
+                .to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply table row addition");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "row-1".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Name"),
+                            rich_text_json("Status"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "row-2".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("New task"),
+                            rich_text_json("Done"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Append {
+                block_id: "table-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "table_row",
+                        "table_row": {
+                            "cells": [
+                                rich_text_json("Added task"),
+                                rich_text_json("Next"),
+                            ],
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "row-2",
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_deletes_table_rows_from_markdown_table() {
+    let api = Arc::new(RecordingNotionApi::with_table(
+        "2026-06-10T00:00:00.000Z",
+        table_block("table-1", 2, true),
+        vec![
+            table_row_block("row-1", &["Name", "Status"]),
+            table_row_block("row-2", &["Keep task", "Todo"]),
+            table_row_block("row-3", &["Drop task", "Later"]),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("table-1"),
+            content: "| Name | Status |\n| --- | --- |\n| Kept task | Done |".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply table row deletion");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "row-1".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Name"),
+                            rich_text_json("Status"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "row-2".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Kept task"),
+                            rich_text_json("Done"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Delete {
+                block_id: "row-3".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_updates_supported_page_properties() {
     let api = Arc::new(RecordingNotionApi::with_page_properties(
         "2026-06-10T00:00:00.000Z",

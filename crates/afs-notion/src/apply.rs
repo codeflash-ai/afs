@@ -367,13 +367,12 @@ fn apply_table_update(
     let current_rows = current_table_rows(bundles, table_id)?;
     let parsed = parse_markdown_table(markdown, table)?;
 
-    if parsed.rows.len() != current_rows.len() {
-        return Err(AfsError::Unsupported(
-            "writing Notion table row additions or deletions",
-        ));
-    }
-
-    for (row_block, cells) in current_rows.iter().zip(parsed.rows) {
+    let rows_to_update = current_rows.len().min(parsed.rows.len());
+    for (row_block, cells) in current_rows
+        .iter()
+        .zip(parsed.rows.iter())
+        .take(rows_to_update)
+    {
         let current_row = row_block.table_row.as_ref().ok_or_else(|| {
             AfsError::InvalidState(format!(
                 "notion table row block `{}` is missing its `table_row` payload",
@@ -402,6 +401,27 @@ fn apply_table_update(
                 },
             }),
         )?;
+    }
+
+    let mut append_after = current_rows.last().map(|row| RemoteId::new(row.id.clone()));
+    for cells in parsed.rows.iter().skip(current_rows.len()) {
+        let cells = cells
+            .iter()
+            .map(|cell| rich_text_payload(cell, None))
+            .collect::<AfsResult<Vec<_>>>()?;
+        let result = api.append_block_children(
+            table_id.as_str(),
+            append_body(table_row_append_child(cells), append_after.as_ref()),
+        )?;
+        append_after = result
+            .results
+            .first()
+            .map(|row| RemoteId::new(row.id.clone()))
+            .or(append_after);
+    }
+
+    for row_block in current_rows.iter().skip(parsed.rows.len()) {
+        api.delete_block(&row_block.id)?;
     }
 
     Ok(())
@@ -1286,6 +1306,16 @@ fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
             },
         }),
     }
+}
+
+fn table_row_append_child(cells: Vec<Value>) -> Value {
+    json!({
+        "object": "block",
+        "type": "table_row",
+        "table_row": {
+            "cells": cells,
+        },
+    })
 }
 
 fn rich_text(content: &str) -> Value {

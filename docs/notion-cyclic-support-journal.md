@@ -96,7 +96,7 @@ and what Markdown shape agents should expect.
 - **Verification:** Fixture render coverage asserts that a returned
   `link_preview` block renders to Markdown link syntax.
 
-### Same-Shape Table Cell Edits
+### Table Cell And Row Edits
 
 - **Notion input:** Simple `table` blocks with `table_row` children and no
   nested row children.
@@ -105,13 +105,16 @@ and what Markdown shape agents should expect.
   headerless tables keep the renderer's empty Markdown header marker and map
   data lines to Notion rows.
 - **Write behavior:** A Markdown edit to an existing table updates the
-  corresponding Notion `table_row.cells` values when table width, row count, and
-  header flags are unchanged. Row additions, row deletions, width changes, and
-  header-mode changes fail before API mutation.
+  corresponding Notion `table_row.cells` values when table width and header
+  flags are unchanged. Additional Markdown rows append Notion `table_row`
+  children under the table, and removed trailing rows archive the corresponding
+  Notion row blocks. Width changes and header-mode changes still fail before API
+  mutation.
 - **Verification:** Core diff coverage asserts that table edits produce a table
   block update rather than archive/recreate. Fixture apply tests assert exact
-  row update payloads, and the live mounted edit cycle updates a table cell then
-  verifies the rendered Notion result through the API.
+  row update/append/delete payloads, and the live mounted edit cycle updates a
+  table cell, appends a table row, then verifies the rendered Notion result
+  through the API.
 - **Bug fixed during live testing:** The live database fixtures used a fixed
   Notion unique-ID prefix, which can collide at workspace scope on repeated
   runs. The live fixtures now generate a short unique alphanumeric prefix for

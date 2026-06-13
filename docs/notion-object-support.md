@@ -42,7 +42,7 @@ Sources used for the baseline:
 | `code` | Native fenced code | Yes | fixture, live | Language is preserved on simple code fences. |
 | `divider` | Native Markdown rule | Yes | fixture, live | `---`. |
 | `equation` | Native display math | Yes | fixture, live | `$$ ... $$`. |
-| `table` | Native Markdown table | Yes for same-shape existing tables | fixture, live read/write | Existing cell edits update table rows when width, header mode, and row count stay unchanged. Row add/delete and width changes are still blocked. |
+| `table` | Native Markdown table | Yes for existing tables with stable width/header mode | fixture, live read/write | Existing cell edits update table rows. Added Markdown rows append Notion `table_row` children; removed trailing rows archive row blocks. Width and header-mode changes are still blocked. |
 | `table_row` | Structural inside tables | No | fixture | Standalone/malformed rows render as directives. |
 | `child_page` | Directive and structural enumeration | No direct block write | fixture, live read | New child pages are created through page/entity creation, not block edits. |
 | `child_database` | Directive and structural enumeration | No direct block write | fixture, live read | Databases are created through the database API, not Markdown block writes. |
@@ -117,8 +117,8 @@ Sources used for the baseline:
 
 - Media upload, hosted file rewrites, and non-image downloads are deferred until
   AFS has size limits, retention rules, and local path ownership semantics.
-- Table structural writes are deferred until the planner can produce row-level
-  operations for row add/delete, width changes, and header-mode changes.
+- Table width changes and header-mode changes are deferred until the planner can
+  represent them without losing Notion table semantics.
 - Layout and generated blocks (`column_*`, `breadcrumb`, `table_of_contents`,
   tabs) stay as directives because Markdown cannot represent their semantics.
 - Comments are not mounted because they need a separate thread model and push
@@ -132,8 +132,8 @@ Sources used for the baseline:
 1. Add fixture-backed write tests before widening any block type. The Tier 1
    writer suite now covers headings, numbered lists, to-dos, quotes, callouts,
    code fences, dividers, and equations.
-2. Extend table writes beyond same-shape cell edits. Row add/delete and width
-   changes need row-level diff/apply rather than whole-table replacement.
+2. Extend table writes beyond stable-width row edits. Width changes and header
+   mode changes need a safer representation than whole-table replacement.
 3. Keep layout, generated, synced, and unknown future blocks directive-backed
    until their Notion semantics can be represented without content loss.
 4. Design media writes separately from text block writes. Upload support needs

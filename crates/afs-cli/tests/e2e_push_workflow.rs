@@ -349,7 +349,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         )
         .replace(
             "| Editable table item | Editable table state |",
-            "| Editable table item changed | Editable table state done |",
+            "| Editable table item changed | Editable table state done |\n| Editable table added | Editable table added state |",
         )
         .replace(
             "[Editable bookmark](https://example.com/editable-bookmark)",
@@ -436,6 +436,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "> Editable quote changed",
         "> [!NOTE]\n> Editable callout changed",
         "| Editable table item changed | Editable table state done |",
+        "| Editable table added | Editable table added state |",
         "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
         "[Editable embed changed](https://example.com/editable-embed-changed)",
         "![Editable image changed](https://www.w3.org/assets/logos/w3c-2025-transitional/w3c-72x48.png)",
