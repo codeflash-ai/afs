@@ -243,3 +243,18 @@ and what Markdown shape agents should expect.
   row creation. The live mounted database-row cycle edits and creates rich-text
   properties with bold text, a typed date mention, and an external text link,
   then verifies the fresh Notion render.
+
+### Link Preview Mention Write Deferral
+
+- **Notion input:** Rich-text `link_preview` mentions.
+- **Markdown output:** Link-preview mentions render as ordinary Markdown links
+  so the URL remains visible to agents.
+- **Write behavior:** Kept read-only. A live write probe against the current
+  Notion API rejected `mention.link_preview` in page child rich text payloads;
+  the validation response allowed user/date/page/database/template/custom emoji
+  mention payloads instead. Until the API exposes a writable shape, AFS should
+  treat edited link-preview mentions as unsupported rather than silently
+  converting them to ordinary text links.
+- **Verification:** The failed live probe happened while attempting to extend
+  `live_cyclic_supported_block_edits_push_and_verify_notion`; no writer support
+  was kept in this PR because fixture-only support would be misleading.

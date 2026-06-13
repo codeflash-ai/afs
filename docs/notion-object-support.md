@@ -82,7 +82,7 @@ Sources used for the baseline:
 | Database mention | Markdown link to Notion URL; explicit `@database(...)` write syntax | Yes through explicit ID syntax; label edits preserve database type when target ID is unchanged | fixture, live read/write | Stable ID is preserved. Agents can write `@database(11111111-1111-1111-1111-111111111111)` or `@database(Name <11111111-1111-1111-1111-111111111111>)`. |
 | User mention | Plain `@name`/fallback; explicit `@user(...)` write syntax | Yes through explicit ID syntax | fixture, live read/write | Agents can write `@user(11111111-1111-1111-1111-111111111111)` or `@user(Name <11111111-1111-1111-1111-111111111111>)`; name/email lookup is deferred. |
 | Date mention | Plain date/range text; explicit `@date(...)` write syntax | Yes through explicit syntax | fixture, live read/write | Agents can write `@date(2026-06-14)` or `@date(2026-06-14 to 2026-06-21, tz=America/Chicago)` when the result must remain a typed Notion date mention. Plain dates stay plain text unless preserved from the preimage. |
-| Link preview mention | Markdown link | Read only | fixture | Preserves URL. |
+| Link preview mention | Markdown link | Read only | fixture, live API probe | Preserves URL on read. Current Notion write validation rejects `mention.link_preview` in page child rich text payloads, so AFS must not synthesize or preserve it through edited writes yet. |
 | Unknown mention variants | Plain text fallback | No | fixture | Avoids losing visible content while blocking typed edits. |
 
 ## Page And Data Source Properties
