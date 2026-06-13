@@ -5,6 +5,7 @@ NPM ?= npm
 
 DESKTOP_DIR := apps/desktop
 DESKTOP_NPM := $(NPM) --prefix $(DESKTOP_DIR)
+DESKTOP_NODE_MODULES_STAMP := $(DESKTOP_DIR)/node_modules/.package-lock.json
 
 .DEFAULT_GOAL := help
 
@@ -13,8 +14,13 @@ help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 .PHONY: setup
-setup: ## Install desktop npm dependencies.
+setup: $(DESKTOP_NODE_MODULES_STAMP) ## Install desktop npm dependencies.
+
+$(DESKTOP_NODE_MODULES_STAMP): $(DESKTOP_DIR)/package-lock.json $(DESKTOP_DIR)/package.json
 	$(DESKTOP_NPM) ci
+
+.PHONY: build-all
+build-all: build-release build-tauri ## Build all deliverables in release mode.
 
 .PHONY: build
 build: build-rust build-desktop ## Build the Rust workspace and desktop frontend.
@@ -24,15 +30,15 @@ build-rust: ## Build all Rust workspace packages.
 	$(CARGO) build --workspace
 
 .PHONY: build-release
-build-release: ## Build all Rust workspace packages in release mode.
+build-release: build-desktop ## Build all Rust workspace packages in release mode.
 	$(CARGO) build --workspace --release
 
 .PHONY: build-desktop
-build-desktop: ## Build the desktop frontend assets.
+build-desktop: $(DESKTOP_NODE_MODULES_STAMP) ## Build the desktop frontend assets.
 	$(DESKTOP_NPM) run build
 
 .PHONY: build-tauri
-build-tauri: ## Build the packaged Tauri desktop app.
+build-tauri: build-desktop ## Build the packaged Tauri desktop app.
 	$(DESKTOP_NPM) run tauri -- build
 
 .PHONY: prepare-macos-file-provider
