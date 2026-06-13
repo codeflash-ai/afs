@@ -327,6 +327,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
             "Editable paragraph original.",
             "Editable paragraph changed.",
         )
+        .replace("Editable date 2026-06-13", "Editable date @date(2026-06-14)")
         .replace("# Editable heading one", "# Editable heading one changed")
         .replace("## Editable heading two", "## Editable heading two changed")
         .replace(
@@ -417,6 +418,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     let verified = render_live_page(&connector, &source.id, &page_path);
     for expected in [
         "Editable paragraph changed.",
+        "Editable date 2026-06-14",
         "# Editable heading one changed",
         "## Editable heading two changed",
         "### Editable heading three changed",
@@ -1199,6 +1201,13 @@ fn diverse_page_children(target_page_id: &str, database_id: &str) -> Vec<Value> 
 fn supported_edit_children() -> Vec<Value> {
     vec![
         paragraph_child("Editable paragraph original."),
+        json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [text_part("Editable date "), date_mention_part("2026-06-13")]
+            }
+        }),
         rich_text_child("heading_1", "Editable heading one"),
         rich_text_child("heading_2", "Editable heading two"),
         rich_text_child("heading_3", "Editable heading three"),
@@ -1357,6 +1366,17 @@ fn database_mention_part(label: &str, database_id: &str) -> Value {
             "database": { "id": database_id }
         },
         "plain_text": label
+    })
+}
+
+fn date_mention_part(start: &str) -> Value {
+    json!({
+        "type": "mention",
+        "mention": {
+            "type": "date",
+            "date": { "start": start }
+        },
+        "plain_text": start
     })
 }
 

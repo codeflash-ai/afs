@@ -12,9 +12,9 @@ use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
     DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, IdRefDto,
-    LinkDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto, TableBlockDto,
-    TableRowBlockDto, TextRichTextDto, UrlBlockDto,
+    LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto,
+    PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
+    TableBlockDto, TableRowBlockDto, TextRichTextDto, UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -641,7 +641,7 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
         vec![RemoteId::new("page-1")],
         vec![PushOperation::UpdateBlock {
             block_id: RemoteId::new("paragraph-1"),
-            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and database [Tasks updated](https://www.notion.so/33333333333333333333333333333333) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
+            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and database [Tasks updated](https://www.notion.so/33333333333333333333333333333333) and @date(2026-06-11 to 2026-06-12, tz=America/Chicago) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -733,6 +733,23 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
                             },
                         },
                         {
+                            "type": "mention",
+                            "mention": {
+                                "type": "date",
+                                "date": {
+                                    "start": "2026-06-11",
+                                    "end": "2026-06-12",
+                                    "time_zone": "America/Chicago",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
                             "type": "equation",
                             "equation": {
                                 "expression": "E=mc^2",
@@ -773,6 +790,47 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
             }),
         }]
     );
+}
+
+#[test]
+fn apply_rejects_link_to_page_retargeting_before_api_mutation() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![link_to_page_block(
+            "page-link-1",
+            "page_id",
+            "11111111-1111-1111-1111-111111111111",
+        )],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("page-link-1"),
+            content:
+                "[Updated page](https://www.notion.so/Project-22222222222222222222222222222222)"
+                    .to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect_err("link_to_page retargeting is intentionally unsupported");
+
+    assert!(
+        matches!(error, AfsError::Unsupported(message) if message.contains("link_to_page")),
+        "{error:?}"
+    );
+    assert!(api.writes.lock().expect("writes").is_empty());
 }
 
 #[test]
@@ -1900,6 +1958,21 @@ fn table_row_block(id: &str, cells: &[&str]) -> BlockDto {
     block.table_row = Some(TableRowBlockDto {
         cells: cells.iter().map(|cell| rich_text(cell)).collect(),
     });
+    block
+}
+
+fn link_to_page_block(id: &str, kind: &str, target_id: &str) -> BlockDto {
+    let mut block = block(id, "link_to_page");
+    let mut payload = LinkToPageBlockDto {
+        kind: kind.to_string(),
+        ..Default::default()
+    };
+    match kind {
+        "page_id" => payload.page_id = Some(target_id.to_string()),
+        "database_id" => payload.database_id = Some(target_id.to_string()),
+        _ => {}
+    }
+    block.link_to_page = Some(payload);
     block
 }
 

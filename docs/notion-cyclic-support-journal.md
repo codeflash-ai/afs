@@ -13,8 +13,11 @@ and what Markdown shape agents should expect.
   - `[Linked page](https://www.notion.so/<page-id>)`
   - `[Linked database](https://www.notion.so/<database-id>)`
 - **Write behavior:** Unchanged link blocks are preserved during pushes. Direct
-  retargeting of a `link_to_page` block is not yet supported; malformed native
-  link payloads still render as guarded AFS directives.
+  retargeting of a `link_to_page` block is blocked before mutation: live API
+  probing showed Notion accepts a target update request but returns the original
+  target unchanged. Replacement-by-append/delete is deferred until AFS journals
+  undo-aware block identity replacement. Malformed native link payloads still
+  render as guarded AFS directives.
 - **Inline mentions:** Page and database rich-text mentions now render as normal
   Notion URL links instead of `afs://` links. The writer accepts page URLs on
   Notion hosts as page mention writes and keeps legacy `afs://` parsing for
@@ -184,3 +187,19 @@ and what Markdown shape agents should expect.
   produce `mention.database` payloads. The live diverse page cyclic test creates
   both a rich-text database mention and a database `link_to_page` block, then
   verifies the mounted read/no-op push does not mutate the Notion block JSON.
+
+### Explicit Date Mention Writes
+
+- **Notion input:** Rich-text date mentions.
+- **Markdown output:** Date mentions continue to render as readable date or
+  range text, for example `2026-06-13`.
+- **Write behavior:** Unchanged rendered date mentions preserve their typed
+  Notion mention payload through the preimage. When an agent needs to change or
+  create a typed date mention, it can use `@date(2026-06-14)` or
+  `@date(2026-06-14 to 2026-06-21, tz=America/Chicago)`. Plain date-looking
+  text is not auto-promoted to a date mention because normal prose can contain
+  dates.
+- **Verification:** Fixture apply tests assert `@date(...)` produces a typed
+  `mention.date` request payload. The live supported-edit cycle edits a Notion
+  date mention through the mounted Markdown file and verifies the fresh Notion
+  render shows the updated date.

@@ -19,6 +19,20 @@ the local symptom, and the fix made in the PR.
   and `[Linked database](https://www.notion.so/...)`. The live cyclic read test
   asserts no `type=link_to_page` directive appears for valid links.
 
+### `link_to_page` Target PATCH Was A Silent No-Op
+
+- **Found by:** live scratch API probe while evaluating editable page/database
+  link targets.
+- **Symptom:** `PATCH /v1/blocks/{block_id}` with a new `link_to_page.page_id`
+  returned HTTP success but the response and subsequent child-list fetch still
+  showed the original target ID.
+- **Decision:** AFS now keeps direct `link_to_page` retargeting blocked with a
+  specific unsupported-write message. Replacing the block by append/delete is
+  deferred until the journal can represent undo-aware block replacement, because
+  the old block ID disappears.
+- **Verification:** Added a fixture apply test that attempts to retarget a
+  rendered `link_to_page` Markdown link and asserts no Notion API write is made.
+
 ### Full Same-Shape Page Edits Planned Archive/Recreate
 
 - **Found by:** `live_cyclic_supported_block_edits_push_and_verify_notion`.

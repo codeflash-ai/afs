@@ -1129,6 +1129,12 @@ fn parse_supported_block(
         return Err(AfsError::Unsupported("empty Notion block writes"));
     }
 
+    if current_kind == Some("link_to_page") {
+        return Err(AfsError::Unsupported(
+            "retargeting Notion link_to_page blocks; Notion ignores direct target updates and replacement needs undo-aware block identity support",
+        ));
+    }
+
     if let Some((language, code)) = parse_code_fence(trimmed) {
         let language = if language.is_empty() {
             "plain text".to_string()
@@ -1331,6 +1337,12 @@ enum RichTextWritePart {
         id: String,
         annotations: InlineAnnotations,
     },
+    DateMention {
+        start: String,
+        end: Option<String>,
+        time_zone: Option<String>,
+        annotations: InlineAnnotations,
+    },
     Preimage(Box<RichTextDto>),
 }
 
@@ -1340,7 +1352,8 @@ impl RichTextWritePart {
             Self::Text { annotations, .. }
             | Self::Equation { annotations, .. }
             | Self::PageMention { annotations, .. }
-            | Self::DatabaseMention { annotations, .. } => apply(annotations),
+            | Self::DatabaseMention { annotations, .. }
+            | Self::DateMention { annotations, .. } => apply(annotations),
             Self::Preimage(part) => {
                 let mut annotations = InlineAnnotations::from(&part.annotations);
                 apply(&mut annotations);
@@ -1422,6 +1435,30 @@ impl RichTextWritePart {
                         },
                     },
                 });
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::DateMention {
+                start,
+                end,
+                time_zone,
+                annotations,
+            } => {
+                let mut value = json!({
+                    "type": "mention",
+                    "mention": {
+                        "type": "date",
+                        "date": {
+                            "start": start,
+                        },
+                    },
+                });
+                if let Some(end) = end {
+                    value["mention"]["date"]["end"] = json!(end);
+                }
+                if let Some(time_zone) = time_zone {
+                    value["mention"]["date"]["time_zone"] = json!(time_zone);
+                }
                 insert_annotations(&mut value, annotations);
                 Ok(value)
             }
@@ -1604,6 +1641,21 @@ impl InlineParser<'_> {
             )));
         }
 
+        if rest.starts_with("@date(")
+            && let Some(end) = find_closing(rest, 6, ")")
+        {
+            let (start, end_date, time_zone) = parse_date_mention_args(&rest[6..end])?;
+            return Ok(Some((
+                vec![RichTextWritePart::DateMention {
+                    start,
+                    end: end_date,
+                    time_zone,
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
         if rest.starts_with('[')
             && let Some((label, href, consumed)) = parse_markdown_link(rest)
         {
@@ -1668,7 +1720,7 @@ impl InlineParser<'_> {
 
     fn next_special_or_preimage(&self, start: usize, closing: Option<&str>) -> usize {
         let mut next = self.input.len();
-        for marker in ["**", "~~", "<u>", "`", "$", "[", "_"] {
+        for marker in ["**", "~~", "<u>", "`", "$", "@date(", "[", "_"] {
             if let Some(offset) = self.input[start..].find(marker) {
                 next = next.min(start + offset);
             }
@@ -1704,6 +1756,63 @@ fn parse_nested(
 
 fn find_closing(input: &str, start: usize, marker: &str) -> Option<usize> {
     input[start..].find(marker).map(|offset| start + offset)
+}
+
+fn parse_date_mention_args(input: &str) -> AfsResult<(String, Option<String>, Option<String>)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(invalid_date_mention_syntax());
+    }
+
+    let (range, time_zone) = if let Some((range, time_zone)) = input
+        .rsplit_once(", tz=")
+        .or_else(|| input.rsplit_once(", timezone="))
+    {
+        let time_zone = time_zone.trim();
+        if time_zone.is_empty() {
+            return Err(invalid_date_mention_syntax());
+        }
+        (range.trim(), Some(time_zone.to_string()))
+    } else {
+        (input, None)
+    };
+
+    let (start, end) = if let Some((start, end)) = range.split_once(" to ") {
+        let start = start.trim();
+        let end = end.trim();
+        if start.is_empty() || end.is_empty() {
+            return Err(invalid_date_mention_syntax());
+        }
+        (start.to_string(), Some(end.to_string()))
+    } else {
+        (range.trim().to_string(), None)
+    };
+
+    if !looks_like_date_literal(&start)
+        || end
+            .as_deref()
+            .is_some_and(|end| !looks_like_date_literal(end))
+    {
+        return Err(invalid_date_mention_syntax());
+    }
+
+    Ok((start, end, time_zone))
+}
+
+fn looks_like_date_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 10
+        && bytes[0..4].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn invalid_date_mention_syntax() -> AfsError {
+    AfsError::Unsupported(
+        "date mention syntax; use @date(YYYY-MM-DD) or @date(YYYY-MM-DD to YYYY-MM-DD)",
+    )
 }
 
 fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
