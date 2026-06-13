@@ -1045,6 +1045,7 @@ fn apply_updates_supported_page_properties() {
             ("Points".to_string(), page_property("number")),
             ("Due".to_string(), page_property("date")),
             ("URL".to_string(), page_property("url")),
+            ("Files".to_string(), page_property("files")),
         ]),
     ));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -1075,6 +1076,13 @@ fn apply_updates_supported_page_properties() {
                     "URL".to_string(),
                     PropertyValue::String("https://example.com/afs".to_string()),
                 ),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec![
+                        "Spec <https://example.com/spec.pdf>".to_string(),
+                        "https://example.com/diagram.png".to_string(),
+                    ]),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1104,6 +1112,7 @@ fn apply_updates_supported_page_properties() {
             keys: vec![
                 "Done".to_string(),
                 "Due".to_string(),
+                "Files".to_string(),
                 "Points".to_string(),
                 "Status".to_string(),
                 "Tags".to_string(),
@@ -1147,6 +1156,24 @@ fn apply_updates_supported_page_properties() {
                     "URL": {
                         "url": "https://example.com/afs",
                     },
+                    "Files": {
+                        "files": [
+                            {
+                                "name": "Spec",
+                                "type": "external",
+                                "external": {
+                                    "url": "https://example.com/spec.pdf",
+                                },
+                            },
+                            {
+                                "name": "diagram.png",
+                                "type": "external",
+                                "external": {
+                                    "url": "https://example.com/diagram.png",
+                                },
+                            },
+                        ],
+                    },
                 },
             }),
         }]
@@ -1163,6 +1190,7 @@ fn apply_creates_database_row_with_properties_and_children() {
             ("Tags".to_string(), data_source_property("multi_select")),
             ("Done".to_string(), data_source_property("checkbox")),
             ("Points".to_string(), data_source_property("number")),
+            ("Files".to_string(), data_source_property("files")),
         ]),
     ));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -1183,6 +1211,12 @@ fn apply_creates_database_row_with_properties_and_children() {
                 ),
                 ("Done".to_string(), PropertyValue::Bool(false)),
                 ("Points".to_string(), PropertyValue::Number("5".to_string())),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec![
+                        "Design <https://example.com/design.pdf>".to_string(),
+                    ]),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1246,6 +1280,17 @@ fn apply_creates_database_row_with_properties_and_children() {
                     },
                     "Points": {
                         "number": 5.0,
+                    },
+                    "Files": {
+                        "files": [
+                            {
+                                "name": "Design",
+                                "type": "external",
+                                "external": {
+                                    "url": "https://example.com/design.pdf",
+                                },
+                            },
+                        ],
                     },
                 },
                 "children": [

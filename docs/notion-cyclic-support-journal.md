@@ -113,3 +113,19 @@ and what Markdown shape agents should expect.
   Notion unique-ID prefix, which can collide at workspace scope on repeated
   runs. The live fixtures now generate a short unique alphanumeric prefix for
   each scratch database.
+
+### External File Properties
+
+- **Notion input:** Database/page `files` properties containing external files
+  or Notion-hosted files.
+- **Markdown output:** File properties render as frontmatter lists. Entries with
+  both name and URL use `Name <https://example.com/file.pdf>`; URL-only entries
+  render as the URL string.
+- **Write behavior:** Frontmatter edits can write external file URLs using
+  either `https://example.com/file.pdf` or `Name <https://example.com/file.pdf>`
+  list entries. Uploading local files, rewriting hosted Notion files, and
+  retention/dedupe policy remain deferred.
+- **Verification:** Fixture apply tests assert exact page update and row create
+  payloads. Schema tests validate accepted/rejected file frontmatter. The live
+  mounted database cycle edits and creates rows with file properties, and the
+  live direct integrity test creates and updates a file property through the API.

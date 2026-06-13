@@ -20,7 +20,7 @@ Sources used for the baseline:
 | Data source | Read/query rows, render `_schema.yaml`, validate row property writes, create rows when database has exactly one data source | fixture, live, mounted live | Multi-data-source row writes are intentionally blocked until path/schema selection exists. |
 | User | Read only when embedded in mentions/properties | fixture | User objects are not mounted as standalone files in v1. |
 | Comment | Unsupported | none | Comments are not in the v1 filesystem model from `plan.md`; adding them needs a thread representation and write policy. |
-| File upload | Unsupported for upload; external/download URLs are read | fixture, live image download | Uploading files needs retention, size, dedupe, and local path ownership policy. |
+| File upload | Unsupported for upload; external/download URLs are read and external file properties are writable | fixture, live image download, live property write | Uploading local files still needs retention, size, dedupe, and local path ownership policy. |
 | View | Unsupported | none | Views are database presentation state, not row/page content. |
 | Custom emoji | Unsupported | none | Emoji metadata is presentation state; emoji text still appears through rich text/plain text. |
 | Webhook event | Unsupported locally | none | Webhooks belong to the optional relay path, not the local direct connector. |
@@ -100,7 +100,7 @@ Sources used for the baseline:
 | `url` | Yes | Yes | fixture, live, mounted live, schema | Nullable HTTP/HTTPS string. |
 | `email` | Yes | Yes | fixture, live, mounted live, schema | Nullable email string. |
 | `phone_number` | Yes | Yes | fixture, live, mounted live, schema | Nullable string. |
-| `files` | Yes | No | fixture, live read-empty, schema-blocked | File upload/link ownership policy is not designed yet. |
+| `files` | Yes | Yes for external URLs | fixture, live read/write, schema | Frontmatter accepts `https://...` or `Name <https://...>` entries and writes Notion external file objects. Hosted/uploaded file ownership remains read-only. |
 | `people` | Yes | No | fixture, live read-empty, schema-blocked | Needs user lookup and permission-aware validation before writes. |
 | `relation` | Yes | No | fixture, schema-blocked | Needs target data-source schema and path/ID resolution before writes. |
 | `formula` | Yes | No | fixture, schema-blocked | Computed/read-only by Notion. |
@@ -115,8 +115,8 @@ Sources used for the baseline:
 
 ## Current Intentional Gaps
 
-- Media upload and non-image downloads are deferred until AFS has size limits,
-  retention rules, and local path ownership semantics.
+- Media upload, hosted file rewrites, and non-image downloads are deferred until
+  AFS has size limits, retention rules, and local path ownership semantics.
 - Table structural writes are deferred until the planner can produce row-level
   operations for row add/delete, width changes, and header-mode changes.
 - Layout and generated blocks (`column_*`, `breadcrumb`, `table_of_contents`,

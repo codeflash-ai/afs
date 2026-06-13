@@ -656,6 +656,7 @@ fn property_value_for_kind(kind: &str, value: &PropertyValue, key: &str) -> AfsR
         "checkbox" => bool_property(value, key),
         "date" => date_property(value, key),
         "url" | "email" | "phone_number" => nullable_string_property(kind, value, key),
+        "files" => files_property(value, key),
         _ => Err(AfsError::Unsupported("updating this Notion property type")),
     }
 }
@@ -751,6 +752,72 @@ fn single_property(kind: &str, value: Value) -> Value {
     let mut object = Map::new();
     object.insert(kind.to_string(), value);
     Value::Object(object)
+}
+
+fn files_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    let entries = match value {
+        PropertyValue::Null => Vec::new(),
+        PropertyValue::String(value) if value.trim().is_empty() => Vec::new(),
+        PropertyValue::String(value) => vec![value.as_str()],
+        PropertyValue::List(values) => values.iter().map(String::as_str).collect(),
+        _ => return Err(property_type_error(key, "file URL string or list")),
+    };
+
+    let files = entries
+        .into_iter()
+        .map(|entry| external_file_property_value(entry, key))
+        .collect::<AfsResult<Vec<_>>>()?;
+    Ok(json!({ "files": files }))
+}
+
+fn external_file_property_value(entry: &str, key: &str) -> AfsResult<Value> {
+    let (name, url) = parse_external_file_entry(entry);
+    if url.trim().is_empty() || !valid_url(url) {
+        return Err(AfsError::Validation(vec![property_issue(
+            key,
+            "notion_property_file_url_invalid",
+            "Notion file properties must be HTTP(S) URLs or `name <url>` entries",
+        )]));
+    }
+    let name = if name.trim().is_empty() {
+        file_name_from_url(url)
+    } else {
+        name.trim().to_string()
+    };
+
+    Ok(json!({
+        "name": name,
+        "type": "external",
+        "external": {
+            "url": url,
+        },
+    }))
+}
+
+fn parse_external_file_entry(entry: &str) -> (&str, &str) {
+    let trimmed = entry.trim();
+    if let Some(without_close) = trimmed.strip_suffix('>')
+        && let Some((name, url)) = without_close.rsplit_once(" <")
+    {
+        return (name, url);
+    }
+    ("", trimmed)
+}
+
+fn file_name_from_url(url: &str) -> String {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("File")
+        .to_string()
+}
+
+fn valid_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 fn required_string(value: &PropertyValue, key: &str) -> AfsResult<String> {

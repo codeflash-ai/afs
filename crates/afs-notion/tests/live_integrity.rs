@@ -255,7 +255,7 @@ fn live_database_row_property_create_edit_verify_integrity() {
         .database_schema_yaml(&database_id)
         .expect("live schema");
     let valid_row = parse_canonical_markdown(
-        "---\ntitle: AFS created row\nNotes: Rich row notes\nPoints: 42\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\n  - Beta\nDone: false\nDue: \"2026-06-10\"\nURL: https://example.com/afs-live\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\n---\n# Row body\n",
+        "---\ntitle: AFS created row\nNotes: Rich row notes\nPoints: 42\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\n  - Beta\nDone: false\nDue: \"2026-06-10\"\nURL: https://example.com/afs-live\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\nFiles:\n  - Spec <https://example.com/spec.pdf>\n---\n# Row body\n",
     )
     .expect("valid row frontmatter");
     assert!(validate_create_row_frontmatter(&schema_yaml, &valid_row, "Rows/valid.md").is_clean());
@@ -317,6 +317,10 @@ fn live_database_row_property_create_edit_verify_integrity() {
                     "Phone".to_string(),
                     PropertyValue::String("+1 415 555 0100".to_string()),
                 ),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec!["Spec <https://example.com/spec.pdf>".to_string()]),
+                ),
             ]),
             body: "# Row body\n\nCreated from live integration.\n".to_string(),
             source_path: "Rows/afs-created-row.md".into(),
@@ -362,6 +366,12 @@ fn live_database_row_property_create_edit_verify_integrity() {
             .frontmatter
             .contains("\"URL\": \"https://example.com/afs-live\"")
     );
+    assert!(
+        rendered
+            .document
+            .frontmatter
+            .contains("\"Spec <https://example.com/spec.pdf>\"")
+    );
 
     let update = PushPlan::new(
         vec![row_id.clone()],
@@ -380,6 +390,12 @@ fn live_database_row_property_create_edit_verify_integrity() {
                 (
                     "URL".to_string(),
                     PropertyValue::String("https://example.com/afs-live-updated".to_string()),
+                ),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec![
+                        "Spec updated <https://example.com/spec-updated.pdf>".to_string(),
+                    ]),
                 ),
             ]),
         }],
@@ -415,6 +431,12 @@ fn live_database_row_property_create_edit_verify_integrity() {
             .document
             .frontmatter
             .contains("\"URL\": \"https://example.com/afs-live-updated\"")
+    );
+    assert!(
+        verified_render
+            .document
+            .frontmatter
+            .contains("\"Spec updated <https://example.com/spec-updated.pdf>\"")
     );
 }
 

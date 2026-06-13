@@ -497,6 +497,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"URL\":",
         "\"Email\":",
         "\"Phone\":",
+        "\"Files\":",
     ] {
         assert!(schema.contains(expected), "missing {expected:?}\n{schema}");
     }
@@ -512,6 +513,8 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"State\": \"Not started\"",
         "\"Done\": false",
         "\"URL\": \"https://example.com/afs-db-row\"",
+        "\"Files\":",
+        "\"Initial file <https://example.com/initial.pdf>\"",
         "Database row paragraph original.",
     ] {
         assert!(
@@ -563,6 +566,10 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
             "\"URL\": \"https://example.com/afs-db-row-updated\"",
         )
         .replace(
+            "\"Initial file <https://example.com/initial.pdf>\"",
+            "\"Updated file <https://example.com/updated.pdf>\"",
+        )
+        .replace(
             "Database row paragraph original.",
             "Database row paragraph changed.",
         );
@@ -598,6 +605,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"State\": \"In progress\"",
         "\"Done\": true",
         "\"URL\": \"https://example.com/afs-db-row-updated\"",
+        "\"Updated file <https://example.com/updated.pdf>\"",
         "Database row paragraph changed.",
     ] {
         assert!(
@@ -610,7 +618,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     let new_row_path = database_dir.join("new-cyclic-row.md");
     fs::write(
         &new_row_path,
-        "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\n---\n# Created row body\n\nCreated from mounted markdown.\n",
+        "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\nFiles:\n  - Created file <https://example.com/created.pdf>\n---\n# Created row body\n\nCreated from mounted markdown.\n",
     )
     .expect("write new live database row file");
 
@@ -647,6 +655,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         "\"URL\": \"https://example.com/afs-created-row\"",
         "\"Email\": \"cyclic@example.com\"",
         "\"Phone\": \"+1 415 555 0199\"",
+        "\"Created file <https://example.com/created.pdf>\"",
         "Created from mounted markdown.",
     ] {
         assert!(
@@ -1262,6 +1271,20 @@ fn database_row_properties(
         (
             "Phone".to_string(),
             json!({ "phone_number": "+1 415 555 0199" }),
+        ),
+        (
+            "Files".to_string(),
+            json!({
+                "files": [
+                    {
+                        "name": "Initial file",
+                        "type": "external",
+                        "external": {
+                            "url": "https://example.com/initial.pdf"
+                        }
+                    }
+                ]
+            }),
         ),
     ])
 }

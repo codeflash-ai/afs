@@ -270,6 +270,7 @@ fn validate_value_for_property(
         "url" => validate_nullable_string_shape(value, "URL", valid_url),
         "email" => validate_nullable_string_shape(value, "email address", valid_email),
         "phone_number" => validate_nullable_string(value, "phone number"),
+        "files" => validate_files(value),
         _ => Ok(()),
     }
 }
@@ -453,6 +454,45 @@ fn validate_nullable_string_shape(
     Ok(())
 }
 
+fn validate_files(value: &PropertyValue) -> Result<(), (&'static str, String, &'static str)> {
+    let entries = match value {
+        PropertyValue::Null => return Ok(()),
+        PropertyValue::String(value) if value.trim().is_empty() => return Ok(()),
+        PropertyValue::String(value) => vec![value.as_str()],
+        PropertyValue::List(values) => values.iter().map(String::as_str).collect(),
+        _ => {
+            return Err((
+                "notion_schema_property_type_mismatch",
+                "must be a file URL string or list".to_string(),
+                "use HTTP(S) URLs or `name <url>` list entries",
+            ));
+        }
+    };
+
+    if entries.iter().all(|entry| {
+        let (_, url) = parse_external_file_entry(entry);
+        valid_url(url)
+    }) {
+        Ok(())
+    } else {
+        Err((
+            "notion_schema_property_shape_invalid",
+            "must contain valid HTTP(S) file URLs".to_string(),
+            "use HTTP(S) URLs or `name <url>` list entries",
+        ))
+    }
+}
+
+fn parse_external_file_entry(entry: &str) -> (&str, &str) {
+    let trimmed = entry.trim();
+    if let Some(without_close) = trimmed.strip_suffix('>')
+        && let Some((name, url)) = without_close.rsplit_once(" <")
+    {
+        return (name, url);
+    }
+    ("", trimmed)
+}
+
 fn valid_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
@@ -555,6 +595,7 @@ impl PropertySchema {
                 | "url"
                 | "email"
                 | "phone_number"
+                | "files"
         )
     }
 
@@ -611,7 +652,7 @@ mod tests {
     #[test]
     fn validates_create_row_against_schema_options_and_types() {
         let parsed = parse_canonical_markdown(
-            "---\ntitle: New task\nStatus: Todo\nTags:\n  - Backend\nDone: false\nPoints: 5\nDue:\n  start: \"2026-06-10\"\nURL: https://example.com/afs\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\n---\n# Body\n",
+            "---\ntitle: New task\nStatus: Todo\nTags:\n  - Backend\nDone: false\nPoints: 5\nDue:\n  start: \"2026-06-10\"\nURL: https://example.com/afs\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\nFiles:\n  - Spec <https://example.com/spec.pdf>\n---\n# Body\n",
         )
         .expect("parse row");
 
@@ -623,7 +664,7 @@ mod tests {
     #[test]
     fn rejects_unknown_options_and_read_only_properties() {
         let parsed = parse_canonical_markdown(
-            "---\ntitle: New task\nStatus: Blocked\nFormula: edited\n---\n# Body\n",
+            "---\ntitle: New task\nStatus: Blocked\nFormula: edited\nFiles:\n  - not-a-url\n---\n# Body\n",
         )
         .expect("parse row");
 
@@ -636,6 +677,7 @@ mod tests {
                 .map(|issue| issue.code.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "notion_schema_property_shape_invalid",
                 "notion_schema_property_read_only",
                 "notion_schema_option_unknown"
             ]
@@ -735,6 +777,9 @@ data_sources:
       Phone:
         id: "phone-id"
         type: "phone_number"
+      Files:
+        id: "files-id"
+        type: "files"
       Formula:
         id: "formula-id"
         type: "formula"
