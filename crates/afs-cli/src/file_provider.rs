@@ -201,11 +201,35 @@ fn ensure_macos_file_provider_shortcut_at(
             mount.root.display()
         ))
     })?;
-    if shortcut.exists() || shortcut.symlink_metadata().is_ok() {
-        return Ok(Some(shortcut));
+    if let Ok(metadata) = shortcut.symlink_metadata() {
+        if !metadata.file_type().is_symlink() {
+            return Err(FileProviderHelperError::Failed(format!(
+                "could not create macOS File Provider shortcut `{}` because it already exists and is not a symlink",
+                shortcut.display()
+            )));
+        }
+
+        if std::fs::read_link(&shortcut)
+            .map(|target| target == access_root)
+            .unwrap_or(false)
+        {
+            return Ok(Some(shortcut));
+        }
+
+        std::fs::remove_file(&shortcut).map_err(|error| {
+            FileProviderHelperError::Failed(format!(
+                "could not replace stale macOS File Provider shortcut `{}`: {error}",
+                shortcut.display()
+            ))
+        })?;
     }
-    std::os::unix::fs::symlink(&access_root, &shortcut)
-        .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
+    std::os::unix::fs::symlink(&access_root, &shortcut).map_err(|error| {
+        FileProviderHelperError::Failed(format!(
+            "could not create macOS File Provider shortcut `{}` -> `{}`: {error}",
+            shortcut.display(),
+            access_root.display()
+        ))
+    })?;
     Ok(Some(shortcut))
 }
 
@@ -239,10 +263,14 @@ pub fn macos_file_provider_display_name(root: &Path, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn strip_file_provider_directory_prefix(name: &str) -> &str {
-    name.strip_prefix("AgentFS-")
+fn strip_file_provider_directory_prefix(mut name: &str) -> &str {
+    while let Some(stripped) = name
+        .strip_prefix("AgentFS-")
         .filter(|stripped| !stripped.is_empty())
-        .unwrap_or(name)
+    {
+        name = stripped;
+    }
+    name
 }
 
 #[cfg(target_os = "macos")]
@@ -558,6 +586,13 @@ mod tests {
         );
         assert_eq!(
             super::macos_file_provider_display_name(
+                std::path::Path::new("/Users/example/Library/CloudStorage/AgentFS-AgentFS-Notion"),
+                "fallback",
+            ),
+            "Notion"
+        );
+        assert_eq!(
+            super::macos_file_provider_display_name(
                 std::path::Path::new("/Users/example/Documents/AFS/Notion"),
                 "fallback",
             ),
@@ -597,6 +632,54 @@ mod macos_tests {
             fs::read_link(shortcut).expect("shortcut target"),
             access_root
         );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn file_provider_shortcut_repairs_stale_symlink() {
+        let base = unique_temp_path("afs-file-provider-shortcut-repair");
+        let root = base.join("Mount");
+        let stale_access_root = base.join("CloudStorage").join("AgentFS-AgentFS-Notion");
+        let access_root = base.join("CloudStorage").join("AgentFS-Notion");
+        fs::create_dir_all(&root).expect("create root");
+        let shortcut = root.join("Notion Files");
+        std::os::unix::fs::symlink(&stale_access_root, &shortcut).expect("create stale shortcut");
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", root.clone())
+            .projection(ProjectionMode::MacosFileProvider);
+
+        let repaired = super::ensure_macos_file_provider_shortcut_at(&mount, &access_root)
+            .expect("repair shortcut")
+            .expect("shortcut path");
+
+        assert_eq!(repaired, shortcut);
+        assert_eq!(
+            fs::read_link(root.join("Notion Files")).expect("shortcut target"),
+            access_root
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn file_provider_shortcut_rejects_existing_non_symlink() {
+        let base = unique_temp_path("afs-file-provider-shortcut-conflict");
+        let root = base.join("Mount");
+        let access_root = base.join("CloudStorage").join("AgentFS-Notion");
+        let shortcut = root.join("Notion Files");
+        fs::create_dir_all(&shortcut).expect("create conflicting directory");
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", root.clone())
+            .projection(ProjectionMode::MacosFileProvider);
+
+        let error = super::ensure_macos_file_provider_shortcut_at(&mount, &access_root)
+            .expect_err("non-symlink conflict is rejected");
+
+        assert!(
+            error
+                .message()
+                .contains("already exists and is not a symlink")
+        );
+        assert!(shortcut.is_dir());
 
         let _ = fs::remove_dir_all(base);
     }
