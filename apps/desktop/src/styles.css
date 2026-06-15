@@ -784,6 +784,84 @@ p {
   font-size: 12px;
 }
 
+.search-results {
+  display: grid;
+  gap: 6px;
+}
+
+.search-results button,
+.tray-search-results button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 46px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  text-align: left;
+}
+
+.search-results button:hover,
+.tray-search-results button:hover {
+  border-color: rgba(43, 89, 116, 0.28);
+  background: rgba(246, 250, 249, 0.94);
+}
+
+.search-results strong,
+.tray-search-results strong {
+  display: block;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-results code,
+.tray-search-results small {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-state {
+  min-width: 72px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(37, 124, 93, 0.1);
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 900;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.search-state.online_only,
+.search-state.preparing {
+  background: rgba(43, 89, 116, 0.1);
+  color: var(--blue);
+}
+
+.search-state.pending_changes {
+  background: rgba(217, 140, 31, 0.12);
+  color: var(--orange);
+}
+
+.search-state.conflict,
+.search-state.no_access,
+.search-state.not_found {
+  background: rgba(191, 73, 73, 0.12);
+  color: var(--red);
+}
+
 .field-error {
   color: var(--red);
   font-size: 12px;
@@ -1278,7 +1356,9 @@ p {
   width: 360px;
   height: 520px;
   padding: 16px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.96);
@@ -1374,6 +1454,23 @@ p {
 .tray-locate-row button:disabled {
   background: #dce3e7;
   color: #657283;
+}
+
+.tray-search-results {
+  display: grid;
+  gap: 5px;
+}
+
+.tray-search-results button {
+  min-height: 42px;
+  padding: 7px 8px;
+  border-radius: 9px;
+}
+
+.tray-search-results .search-state {
+  min-width: 62px;
+  padding: 3px 6px;
+  font-size: 9px;
 }
 
 .tray-result {

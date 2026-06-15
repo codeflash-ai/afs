@@ -194,6 +194,11 @@ recently opened pages, and aliases from Notion mentions. That index should be
 updated by daemon reconciliation and virtual filesystem mutations, not by reading
 every file in the mounted folder.
 
+Main app and tray search surfaces should show ranked suggestions while the user
+types, including the projected path and state label. A user should be able to
+select a suggestion, copy the path, or reveal it in Finder without waiting for a
+full workspace sync.
+
 ## Large Workspace Navigation
 
 The product should assume a normal workspace can contain 1,000+ accessible
