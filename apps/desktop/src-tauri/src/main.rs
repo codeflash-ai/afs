@@ -36,7 +36,7 @@ use afsd::virtual_fs::virtual_fs_content_root;
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, WebviewUrl, WebviewWindowBuilder,
     image::Image,
     menu::{Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -164,12 +164,24 @@ struct DesktopSettingChange {
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 const DESKTOP_ACTIVITY_LIMIT: usize = 20;
+const TRAY_POPOVER_WIDTH: f64 = 360.0;
+const TRAY_POPOVER_HEIGHT: f64 = 520.0;
+const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
+const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
 
 #[derive(Clone, Copy)]
 enum TrayVisualState {
     Ready,
     Review,
     Reconnect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenBounds {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
 }
 
 #[tauri::command]
@@ -2146,11 +2158,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use afs_store::{ConnectionId, ConnectionRecord};
+    use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, TrayVisualState, connection_metadata_changed,
+        DESKTOP_ACTIVITY_LIMIT, ScreenBounds, TrayVisualState, connection_metadata_changed,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        record_desktop_activity, should_hide_tray_popover, tray_icon_image, validate_mount_root,
+        record_desktop_activity, should_hide_tray_popover, tray_icon_image, tray_popover_position,
+        validate_mount_root,
     };
 
     #[test]
@@ -2220,6 +2234,57 @@ mod tests {
             "main",
             &tauri::WindowEvent::Focused(false)
         ));
+    }
+
+    #[test]
+    fn tray_popover_position_stays_inside_right_screen_edge() {
+        let position = tray_popover_position(
+            PhysicalPosition::new(1424.0, 20.0),
+            PhysicalSize::new(360, 520),
+            Some(ScreenBounds {
+                left: 0.0,
+                top: 0.0,
+                right: 1440.0,
+                bottom: 900.0,
+            }),
+        );
+
+        assert_eq!(position.x, 1072);
+        assert_eq!(position.y, 32);
+    }
+
+    #[test]
+    fn tray_popover_position_stays_inside_negative_left_screen_edge() {
+        let position = tray_popover_position(
+            PhysicalPosition::new(-1432.0, 20.0),
+            PhysicalSize::new(360, 520),
+            Some(ScreenBounds {
+                left: -1440.0,
+                top: 0.0,
+                right: 0.0,
+                bottom: 900.0,
+            }),
+        );
+
+        assert_eq!(position.x, -1432);
+        assert_eq!(position.y, 32);
+    }
+
+    #[test]
+    fn tray_popover_position_moves_above_bottom_edge_when_possible() {
+        let position = tray_popover_position(
+            PhysicalPosition::new(800.0, 880.0),
+            PhysicalSize::new(360, 520),
+            Some(ScreenBounds {
+                left: 0.0,
+                top: 0.0,
+                right: 1440.0,
+                bottom: 900.0,
+            }),
+        );
+
+        assert_eq!(position.x, 620);
+        assert_eq!(position.y, 348);
     }
 
     #[test]
@@ -2547,7 +2612,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
     WebviewWindowBuilder::new(app, "tray", WebviewUrl::App("index.html#tray".into()))
         .title("AFS")
-        .inner_size(360.0, 520.0)
+        .inner_size(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT)
         .resizable(false)
         .decorations(false)
         .always_on_top(true)
@@ -2571,12 +2636,85 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
     }
 
     refresh_tray_icon(app);
-    let x = (position.x - 180.0).max(8.0) as i32;
-    let y = (position.y + 12.0).max(8.0) as i32;
-    let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+    let scale_factor = window.scale_factor().unwrap_or(1.0);
+    let popover_size = window.outer_size().unwrap_or_else(|_| {
+        PhysicalSize::new(
+            (TRAY_POPOVER_WIDTH * scale_factor).round() as u32,
+            (TRAY_POPOVER_HEIGHT * scale_factor).round() as u32,
+        )
+    });
+    let screen_bounds = screen_bounds_for_tray_anchor(app, position);
+    let popover_position = tray_popover_position(position, popover_size, screen_bounds);
+    let _ = window.set_position(Position::Physical(popover_position));
     let _ = window.eval("window.dispatchEvent(new CustomEvent('afs-refresh-snapshot'));");
     let _ = window.show();
     let _ = window.set_focus();
+}
+
+fn screen_bounds_for_tray_anchor(
+    app: &AppHandle,
+    position: PhysicalPosition<f64>,
+) -> Option<ScreenBounds> {
+    if let Ok(Some(monitor)) = app.monitor_from_point(position.x, position.y) {
+        return Some(monitor_work_area_bounds(&monitor));
+    }
+
+    app.primary_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor_work_area_bounds(&monitor))
+}
+
+fn monitor_work_area_bounds(monitor: &tauri::Monitor) -> ScreenBounds {
+    let work_area = monitor.work_area();
+    ScreenBounds {
+        left: f64::from(work_area.position.x),
+        top: f64::from(work_area.position.y),
+        right: f64::from(work_area.position.x) + f64::from(work_area.size.width),
+        bottom: f64::from(work_area.position.y) + f64::from(work_area.size.height),
+    }
+}
+
+fn tray_popover_position(
+    anchor: PhysicalPosition<f64>,
+    popover_size: PhysicalSize<u32>,
+    screen_bounds: Option<ScreenBounds>,
+) -> PhysicalPosition<i32> {
+    let width = f64::from(popover_size.width).max(TRAY_POPOVER_WIDTH);
+    let height = f64::from(popover_size.height).max(TRAY_POPOVER_HEIGHT);
+    let preferred_x = anchor.x - (width / 2.0);
+    let preferred_y = anchor.y + TRAY_POPOVER_ANCHOR_OFFSET;
+
+    let (x, y) = match screen_bounds {
+        Some(bounds) => {
+            let min_x = bounds.left + TRAY_POPOVER_EDGE_MARGIN;
+            let max_x = bounds.right - width - TRAY_POPOVER_EDGE_MARGIN;
+            let min_y = bounds.top + TRAY_POPOVER_EDGE_MARGIN;
+            let max_y = bounds.bottom - height - TRAY_POPOVER_EDGE_MARGIN;
+            let above_y = anchor.y - height - TRAY_POPOVER_ANCHOR_OFFSET;
+            let y = if preferred_y > max_y && above_y >= min_y {
+                above_y
+            } else {
+                clamp_axis(preferred_y, min_y, max_y)
+            };
+
+            (clamp_axis(preferred_x, min_x, max_x), y)
+        }
+        None => (
+            preferred_x.max(TRAY_POPOVER_EDGE_MARGIN),
+            preferred_y.max(TRAY_POPOVER_EDGE_MARGIN),
+        ),
+    };
+
+    PhysicalPosition::new(x.round() as i32, y.round() as i32)
+}
+
+fn clamp_axis(value: f64, min: f64, max: f64) -> f64 {
+    if max < min {
+        min
+    } else {
+        value.clamp(min, max)
+    }
 }
 
 fn show_main_window_with_view(app: &AppHandle, view: Option<&str>) {
