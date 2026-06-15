@@ -291,7 +291,20 @@ fn review_push_plan() -> PushPlan {
 }
 
 #[tauri::command]
-fn push_to_notion(app: AppHandle) -> ActionReport {
+async fn push_to_notion(app: AppHandle) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(push_to_notion_blocking).await {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Push worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+fn push_to_notion_blocking() -> ActionReport {
     let Ok(snapshot) = load_desktop_snapshot() else {
         return ActionReport {
             ok: false,
@@ -316,9 +329,6 @@ fn push_to_notion(app: AppHandle) -> ActionReport {
                 ok: push_report_exit_code(&report) == 0,
                 message: push_report_message(&report),
             };
-            if action_report.ok {
-                refresh_tray_icon(&app);
-            }
             action_report
         }
         Err(message) => ActionReport { ok: false, message },
