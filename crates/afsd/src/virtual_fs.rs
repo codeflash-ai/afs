@@ -288,7 +288,7 @@ pub fn materialize_virtual_fs_item<S, Source>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
     Source: HydrationSource + ?Sized,
 {
     let mount = require_virtual_mount(store, mount_id)?;

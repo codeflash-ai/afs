@@ -9,7 +9,8 @@ use afs_core::model::MountId;
 #[cfg(target_os = "macos")]
 use afs_store::ProjectionMode;
 use afs_store::{
-    EntityRepository, MountConfig, MountRepository, ShadowRepository, VirtualMutationRepository,
+    EntityRepository, FreshnessStateRepository, MountConfig, MountRepository, ShadowRepository,
+    VirtualMutationRepository,
 };
 use std::path::{Path, PathBuf};
 
@@ -53,7 +54,11 @@ pub fn materialize_file_provider_item<S, Source>(
     identifier: &str,
 ) -> AfsResult<FileProviderMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
     Source: HydrationSource + ?Sized,
 {
     virtual_fs::materialize_virtual_fs_item(store, source, mount_id, identifier)

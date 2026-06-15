@@ -328,6 +328,14 @@ fn scheduled_pull_preserves_hydrated_files_and_queues_changed_remote_refresh() {
 
     assert_eq!(report.stubbed, 0);
     assert_eq!(report.queued_hydrations, 1);
+    assert_eq!(
+        supervisor
+            .hydration()
+            .peek_ready()
+            .expect("remote refresh hydration")
+            .reason,
+        HydrationReason::RemoteFastForward
+    );
     let contents = std::fs::read_to_string(root.join("Roadmap.md")).expect("hydrated file");
     assert!(contents.contains("Local hydrated body."));
     assert!(!contents.contains(CanonicalDocument::STUB_MARKER));

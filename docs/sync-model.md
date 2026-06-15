@@ -378,6 +378,20 @@ Current implementation:
 Automatically update clean inactive files when remote changes. Delay updates for
 recently active files. Never overwrite pending local edits.
 
+Current implementation:
+
+- Remote observation jobs and scheduled pull enumeration can enqueue
+  `remote_fast_forward` hydration for changed hydrated pages.
+- Before queueing that hydration, the daemon verifies the local file/cache still
+  matches the stored shadow and that the freshness state has an unresolved
+  remote hint.
+- Recently opened or locally touched files get a short working-copy lease; AFS
+  re-observes after the lease instead of replacing the file immediately.
+- If a local file becomes pending before the auto hydration runs, the hydration
+  executor skips without fetching remote content or inserting conflict markers.
+- Successful hydration clears the entity's pending remote hint so status returns
+  to `all_synced` once the local shadow and remote version agree.
+
 ### Stage 8: Remote Change Explanation
 
 When metadata says remote changed, lazily compare:

@@ -60,6 +60,7 @@ pub struct DaemonRuntimeHandle {
 
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const FRESHNESS_JOB_BUDGET_UNITS: u16 = 5;
+const AUTO_FAST_FORWARD_ACTIVE_LEASE_MS: u64 = 30_000;
 
 impl DaemonRuntimeHandle {
     pub fn request(&self, request: DaemonRequest) -> DaemonResponse {
@@ -352,6 +353,8 @@ pub struct ScheduledPullRuntimeReport {
 pub struct FreshnessRuntimeReport {
     pub job: SyncJob,
     pub remote_hint_pending: bool,
+    pub queued_hydrations: Vec<HydrationRequest>,
+    pub follow_up_jobs: Vec<SyncJob>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1182,11 +1185,17 @@ impl RuntimeState {
                 }
                 Err(error) => eprintln!("afsd file event failed: {error}"),
             },
-            JobCompletion::Freshness(result) => {
-                if let Err(error) = result {
-                    eprintln!("afsd freshness job failed: {error}");
+            JobCompletion::Freshness(result) => match result {
+                Ok(result) => {
+                    for request in result.queued_hydrations {
+                        self.queue_hydration(request);
+                    }
+                    for job in result.follow_up_jobs {
+                        self.queue_freshness(job);
+                    }
                 }
-            }
+                Err(error) => eprintln!("afsd freshness job failed: {error}"),
+            },
         }
 
         self.maybe_start_next_job();
@@ -1226,7 +1235,10 @@ impl RuntimeState {
             Some(MutatingJob::Request(request))
         } else if let Some(request) = self.hydration.pop_ready() {
             Some(MutatingJob::Hydration { request })
-        } else if let Some(job) = self.freshness.pop_ready(FRESHNESS_JOB_BUDGET_UNITS) {
+        } else if let Some(job) = self
+            .freshness
+            .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
+        {
             Some(MutatingJob::Freshness { job })
         } else {
             self.pending_scheduled_tick
@@ -1270,6 +1282,24 @@ impl RuntimeState {
     }
 
     fn queue_hydration(&mut self, request: HydrationRequest) {
+        if request.reason == HydrationReason::RemoteFastForward {
+            match self.auto_fast_forward_queue_decision(&request) {
+                Ok(AutoFastForwardQueueDecision::Queue) => {}
+                Ok(AutoFastForwardQueueDecision::Skip) => return,
+                Ok(AutoFastForwardQueueDecision::Delay(job)) => {
+                    self.queue_freshness(job);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "afsd skipped remote fast-forward for `{}`: {error}",
+                        request.path.display()
+                    );
+                    return;
+                }
+            }
+        }
+
         self.hydration.queue_request(request.clone());
 
         match SqliteStateStore::open(self.config.state_root.clone())
@@ -1282,6 +1312,15 @@ impl RuntimeState {
 
     fn queue_freshness(&mut self, job: SyncJob) {
         self.freshness.upsert(job);
+    }
+
+    fn auto_fast_forward_queue_decision(
+        &self,
+        request: &HydrationRequest,
+    ) -> afs_core::AfsResult<AutoFastForwardQueueDecision> {
+        let store =
+            SqliteStateStore::open(self.config.state_root.clone()).map_err(AfsError::from)?;
+        auto_fast_forward_queue_decision(&store, &self.config.state_root, request)
     }
 
     fn queue_child_refresh(&mut self, mount_id: String, container_identifier: String) {
@@ -1406,6 +1445,97 @@ where
         .projection
         .uses_virtual_filesystem()
         .then(|| virtual_fs_content_root(state_root, &mount.mount_id)))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AutoFastForwardQueueDecision {
+    Queue,
+    Skip,
+    Delay(SyncJob),
+}
+
+fn auto_fast_forward_queue_decision<S>(
+    store: &S,
+    state_root: &Path,
+    request: &HydrationRequest,
+) -> afs_core::AfsResult<AutoFastForwardQueueDecision>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+{
+    let Some(entity) = store
+        .get_entity(&request.mount_id, &request.remote_id)
+        .map_err(AfsError::from)?
+    else {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    };
+    if entity.kind != EntityKind::Page || entity.hydration != HydrationState::Hydrated {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    }
+
+    let Some(freshness) = store
+        .get_freshness_state(&request.mount_id, &request.remote_id)
+        .map_err(AfsError::from)?
+    else {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    };
+    if !freshness.remote_hint_pending {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    }
+
+    let Some(mount) = store.get_mount(&request.mount_id).map_err(AfsError::from)? else {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    };
+    let path = projection_content_path(state_root, &mount, &entity);
+    if !hydrated_file_matches_shadow(store, &mount, &entity, &path)? {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    }
+
+    let now = freshness_timestamp();
+    if let Some(next_eligible_at) = active_lease_until(&freshness, &now) {
+        return Ok(AutoFastForwardQueueDecision::Delay(
+            SyncJob::new(
+                request.mount_id.clone(),
+                Some(request.remote_id.clone()),
+                SyncJobKind::ObserveEntity,
+                ChangeHintKind::RemoteMaybeChanged,
+            )
+            .next_eligible_at(next_eligible_at),
+        ));
+    }
+
+    Ok(AutoFastForwardQueueDecision::Queue)
+}
+
+fn projection_content_path(
+    state_root: &Path,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+) -> PathBuf {
+    if mount.projection.uses_virtual_filesystem() {
+        virtual_fs_content_root(state_root, &mount.mount_id).join(&entity.path)
+    } else {
+        mount.root.join(&entity.path)
+    }
+}
+
+fn active_lease_until(freshness: &FreshnessStateRecord, now: &str) -> Option<String> {
+    let now_ms = parse_unix_ms(now)?;
+    let active_until = [
+        freshness.last_opened_at.as_deref(),
+        freshness.last_local_change_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(parse_unix_ms)
+    .map(|timestamp| timestamp.saturating_add(AUTO_FAST_FORWARD_ACTIVE_LEASE_MS))
+    .filter(|active_until| *active_until > now_ms)
+    .max()?;
+
+    Some(format!("unix_ms:{active_until}"))
+}
+
+fn parse_unix_ms(value: &str) -> Option<u64> {
+    value.strip_prefix("unix_ms:")?.parse().ok()
 }
 
 fn run_job(
@@ -1991,10 +2121,43 @@ where
         .save_freshness_state(freshness)
         .map_err(AfsError::from)?;
 
+    let queued_hydrations = auto_fast_forward_requests_from_observation(
+        existing.as_ref(),
+        &observation,
+        remote_hint_pending,
+    );
+
     Ok(FreshnessRuntimeReport {
         job,
         remote_hint_pending,
+        queued_hydrations,
+        follow_up_jobs: Vec::new(),
     })
+}
+
+fn auto_fast_forward_requests_from_observation(
+    existing: Option<&EntityRecord>,
+    observation: &RemoteObservation,
+    remote_hint_pending: bool,
+) -> Vec<HydrationRequest> {
+    let Some(entity) = existing else {
+        return Vec::new();
+    };
+    if !remote_hint_pending
+        || observation.deleted
+        || observation.kind != EntityKind::Page
+        || entity.hydration != HydrationState::Hydrated
+    {
+        return Vec::new();
+    }
+
+    vec![HydrationRequest::new(
+        observation.mount_id.clone(),
+        observation.remote_id.clone(),
+        entity.path.clone(),
+        HydrationState::Hydrated,
+        HydrationReason::RemoteFastForward,
+    )]
 }
 
 fn remote_observation_record(

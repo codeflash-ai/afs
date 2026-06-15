@@ -102,7 +102,7 @@ impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
             .existing
             .is_some_and(|existing| should_refresh_hydrated_entity(existing, request.entry))
         {
-            return policy_hydration();
+            return remote_fast_forward_hydration();
         }
 
         EntityFetchPlan::default()
@@ -418,6 +418,12 @@ fn rename_projection_if_needed(
 fn policy_hydration() -> EntityFetchPlan {
     EntityFetchPlan {
         queue_hydration: Some(HydrationReason::Policy),
+    }
+}
+
+fn remote_fast_forward_hydration() -> EntityFetchPlan {
+    EntityFetchPlan {
+        queue_hydration: Some(HydrationReason::RemoteFastForward),
     }
 }
 
