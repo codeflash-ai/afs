@@ -92,6 +92,29 @@ fn deleting_a_normal_paragraph_produces_archive() {
 }
 
 #[test]
+fn deleting_blocks_before_directive_does_not_move_surviving_directive() {
+    let shadow = shadow(
+        "Intro paragraph.\n\nRemove me.\n\n::afs{id=media-1 type=image title=\"Diagram\"}",
+        ["paragraph-1", "paragraph-2"],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "Intro paragraph.\n\n::afs{id=media-1 type=image title=\"Diagram\"}",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::ArchiveBlock {
+            block_id: RemoteId::new("paragraph-2"),
+        }]
+    );
+}
+
+#[test]
 fn moving_an_unchanged_directive_produces_move_not_validation_error() {
     let shadow = shadow(
         "Intro paragraph.\n\n::afs{id=media-1 type=image title=\"Diagram\"}",

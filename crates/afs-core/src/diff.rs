@@ -85,17 +85,30 @@ pub fn plan_block_diff(
     }
 
     let (matches, degradations) = align_blocks(shadow, &edited_blocks);
+    let matched_shadow_indexes = matches
+        .iter()
+        .filter_map(|index| *index)
+        .collect::<BTreeSet<_>>();
     let mut operations = property_diff_operations(shadow, edited)?;
     let mut matched_shadow = BTreeSet::new();
     let mut previous_existing_id: Option<RemoteId> = None;
+    let mut appended_since_previous_existing = false;
 
     for (edited_index, edited_block) in edited_blocks.iter().enumerate() {
         match matches[edited_index] {
             Some(shadow_index) => {
                 matched_shadow.insert(shadow_index);
                 let shadow_block = &shadow.blocks[shadow_index];
+                let current_after =
+                    previous_surviving_shadow_id(shadow, &matched_shadow_indexes, shadow_index);
 
-                if should_move_block(shadow_index, edited_index, shadow_block, edited_block) {
+                if should_move_block(
+                    current_after.as_ref(),
+                    previous_existing_id.as_ref(),
+                    shadow_block,
+                    edited_block,
+                    appended_since_previous_existing,
+                ) {
                     operations.push(PushOperation::MoveBlock {
                         block_id: shadow_block.remote_id.clone(),
                         after: previous_existing_id.clone(),
@@ -110,6 +123,7 @@ pub fn plan_block_diff(
                 }
 
                 previous_existing_id = Some(shadow_block.remote_id.clone());
+                appended_since_previous_existing = false;
             }
             None => {
                 operations.push(PushOperation::AppendBlock {
@@ -117,6 +131,7 @@ pub fn plan_block_diff(
                     after: previous_existing_id.clone(),
                     content: edited_block.text.clone(),
                 });
+                appended_since_previous_existing = true;
             }
         }
     }
@@ -448,13 +463,25 @@ fn same_alignment_kind(left: &MarkdownBlockKind, right: &MarkdownBlockKind) -> b
     }
 }
 
-fn should_move_block(
+fn previous_surviving_shadow_id(
+    shadow: &ShadowDocument,
+    matched_shadow_indexes: &BTreeSet<usize>,
     shadow_index: usize,
-    edited_index: usize,
+) -> Option<RemoteId> {
+    (0..shadow_index)
+        .rev()
+        .find(|index| matched_shadow_indexes.contains(index))
+        .map(|index| shadow.blocks[index].remote_id.clone())
+}
+
+fn should_move_block(
+    current_after: Option<&RemoteId>,
+    desired_after: Option<&RemoteId>,
     shadow_block: &ShadowBlock,
     edited_block: &SegmentedBlock,
+    appended_since_previous_existing: bool,
 ) -> bool {
-    shadow_index != edited_index
+    (appended_since_previous_existing || current_after != desired_after)
         && shadow_block.kind.is_directive()
         && edited_block.is_directive()
         && shadow_block.content_hash == edited_block.content_hash
