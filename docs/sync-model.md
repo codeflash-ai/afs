@@ -1,0 +1,397 @@
+# Sync Freshness Model
+
+This document defines the connector-neutral model AFS uses to minimize remote
+drift without repeatedly crawling large workspaces. Notion is the first
+implementation target, but the concepts must work for future sources such as
+Linear, Google Drive, GitHub, Slack, and custom internal systems.
+
+## Goals
+
+- Keep active files and folders fresh automatically.
+- Avoid frequent full-workspace scans.
+- Never overwrite local pending edits.
+- Fast-forward clean local files when the remote changes and replacement is not
+  surprising.
+- Give humans and agents clear safety states.
+- Keep push preflight as the authoritative safety check before remote writes.
+
+## Core Concepts
+
+### Entity
+
+An `Entity` is any remote object AFS knows about. Examples include a Notion page,
+database, database row, directory-like container, asset, schema, or future
+connector object.
+
+### RemoteId
+
+A `RemoteId` is a connector-owned stable identifier for an entity.
+
+### RemoteVersion
+
+A `RemoteVersion` is an opaque connector-owned version token. AFS core compares
+versions for equality, but does not assume their format or ordering.
+
+Examples:
+
+- Notion: `last_edited_time`
+- HTTP-backed stores: `ETag`
+- GitHub-like APIs: revision SHA
+- Custom APIs: sequence number or content version
+
+### RemoteObservation
+
+A `RemoteObservation` is a cheap metadata snapshot. It should be much cheaper
+than full hydration and should not fetch full document bodies.
+
+Typical fields:
+
+- remote id
+- kind
+- title or display name
+- parent remote id
+- projected path hint
+- remote version
+- deleted or moved markers
+- raw connector metadata when needed for debugging or later reconciliation
+
+### Shadow
+
+A `Shadow` is the last accepted full rendered version of an entity. For a
+Markdown-backed page, this is the canonical Markdown render that local files are
+compared against.
+
+### Clean File
+
+A clean file is a local file whose content still matches its stored shadow:
+
+```text
+local file == stored shadow
+```
+
+A file can be clean even if the remote has changed since that shadow was stored.
+That means the local copy has no local edits and can usually be fast-forwarded.
+
+### Pending Local File
+
+A pending local file has been changed by a human, agent, or local tool:
+
+```text
+local file != stored shadow
+```
+
+AFS must not overwrite pending local files with remote content.
+
+### ChangeHint
+
+A `ChangeHint` is an advisory signal that something may have changed. Hints can
+come from polling, webhooks, file open/read, directory listing, local edit, push,
+URL locate, or explicit refresh.
+
+Hints are not authoritative. They schedule observation or hydration work.
+
+### FreshnessTier
+
+`FreshnessTier` controls how aggressively AFS spends sync budget on an entity or
+container:
+
+```text
+immediate
+hot
+warm
+cold
+dormant
+```
+
+Freshness follows user and agent intent. Active paths are checked more often;
+unused paths decay.
+
+### SyncJob
+
+A `SyncJob` is bounded daemon work:
+
+- observe one entity
+- enumerate immediate children of one container
+- hydrate one entity
+- fetch one asset
+- run push preflight
+- explain a remote change
+
+Jobs carry priority, freshness tier, reason, estimated cost, next eligible time,
+connector rate-limit bucket, and a dedupe key.
+
+## Invariant
+
+```text
+Remote hints are advisory.
+Push preflight is authoritative.
+```
+
+Background freshness can be delayed or incomplete. A push must still re-check
+the current remote version immediately before applying remote mutations.
+
+## State Model
+
+Each entity conceptually tracks:
+
+- base remote version: the version represented by the stored shadow
+- observed remote version: the newest cheap remote version AFS has seen
+- local file hash or local state
+- stored shadow
+- freshness tier
+- last checked/opened/modified times
+- remote hint pending flag
+
+Main states:
+
+```text
+Clean
+  local == shadow
+  observed remote == base remote
+
+Remote changed
+  local == shadow
+  observed remote != base remote
+
+Local pending
+  local != shadow
+  observed remote == base remote
+
+Diverged
+  local != shadow
+  observed remote != base remote
+```
+
+## Freshness Scheduling
+
+AFS must not frequently scan an entire workspace. The daemon should use a
+bounded priority queue instead.
+
+Priority order:
+
+```text
+1. Push preflight and review path
+2. Pending local files
+3. User-opened files
+4. Recently listed folders
+5. Pasted or located URLs
+6. Top-level workspace navigation
+7. Recently active hydrated files
+8. Cold background sampling
+```
+
+Freshness tiers:
+
+```text
+Immediate
+  Triggered by open, list, locate URL, push, or local edit.
+  Fetch needed metadata/content now.
+
+Hot
+  Pending files, recently opened files, recently opened folders.
+  Check frequently while active.
+
+Warm
+  Recently visited folders and hydrated files.
+  Check occasionally.
+
+Cold
+  Discovered but unused areas.
+  Check rarely.
+
+Dormant
+  Never visited or deep workspace areas.
+  Check only on navigation, locate, search, webhook hint, or explicit refresh.
+```
+
+Operation costs:
+
+```text
+Version check
+  Cheap. Is remote newer or different?
+
+Directory enumeration
+  Medium. What immediate children exist here?
+
+Hydration
+  Expensive. Fetch/render full content and media.
+```
+
+AFS should do many cheap checks for hot entities, some enumeration for visible
+navigation, and little background hydration.
+
+## Auto-Fast-Forward Policy
+
+When remote changed and local has no pending edits, AFS may update the local
+working copy.
+
+```text
+Remote changed, local clean, file inactive:
+  Auto-fast-forward local file.
+
+Remote changed, local clean, file recently active:
+  Stage remote update, delay replacement briefly, show a quiet state.
+
+Remote changed, local pending:
+  Never overwrite. Mark review needed.
+
+Remote changed, local pending, user pushes:
+  Preflight detects divergence, hydrates remote, and requires merge/review.
+
+Remote moved/deleted, local clean:
+  Apply move/delete or tombstone.
+
+Remote moved/deleted, local pending:
+  Mark review needed.
+```
+
+Use a lightweight working-copy lease:
+
+```text
+when file is opened/read/revealed:
+  active_until = now + short duration
+```
+
+While active, AFS can observe and hydrate remote content in the background, but
+should delay replacing the local file unless the user explicitly accepts it.
+
+## Staged Implementation Plan
+
+### Stage 1: Generic Sync Model Docs
+
+Define the connector-neutral model in this document.
+
+### Stage 2: Remote Observation And Freshness Storage
+
+Persist latest observed remote metadata separately from last accepted synced
+state.
+
+```text
+remote_observations
+  mount_id
+  remote_id
+  kind
+  title
+  parent_remote_id
+  projected_path
+  remote_version_observed
+  observed_at
+  deleted
+  raw_connector_metadata_json
+
+freshness_states
+  mount_id
+  remote_id
+  tier
+  last_checked_at
+  next_check_at
+  last_opened_at
+  last_local_change_at
+  remote_hint_pending
+```
+
+This separates:
+
+```text
+last synced base
+latest observed remote
+current local projection
+```
+
+### Stage 3: Generic Connector Observation API
+
+Add connector methods cheaper than hydration:
+
+```text
+observe_entity(...)
+enumerate_children(...)
+hydrate_entity(...)
+```
+
+Core daemon code must treat `RemoteVersion` as opaque.
+
+### Stage 4: Bounded Scheduler / Work Queue
+
+Replace broad scheduled polling with explicit jobs:
+
+```text
+observe_entity
+enumerate_children
+hydrate_entity
+fetch_asset
+push_preflight
+explain_remote_change
+```
+
+The daemon spends a bounded budget per tick and never recursively scans the full
+workspace unless explicitly requested.
+
+### Stage 5: Pending Files Become Hot
+
+When local content changes, mark the file pending, promote it to hot, schedule a
+remote metadata check soon, and keep push preflight strict.
+
+### Stage 6: Observability, Safety States, And Optional Barriers
+
+The daemon remains primary. Users and agents should not need manual freshness
+commands in the normal path.
+
+Expose clear states:
+
+```text
+all synced
+pending local changes
+remote update available
+review needed
+conflicted
+checking freshness
+push succeeded
+```
+
+CLI commands such as `afs status --json`, `afs inspect <path> --json`, or
+`afs prepare <path>` are optional barriers for tests, scripts, and power users.
+
+### Stage 7: Safe Auto-Fast-Forward
+
+Automatically update clean inactive files when remote changes. Delay updates for
+recently active files. Never overwrite pending local edits.
+
+### Stage 8: Remote Change Explanation
+
+When metadata says remote changed, lazily compare:
+
+```text
+old shadow
+new remote render
+local file
+```
+
+Produce machine-readable states such as remote-changed-only, local-changed-only,
+both-changed, safe-to-fast-forward, and needs-review.
+
+### Stage 9: Webhook / Relay Hints
+
+Wire broker or relay events into the same `ChangeHint` path. The relay should
+only say that a remote object may have changed; the daemon still decides when to
+observe, hydrate, or ignore it based on budget and tier.
+
+### Stage 10: Generalize And Optimize
+
+Add connector capability flags, fake connector tests, cold subtree decay,
+activity scoring, media pruning, deep refresh, batching, and metrics.
+
+## Recommended Build Order
+
+```text
+1. docs/sync-model.md
+2. remote observation + freshness store schema
+3. fake connector tests for state transitions
+4. Notion observation API
+5. bounded scheduler
+6. pending-file hot tracking and push preflight integration
+7. UI/tray/CLI safety states
+8. safe auto-fast-forward
+9. remote change explanation/diff
+10. webhook/relay hints
+11. optimization and connector capability model
+```

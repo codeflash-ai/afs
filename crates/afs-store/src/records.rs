@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use afs_core::freshness::{FreshnessTier, RemoteObservation, RemoteVersion};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, SourceSpan, TreeEntry};
 use afs_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
@@ -170,6 +171,132 @@ pub struct VirtualMutationRecord {
     pub content_path: Option<PathBuf>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteObservationRecord {
+    pub mount_id: MountId,
+    pub remote_id: RemoteId,
+    pub kind: EntityKind,
+    pub title: String,
+    pub parent_remote_id: Option<RemoteId>,
+    pub projected_path: PathBuf,
+    pub remote_version: Option<RemoteVersion>,
+    pub observed_at: String,
+    pub deleted: bool,
+    pub raw_metadata_json: String,
+}
+
+impl RemoteObservationRecord {
+    pub fn new(
+        mount_id: MountId,
+        remote_id: RemoteId,
+        kind: EntityKind,
+        title: impl Into<String>,
+        projected_path: impl Into<PathBuf>,
+        observed_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            mount_id,
+            remote_id,
+            kind,
+            title: title.into(),
+            parent_remote_id: None,
+            projected_path: projected_path.into(),
+            remote_version: None,
+            observed_at: observed_at.into(),
+            deleted: false,
+            raw_metadata_json: "{}".to_string(),
+        }
+    }
+
+    pub fn with_parent(mut self, parent_remote_id: RemoteId) -> Self {
+        self.parent_remote_id = Some(parent_remote_id);
+        self
+    }
+
+    pub fn with_remote_version(mut self, remote_version: RemoteVersion) -> Self {
+        self.remote_version = Some(remote_version);
+        self
+    }
+
+    pub fn deleted(mut self, deleted: bool) -> Self {
+        self.deleted = deleted;
+        self
+    }
+
+    pub fn with_raw_metadata_json(mut self, raw_metadata_json: impl Into<String>) -> Self {
+        self.raw_metadata_json = raw_metadata_json.into();
+        self
+    }
+}
+
+impl From<RemoteObservationRecord> for RemoteObservation {
+    fn from(value: RemoteObservationRecord) -> Self {
+        Self {
+            mount_id: value.mount_id,
+            remote_id: value.remote_id,
+            kind: value.kind,
+            title: value.title,
+            parent_remote_id: value.parent_remote_id,
+            projected_path: value.projected_path,
+            remote_version: value.remote_version,
+            deleted: value.deleted,
+            raw_metadata_json: value.raw_metadata_json,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessStateRecord {
+    pub mount_id: MountId,
+    pub remote_id: RemoteId,
+    pub tier: FreshnessTier,
+    pub last_checked_at: Option<String>,
+    pub next_check_at: Option<String>,
+    pub last_opened_at: Option<String>,
+    pub last_local_change_at: Option<String>,
+    pub remote_hint_pending: bool,
+}
+
+impl FreshnessStateRecord {
+    pub fn new(mount_id: MountId, remote_id: RemoteId, tier: FreshnessTier) -> Self {
+        Self {
+            mount_id,
+            remote_id,
+            tier,
+            last_checked_at: None,
+            next_check_at: None,
+            last_opened_at: None,
+            last_local_change_at: None,
+            remote_hint_pending: false,
+        }
+    }
+
+    pub fn checked_at(mut self, last_checked_at: impl Into<String>) -> Self {
+        self.last_checked_at = Some(last_checked_at.into());
+        self
+    }
+
+    pub fn next_check_at(mut self, next_check_at: impl Into<String>) -> Self {
+        self.next_check_at = Some(next_check_at.into());
+        self
+    }
+
+    pub fn opened_at(mut self, last_opened_at: impl Into<String>) -> Self {
+        self.last_opened_at = Some(last_opened_at.into());
+        self
+    }
+
+    pub fn local_change_at(mut self, last_local_change_at: impl Into<String>) -> Self {
+        self.last_local_change_at = Some(last_local_change_at.into());
+        self
+    }
+
+    pub fn remote_hint_pending(mut self, remote_hint_pending: bool) -> Self {
+        self.remote_hint_pending = remote_hint_pending;
+        self
+    }
 }
 
 impl EntityRecord {

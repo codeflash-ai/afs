@@ -20,11 +20,12 @@ pub use error::{StoreError, StoreResult};
 pub use memory::InMemoryStateStore;
 pub use records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    HydrationJobRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
-    VirtualMutationKind, VirtualMutationRecord,
+    FreshnessStateRecord, HydrationJobRecord, MountConfig, ProjectionMode, RemoteObservationRecord,
+    ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
 };
 pub use repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
-    JournalRepository, MountRepository, ShadowRepository, VirtualMutationRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, FreshnessStateRepository,
+    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
+    ShadowRepository, VirtualMutationRepository,
 };
 pub use sqlite::SqliteStateStore;

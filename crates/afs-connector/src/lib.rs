@@ -6,6 +6,7 @@
 //! and apply calls.
 
 use afs_core::AfsResult;
+use afs_core::freshness::RemoteObservation;
 use afs_core::journal::PushId;
 use afs_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
 use afs_core::planner::{PushOperationKind, PushPlan};
@@ -26,6 +27,13 @@ pub struct ConnectorCapabilities {
 pub struct EnumerateRequest {
     pub mount_id: MountId,
     pub cursor: Option<String>,
+}
+
+/// Cheap metadata request for one known source object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObserveRequest {
+    pub mount_id: MountId,
+    pub remote_id: RemoteId,
 }
 
 /// A source-side container whose immediate children can be listed lazily.
@@ -117,6 +125,17 @@ pub trait Connector {
         PushOperationKind::all().into_iter().collect()
     }
     fn enumerate(&self, request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>>;
+    /// Observe one entity without hydrating its body.
+    ///
+    /// Implementations should return identity, display metadata, parent/path
+    /// hints, deletion state, and an opaque remote version when available.
+    /// Hosts use this for freshness scheduling; push preflight still performs
+    /// authoritative connector-specific concurrency checks.
+    fn observe(&self, _request: ObserveRequest) -> AfsResult<RemoteObservation> {
+        Err(afs_core::AfsError::Unsupported(
+            "connector does not support remote observation",
+        ))
+    }
     /// List immediate child metadata for a single filesystem container.
     ///
     /// This must not fetch full document bodies. Returning metadata only lets

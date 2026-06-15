@@ -7,8 +7,8 @@ use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::JournalStore;
 use afs_core::model::{EntityKind, HydrationState};
 use afs_store::{
-    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository, VirtualMutationRepository,
+    EntityRecord, EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig,
+    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 use crate::execution::{
@@ -182,6 +182,8 @@ impl<S, W> DaemonExecutor for DaemonSupervisor<S, W, HydrationQueue>
 where
     S: MountRepository
         + EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
         + ShadowRepository
         + JournalRepository
         + JournalStore
