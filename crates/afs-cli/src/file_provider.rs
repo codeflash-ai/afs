@@ -204,7 +204,7 @@ fn ensure_macos_file_provider_shortcut_at(
     if shortcut.exists() || shortcut.symlink_metadata().is_ok() {
         return Ok(Some(shortcut));
     }
-    std::os::unix::fs::symlink(&access_root, &shortcut)
+    std::os::unix::fs::symlink(access_root, &shortcut)
         .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
     Ok(Some(shortcut))
 }

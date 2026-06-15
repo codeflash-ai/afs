@@ -705,7 +705,13 @@ function MainShell({
               onRefresh={onRefresh}
             />
           )}
-          {view === "mount" && <MountDetailView snapshot={snapshot} onReview={() => onViewChange("pending")} />}
+          {view === "mount" && (
+            <MountDetailView
+              snapshot={snapshot}
+              onRefresh={onRefresh}
+              onReview={() => onViewChange("pending")}
+            />
+          )}
           {view === "pending" && <PendingView snapshot={snapshot} onReview={() => onViewChange("review")} />}
           {view === "review" && (
             <ReviewView
@@ -907,9 +913,19 @@ function HomeView({
   );
 }
 
-function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview: () => void }) {
+function MountDetailView({
+  snapshot,
+  onRefresh,
+  onReview,
+}: {
+  snapshot: DesktopSnapshot;
+  onRefresh: () => Promise<void>;
+  onReview: () => void;
+}) {
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
   const [actionError, setActionError] = useState("");
+  const [accessMessage, setAccessMessage] = useState("");
+  const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
 
   async function openFolder() {
     setActionError("");
@@ -921,6 +937,28 @@ function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; on
     if (!report.ok) {
       setActionError(report.message);
     }
+  }
+
+  async function changeNotionAccess() {
+    if (accessState === "changing") {
+      return;
+    }
+
+    setAccessMessage("");
+    setAccessState("changing");
+    const report = await callCommand<ActionReport>(
+      "change_notion_access",
+      undefined,
+      { ok: true, message: "Changed demo Notion access." },
+    );
+    if (!report.ok) {
+      setAccessMessage(report.message);
+      setAccessState("error");
+      return;
+    }
+    setAccessMessage(report.message);
+    setAccessState("success");
+    await onRefresh().catch(() => undefined);
   }
 
   return (
@@ -948,9 +986,22 @@ function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; on
           <SecondaryButton compact icon={<Copy />} onClick={() => copyText(snapshot.mount.localPath)}>
             Copy Path
           </SecondaryButton>
+          <SecondaryButton
+            compact
+            disabled={connectionMissing(snapshot) || accessState === "changing"}
+            icon={accessState === "changing" ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
+            onClick={() => void changeNotionAccess()}
+          >
+            {accessState === "changing" ? "Waiting for Notion" : "Change Notion Access"}
+          </SecondaryButton>
         </div>
       </section>
       {actionError && <p className="field-error">{actionError}</p>}
+      {accessMessage && (
+        <p className={accessState === "error" ? "field-error" : "quiet-note inline-note"}>
+          {accessMessage}
+        </p>
+      )}
 
       <section className="detail-grid">
         <div className="panel">

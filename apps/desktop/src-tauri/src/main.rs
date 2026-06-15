@@ -107,7 +107,7 @@ struct PendingChange {
     state: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivityItem {
     title: String,
@@ -163,6 +163,7 @@ struct DesktopSettingChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+const DESKTOP_ACTIVITY_LIMIT: usize = 20;
 
 #[derive(Clone, Copy)]
 enum TrayVisualState {
@@ -180,6 +181,47 @@ fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
 
 #[tauri::command]
 async fn connect_notion(app: AppHandle) -> ActionReport {
+    run_notion_connection_flow(app, NotionConnectionAction::Connect).await
+}
+
+#[tauri::command]
+async fn change_notion_access(app: AppHandle) -> ActionReport {
+    run_notion_connection_flow(app, NotionConnectionAction::ChangeAccess).await
+}
+
+#[derive(Clone, Copy)]
+enum NotionConnectionAction {
+    Connect,
+    ChangeAccess,
+}
+
+impl NotionConnectionAction {
+    fn activity_title(self) -> &'static str {
+        match self {
+            Self::Connect => "Connected Notion workspace",
+            Self::ChangeAccess => "Changed Notion access",
+        }
+    }
+
+    fn activity_kind(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::ChangeAccess => "access",
+        }
+    }
+
+    fn failure_label(self) -> &'static str {
+        match self {
+            Self::Connect => "connect notion",
+            Self::ChangeAccess => "change notion access",
+        }
+    }
+}
+
+async fn run_notion_connection_flow(
+    app: AppHandle,
+    action: NotionConnectionAction,
+) -> ActionReport {
     if CONNECT_NOTION_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         return ActionReport {
             ok: false,
@@ -190,6 +232,7 @@ async fn connect_notion(app: AppHandle) -> ActionReport {
     clear_notion_login_link();
 
     let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
     let result =
         tauri::async_runtime::spawn_blocking(move || connect_notion_with_broker(state_root))
             .await
@@ -197,14 +240,24 @@ async fn connect_notion(app: AppHandle) -> ActionReport {
     CONNECT_NOTION_IN_PROGRESS.store(false, Ordering::Release);
 
     let report = match result {
-        Ok(Ok(message)) => ActionReport { ok: true, message },
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                action.activity_title(),
+                &message,
+                action.activity_kind(),
+            ) {
+                eprintln!("afs desktop could not record Notion access activity: {error}");
+            }
+            ActionReport { ok: true, message }
+        }
         Ok(Err(message)) | Err(message) => {
-            eprintln!("afs desktop connect notion failed: {message}");
+            eprintln!("afs desktop {} failed: {message}", action.failure_label());
             ActionReport { ok: false, message }
         }
     };
     if report.ok {
-        refresh_tray_icon(&app);
+        refresh_desktop_surfaces(&app);
     }
     report
 }
@@ -234,23 +287,21 @@ async fn choose_mount_folder(
 #[tauri::command]
 fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
     let state_root = default_state_root();
-    let report =
-        match ensure_daemon_running(&state_root).and_then(|_| reload_daemon_mounts(&state_root)) {
-            Ok(()) => {
-                refresh_tray_icon(&app);
-                ActionReport {
-                    ok: true,
-                    message: "AFS daemon is running.".to_string(),
-                }
+    match ensure_daemon_running(&state_root).and_then(|_| reload_daemon_mounts(&state_root)) {
+        Ok(()) => {
+            refresh_tray_icon(&app);
+            ActionReport {
+                ok: true,
+                message: "AFS daemon is running.".to_string(),
             }
-            Err(message) => ActionReport { ok: false, message },
-        };
-    report
+        }
+        Err(message) => ActionReport { ok: false, message },
+    }
 }
 
 #[tauri::command]
 fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
-    let report = match create_notion_workspace_mount(&path) {
+    match create_notion_workspace_mount(&path) {
         Ok(report) => {
             refresh_tray_icon(&app);
             ActionReport {
@@ -259,8 +310,7 @@ fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
             }
         }
         Err(message) => ActionReport { ok: false, message },
-    };
-    report
+    }
 }
 
 #[tauri::command]
@@ -324,13 +374,10 @@ fn push_to_notion_blocking() -> ActionReport {
     .unwrap_or_else(|_| PathBuf::from(&change.local_path));
 
     match push_target_direct(&target) {
-        Ok(report) => {
-            let action_report = ActionReport {
-                ok: push_report_exit_code(&report) == 0,
-                message: push_report_message(&report),
-            };
-            action_report
-        }
+        Ok(report) => ActionReport {
+            ok: push_report_exit_code(&report) == 0,
+            message: push_report_message(&report),
+        },
         Err(message) => ActionReport { ok: false, message },
     }
 }
@@ -431,7 +478,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
         mount: mount_summary(mount.as_ref(), connection.as_ref()),
         settings: desktop_settings(),
         pending_changes,
-        activity: activity_from_journals(&journals, &store),
+        activity: activity_from_journals(&journals, &store, &state_root),
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
@@ -578,8 +625,10 @@ fn status_summary_for_entry(entry: &afs_cli::status::StatusEntry) -> String {
 fn activity_from_journals(
     journals: &[JournalEntry],
     store: &SqliteStateStore,
+    state_root: &Path,
 ) -> Vec<ActivityItem> {
-    let mut items = journals
+    let mut items = load_desktop_activity(state_root).unwrap_or_default();
+    let journal_items = journals
         .iter()
         .rev()
         .take(8)
@@ -595,6 +644,8 @@ fn activity_from_journals(
             }
         })
         .collect::<Vec<_>>();
+    items.extend(journal_items);
+    items.truncate(8);
 
     if items.is_empty() {
         items.push(ActivityItem {
@@ -607,6 +658,46 @@ fn activity_from_journals(
     }
 
     items
+}
+
+fn record_desktop_activity(
+    state_root: &Path,
+    title: &str,
+    detail: &str,
+    kind: &str,
+) -> Result<(), String> {
+    let mut items = load_desktop_activity(state_root).unwrap_or_default();
+    items.insert(
+        0,
+        ActivityItem {
+            title: title.to_string(),
+            detail: detail.to_string(),
+            when: "Recent".to_string(),
+            kind: kind.to_string(),
+            undo_available: false,
+        },
+    );
+    items.truncate(DESKTOP_ACTIVITY_LIMIT);
+
+    let path = desktop_activity_path(state_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create desktop activity folder: {error}"))?;
+    }
+    let contents = serde_json::to_string_pretty(&items)
+        .map_err(|error| format!("Could not serialize desktop activity: {error}"))?;
+    fs::write(&path, contents).map_err(|error| format!("Could not write desktop activity: {error}"))
+}
+
+fn load_desktop_activity(state_root: &Path) -> Result<Vec<ActivityItem>, String> {
+    let path = desktop_activity_path(state_root);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read desktop activity: {error}"))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("Could not parse desktop activity: {error}"))
 }
 
 fn journal_title(journal: &JournalEntry, store: &SqliteStateStore) -> String {
@@ -1117,6 +1208,10 @@ fn desktop_settings_path() -> PathBuf {
     default_state_root().join("desktop.json")
 }
 
+fn desktop_activity_path(state_root: &Path) -> PathBuf {
+    state_root.join("desktop-activity.json")
+}
+
 fn launch_agent_path() -> Option<PathBuf> {
     home_dir().ok().map(|home| {
         home.join("Library")
@@ -1300,7 +1395,7 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
             .arg(&target)
             .spawn()
             .map_err(|error| error.to_string())?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1977,8 +2072,9 @@ mod tests {
     use afs_store::{ConnectionId, ConnectionRecord};
 
     use super::{
-        TrayVisualState, connection_metadata_changed, notion_id_from_url, should_hide_tray_popover,
-        tray_icon_image, validate_mount_root,
+        DESKTOP_ACTIVITY_LIMIT, TrayVisualState, connection_metadata_changed,
+        load_desktop_activity, notion_id_from_url, record_desktop_activity,
+        should_hide_tray_popover, tray_icon_image, validate_mount_root,
     };
 
     #[test]
@@ -2080,6 +2176,34 @@ mod tests {
             Some(&previous),
             Some(&previous)
         ));
+    }
+
+    #[test]
+    fn desktop_activity_records_newest_first_and_caps_entries() {
+        let temp = TestTempDir::new("desktop-activity");
+        for index in 0..(DESKTOP_ACTIVITY_LIMIT + 2) {
+            record_desktop_activity(
+                temp.path(),
+                &format!("Changed Notion access {index}"),
+                "Connected Notion workspace. AFS refreshed the mounted folder.",
+                "access",
+            )
+            .expect("record desktop activity");
+        }
+
+        let items = load_desktop_activity(temp.path()).expect("load desktop activity");
+
+        assert_eq!(items.len(), DESKTOP_ACTIVITY_LIMIT);
+        assert_eq!(
+            items.first().map(|item| item.title.as_str()),
+            Some("Changed Notion access 21")
+        );
+        assert_eq!(
+            items.last().map(|item| item.title.as_str()),
+            Some("Changed Notion access 2")
+        );
+        assert!(items.iter().all(|item| item.when == "Recent"));
+        assert!(items.iter().all(|item| !item.undo_available));
     }
 
     struct TestTempDir {
@@ -2238,6 +2362,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
             connect_notion,
+            change_notion_access,
             notion_login_link,
             choose_mount_folder,
             ensure_runtime_ready,
