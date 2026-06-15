@@ -78,7 +78,7 @@ type LocatedItem = {
   title: string;
   kind: string;
   localPath: string;
-  state: "ready" | "preparing" | "no_access" | "not_found";
+  state: "ready" | "online_only" | "pending_changes" | "conflict" | "preparing" | "no_access" | "not_found";
 };
 
 type PushPlan = {
@@ -183,6 +183,21 @@ const samplePushPlan: PushPlan = {
   files: sampleSnapshot.pendingChanges,
 };
 
+const sampleSearchResults: LocatedItem[] = [
+  {
+    title: "Roadmap 2026",
+    kind: "Page",
+    localPath: "~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md",
+    state: "ready",
+  },
+  {
+    title: "Launch Plan",
+    kind: "Page",
+    localPath: "~/Documents/AFS/Notion/Marketing/Launch Plan ~8841.md",
+    state: "online_only",
+  },
+];
+
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -200,6 +215,54 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function useNotionSearchResults(query: string, enabled = true) {
+  const [results, setResults] = useState<LocatedItem[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!enabled || trimmed.length < 2) {
+      setResults([]);
+      setSearching(false);
+      return;
+    }
+
+    let cancelled = false;
+    setSearching(true);
+    const timer = window.setTimeout(() => {
+      void callCommand<LocatedItem[]>(
+        "search_notion_pages",
+        { query: trimmed },
+        sampleSearchResults.filter((item) =>
+          `${item.title} ${item.localPath}`.toLowerCase().includes(trimmed.toLowerCase()),
+        ),
+      )
+        .then((items) => {
+          if (!cancelled) {
+            setResults(items);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setResults([]);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setSearching(false);
+          }
+        });
+    }, 160);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [enabled, query]);
+
+  return { results, searching };
 }
 
 export default function App() {
@@ -605,8 +668,18 @@ function Onboarding({
             <LocateBox
               label="Open a Notion page"
               value={locateUrl}
-              onChange={setLocateUrl}
+              onChange={(next) => {
+                setLocateUrl(next);
+                setLocateState("idle");
+                setLocatedItem(null);
+              }}
               onSubmit={locatePage}
+              onSelect={(item) => {
+                setLocatedItem(item);
+                setLocateState("ready");
+                setLocateError("");
+                setLocateUrl(item.title);
+              }}
               state={locateState}
               error={locateError}
             />
@@ -868,8 +941,18 @@ function HomeView({
             <LocateBox
               label="Open a Notion page"
               value={url}
-              onChange={setUrl}
+              onChange={(next) => {
+                setUrl(next);
+                setLocateState("idle");
+                setLocatedItem(null);
+              }}
               onSubmit={locatePage}
+              onSelect={(item) => {
+                setLocatedItem(item);
+                setLocateState("ready");
+                setLocateError("");
+                setUrl(item.title);
+              }}
               state={locateState}
               error={locateError}
             />
@@ -1372,7 +1455,9 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [quitOptionsOpen, setQuitOptionsOpen] = useState(false);
+  const { results: searchResults, searching } = useNotionSearchResults(url);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
+  const visibleSearchResults = locateState === "ready" ? [] : searchResults.slice(0, 3);
 
   async function locatePage() {
     if (!url.trim()) {
@@ -1399,6 +1484,13 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
       setLocatedItem(null);
       setLocateState("error");
     }
+  }
+
+  function selectSearchResult(item: LocatedItem) {
+    setLocatedItem(item);
+    setLocateState("ready");
+    setLocateError("");
+    setUrl(item.title);
   }
 
   function openMain(view?: AppView) {
@@ -1437,7 +1529,12 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
           <input
             value={url}
             placeholder="Paste URL or search title"
-            onChange={(event) => setUrl(event.target.value)}
+            onChange={(event) => {
+              setUrl(event.target.value);
+              setLocateState("idle");
+              setLocateError("");
+              setLocatedItem(null);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
                 locatePage();
@@ -1449,6 +1546,17 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
           </button>
         </div>
         {locateState === "error" && <p className="field-error">{locateError || "Paste a Notion URL or search title."}</p>}
+        {visibleSearchResults.length > 0 && (
+          <div className="tray-search-results" aria-busy={searching ? "true" : "false"}>
+            {visibleSearchResults.map((item) => (
+              <button type="button" key={`${item.kind}-${item.localPath}`} onClick={() => selectSearchResult(item)}>
+                <strong>{item.title}</strong>
+                <small>{item.localPath}</small>
+                <span className={`search-state ${item.state}`}>{locatedStateLabel(item.state)}</span>
+              </button>
+            ))}
+          </div>
+        )}
         {locatedItem && (
           <div className="tray-result">
             <strong>{locatedItem.title}</strong>
@@ -1541,6 +1649,7 @@ function LocateBox({
   value,
   onChange,
   onSubmit,
+  onSelect,
   state,
   error,
 }: {
@@ -1548,9 +1657,12 @@ function LocateBox({
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onSelect?: (item: LocatedItem) => void;
   state: LocateState;
   error?: string;
 }) {
+  const { results, searching } = useNotionSearchResults(value);
+
   return (
     <div className="locate-box">
       <label>{label}</label>
@@ -1570,7 +1682,40 @@ function LocateBox({
           {state === "preparing" ? "Preparing" : "Open Page"}
         </PrimaryButton>
       </div>
+      {state !== "ready" && results.length > 0 && (
+        <SearchResultList
+          items={results}
+          searching={searching}
+          onSelect={(item) => {
+            onSelect?.(item);
+          }}
+        />
+      )}
       {state === "error" && <p className="field-error">{error || "Paste a Notion URL or search title/path."}</p>}
+    </div>
+  );
+}
+
+function SearchResultList({
+  items,
+  searching,
+  onSelect,
+}: {
+  items: LocatedItem[];
+  searching?: boolean;
+  onSelect: (item: LocatedItem) => void;
+}) {
+  return (
+    <div className="search-results" aria-busy={searching ? "true" : "false"}>
+      {items.map((item) => (
+        <button type="button" key={`${item.kind}-${item.localPath}`} onClick={() => onSelect(item)}>
+          <div>
+            <strong>{item.title}</strong>
+            <code>{item.localPath}</code>
+          </div>
+          <span className={`search-state ${item.state}`}>{locatedStateLabel(item.state)}</span>
+        </button>
+      ))}
     </div>
   );
 }
@@ -1900,6 +2045,28 @@ function healthIconState(state: string): "default" | "review" | "reconnect" {
     return "review";
   }
   return "default";
+}
+
+function locatedStateLabel(state: LocatedItem["state"]) {
+  if (state === "online_only") {
+    return "Online Only";
+  }
+  if (state === "pending_changes") {
+    return "Pending";
+  }
+  if (state === "conflict") {
+    return "Conflict";
+  }
+  if (state === "preparing") {
+    return "Preparing";
+  }
+  if (state === "no_access") {
+    return "No Access";
+  }
+  if (state === "not_found") {
+    return "Not Found";
+  }
+  return "Ready";
 }
 
 function joinMountPath(mountPath: string, relativePath: string) {
