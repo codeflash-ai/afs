@@ -19,6 +19,7 @@ use afs_store::{
 };
 use afsd::execution::PushJobReport;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -60,57 +61,519 @@ const EXIT_VALIDATION: i32 = 3;
 const DEFAULT_DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DAEMON_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
 
-const COMMANDS: &[&str] = &[
-    "connect",
-    "connections",
-    "profiles",
-    "connection",
-    "disconnect",
-    "daemon",
-    "mount",
-    "info",
-    "status",
-    "pull",
-    "push",
-    "diff",
-    "undo",
-    "log",
-    "restore",
-    "config",
-    "file-provider",
-];
+#[derive(Debug, Parser)]
+#[command(
+    name = "afs",
+    about = "AgentFS command line interface",
+    long_about = "AgentFS projects remote workspaces, such as Notion, as local Markdown files that can be inspected, edited, pulled, pushed, and reconciled.",
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Emit machine-readable JSON for command output. Ignored when printing help."
+    )]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Option<AfsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum AfsCommand {
+    #[command(about = "Connect AgentFS to a remote source")]
+    Connect {
+        #[command(subcommand)]
+        command: ConnectCommand,
+    },
+    #[command(about = "List saved source connections")]
+    Connections,
+    #[command(about = "List connector profiles")]
+    Profiles,
+    #[command(about = "Inspect or manage a saved source connection")]
+    Connection {
+        #[command(subcommand)]
+        command: ConnectionCommand,
+    },
+    #[command(about = "Disconnect and remove a saved source connection")]
+    Disconnect(DisconnectArgs),
+    #[command(about = "Start, stop, reload, or inspect the AgentFS daemon")]
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+    #[command(about = "Mount a remote source into the local filesystem")]
+    Mount {
+        #[command(subcommand)]
+        command: MountCommand,
+    },
+    #[command(about = "Show source, mount, and sync metadata for a path")]
+    Info(PathArg),
+    #[command(about = "Show local sync state for mounts or paths")]
+    Status(PathArg),
+    #[command(about = "Pull remote content into the local projection")]
+    Pull(RequiredPathArg),
+    #[command(about = "Push local changes back to the remote source")]
+    Push(PushArgs),
+    #[command(about = "Preview the push plan for local changes")]
+    Diff(RequiredPathArg),
+    #[command(about = "Undo a reconciled push using its journal entry")]
+    Undo(UndoArgs),
+    #[command(about = "List push journal entries")]
+    Log(PathArg),
+    #[command(about = "Restore a local file from the last synced shadow")]
+    Restore(RestoreCliArgs),
+    #[command(about = "Configuration commands")]
+    Config,
+    #[command(
+        name = "file-provider",
+        about = "Manage virtual filesystem registration"
+    )]
+    FileProvider {
+        #[command(subcommand)]
+        command: FileProviderCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConnectCommand {
+    #[command(about = "Connect a Notion workspace")]
+    Notion(ConnectNotionArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConnectNotionArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to notion-main."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Read a Notion integration token from standard input.")]
+    token_stdin: bool,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
+    #[arg(
+        long,
+        help = "Use direct Notion OAuth environment credentials instead of the broker."
+    )]
+    direct_oauth: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConnectionCommand {
+    #[command(about = "Show connection details")]
+    Show(ConnectionShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConnectionShowArgs {
+    #[arg(value_name = "id", help = "Connection id to inspect.")]
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct DisconnectArgs {
+    #[arg(value_name = "id", help = "Connection id to remove.")]
+    id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    #[command(about = "Start the daemon")]
+    Start(DaemonArgs),
+    #[command(about = "Stop the daemon")]
+    Stop(DaemonArgs),
+    #[command(about = "Show daemon status")]
+    Status(DaemonArgs),
+    #[command(about = "Reload daemon mount watches")]
+    Reload(DaemonArgs),
+    #[command(about = "Restart the daemon")]
+    Restart(DaemonArgs),
+}
+
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[arg(long, help = "Run afsd as a detached session process.")]
+    session: bool,
+    #[arg(long, help = "Run afsd with launchd. Supported on macOS only.")]
+    launchd: bool,
+    #[arg(long, value_name = "PATH", help = "Path to the afsd binary to launch.")]
+    afsd_bin: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "AgentFS state directory. Defaults to $AFS_STATE_DIR or ~/.afs."
+    )]
+    state_dir: Option<String>,
+    #[arg(
+        long,
+        value_name = "host:port|off",
+        help = "TCP listener address for daemon IPC, or off to disable."
+    )]
+    tcp_addr: Option<String>,
+    #[arg(
+        long,
+        value_name = "KEY",
+        help = "Environment variable to pass through to the daemon. Repeatable."
+    )]
+    include_env: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum MountCommand {
+    #[command(about = "Mount Notion content")]
+    Notion(MountNotionArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("notion-root")
+        .required(true)
+        .args(["workspace", "root_page"])
+))]
+struct MountNotionArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the mount should be registered."
+    )]
+    path: String,
+    #[arg(long, help = "Mount all Notion content shared with the integration.")]
+    workspace: bool,
+    #[arg(
+        long,
+        value_name = "page-id",
+        help = "Mount a specific Notion root page."
+    )]
+    root_page: Option<String>,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to notion-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode: plain-files, macos-file-provider, or linux-fuse."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct PathArg {
+    #[arg(
+        value_name = "path",
+        help = "Path inside an AgentFS mount. Defaults to the current scope when omitted."
+    )]
+    path: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RequiredPathArg {
+    #[arg(value_name = "path", help = "Path inside an AgentFS mount.")]
+    path: String,
+}
+
+#[derive(Debug, Args)]
+struct PushArgs {
+    #[arg(value_name = "path", help = "File or directory scope to push.")]
+    path: String,
+    #[arg(
+        short = 'y',
+        long = "yes",
+        help = "Approve safe push plans without prompting."
+    )]
+    yes: bool,
+    #[arg(long, help = "Approve plans that trip destructive-change guardrails.")]
+    confirm: bool,
+}
+
+#[derive(Debug, Args)]
+struct UndoArgs {
+    #[arg(value_name = "push-id", help = "Push journal id to undo.")]
+    push_id: String,
+}
+
+#[derive(Debug, Args)]
+struct RestoreCliArgs {
+    #[arg(
+        value_name = "path",
+        help = "File path to restore from the last synced shadow."
+    )]
+    path: String,
+    #[arg(long, help = "Restore even if the file is marked conflicted.")]
+    force: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum FileProviderCommand {
+    #[command(about = "Register a virtual filesystem provider for a mount")]
+    Register(FileProviderTargetArg),
+    #[command(about = "Open a registered virtual filesystem mount")]
+    Open(FileProviderTargetArg),
+    #[command(about = "Unregister a virtual filesystem provider for a mount")]
+    Unregister(FileProviderTargetArg),
+    #[command(about = "List registered file provider domains")]
+    List,
+    #[command(about = "Reset file provider registration state")]
+    Reset,
+}
+
+#[derive(Debug, Args)]
+struct FileProviderTargetArg {
+    #[arg(
+        value_name = "mount-id-or-path",
+        help = "Mount id or path inside an AgentFS mount."
+    )]
+    target: String,
+}
 
 pub fn dispatch(args: &[String]) -> i32 {
-    if args.is_empty() || has_flag(args, "--help") || has_flag(args, "-h") {
+    let cli = match parse_cli(args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            let _ = error.print();
+            return exit_code;
+        }
+    };
+
+    let Some(command) = cli.command else {
         print_help();
         return EXIT_SUCCESS;
-    }
+    };
 
-    let json = has_flag(args, "--json");
-    match args[0].as_str() {
-        "connect" => connect(&args[1..], json),
-        "connections" => connections(&args[1..], json),
-        "profiles" => profiles(&args[1..], json),
-        "connection" => connection(&args[1..], json),
-        "disconnect" => disconnect(&args[1..], json),
-        "daemon" => daemon(&args[1..], json),
-        "mount" => mount(&args[1..], json),
-        "info" => info(&args[1..], json),
-        "status" => status(&args[1..], json),
-        "pull" => pull(&args[1..], json),
-        "push" => push(&args[1..], json),
-        "diff" => diff(&args[1..], json),
-        "restore" => restore(&args[1..], json),
-        "undo" => undo(&args[1..], json),
-        "log" => log(&args[1..], json),
-        "config" => stub("config", json),
-        "file-provider" => file_provider(&args[1..], json),
-        command => {
-            eprintln!("unknown command: {command}");
-            print_help();
-            EXIT_USAGE
+    let legacy_args = legacy_args_for_command(&command);
+    let json = cli.json;
+    match command {
+        AfsCommand::Connect { .. } => connect(&legacy_args[1..], json),
+        AfsCommand::Connections => connections(&legacy_args[1..], json),
+        AfsCommand::Profiles => profiles(&legacy_args[1..], json),
+        AfsCommand::Connection { .. } => connection(&legacy_args[1..], json),
+        AfsCommand::Disconnect(_) => disconnect(&legacy_args[1..], json),
+        AfsCommand::Daemon { .. } => daemon(&legacy_args[1..], json),
+        AfsCommand::Mount { .. } => mount(&legacy_args[1..], json),
+        AfsCommand::Info(_) => info(&legacy_args[1..], json),
+        AfsCommand::Status(_) => status(&legacy_args[1..], json),
+        AfsCommand::Pull(_) => pull(&legacy_args[1..], json),
+        AfsCommand::Push(_) => push(&legacy_args[1..], json),
+        AfsCommand::Diff(_) => diff(&legacy_args[1..], json),
+        AfsCommand::Restore(_) => restore(&legacy_args[1..], json),
+        AfsCommand::Undo(_) => undo(&legacy_args[1..], json),
+        AfsCommand::Log(_) => log(&legacy_args[1..], json),
+        AfsCommand::Config => stub("config", json),
+        AfsCommand::FileProvider { .. } => file_provider(&legacy_args[1..], json),
+    }
+}
+
+fn parse_cli(args: &[String]) -> Result<Cli, clap::Error> {
+    Cli::try_parse_from(
+        std::iter::once("afs".to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
+    let mut args = Vec::new();
+    match command {
+        AfsCommand::Connect { command } => {
+            args.push("connect".to_string());
+            match command {
+                ConnectCommand::Notion(options) => {
+                    args.push("notion".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--token-stdin", options.token_stdin);
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_flag(&mut args, "--direct-oauth", options.direct_oauth);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
+            }
+        }
+        AfsCommand::Connections => args.push("connections".to_string()),
+        AfsCommand::Profiles => args.push("profiles".to_string()),
+        AfsCommand::Connection { command } => {
+            args.push("connection".to_string());
+            match command {
+                ConnectionCommand::Show(options) => {
+                    args.push("show".to_string());
+                    args.push(options.id.clone());
+                }
+            }
+        }
+        AfsCommand::Disconnect(options) => {
+            args.push("disconnect".to_string());
+            args.push(options.id.clone());
+        }
+        AfsCommand::Daemon { command } => {
+            args.push("daemon".to_string());
+            match command {
+                DaemonCommand::Start(options) => {
+                    args.push("start".to_string());
+                    push_daemon_args(&mut args, options);
+                }
+                DaemonCommand::Stop(options) => {
+                    args.push("stop".to_string());
+                    push_daemon_args(&mut args, options);
+                }
+                DaemonCommand::Status(options) => {
+                    args.push("status".to_string());
+                    push_daemon_args(&mut args, options);
+                }
+                DaemonCommand::Reload(options) => {
+                    args.push("reload".to_string());
+                    push_daemon_args(&mut args, options);
+                }
+                DaemonCommand::Restart(options) => {
+                    args.push("restart".to_string());
+                    push_daemon_args(&mut args, options);
+                }
+            }
+        }
+        AfsCommand::Mount { command } => {
+            args.push("mount".to_string());
+            match command {
+                MountCommand::Notion(options) => {
+                    args.push("notion".to_string());
+                    args.push(options.path.clone());
+                    push_flag(&mut args, "--workspace", options.workspace);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--root-page",
+                        options.root_page.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_flag(&mut args, "--read-only", options.read_only);
+                }
+            }
+        }
+        AfsCommand::Info(options) => {
+            args.push("info".to_string());
+            push_optional_positional(&mut args, options.path.as_deref());
+        }
+        AfsCommand::Status(options) => {
+            args.push("status".to_string());
+            push_optional_positional(&mut args, options.path.as_deref());
+        }
+        AfsCommand::Pull(options) => {
+            args.push("pull".to_string());
+            args.push(options.path.clone());
+        }
+        AfsCommand::Push(options) => {
+            args.push("push".to_string());
+            args.push(options.path.clone());
+            push_flag(&mut args, "--yes", options.yes);
+            push_flag(&mut args, "--confirm", options.confirm);
+        }
+        AfsCommand::Diff(options) => {
+            args.push("diff".to_string());
+            args.push(options.path.clone());
+        }
+        AfsCommand::Undo(options) => {
+            args.push("undo".to_string());
+            args.push(options.push_id.clone());
+        }
+        AfsCommand::Log(options) => {
+            args.push("log".to_string());
+            push_optional_positional(&mut args, options.path.as_deref());
+        }
+        AfsCommand::Restore(options) => {
+            args.push("restore".to_string());
+            args.push(options.path.clone());
+            push_flag(&mut args, "--force", options.force);
+        }
+        AfsCommand::Config => args.push("config".to_string()),
+        AfsCommand::FileProvider { command } => {
+            args.push("file-provider".to_string());
+            match command {
+                FileProviderCommand::Register(options) => {
+                    args.push("register".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Open(options) => {
+                    args.push("open".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Unregister(options) => {
+                    args.push("unregister".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::List => args.push("list".to_string()),
+                FileProviderCommand::Reset => args.push("reset".to_string()),
+            }
         }
     }
+    args
+}
+
+fn push_daemon_args(args: &mut Vec<String>, options: &DaemonArgs) {
+    push_flag(args, "--session", options.session);
+    push_flag(args, "--launchd", options.launchd);
+    push_optional_flag_value(args, "--afsd-bin", options.afsd_bin.as_deref());
+    push_optional_flag_value(args, "--state-dir", options.state_dir.as_deref());
+    push_optional_flag_value(args, "--tcp-addr", options.tcp_addr.as_deref());
+    for value in &options.include_env {
+        push_flag_value(args, "--include-env", value);
+    }
+}
+
+fn push_flag(args: &mut Vec<String>, flag: &str, enabled: bool) {
+    if enabled {
+        args.push(flag.to_string());
+    }
+}
+
+fn push_optional_positional(args: &mut Vec<String>, value: Option<&str>) {
+    if let Some(value) = value {
+        args.push(value.to_string());
+    }
+}
+
+fn push_optional_flag_value(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        push_flag_value(args, flag, value);
+    }
+}
+
+fn push_flag_value(args: &mut Vec<String>, flag: &str, value: &str) {
+    args.push(flag.to_string());
+    args.push(value.to_string());
 }
 
 fn daemon(args: &[String], json: bool) -> i32 {
@@ -2886,17 +3349,16 @@ impl CommandError {
 }
 
 fn print_help() {
-    println!("afs <command> [options]");
+    let _ = Cli::command().print_help();
     println!();
-    println!("Commands:");
-    for command in COMMANDS {
-        println!("  {command}");
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use clap::Parser;
+    use clap::error::ErrorKind;
 
     use afs_core::model::MountId;
     use afs_store::{MountConfig, ProjectionMode};
@@ -2906,12 +3368,257 @@ mod tests {
     use crate::push::PushReport;
 
     use super::{
-        DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
-        diff_report_exit_code, notion_oauth_broker_config, projection_mode_for_target,
-        projection_usage_options_for_target, prompt_for_push_confirmation,
-        pull_direct_fallback_error, should_prompt_for_push_confirmation,
-        validate_virtual_projection_registration,
+        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
+        diff_report_exit_code, legacy_args_for_command, notion_oauth_broker_config,
+        projection_mode_for_target, projection_usage_options_for_target,
+        prompt_for_push_confirmation, pull_direct_fallback_error,
+        should_prompt_for_push_confirmation, validate_virtual_projection_registration,
     };
+
+    #[test]
+    fn clap_help_is_available_for_commands_and_nested_subcommands() {
+        let cases = vec![
+            (
+                vec!["--help"],
+                vec!["Usage: afs", "Commands:", "push", "file-provider"],
+            ),
+            (
+                vec!["connect", "--help"],
+                vec!["Usage: afs connect", "Commands:", "notion", "--json"],
+            ),
+            (
+                vec!["connect", "notion", "--help"],
+                vec![
+                    "Usage: afs connect notion",
+                    "Connect a Notion workspace",
+                    "--token-stdin",
+                    "--direct-oauth",
+                ],
+            ),
+            (
+                vec!["connections", "--help"],
+                vec!["Usage: afs connections", "List saved source", "--json"],
+            ),
+            (
+                vec!["profiles", "--help"],
+                vec!["Usage: afs profiles", "List connector profiles", "--json"],
+            ),
+            (
+                vec!["connection", "--help"],
+                vec!["Usage: afs connection", "Commands:", "show", "--json"],
+            ),
+            (
+                vec!["connection", "show", "--help"],
+                vec![
+                    "Usage: afs connection show",
+                    "Show connection details",
+                    "id",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["disconnect", "--help"],
+                vec!["Usage: afs disconnect", "Disconnect", "id", "--json"],
+            ),
+            (
+                vec!["daemon", "--help"],
+                vec!["Usage: afs daemon", "Commands:", "start", "restart"],
+            ),
+            (
+                vec!["daemon", "start", "--help"],
+                vec![
+                    "Usage: afs daemon start",
+                    "Start the daemon",
+                    "--session",
+                    "--afsd-bin",
+                ],
+            ),
+            (
+                vec!["daemon", "stop", "--help"],
+                vec!["Usage: afs daemon stop", "Stop the daemon", "--tcp-addr"],
+            ),
+            (
+                vec!["daemon", "status", "--help"],
+                vec![
+                    "Usage: afs daemon status",
+                    "Show daemon status",
+                    "--tcp-addr",
+                ],
+            ),
+            (
+                vec!["daemon", "reload", "--help"],
+                vec!["Usage: afs daemon reload", "Reload daemon", "--tcp-addr"],
+            ),
+            (
+                vec!["daemon", "restart", "--help"],
+                vec![
+                    "Usage: afs daemon restart",
+                    "Restart the daemon",
+                    "--tcp-addr",
+                ],
+            ),
+            (
+                vec!["mount", "--help"],
+                vec!["Usage: afs mount", "Commands:", "notion", "--json"],
+            ),
+            (
+                vec!["mount", "notion", "--help"],
+                vec![
+                    "Usage: afs mount notion",
+                    "Mount Notion content",
+                    "--workspace",
+                    "--root-page",
+                ],
+            ),
+            (
+                vec!["info", "--help"],
+                vec!["Usage: afs info", "Show source", "path", "--json"],
+            ),
+            (
+                vec!["status", "--help"],
+                vec![
+                    "Usage: afs status",
+                    "Show local sync state",
+                    "path",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["pull", "--help"],
+                vec!["Usage: afs pull", "Pull remote content", "path", "--json"],
+            ),
+            (
+                vec!["push", "--help"],
+                vec![
+                    "Usage: afs push",
+                    "Push local changes",
+                    "--yes",
+                    "--confirm",
+                ],
+            ),
+            (
+                vec!["diff", "--help"],
+                vec!["Usage: afs diff", "Preview the push plan", "path", "--json"],
+            ),
+            (
+                vec!["undo", "--help"],
+                vec![
+                    "Usage: afs undo",
+                    "Undo a reconciled push",
+                    "push-id",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["log", "--help"],
+                vec!["Usage: afs log", "List push journal", "path", "--json"],
+            ),
+            (
+                vec!["restore", "--help"],
+                vec![
+                    "Usage: afs restore",
+                    "Restore a local file",
+                    "--force",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["config", "--help"],
+                vec!["Usage: afs config", "Configuration commands", "--json"],
+            ),
+            (
+                vec!["file-provider", "--help"],
+                vec!["Usage: afs file-provider", "Commands:", "register", "reset"],
+            ),
+            (
+                vec!["file-provider", "register", "--help"],
+                vec![
+                    "Usage: afs file-provider register",
+                    "Register a virtual filesystem",
+                    "mount-id-or-path",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["file-provider", "open", "--help"],
+                vec![
+                    "Usage: afs file-provider open",
+                    "Open a registered virtual filesystem",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "unregister", "--help"],
+                vec![
+                    "Usage: afs file-provider unregister",
+                    "Unregister a virtual filesystem",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "list", "--help"],
+                vec![
+                    "Usage: afs file-provider list",
+                    "List registered file provider",
+                ],
+            ),
+            (
+                vec!["file-provider", "reset", "--help"],
+                vec!["Usage: afs file-provider reset", "Reset file provider"],
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let help = clap_help(args);
+            for needle in expected {
+                assert!(
+                    help.contains(needle),
+                    "expected help to contain `{needle}`:\n{help}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clap_json_help_still_displays_text_help() {
+        let help = clap_help(vec!["push", "Roadmap.md", "--json", "--help"]);
+
+        assert!(help.contains("Usage: afs push"));
+        assert!(help.contains("Push local changes"));
+        assert!(!help.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn clap_parsed_commands_convert_to_legacy_args_for_execution() {
+        let cli = parse_cli(["--json", "push", "Roadmap.md", "--yes", "--confirm"]);
+        assert!(cli.json);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["push", "Roadmap.md", "--yes", "--confirm"]
+        );
+
+        let cli = parse_cli([
+            "daemon",
+            "start",
+            "--session",
+            "--state-dir",
+            "/tmp/afs-state",
+            "--include-env",
+            "NOTION_TOKEN",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "daemon",
+                "start",
+                "--session",
+                "--state-dir",
+                "/tmp/afs-state",
+                "--include-env",
+                "NOTION_TOKEN"
+            ]
+        );
+    }
 
     #[test]
     fn clean_diff_report_exits_successfully() {
@@ -3243,5 +3950,25 @@ mod tests {
             unsupported: Vec::new(),
             suggested_fix: None,
         }
+    }
+
+    fn clap_help(args: Vec<&str>) -> String {
+        let error = Cli::try_parse_from(argv(args)).expect_err("help exits through clap error");
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        error.to_string()
+    }
+
+    fn parse_cli<const N: usize>(args: [&str; N]) -> Cli {
+        Cli::try_parse_from(argv(args)).expect("parse cli")
+    }
+
+    fn argv<I, S>(args: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        std::iter::once("afs".to_string())
+            .chain(args.into_iter().map(|arg| arg.as_ref().to_string()))
+            .collect()
     }
 }
