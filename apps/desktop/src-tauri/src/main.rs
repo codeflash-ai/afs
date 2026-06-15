@@ -1544,8 +1544,28 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
+    let report = run_daemon_control(&daemon_control_args("start", state_root))
+        .map_err(|error| format!("Could not start afsd: {}", error.message()))?;
+    if report.state == DaemonRunState::Running {
+        Ok(())
+    } else {
+        Err("afsd did not start.".to_string())
+    }
+}
+
+fn restart_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
+    let report = run_daemon_control(&daemon_control_args("restart", state_root))
+        .map_err(|error| format!("Could not restart afsd: {}", error.message()))?;
+    if report.state == DaemonRunState::Running {
+        Ok(())
+    } else {
+        Err("afsd did not restart.".to_string())
+    }
+}
+
+fn daemon_control_args(action: &str, state_root: &Path) -> Vec<String> {
     let mut args = vec![
-        "start".to_string(),
+        action.to_string(),
         "--session".to_string(),
         "--state-dir".to_string(),
         state_root.display().to_string(),
@@ -1560,14 +1580,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
         args.push("--afsd-bin".to_string());
         args.push(afsd_bin.display().to_string());
     }
-
-    let report = run_daemon_control(&args)
-        .map_err(|error| format!("Could not start afsd: {}", error.message()))?;
-    if report.state == DaemonRunState::Running {
-        Ok(())
-    } else {
-        Err("afsd did not start.".to_string())
-    }
+    args
 }
 
 fn bundled_afsd_binary() -> Option<PathBuf> {
@@ -1577,6 +1590,43 @@ fn bundled_afsd_binary() -> Option<PathBuf> {
 }
 
 fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
+    match reload_daemon_mounts_once(state_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_unsupported_schema_version() => {
+            eprintln!(
+                "afs desktop detected a stale afsd schema reader during reload: {}",
+                error.message
+            );
+            restart_daemon_for_current_binary(state_root)?;
+            reload_daemon_mounts_once(state_root).map_err(|retry_error| {
+                format!(
+                    "Could not reload afsd mounts after restarting afsd for the current state schema: {}",
+                    retry_error.message
+                )
+            })
+        }
+        Err(error) => Err(format!("Could not reload afsd mounts: {}", error.message)),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DaemonReloadError {
+    message: String,
+}
+
+impl DaemonReloadError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn is_unsupported_schema_version(&self) -> bool {
+        is_unsupported_schema_version_message(&self.message)
+    }
+}
+
+fn reload_daemon_mounts_once(state_root: &Path) -> Result<(), DaemonReloadError> {
     match send_request(state_root, &DaemonRequest::ReloadMounts) {
         Ok(response) if response.ok => Ok(()),
         Ok(response) => {
@@ -1584,10 +1634,14 @@ fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
                 .error
                 .map(|error| format!("{}: {}", error.code, error.message))
                 .unwrap_or_else(|| "daemon returned an unknown reload error".to_string());
-            Err(format!("Could not reload afsd mounts: {message}"))
+            Err(DaemonReloadError::new(message))
         }
-        Err(error) => Err(format!("Could not reload afsd mounts: {}", error.message())),
+        Err(error) => Err(DaemonReloadError::new(error.message().to_string())),
     }
+}
+
+fn is_unsupported_schema_version_message(message: &str) -> bool {
+    message.contains("unsupported schema version") && message.contains("supports up to")
 }
 
 fn prefetch_virtual_projection_root(state_root: &Path, mount_id: &str) -> Result<(), String> {
@@ -2095,8 +2149,8 @@ mod tests {
 
     use super::{
         DESKTOP_ACTIVITY_LIMIT, TrayVisualState, connection_metadata_changed,
-        load_desktop_activity, notion_id_from_url, record_desktop_activity,
-        should_hide_tray_popover, tray_icon_image, validate_mount_root,
+        is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
+        record_desktop_activity, should_hide_tray_popover, tray_icon_image, validate_mount_root,
     };
 
     #[test]
@@ -2197,6 +2251,16 @@ mod tests {
         assert!(!connection_metadata_changed(
             Some(&previous),
             Some(&previous)
+        ));
+    }
+
+    #[test]
+    fn detects_stale_daemon_schema_reload_errors() {
+        assert!(is_unsupported_schema_version_message(
+            "reload_mounts_failed: io error: unsupported schema version 10; this binary supports up to 9"
+        ));
+        assert!(!is_unsupported_schema_version_message(
+            "reload_mounts_failed: io error: database is locked"
         ));
     }
 
