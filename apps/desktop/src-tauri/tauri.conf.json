@@ -7,10 +7,12 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "./scripts/prepare-macos-file-provider.sh",
     "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": false,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -21,7 +23,11 @@
         "minHeight": 620,
         "resizable": true,
         "center": true,
-        "decorations": false
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "transparent": false,
+        "shadow": true
       }
     ],
     "security": {
@@ -29,7 +35,34 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all"
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "Productivity",
+    "shortDescription": "Mount workspaces as local files for agents.",
+    "longDescription": "AFS lets agents edit connected workspaces through local files while keeping remote writes reviewable.",
+    "icon": ["icons/icon.png"],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-",
+      "files": {
+        "PlugIns/AgentFSFileProvider.appex": "macos/AgentFSFileProvider/AgentFSFileProvider.appex",
+        "MacOS/agentfs-file-providerctl": "macos/AgentFSFileProvider/agentfs-file-providerctl",
+        "MacOS/afsd": "macos/afsd"
+      },
+      "dmg": {
+        "windowSize": {
+          "width": 660,
+          "height": 420
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 190
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 190
+        }
+      }
+    }
   }
 }

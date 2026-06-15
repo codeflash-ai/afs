@@ -30,7 +30,8 @@ use crate::connect::{
     run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
-    ConnectorResolveError, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
+    ConnectorResolveError, SourceDescriptor, resolve_source_for_mount_id, resolve_source_for_path,
+    source_descriptor,
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff};
@@ -502,7 +503,7 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
     match registration {
         VirtualProjectionRegistration::MacosFileProvider => {
             let display_name = file_provider_display_name(&mount);
-            run_file_provider_helper(
+            let exit_code = run_file_provider_helper(
                 json,
                 "register",
                 vec![
@@ -512,7 +513,18 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
                     display_name,
                 ],
                 Some(mount_id),
-            )
+            );
+            if exit_code == EXIT_SUCCESS
+                && let Err(error) =
+                    file_provider_helper::ensure_macos_file_provider_shortcut(&mount)
+            {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", error.code(), error.message()),
+                    EXIT_INTERNAL,
+                );
+            }
+            exit_code
         }
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
     }
@@ -643,7 +655,8 @@ fn restore(args: &[String], json: bool) -> i32 {
 }
 
 fn mount(args: &[String], json: bool) -> i32 {
-    if first_positional(args) != Some("notion") {
+    let descriptor = source_descriptor("notion");
+    if first_positional(args) != Some(descriptor.id()) {
         return command_error(
             json,
             CommandError::new("mount", "usage", mount_usage()),
@@ -666,7 +679,10 @@ fn mount(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "mount",
                 "usage",
-                "afs mount notion accepts either --workspace or --root-page <page-id>, not both",
+                format!(
+                    "afs mount {} accepts either --workspace or --root-page <page-id>, not both",
+                    descriptor.id()
+                ),
             ),
             EXIT_USAGE,
         );
@@ -677,7 +693,10 @@ fn mount(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "mount",
                 "usage",
-                "afs mount notion requires --workspace or --root-page <page-id>",
+                format!(
+                    "afs mount {} requires --workspace or --root-page <page-id>",
+                    descriptor.id()
+                ),
             ),
             EXIT_USAGE,
         );
@@ -714,9 +733,9 @@ fn mount(args: &[String], json: bool) -> i32 {
         mount_id: MountId::new(
             flag_value(args, "--mount-id")
                 .map(str::to_string)
-                .unwrap_or_else(|| "notion-main".to_string()),
+                .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
         ),
-        connector: "notion".to_string(),
+        connector: descriptor.id().to_string(),
         root: PathBuf::from(root),
         remote_root_id: root_page_id.map(RemoteId::new),
         connection_id,
@@ -795,7 +814,7 @@ fn pull(args: &[String], json: bool) -> i32 {
     warn_daemon_fallback("pull", fallback_reason);
 
     let credentials = open_credential_store(&state_root);
-    let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), path) {
+    let connector = match resolve_source_for_path(&store, credentials.as_ref(), path) {
         Ok(connector) => connector,
         Err(error) => return connector_command_error("pull", json, error),
     };
@@ -950,14 +969,11 @@ fn undo(args: &[String], json: bool) -> i32 {
     };
     let state_root = default_state_root();
     let credentials = open_credential_store(&state_root);
-    let connector = match resolve_notion_connector_for_mount_id(
-        &store,
-        credentials.as_ref(),
-        &journal.mount_id,
-    ) {
-        Ok(connector) => connector,
-        Err(error) => return connector_command_error("undo", json, error),
-    };
+    let connector =
+        match resolve_source_for_mount_id(&store, credentials.as_ref(), &journal.mount_id) {
+            Ok(connector) => connector,
+            Err(error) => return connector_command_error("undo", json, error),
+        };
     let mut undo_applier = ConnectorUndoApplier::new(&connector);
 
     match run_undo_with_applier(&mut store, push_id, &mut undo_applier) {
@@ -1050,7 +1066,7 @@ fn push(args: &[String], json: bool) -> i32 {
     };
 
     let credentials = open_credential_store(&state_root);
-    let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), path) {
+    let connector = match resolve_source_for_path(&store, credentials.as_ref(), path) {
         Ok(connector) => connector,
         Err(error) => return connector_command_error("push", json, error),
     };
@@ -1779,13 +1795,7 @@ fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn file_provider_display_name(mount: &MountConfig) -> String {
-    mount
-        .root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| mount.mount_id.0.clone())
+    file_provider_helper::macos_file_provider_display_name(&mount.root, &mount.mount_id.0)
 }
 
 fn stub(command: &str, json: bool) -> i32 {
@@ -2009,6 +2019,7 @@ fn resolve_mount_connection(
     store: &SqliteStateStore,
     args: &[String],
 ) -> Result<Option<ConnectionId>, CommandError> {
+    let descriptor = source_descriptor("notion");
     if let Some(connection_id) = flag_value(args, "--connection") {
         let connection_id = ConnectionId::new(connection_id);
         let connection = store
@@ -2020,7 +2031,7 @@ fn resolve_mount_connection(
                     "missing_connection",
                     format!("connection `{}` was not found", connection_id.0),
                 )
-                .with_suggested_command("afs connect notion")
+                .with_optional_suggested_command(descriptor.connect_command())
             })?;
         if connection.status != "active" {
             return Err(CommandError::new(
@@ -2028,9 +2039,9 @@ fn resolve_mount_connection(
                 "connection_revoked",
                 format!("connection `{}` is revoked", connection.connection_id.0),
             )
-            .with_suggested_command("afs connect notion"));
+            .with_optional_suggested_command(descriptor.connect_command()));
         }
-        validate_connection_profile(store, &connection)?;
+        validate_connection_profile(store, &connection, &descriptor)?;
         return Ok(Some(connection.connection_id));
     }
 
@@ -2038,24 +2049,39 @@ fn resolve_mount_connection(
         .list_connections()
         .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?
         .into_iter()
-        .filter(|connection| connection.connector == "notion" && connection.status == "active")
+        .filter(|connection| {
+            connection.connector == descriptor.id() && connection.status == "active"
+        })
         .collect::<Vec<_>>();
     for connection in &active {
-        validate_connection_profile(store, connection)?;
+        validate_connection_profile(store, connection, &descriptor)?;
     }
     match active.as_slice() {
         [connection] => Ok(Some(connection.connection_id.clone())),
-        [] if std::env::var("NOTION_TOKEN").is_ok() => Ok(None),
-        [] => Err(CommandError::new(
-            "mount",
-            "missing_connection",
-            "missing Notion connection; run `afs connect notion`",
-        )
-        .with_suggested_command("afs connect notion")),
+        [] if descriptor
+            .auth_env_var()
+            .is_some_and(|env_var| std::env::var(env_var).is_ok()) =>
+        {
+            Ok(None)
+        }
+        [] => {
+            let message = match descriptor.connect_command() {
+                Some(command) => format!(
+                    "missing {} connection; run `{command}`",
+                    descriptor.display_name()
+                ),
+                None => format!("missing {} connection", descriptor.display_name()),
+            };
+            Err(CommandError::new("mount", "missing_connection", message)
+                .with_optional_suggested_command(descriptor.connect_command()))
+        }
         _ => Err(CommandError::new(
             "mount",
             "missing_connection",
-            "multiple Notion connections exist; pass --connection <id>",
+            format!(
+                "multiple {} connections exist; pass --connection <id>",
+                descriptor.display_name()
+            ),
         )),
     }
 }
@@ -2063,6 +2089,7 @@ fn resolve_mount_connection(
 fn validate_connection_profile(
     store: &SqliteStateStore,
     connection: &ConnectionRecord,
+    descriptor: &SourceDescriptor,
 ) -> Result<(), CommandError> {
     let Some(profile_id) = &connection.profile_id else {
         return Ok(());
@@ -2076,7 +2103,7 @@ fn validate_connection_profile(
                 "auth_profile_unavailable",
                 format!("connector profile `{}` was not found", profile_id.0),
             )
-            .with_suggested_command("afs connect notion")
+            .with_optional_suggested_command(descriptor.connect_command())
         })?;
     if profile.status != "active" {
         return Err(CommandError::new(
@@ -2087,7 +2114,7 @@ fn validate_connection_profile(
                 profile.profile_id.0, profile.status
             ),
         )
-        .with_suggested_command("afs connect notion"));
+        .with_optional_suggested_command(descriptor.connect_command()));
     }
     if profile.connector != connection.connector || profile.auth_kind != connection.auth_kind {
         return Err(CommandError::new(
@@ -2098,7 +2125,7 @@ fn validate_connection_profile(
                 profile.profile_id.0, connection.connection_id.0
             ),
         )
-        .with_suggested_command("afs connect notion"));
+        .with_optional_suggested_command(descriptor.connect_command()));
     }
     Ok(())
 }
@@ -2410,6 +2437,7 @@ fn diff_error_exit_code(error: &DiffError) -> i32 {
         DiffError::MountNotFound(_) => EXIT_USAGE,
         DiffError::ReadFile { .. } => EXIT_INTERNAL,
         DiffError::Store(_) => EXIT_INTERNAL,
+        DiffError::Prepare(_) => EXIT_INTERNAL,
     }
 }
 
@@ -2524,8 +2552,10 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 }
 
 fn mount_usage() -> String {
+    let descriptor = source_descriptor("notion");
     format!(
-        "usage: afs mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
+        "usage: afs mount {} <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
+        descriptor.id(),
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -2663,6 +2693,11 @@ impl CommandError {
 
     fn with_suggested_command(mut self, suggested_command: impl Into<String>) -> Self {
         self.suggested_command = Some(suggested_command.into());
+        self
+    }
+
+    fn with_optional_suggested_command(mut self, suggested_command: Option<&str>) -> Self {
+        self.suggested_command = suggested_command.map(str::to_string);
         self
     }
 }

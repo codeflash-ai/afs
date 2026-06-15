@@ -44,6 +44,10 @@ type DesktopSnapshot = {
     readOnly: boolean;
     status: string;
   };
+  settings: {
+    launchAtLogin: boolean;
+    showMenuBar: boolean;
+  };
   pendingChanges: PendingChange[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
@@ -111,6 +115,10 @@ const sampleSnapshot: DesktopSnapshot = {
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
+  },
+  settings: {
+    launchAtLogin: true,
+    showMenuBar: true,
   },
   pendingChanges: [
     {
@@ -196,13 +204,16 @@ function errorMessage(error: unknown) {
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(sampleSnapshot);
+  const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
   const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
+  const setupIsComplete = setupComplete(snapshot);
 
   async function refreshSnapshot() {
     const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
     setSnapshot(nextSnapshot);
+    setSnapshotLoaded(true);
   }
 
   useEffect(() => {
@@ -211,8 +222,20 @@ export default function App() {
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
       await refreshSnapshot();
-    })().catch(() => setSnapshot(sampleSnapshot));
+    })().catch(() => {
+      setSnapshot(sampleSnapshot);
+      setSnapshotLoaded(true);
+    });
   }, []);
+
+  useEffect(() => {
+    if (!snapshotLoaded || route === "#app" || route === "#tray" || route === "#onboarding-ready") {
+      return;
+    }
+    if (setupIsComplete) {
+      setShowOnboarding(false);
+    }
+  }, [route, setupIsComplete, snapshotLoaded]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -229,6 +252,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const refresh = () => {
+      void refreshSnapshot().catch(() => undefined);
+    };
+
+    window.addEventListener("afs-refresh-snapshot", refresh);
+    return () => {
+      window.removeEventListener("afs-refresh-snapshot", refresh);
+    };
+  }, []);
+
+  useEffect(() => {
     document.body.dataset.surface = route === "#tray" ? "tray" : "app";
   }, [route]);
 
@@ -240,6 +274,7 @@ export default function App() {
     return (
       <Onboarding
         snapshot={snapshot}
+        snapshotLoaded={snapshotLoaded}
         onComplete={() => {
           void refreshSnapshot().catch(() => undefined);
           setShowOnboarding(false);
@@ -254,24 +289,77 @@ export default function App() {
 
 function Onboarding({
   snapshot,
+  snapshotLoaded,
   onComplete,
 }: {
   snapshot: DesktopSnapshot;
+  snapshotLoaded: boolean;
   onComplete: () => void;
 }) {
   const [step, setStep] = useState(() => (window.location.hash === "#onboarding-ready" ? 4 : 1));
   const [oauthReady, setOauthReady] = useState(false);
   const [oauthInFlight, setOauthInFlight] = useState(false);
   const [oauthError, setOauthError] = useState("");
+  const [loginUrl, setLoginUrl] = useState("");
+  const [loginCopyMessage, setLoginCopyMessage] = useState("");
+  const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
+  const [mountPathDirty, setMountPathDirty] = useState(false);
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [mountError, setMountError] = useState("");
 
+  useEffect(() => {
+    setConnectedWorkspace(snapshot.connection.workspaceName);
+  }, [snapshot.connection.workspaceName]);
+
+  useEffect(() => {
+    if (!mountPathDirty) {
+      setMountPath(snapshot.mount.localPath);
+    }
+  }, [mountPathDirty, snapshot.mount.localPath]);
+
+  useEffect(() => {
+    if (step !== 2 || !oauthInFlight || oauthReady) {
+      return;
+    }
+
+    let cancelled = false;
+    async function refreshLoginUrl() {
+      const url = await callCommand<string | null>("notion_login_link", undefined, null).catch(() => null);
+      if (!cancelled && url) {
+        setLoginUrl(url);
+      }
+    }
+
+    void refreshLoginUrl();
+    const interval = window.setInterval(() => void refreshLoginUrl(), 700);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [oauthInFlight, oauthReady, step]);
+
+  useEffect(() => {
+    if (!snapshotLoaded || window.location.hash === "#onboarding-ready" || connectionMissing(snapshot)) {
+      return;
+    }
+
+    setOauthReady(true);
+    setStep((current) => {
+      if (mountMissing(snapshot)) {
+        return current < 3 ? 3 : current;
+      }
+      return current < 4 ? 4 : current;
+    });
+  }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
+
   async function startConnect() {
     setOauthError("");
+    setLoginUrl("");
+    setLoginCopyMessage("");
     setOauthReady(false);
     setOauthInFlight(true);
     setStep(2);
@@ -285,12 +373,33 @@ function Onboarding({
         setOauthError(report.message);
         return;
       }
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      setConnectedWorkspace(nextSnapshot.connection.workspaceName);
       setOauthReady(true);
     } catch (error) {
       setOauthError(errorMessage(error));
     } finally {
       setOauthInFlight(false);
     }
+  }
+
+  async function copyLoginLink() {
+    setOauthError("");
+    setLoginCopyMessage("");
+    const url =
+      loginUrl ||
+      (await callCommand<string | null>("notion_login_link", undefined, null).catch(() => null));
+    if (!url) {
+      setOauthError("The Notion login link is still being prepared. Try again in a moment.");
+      return;
+    }
+    setLoginUrl(url);
+    copyText(url);
+    setLoginCopyMessage("Copied login link.");
   }
 
   async function startMount() {
@@ -304,6 +413,13 @@ function Onboarding({
       setMountError(report.message);
       return;
     }
+    const nextSnapshot = await callCommand<DesktopSnapshot>(
+      "desktop_snapshot",
+      undefined,
+      sampleSnapshot,
+    );
+    setMountPathDirty(false);
+    setMountPath(nextSnapshot.mount.localPath);
     setStep(4);
   }
 
@@ -316,6 +432,7 @@ function Onboarding({
         null,
       );
       if (selected) {
+        setMountPathDirty(true);
         setMountPath(selected.replace(/\/$/, ""));
       }
     } catch (error) {
@@ -383,12 +500,25 @@ function Onboarding({
         )}
 
         {step === 2 && (
-          <SetupContent mark={<BrandTile variant="notion">N</BrandTile>}>
+          <SetupContent
+            mark={
+              <BrandTile variant={oauthReady ? "ready" : "notion"}>
+                {oauthReady ? undefined : "N"}
+              </BrandTile>
+            }
+          >
             <div>
-              <h1>Finish connecting in Notion</h1>
+              <div className={`sync-note ${oauthReady ? "connected" : ""}`}>
+                {oauthReady ? <Check /> : <Loader2 className={oauthInFlight ? "spin" : ""} />}
+                {oauthReady ? "Notion connected" : "Waiting for Notion"}
+              </div>
+              <h1>{oauthReady ? "Your Notion workspace is connected" : "Finish connecting in Notion"}</h1>
               <p>
-                A browser window is open. Choose your workspace, pick the pages
-                AFS can use, then approve access.
+                {oauthReady
+                  ? `${
+                      connectedWorkspace || "Your workspace"
+                    } is ready. Next, choose where AFS should place the local folder.`
+                  : "A browser window is open. Choose your workspace, pick the pages AFS can use, then approve access."}
               </p>
             </div>
             <ProgressList
@@ -399,11 +529,12 @@ function Onboarding({
               ]}
             />
             <PrimaryButton disabled={!oauthReady} onClick={() => setStep(3)}>
-              {oauthReady ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Continue"}
+              {oauthReady ? "Continue to folder setup" : oauthInFlight ? "Waiting for Notion" : "Continue"}
             </PrimaryButton>
-            <TextButton disabled={oauthInFlight} onClick={() => void startConnect()}>
-              Open browser again
+            <TextButton disabled={!oauthInFlight && !loginUrl} onClick={() => void copyLoginLink()}>
+              Copy login link
             </TextButton>
+            {loginCopyMessage && <p className="quiet-note">{loginCopyMessage}</p>}
             {oauthError && <p className="field-error">{oauthError}</p>}
             <p className="quiet-note">Credentials are stored securely in the OS credential store.</p>
           </SetupContent>
@@ -413,10 +544,19 @@ function Onboarding({
           <SetupContent mark={<BrandTile variant="folder" />}>
             <div>
               <h1>Where should your Notion files appear?</h1>
-              <p>AFS keeps the folder visible in Documents and organized under its own directory.</p>
+              <p>
+                Choose a name for this workspace. macOS shows the live Notion folder in
+                CloudStorage and AFS keeps a shortcut here.
+              </p>
             </div>
             <div className="path-field">
-              <input value={mountPath} onChange={(event) => setMountPath(event.target.value)} />
+              <input
+                value={mountPath}
+                onChange={(event) => {
+                  setMountPathDirty(true);
+                  setMountPath(event.target.value);
+                }}
+              />
               <SecondaryButton compact onClick={chooseFolder}>
                 Choose
               </SecondaryButton>
@@ -441,8 +581,8 @@ function Onboarding({
               </div>
               <h1>You’re ready to use AFS</h1>
               <p>
-                Your Notion folder is in Documents. AFS will keep syncing the workspace quietly in
-                the background.
+                Your Notion folder is ready. AFS will keep syncing the workspace quietly in the
+                background.
               </p>
             </div>
             <div className="ready-folder">
@@ -458,6 +598,10 @@ function Onboarding({
             <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
               Open Notion Folder
             </PrimaryButton>
+            <p className="quiet-note">
+              If Finder asks to enable the AFS File Provider, click Enable once. macOS requires
+              this approval before showing the Notion files.
+            </p>
             <LocateBox
               label="Open a Notion page"
               value={locateUrl}
@@ -814,7 +958,6 @@ function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; on
         <div className="panel">
           <PanelTitle title="Local Files" />
           <SettingRow title="Location" value={snapshot.mount.localPath} />
-          <SettingRow title="Projection" value={snapshot.mount.projection} />
           <SettingRow title="Mounted content" value="Workspace hierarchy" />
           <SettingRow title="Agent guidance" value="AGENTS.md and CLAUDE.md" />
         </div>
@@ -976,7 +1119,14 @@ function SettingsView({
   onRefresh: () => Promise<void>;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
+  const [settingsMessage, setSettingsMessage] = useState("");
+  const [busySetting, setBusySetting] = useState("");
+  const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
+
+  useEffect(() => {
+    setLocalSettings(snapshot.settings);
+  }, [snapshot.settings.launchAtLogin, snapshot.settings.showMenuBar]);
 
   async function repairRuntime() {
     if (!daemonStopped) {
@@ -1005,6 +1155,34 @@ function SettingsView({
     setDiagnosticMessage("Copied diagnostics summary.");
   }
 
+  async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar", enabled: boolean) {
+    setBusySetting(key);
+    setSettingsMessage("");
+    const previous = localSettings;
+    setLocalSettings({
+      ...localSettings,
+      launchAtLogin: key === "launch_at_login" ? enabled : localSettings.launchAtLogin,
+      showMenuBar: key === "show_menu_bar" ? enabled : localSettings.showMenuBar,
+    });
+    try {
+      const report = await callCommand<ActionReport>(
+        "set_desktop_setting",
+        { change: { key, enabled } },
+        { ok: true, message: "Updated setting." },
+      );
+      if (!report.ok) {
+        setLocalSettings(previous);
+      }
+      setSettingsMessage(report.message);
+      await onRefresh().catch(() => undefined);
+    } catch (error) {
+      setLocalSettings(previous);
+      setSettingsMessage(errorMessage(error));
+    } finally {
+      setBusySetting("");
+    }
+  }
+
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Settings" title="AFS controls" />
@@ -1012,9 +1190,20 @@ function SettingsView({
       <section className="settings-grid">
         <div className="panel">
           <PanelTitle title="Startup" />
-          <ToggleRow title="Launch AFS at login" enabled />
-          <ToggleRow title="Show AFS in the menu bar" enabled />
+          <ToggleRow
+            title="Launch AFS at login"
+            enabled={localSettings.launchAtLogin}
+            busy={busySetting === "launch_at_login"}
+            onToggle={(enabled) => void updateDesktopSetting("launch_at_login", enabled)}
+          />
+          <ToggleRow
+            title="Show AFS in the menu bar"
+            enabled={localSettings.showMenuBar}
+            busy={busySetting === "show_menu_bar"}
+            onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
+          />
           <SettingRow title="Default folder" value="~/Documents/AFS" />
+          {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
         <div className="panel">
@@ -1145,6 +1334,9 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
             <strong>{locatedItem.title}</strong>
             <code>{locatedItem.localPath}</code>
             <button onClick={() => copyText(locatedItem.localPath)}>Copy Path</button>
+            <button onClick={() => void callCommand("reveal_path", { path: locatedItem.localPath }, { ok: true })}>
+              Reveal
+            </button>
           </div>
         )}
       </section>
@@ -1271,7 +1463,7 @@ function LocatedPath({ item }: { item: LocatedItem }) {
         <SecondaryButton compact icon={<Copy />} onClick={() => copyText(item.localPath)}>
           Copy Path
         </SecondaryButton>
-        <SecondaryButton compact icon={<FolderOpen />} onClick={() => void callCommand("open_path", { path: item.localPath }, { ok: true })}>
+        <SecondaryButton compact icon={<FolderOpen />} onClick={() => void callCommand("reveal_path", { path: item.localPath }, { ok: true })}>
           Reveal in Finder
         </SecondaryButton>
       </div>
@@ -1314,11 +1506,7 @@ function ViewHeader({
 function WindowChrome({ title, meta }: { title: string; meta?: string }) {
   return (
     <div className="window-chrome" onMouseDown={handleChromeMouseDown}>
-      <div className="traffic">
-        <button aria-label="Close window" className="traffic-dot close" onClick={() => void windowAction("hide")} />
-        <button aria-label="Minimize window" className="traffic-dot minimize" onClick={() => void windowAction("minimize")} />
-        <button aria-label="Toggle fullscreen" className="traffic-dot zoom" onClick={() => void windowAction("toggleMaximize")} />
-      </div>
+      <div className="native-traffic-space" aria-hidden="true" />
       <div data-tauri-drag-region>{title}</div>
       <div data-tauri-drag-region>{meta}</div>
     </div>
@@ -1337,21 +1525,6 @@ function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
 
   event.preventDefault();
   void getCurrentWindow().startDragging();
-}
-
-async function windowAction(action: "hide" | "minimize" | "toggleMaximize") {
-  if (!isTauriRuntime()) {
-    return;
-  }
-
-  const currentWindow = getCurrentWindow();
-  if (action === "hide") {
-    await currentWindow.hide();
-  } else if (action === "minimize") {
-    await currentWindow.minimize();
-  } else {
-    await currentWindow.toggleMaximize();
-  }
 }
 
 function SetupContent({
@@ -1511,11 +1684,27 @@ function SettingRow({ title, value }: { title: string; value: string }) {
   );
 }
 
-function ToggleRow({ title, enabled }: { title: string; enabled: boolean }) {
+function ToggleRow({
+  title,
+  enabled,
+  busy,
+  onToggle,
+}: {
+  title: string;
+  enabled: boolean;
+  busy?: boolean;
+  onToggle?: (enabled: boolean) => void;
+}) {
   return (
     <div className="setting-row">
       <span>{title}</span>
-      <button className={`toggle ${enabled ? "enabled" : ""}`} aria-label={title}>
+      <button
+        className={`toggle ${enabled ? "enabled" : ""}`}
+        aria-label={title}
+        aria-pressed={enabled}
+        disabled={busy}
+        onClick={() => onToggle?.(!enabled)}
+      >
         <i />
       </button>
     </div>
@@ -1546,6 +1735,10 @@ function connectionMissing(snapshot: DesktopSnapshot) {
 
 function mountMissing(snapshot: DesktopSnapshot) {
   return snapshot.mount.status === "not_mounted";
+}
+
+function setupComplete(snapshot: DesktopSnapshot) {
+  return !connectionMissing(snapshot) && !mountMissing(snapshot);
 }
 
 function isAppView(value: string): value is AppView {

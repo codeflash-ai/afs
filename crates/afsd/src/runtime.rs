@@ -30,15 +30,13 @@ use crate::DaemonConfig;
 use crate::execution::{DaemonEventReport, PushJob};
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
-use crate::notion::{
-    ResolvedNotionSource, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
-};
 use crate::pull::run_pull_with_state_root;
 use crate::push::execute_push_job_with_content_root;
 use crate::reconcile::{
     DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull_with_state_root,
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
+use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
     VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write, create_virtual_fs_file,
     materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
@@ -355,8 +353,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             }
         };
         let credentials = open_credential_store(&state_root);
-        let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), &path)
-        {
+        let connector = match resolve_source_for_path(&store, credentials.as_ref(), &path) {
             Ok(connector) => connector,
             Err(error) => return DaemonResponse::error(error.code(), error.message()),
         };
@@ -379,8 +376,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         };
         let credentials = open_credential_store(&state_root);
         let connector =
-            match resolve_notion_connector_for_path(&store, credentials.as_ref(), &job.target_path)
-            {
+            match resolve_source_for_path(&store, credentials.as_ref(), &job.target_path) {
                 Ok(connector) => connector,
                 Err(error) => return DaemonResponse::error(error.code(), error.message()),
             };
@@ -400,7 +396,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let mut store = SqliteStateStore::open(state_root.clone()).map_err(AfsError::from)?;
         let mounts = store.load_mounts().map_err(AfsError::from)?;
         let credentials = open_credential_store(&state_root);
-        let source = ResolvedNotionSource::new(&store, credentials.as_ref(), &mounts)
+        let source = ResolvedSourceSet::new(&store, credentials.as_ref(), &mounts)
             .map_err(AfsError::from)?;
         let mut hydration = HydrationCollector::default();
         let report = reconcile_scheduled_pull_with_state_root(
@@ -429,7 +425,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let request = hydration_request_for_projection(&store, &state_root, request)?;
         let credentials = open_credential_store(&state_root);
         let connector =
-            resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &request.mount_id)
+            resolve_source_for_mount_id(&store, credentials.as_ref(), &request.mount_id)
                 .map_err(AfsError::from)?;
         let output_root = hydration_output_root_for_projection(&store, &state_root, &request)?;
         let mut executor = if let Some(output_root) = output_root {
@@ -496,6 +492,52 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         }
     }
 
+    fn run_file_provider_children(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
+        if matches!(
+            virtual_fs_children_refresh_needed(&store, &mount_id, &container_identifier),
+            Ok(true)
+        ) {
+            let credentials = open_credential_store(&state_root);
+            let connector =
+                match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+                    Ok(connector) => connector,
+                    Err(error) => return DaemonResponse::error(error.code(), error.message()),
+                };
+            if let Err(error) = refresh_virtual_fs_children(
+                &mut store,
+                &connector,
+                &mount_id,
+                &container_identifier,
+            ) {
+                return DaemonResponse::error(afs_error_code(&error), error.to_string());
+            }
+        }
+
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &container_identifier,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
     fn run_virtual_fs_refresh_children(
         &self,
         state_root: PathBuf,
@@ -509,9 +551,8 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             return Ok(0);
         }
         let credentials = open_credential_store(&state_root);
-        let connector =
-            resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id)
-                .map_err(AfsError::from)?;
+        let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
+            .map_err(AfsError::from)?;
         refresh_virtual_fs_children(&mut store, &connector, &mount_id, &container_identifier)
     }
 
@@ -530,11 +571,10 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             return response;
         }
         let credentials = open_credential_store(&state_root);
-        let connector =
-            match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
-                Ok(connector) => connector,
-                Err(error) => return DaemonResponse::error(error.code(), error.message()),
-            };
+        let connector = match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+            Ok(connector) => connector,
+            Err(error) => return DaemonResponse::error(error.code(), error.message()),
+        };
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         match materialize_virtual_fs_item_with_content_root(
             &mut store,
@@ -563,11 +603,10 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             return response;
         }
         let credentials = open_credential_store(&state_root);
-        let connector =
-            match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
-                Ok(connector) => connector,
-                Err(error) => return DaemonResponse::error(error.code(), error.message()),
-            };
+        let connector = match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+            Ok(connector) => connector,
+            Err(error) => return DaemonResponse::error(error.code(), error.message()),
+        };
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         let materialized = match materialize_virtual_fs_item_with_content_root(
             &mut store,
@@ -919,10 +958,6 @@ impl RuntimeState {
             DaemonRequest::VirtualFsChildren {
                 mount_id,
                 container_identifier,
-            }
-            | DaemonRequest::FileProviderChildren {
-                mount_id,
-                container_identifier,
             } => {
                 let response = self.runner.run_virtual_fs_children(
                     self.config.state_root.clone(),
@@ -934,6 +969,18 @@ impl RuntimeState {
                 if should_refresh {
                     self.queue_child_refresh(mount_id, container_identifier);
                 }
+            }
+            DaemonRequest::FileProviderChildren {
+                mount_id,
+                container_identifier,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::FileProviderChildren {
+                        mount_id,
+                        container_identifier,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
             }
             DaemonRequest::VirtualFsMaterialize {
                 mount_id,
@@ -1350,6 +1397,14 @@ fn run_job(
             response: runner.run_file_provider_read(state_root, mount_id, identifier),
             respond_to,
         },
+        MutatingJob::Request(MutatingRequest::FileProviderChildren {
+            mount_id,
+            container_identifier,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_file_provider_children(state_root, mount_id, container_identifier),
+            respond_to,
+        },
         MutatingJob::Request(MutatingRequest::VirtualFsCommitWrite {
             mount_id,
             identifier,
@@ -1451,6 +1506,11 @@ enum MutatingRequest {
         identifier: String,
         respond_to: Sender<DaemonResponse>,
     },
+    FileProviderChildren {
+        mount_id: String,
+        container_identifier: String,
+        respond_to: Sender<DaemonResponse>,
+    },
     VirtualFsCommitWrite {
         mount_id: String,
         identifier: String,
@@ -1530,6 +1590,14 @@ impl MutatingRequest {
             } => (
                 "file_provider_read".to_string(),
                 Some(format!("{mount_id}:{identifier}")),
+            ),
+            Self::FileProviderChildren {
+                mount_id,
+                container_identifier,
+                ..
+            } => (
+                "file_provider_children".to_string(),
+                Some(format!("{mount_id}:{container_identifier}")),
             ),
             Self::VirtualFsCommitWrite {
                 mount_id,

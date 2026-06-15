@@ -11,6 +11,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use afs_store::MountConfig;
+#[cfg(target_os = "macos")]
+use afs_store::ProjectionMode;
 #[cfg(target_os = "linux")]
 use afsd::ipc::{DaemonRequest, send_request_with_timeout};
 use serde_json::Value;
@@ -150,6 +152,66 @@ pub fn register_linux_fuse_mount(
 pub fn open_macos_file_provider_domain(
     mount_id: &str,
 ) -> Result<FileProviderHelperReport, FileProviderHelperError> {
+    let (report, url) = resolve_macos_file_provider_domain(mount_id)?;
+    Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
+    Ok(report)
+}
+
+pub fn macos_file_provider_domain_url(mount_id: &str) -> Result<PathBuf, FileProviderHelperError> {
+    resolve_macos_file_provider_domain(mount_id).map(|(_, url)| url)
+}
+
+pub fn ensure_macos_file_provider_shortcut(
+    mount: &MountConfig,
+) -> Result<Option<PathBuf>, FileProviderHelperError> {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.projection != ProjectionMode::MacosFileProvider {
+            return Ok(None);
+        }
+        let access_root = macos_file_provider_domain_url(&mount.mount_id.0)?;
+        ensure_macos_file_provider_shortcut_at(mount, &access_root)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = mount;
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_file_provider_shortcut_at(
+    mount: &MountConfig,
+    access_root: &Path,
+) -> Result<Option<PathBuf>, FileProviderHelperError> {
+    if access_root == mount.root {
+        return Ok(None);
+    }
+
+    let shortcut = mount
+        .root
+        .join(file_provider_shortcut_name(&mount.connector));
+    std::fs::create_dir_all(&mount.root).map_err(|error| {
+        FileProviderHelperError::Failed(format!(
+            "could not create shortcut folder `{}`: {error}",
+            mount.root.display()
+        ))
+    })?;
+    if shortcut.exists() || shortcut.symlink_metadata().is_ok() {
+        return Ok(Some(shortcut));
+    }
+    std::os::unix::fs::symlink(&access_root, &shortcut)
+        .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
+    Ok(Some(shortcut))
+}
+
+fn resolve_macos_file_provider_domain(
+    mount_id: &str,
+) -> Result<(FileProviderHelperReport, PathBuf), FileProviderHelperError> {
     let report = run_macos_file_provider_helper(
         "open",
         vec!["--mount-id".to_string(), mount_id.to_string()],
@@ -159,16 +221,52 @@ pub fn open_macos_file_provider_domain(
         .get("url")
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| {
             FileProviderHelperError::Failed(
                 "agentfs-file-providerctl did not return a CloudStorage URL".to_string(),
             )
         })?;
-    Command::new("open")
-        .arg(url)
-        .spawn()
-        .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
-    Ok(report)
+    Ok((report, PathBuf::from(url)))
+}
+
+pub fn macos_file_provider_display_name(root: &Path, fallback: &str) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .map(strip_file_provider_directory_prefix)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn strip_file_provider_directory_prefix(name: &str) -> &str {
+    name.strip_prefix("AgentFS-")
+        .filter(|stripped| !stripped.is_empty())
+        .unwrap_or(name)
+}
+
+#[cfg(target_os = "macos")]
+fn file_provider_shortcut_name(connector: &str) -> String {
+    match connector {
+        "notion" => "Notion Files".to_string(),
+        other => format!("{} Files", title_case_connector(other)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn title_case_connector(connector: &str) -> String {
+    connector
+        .split(['-', '_', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn run_macos_file_provider_helper(
@@ -222,9 +320,16 @@ fn file_provider_helper_path() -> Option<PathBuf> {
     }
 
     candidates.push(PathBuf::from(
+        "/Applications/AFS.app/Contents/MacOS/agentfs-file-providerctl",
+    ));
+    candidates.push(PathBuf::from(
         "/Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl",
     ));
     if let Ok(home) = std::env::var("HOME") {
+        candidates.push(
+            PathBuf::from(&home)
+                .join("Applications/AFS.app/Contents/MacOS/agentfs-file-providerctl"),
+        );
         candidates.push(
             PathBuf::from(home)
                 .join("Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
@@ -444,5 +549,70 @@ mod linux_tests {
         assert!(
             unit.contains("StandardOutput=append:/home/example/.afs/logs/afs-fuse.notion_main.log")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn macos_file_provider_display_name_strips_agentfs_cloudstorage_prefix() {
+        assert_eq!(
+            super::macos_file_provider_display_name(
+                std::path::Path::new("/Users/example/Library/CloudStorage/AgentFS-Notion"),
+                "fallback",
+            ),
+            "Notion"
+        );
+        assert_eq!(
+            super::macos_file_provider_display_name(
+                std::path::Path::new("/Users/example/Documents/AFS/Notion"),
+                "fallback",
+            ),
+            "Notion"
+        );
+        assert_eq!(
+            super::macos_file_provider_display_name(std::path::Path::new("/"), "fallback"),
+            "fallback"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use afs_core::model::MountId;
+    use afs_store::{MountConfig, ProjectionMode};
+
+    #[test]
+    fn file_provider_shortcut_creates_missing_mount_root() {
+        let base = unique_temp_path("afs-file-provider-shortcut");
+        let root = base.join("Mount");
+        let access_root = base.join("CloudStorage").join("AgentFS-Notion");
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", root.clone())
+            .projection(ProjectionMode::MacosFileProvider);
+
+        let shortcut = super::ensure_macos_file_provider_shortcut_at(&mount, &access_root)
+            .expect("create shortcut")
+            .expect("shortcut path");
+
+        assert_eq!(shortcut, root.join("Notion Files"));
+        assert!(root.is_dir());
+        assert_eq!(
+            fs::read_link(shortcut).expect("shortcut target"),
+            access_root
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }

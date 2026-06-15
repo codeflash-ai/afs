@@ -1,0 +1,33 @@
+name: notion-live-e2e
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: notion-live-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  notion-live:
+    name: Notion live e2e
+    runs-on: ubuntu-latest
+    environment: notion-live-e2e
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      AFS_NOTION_LIVE_PARENT_PAGE: ${{ secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
+      AFS_NOTION_LIVE_DIR: /tmp/afs-notion-live
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify live Notion secrets
+        run: |
+          test -n "$NOTION_TOKEN"
+          test -n "$AFS_NOTION_LIVE_PARENT_PAGE"
+      - name: Run connector live integrity tests
+        run: cargo test -p afs-notion --test live_integrity -- --ignored --test-threads=1
+      - name: Run mounted workflow live e2e
+        run: cargo test -p afs-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact --test-threads=1
