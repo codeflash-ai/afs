@@ -18,10 +18,11 @@ The current implementation is a live-capable read, pull, and narrow write projec
   equations, display equations, and heading levels 1-4 render to Markdown where there is a
   stable textual representation;
 - simple Notion tables render as Markdown tables with table-row IDs retained in shadow metadata;
-- toggles, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes,
+- toggles, synced blocks, column layouts, tabs, meeting notes,
   AI/custom blocks, URL-less media payloads, and unsupported or lossy blocks render as `::afs{...}` directives so they
   retain remote identity and useful metadata such as title, URL, source block ID, or target page ID
   when the API exposes it.
+- bookmark/embed/link-preview URL blocks render as ordinary Markdown links.
 - media blocks with a Notion URL render as ordinary Markdown image or link syntax, while still
   keeping local media download metadata in the rendered entity for filesystem-aware callers.
 - `afs push -y` can update, append, and archive simple Notion blocks, update supported page
@@ -93,14 +94,14 @@ GitHub Actions has a manual `notion-live-e2e` workflow for these tests. The work
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, embeds, bookmarks, synced blocks, column layouts, tabs, table of contents, breadcrumbs, link-to-page blocks, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 
 - `RichTextDto` mirrors Notion's `text`, `mention`, and `equation` variants plus shared annotations and links.
 - `TextRichTextDto`, `MentionRichTextDto`, and `EquationRichTextDto` keep variant-specific payloads out of renderer control flow.
 - The renderer preserves whitespace around annotated spans so text like ` bold ` becomes ` **bold** ` instead of pulling spaces into Markdown delimiters.
-- Page and database mentions render as `afs://...` links for now. That keeps the remote identity visible until local cross-document link resolution is implemented.
+- Page and database mentions render as normal Markdown links to Notion object URLs. Unchanged mention preimages still preserve typed Notion mentions during block updates, and agents can create or reassert typed links with `@page(<notion-page-id>)` and `@database(<notion-database-id>)`.
 - Unknown or partially populated rich text falls back to `plain_text` so live API additions remain readable.
 
 Nested children are fetched recursively and rendered after their parent, except valid table rows, which are folded into their parent table's Markdown block. This preserves content and block IDs for the first read path, but it does not yet preserve every Notion nesting/layout nuance. Layout-rich blocks should stay directive-backed until the renderer can round-trip them safely.
@@ -110,16 +111,16 @@ Nested children are fetched recursively and rendered after their parent, except 
 The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, block archive, supported page property update, and database row creation;
-- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, and display equations;
-- supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, `afs://` page links, and unchanged preimage mentions such as dates;
-- supported page property writes: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone;
+- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing stable-width/header-mode tables including row add/delete, existing bookmark/embed URL blocks, and existing URL-backed media blocks;
+- supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, database links whose target ID matches a rendered database mention, explicit `@page(...)` page mentions, explicit `@database(...)` database mentions, explicit `@date(...)` date mentions, explicit `@user(...)` user mentions, legacy `afs://` page links, and unchanged preimage mentions such as dates/users;
+- supported page property writes: title, rich text with the same inline Markdown parser used by page bodies, number, select, status, multi-select, checkbox, date, URL, email, phone, external file URLs, explicit people user IDs, and explicit relation page IDs;
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;
-- unsupported write forms fail before API mutation, including tables, page/database creation outside database-row files, computed/read-only properties, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
+- unsupported write forms fail before API mutation, including table width or header-mode changes, page/database creation outside database-row files, computed/read-only properties, hosted file uploads/rewrites, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
 - after apply, the CLI reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
 
-This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
+This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover nested annotation/link combinations, local relative-file link resolution, and remaining specialized Notion mention variants.
 
 ## Schema-Backed Property Validation
 
@@ -127,7 +128,7 @@ Projected database directories carry `_schema.yaml`, generated from the live Not
 
 For existing rows, only changed frontmatter properties are validated, so read-only values rendered from Notion, such as formulas or rollups, can remain in the file unchanged. For new row files, every non-identity frontmatter property is validated because all of them become create-page payload fields.
 
-The current validator supports the same writable property set as apply: `title`, `rich_text`, `number`, `select`, `status`, `multi_select`, `checkbox`, `date`, `url`, `email`, and `phone_number`. Select-like values must use option names already present in `_schema.yaml`; unknown options stop as `fix_validation` instead of implicitly creating new Notion options. Computed, read-only, or unresolved types such as `files`, `people`, `relation`, `formula`, `rollup`, timestamps, users, `unique_id`, and `verification` are blocked with structured validation errors until their ownership and resolution policies are designed.
+The current validator supports the same writable property set as apply: `title`, `rich_text`, `number`, `select`, `status`, `multi_select`, `checkbox`, `date`, `url`, `email`, `phone_number`, external `files`, explicit `people` user IDs, and `relation` page IDs. Select-like values must use option names already present in `_schema.yaml`; unknown options stop as `fix_validation` instead of implicitly creating new Notion options. Computed, read-only, or unresolved types such as `formula`, `rollup`, timestamps, users, `unique_id`, and `verification` are blocked with structured validation errors until their ownership and resolution policies are designed.
 
 Multi-data-source databases still stop before row writes because AFS does not yet have a path-level way to choose the target data source. Pull the database again if `_schema.yaml` is missing or stale.
 

@@ -27,7 +27,7 @@ Clean Markdown is preferred for diffable blocks. Undiffable or lossy blocks rend
 
 Directive integrity is validated before push. Agents may move directive lines as whole lines, but editing directive contents is rejected unless the change maps to an explicit supported operation.
 
-The first renderer supports common text blocks, richer inline text, display equations, simple tables, and file-like media blocks with API URLs directly. Inline bold, italic, strikethrough, code, external links, date mentions, page/database mentions, link previews, and equations use ordinary Markdown or small HTML fallbacks when Markdown has no native equivalent. Child pages, child databases, toggles, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes, AI/custom blocks, URL-less media payloads, and unsupported/lossy blocks render as directives. This keeps the page inspectable while preserving remote block IDs for later safer round-trip support.
+The first renderer supports common text blocks, richer inline text, display equations, simple tables, bookmark/embed/link-preview URL blocks, and file-like media blocks with API URLs directly. Inline bold, italic, strikethrough, code, external links, date mentions, page/database mentions, link previews, and equations use ordinary Markdown or small HTML fallbacks when Markdown has no native equivalent. Child pages, child databases, toggles, synced blocks, column layouts, tabs, meeting notes, AI/custom blocks, URL-less media payloads, and unsupported/lossy blocks render as directives. This keeps the page inspectable while preserving remote block IDs for later safer round-trip support.
 
 Media blocks with a Notion `file.url` or `external.url` render as ordinary Markdown. Images use image syntax, while other file-like blocks use links:
 
@@ -38,11 +38,11 @@ Media blocks with a Notion `file.url` or `external.url` render as ordinary Markd
 
 When rendered through a filesystem-aware pull or reconcile path, image files are also downloaded into the mount-level `media/` directory so agents can open a local copy without cluttering the Markdown page directory. URL-less media payloads still render as directives, for example `::afs{id=image-id type=image title="Architecture diagram"}`.
 
-The first writer supports block bodies whose Markdown shape maps to one Notion block: paragraphs, headings, single list items, to-dos, quotes, code fences, dividers, and display equations. It also parses the rich inline Markdown emitted by the renderer for bold, italic, strikethrough, underline, code, external links, equations, and `afs://` page links. Unchanged preimage mentions, such as date mentions, are preserved during block updates; unsupported inline shapes fail rather than being flattened silently.
+The first writer supports block bodies whose Markdown shape maps to one Notion block or a guarded existing Notion table: paragraphs, headings, single list items, to-dos, quotes, code fences, dividers, display equations, existing stable-width/header-mode tables including row add/delete, existing bookmark/embed URL blocks, and existing URL-backed media blocks. Media edits write external URLs; uploads and appending new media blocks are deferred. It also parses the rich inline Markdown emitted by the renderer for bold, italic, strikethrough, underline, code, external links, equations, Notion page links, database links whose target ID matches a rendered database mention, explicit page/database mentions written as `@page(<notion-page-id>)` and `@database(<notion-database-id>)`, explicit date mentions written as `@date(2026-06-14)` or `@date(2026-06-14 to 2026-06-21, tz=America/Chicago)`, explicit user mentions written as `@user(<notion-user-id>)`, and legacy `afs://` page links. Unchanged preimage mentions, such as existing date/user mentions, are preserved during block updates; unsupported inline shapes fail rather than being flattened silently.
 
 ## Database Rows
 
-A Notion database row renders as the same page document shape with row properties flattened into frontmatter keys:
+A Notion database row renders as the same page document shape with row properties flattened into frontmatter keys. Rich-text properties use the same inline Markdown contract as page bodies, so annotations, links, equations, and supported explicit mention syntax can be edited from frontmatter:
 
 ```markdown
 ---
@@ -62,7 +62,7 @@ title: "Fix login bug"
 
 Supported read-side property values include title, rich text, number, select, multi-select, status, checkbox, date, URL, email, phone, files, people, relation IDs, created/edited timestamps, created/edited users, formula, rollup, unique ID, and verification values.
 
-Property writes are planned by comparing edited frontmatter against the shadow frontmatter captured during the last render. The Notion writer currently applies title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone properties. Read-only, computed, or identity-backed property classes such as files, people, relation, formula, rollup, created/edited timestamps, created/edited users, unique ID, and verification remain read-side only until schema validation and richer property preimages are added.
+Property writes are planned by comparing edited frontmatter against the shadow frontmatter captured during the last render. The Notion writer currently applies title, rich text, number, select, status, multi-select, checkbox, date, URL, email, phone, external file URL, people, and relation properties. File entries use either `https://...` or `Name <https://...>` frontmatter list values and write Notion external file objects. People entries use Notion user IDs or `Name <user-id>` strings. Relation entries use Notion page IDs as strings or YAML lists. Read-only, computed, or identity-backed property classes such as formula, rollup, created/edited timestamps, created/edited users, unique ID, and verification remain read-side only until schema validation and richer property preimages are added.
 
 A new database row starts as the same document shape without generated identity fields:
 

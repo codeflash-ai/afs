@@ -143,11 +143,8 @@ fn mount_touch_guardrail_requires_confirm() {
 
 #[test]
 fn plan_degradations_surface_in_output() {
-    let parsed = parsed_doc("First rewrite.\n\nSecond rewrite.");
-    let shadow = shadow(
-        "First paragraph.\n\nSecond paragraph.",
-        ["block-1", "block-2"],
-    );
+    let parsed = parsed_doc("- First rewrite.\n\nSecond rewrite.");
+    let shadow = shadow("First paragraph.\n\n- Second item", ["block-1", "block-2"]);
 
     let output = plan_push_pipeline(request(&parsed, &shadow).with_approval(PushApproval {
         assume_yes: true,

@@ -4,16 +4,17 @@ use std::sync::Mutex;
 
 use afs_connector::{ApplyPlanRequest, Connector};
 use afs_core::journal::{JournalApplyEffect, PushId, PushOperationId};
-use afs_core::model::{MountId, RemoteId};
+use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
-    DatabaseDto, DateMentionDto, EquationBlockDto, LinkDto, MentionRichTextDto, PageDto,
-    PageListDto, PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto,
-    RichTextDto, SelectOptionDto, TextRichTextDto,
+    DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, IdRefDto,
+    LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto,
+    PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
+    TableBlockDto, TableRowBlockDto, TextRichTextDto, UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -655,6 +656,39 @@ fn check_concurrency_rejects_remote_timestamp_mismatch() {
 }
 
 #[test]
+fn check_concurrency_uses_database_metadata_for_row_create_parent() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("database-1")],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("database-1"),
+            parent_kind: Some(EntityKind::Database),
+            title: "New row".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Rows/new-row.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let preconditions = vec![RemotePrecondition {
+        remote_id: RemoteId::new("database-1"),
+        remote_edited_at: Some("2026-06-10T00:00:00.000Z".to_string()),
+    }];
+
+    connector
+        .check_concurrency(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &[],
+            remote_preconditions: &preconditions,
+        })
+        .expect("database parent concurrency check");
+}
+
+#[test]
 fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
     let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
         "2026-06-10T00:00:00.000Z",
@@ -664,6 +698,8 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
             date_mention("2026-06-10", "2026-06-10"),
             rich_text_part(" plus "),
             linked_text("Docs", "https://example.com/"),
+            rich_text_part(" and database "),
+            database_mention("Tasks", "33333333-3333-3333-3333-333333333333"),
             rich_text_part("."),
         ],
     ));
@@ -672,7 +708,7 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
         vec![RemoteId::new("page-1")],
         vec![PushOperation::UpdateBlock {
             block_id: RemoteId::new("paragraph-1"),
-            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and $E=mc^2$ [Roadmap](afs://page-2)".to_string(),
+            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and database [Tasks updated](https://www.notion.so/33333333333333333333333333333333) and @date(2026-06-11 to 2026-06-12, tz=America/Chicago) and @user(Ada <55555555-5555-5555-5555-555555555555>) and @page(Roadmap <44444444-4444-4444-4444-444444444444>) and @database(66666666666666666666666666666666) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -745,6 +781,83 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
                         {
                             "type": "text",
                             "text": {
+                                "content": " and database ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "database",
+                                "database": {
+                                    "id": "33333333333333333333333333333333",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "date",
+                                "date": {
+                                    "start": "2026-06-11",
+                                    "end": "2026-06-12",
+                                    "time_zone": "America/Chicago",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "user",
+                                "user": {
+                                    "id": "55555555-5555-5555-5555-555555555555",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "page",
+                                "page": {
+                                    "id": "44444444-4444-4444-4444-444444444444",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "database",
+                                "database": {
+                                    "id": "66666666666666666666666666666666",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
                                 "content": " and ",
                             },
                         },
@@ -761,11 +874,26 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
                             },
                         },
                         {
+                            "type": "text",
+                            "text": {
+                                "content": "Hex docs",
+                                "link": {
+                                    "url": "https://example.com/22222222222222222222222222222222",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " ",
+                            },
+                        },
+                        {
                             "type": "mention",
                             "mention": {
                                 "type": "page",
                                 "page": {
-                                    "id": "page-2",
+                                    "id": "22222222222222222222222222222222",
                                 },
                             },
                         },
@@ -773,6 +901,472 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
                 },
             }),
         }]
+    );
+}
+
+#[test]
+fn apply_rejects_link_to_page_retargeting_before_api_mutation() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![link_to_page_block(
+            "page-link-1",
+            "page_id",
+            "11111111-1111-1111-1111-111111111111",
+        )],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("page-link-1"),
+            content:
+                "[Updated page](https://www.notion.so/Project-22222222222222222222222222222222)"
+                    .to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect_err("link_to_page retargeting is intentionally unsupported");
+
+    assert!(
+        matches!(error, AfsError::Unsupported(message) if message.contains("link_to_page")),
+        "{error:?}"
+    );
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn apply_updates_bookmark_and_embed_blocks_from_markdown_links() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            url_block(
+                "bookmark-1",
+                "bookmark",
+                "https://example.com/original-bookmark",
+                "Original bookmark",
+            ),
+            url_block(
+                "embed-1",
+                "embed",
+                "https://example.com/original-embed",
+                "Original embed",
+            ),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("bookmark-1"),
+                content: "[Updated bookmark](https://example.com/updated-bookmark)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("embed-1"),
+                content: "[Updated embed](https://example.com/updated-embed)".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply URL block updates");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "bookmark-1".to_string(),
+                body: json!({
+                    "bookmark": {
+                        "url": "https://example.com/updated-bookmark",
+                        "caption": rich_text_json("Updated bookmark"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "embed-1".to_string(),
+                body: json!({
+                    "embed": {
+                        "url": "https://example.com/updated-embed",
+                        "caption": rich_text_json("Updated embed"),
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_updates_external_media_blocks_from_markdown_links() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            media_block(
+                "image-1",
+                "image",
+                "https://example.com/original-image.png",
+                "Original image",
+            ),
+            media_block(
+                "video-1",
+                "video",
+                "https://example.com/original-video.mp4",
+                "Original video",
+            ),
+            media_block(
+                "file-1",
+                "file",
+                "https://example.com/original-file.pdf",
+                "Original file",
+            ),
+            media_block(
+                "pdf-1",
+                "pdf",
+                "https://example.com/original.pdf",
+                "Original PDF",
+            ),
+            media_block(
+                "audio-1",
+                "audio",
+                "https://example.com/original-audio.mp3",
+                "Original audio",
+            ),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("image-1"),
+                content: "![Updated image](https://example.com/updated-image.png)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("video-1"),
+                content: "[Updated video](https://example.com/updated-video.mp4)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("file-1"),
+                content: "[Updated file](https://example.com/updated-file.pdf)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("pdf-1"),
+                content: "[Updated PDF](https://example.com/updated.pdf)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("audio-1"),
+                content: "[Updated audio](https://example.com/updated-audio.mp3)".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply external media block updates");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "image-1".to_string(),
+                body: json!({
+                    "image": {
+                        "external": {
+                            "url": "https://example.com/updated-image.png",
+                        },
+                        "caption": rich_text_json("Updated image"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "video-1".to_string(),
+                body: json!({
+                    "video": {
+                        "external": {
+                            "url": "https://example.com/updated-video.mp4",
+                        },
+                        "caption": rich_text_json("Updated video"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "file-1".to_string(),
+                body: json!({
+                    "file": {
+                        "external": {
+                            "url": "https://example.com/updated-file.pdf",
+                        },
+                        "caption": rich_text_json("Updated file"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "pdf-1".to_string(),
+                body: json!({
+                    "pdf": {
+                        "external": {
+                            "url": "https://example.com/updated.pdf",
+                        },
+                        "caption": rich_text_json("Updated PDF"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "audio-1".to_string(),
+                body: json!({
+                    "audio": {
+                        "external": {
+                            "url": "https://example.com/updated-audio.mp3",
+                        },
+                        "caption": rich_text_json("Updated audio"),
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_updates_simple_table_rows_from_markdown_table() {
+    let api = Arc::new(RecordingNotionApi::with_table(
+        "2026-06-10T00:00:00.000Z",
+        table_block("table-1", 2, true),
+        vec![
+            table_row_block("row-1", &["Name", "Status"]),
+            table_row_block("row-2", &["Old task", "Todo"]),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("table-1"),
+            content: "| Name | Status |\n| --- | --- |\n| New task | Done |".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply table row updates");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "row-1".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Name"),
+                            rich_text_json("Status"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "row-2".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("New task"),
+                            rich_text_json("Done"),
+                        ],
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_adds_table_rows_from_markdown_table() {
+    let api = Arc::new(RecordingNotionApi::with_table(
+        "2026-06-10T00:00:00.000Z",
+        table_block("table-1", 2, true),
+        vec![
+            table_row_block("row-1", &["Name", "Status"]),
+            table_row_block("row-2", &["Old task", "Todo"]),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("table-1"),
+            content: "| Name | Status |\n| --- | --- |\n| New task | Done |\n| Added task | Next |"
+                .to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply table row addition");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "row-1".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Name"),
+                            rich_text_json("Status"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "row-2".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("New task"),
+                            rich_text_json("Done"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Append {
+                block_id: "table-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "table_row",
+                        "table_row": {
+                            "cells": [
+                                rich_text_json("Added task"),
+                                rich_text_json("Next"),
+                            ],
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "row-2",
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_deletes_table_rows_from_markdown_table() {
+    let api = Arc::new(RecordingNotionApi::with_table(
+        "2026-06-10T00:00:00.000Z",
+        table_block("table-1", 2, true),
+        vec![
+            table_row_block("row-1", &["Name", "Status"]),
+            table_row_block("row-2", &["Keep task", "Todo"]),
+            table_row_block("row-3", &["Drop task", "Later"]),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("table-1"),
+            content: "| Name | Status |\n| --- | --- |\n| Kept task | Done |".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply table row deletion");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "row-1".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Name"),
+                            rich_text_json("Status"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "row-2".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Kept task"),
+                            rich_text_json("Done"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Delete {
+                block_id: "row-3".to_string(),
+            },
+        ]
     );
 }
 
@@ -786,8 +1380,12 @@ fn apply_updates_supported_page_properties() {
             ("Tags".to_string(), page_property("multi_select")),
             ("Done".to_string(), page_property("checkbox")),
             ("Points".to_string(), page_property("number")),
+            ("Notes".to_string(), page_property("rich_text")),
             ("Due".to_string(), page_property("date")),
             ("URL".to_string(), page_property("url")),
+            ("Files".to_string(), page_property("files")),
+            ("People".to_string(), page_property("people")),
+            ("Relation".to_string(), page_property("relation")),
         ]),
     ));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -811,12 +1409,36 @@ fn apply_updates_supported_page_properties() {
                 ("Done".to_string(), PropertyValue::Bool(false)),
                 ("Points".to_string(), PropertyValue::Number("3".to_string())),
                 (
+                    "Notes".to_string(),
+                    PropertyValue::String("**Updated** notes and @date(2026-06-14)".to_string()),
+                ),
+                (
                     "Due".to_string(),
                     PropertyValue::String("2026-06-10".to_string()),
                 ),
                 (
                     "URL".to_string(),
                     PropertyValue::String("https://example.com/afs".to_string()),
+                ),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec![
+                        "Spec <https://example.com/spec.pdf>".to_string(),
+                        "https://example.com/diagram.png".to_string(),
+                    ]),
+                ),
+                (
+                    "People".to_string(),
+                    PropertyValue::List(vec![
+                        "Ada <aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa>".to_string(),
+                    ]),
+                ),
+                (
+                    "Relation".to_string(),
+                    PropertyValue::List(vec![
+                        "11111111111111111111111111111111".to_string(),
+                        "22222222-2222-2222-2222-222222222222".to_string(),
+                    ]),
                 ),
             ]
             .into_iter()
@@ -847,7 +1469,11 @@ fn apply_updates_supported_page_properties() {
             keys: vec![
                 "Done".to_string(),
                 "Due".to_string(),
+                "Files".to_string(),
+                "Notes".to_string(),
+                "People".to_string(),
                 "Points".to_string(),
+                "Relation".to_string(),
                 "Status".to_string(),
                 "Tags".to_string(),
                 "URL".to_string(),
@@ -882,6 +1508,39 @@ fn apply_updates_supported_page_properties() {
                     "Points": {
                         "number": 3.0,
                     },
+                    "Notes": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": "Updated",
+                                },
+                                "annotations": {
+                                    "bold": true,
+                                    "italic": false,
+                                    "strikethrough": false,
+                                    "underline": false,
+                                    "code": false,
+                                    "color": "default",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": " notes and ",
+                                },
+                            },
+                            {
+                                "type": "mention",
+                                "mention": {
+                                    "type": "date",
+                                    "date": {
+                                        "start": "2026-06-14",
+                                    },
+                                },
+                            },
+                        ],
+                    },
                     "Due": {
                         "date": {
                             "start": "2026-06-10",
@@ -889,6 +1548,35 @@ fn apply_updates_supported_page_properties() {
                     },
                     "URL": {
                         "url": "https://example.com/afs",
+                    },
+                    "Files": {
+                        "files": [
+                            {
+                                "name": "Spec",
+                                "type": "external",
+                                "external": {
+                                    "url": "https://example.com/spec.pdf",
+                                },
+                            },
+                            {
+                                "name": "diagram.png",
+                                "type": "external",
+                                "external": {
+                                    "url": "https://example.com/diagram.png",
+                                },
+                            },
+                        ],
+                    },
+                    "People": {
+                        "people": [
+                            { "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
+                        ],
+                    },
+                    "Relation": {
+                        "relation": [
+                            { "id": "11111111111111111111111111111111" },
+                            { "id": "22222222-2222-2222-2222-222222222222" },
+                        ],
                     },
                 },
             }),
@@ -906,6 +1594,10 @@ fn apply_creates_database_row_with_properties_and_children() {
             ("Tags".to_string(), data_source_property("multi_select")),
             ("Done".to_string(), data_source_property("checkbox")),
             ("Points".to_string(), data_source_property("number")),
+            ("Notes".to_string(), data_source_property("rich_text")),
+            ("Files".to_string(), data_source_property("files")),
+            ("People".to_string(), data_source_property("people")),
+            ("Relation".to_string(), data_source_property("relation")),
         ]),
     ));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -926,6 +1618,24 @@ fn apply_creates_database_row_with_properties_and_children() {
                 ),
                 ("Done".to_string(), PropertyValue::Bool(false)),
                 ("Points".to_string(), PropertyValue::Number("5".to_string())),
+                (
+                    "Notes".to_string(),
+                    PropertyValue::String("Created **rich** notes".to_string()),
+                ),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec![
+                        "Design <https://example.com/design.pdf>".to_string(),
+                    ]),
+                ),
+                (
+                    "People".to_string(),
+                    PropertyValue::List(vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()]),
+                ),
+                (
+                    "Relation".to_string(),
+                    PropertyValue::List(vec!["33333333333333333333333333333333".to_string()]),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -987,8 +1697,59 @@ fn apply_creates_database_row_with_properties_and_children() {
                     "Done": {
                         "checkbox": false,
                     },
+                    "Notes": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": "Created ",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": "rich",
+                                },
+                                "annotations": {
+                                    "bold": true,
+                                    "italic": false,
+                                    "strikethrough": false,
+                                    "underline": false,
+                                    "code": false,
+                                    "color": "default",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": " notes",
+                                },
+                            },
+                        ],
+                    },
                     "Points": {
                         "number": 5.0,
+                    },
+                    "Files": {
+                        "files": [
+                            {
+                                "name": "Design",
+                                "type": "external",
+                                "external": {
+                                    "url": "https://example.com/design.pdf",
+                                },
+                            },
+                        ],
+                    },
+                    "People": {
+                        "people": [
+                            { "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+                        ],
+                    },
+                    "Relation": {
+                        "relation": [
+                            { "id": "33333333333333333333333333333333" },
+                        ],
                     },
                 },
                 "children": [
@@ -1116,6 +1877,7 @@ impl RecordingNotionApi {
                 id: "source-1".to_string(),
                 name: Some("Tasks".to_string()),
             }],
+            last_edited_time: Some(last_edited_time.to_string()),
             ..Default::default()
         };
         api.data_source = DataSourceDto {
@@ -1138,6 +1900,57 @@ impl RecordingNotionApi {
             properties: BTreeMap::new(),
         };
         Self::with_page_and_block_results(page, blocks)
+    }
+
+    fn with_table(last_edited_time: &str, table: BlockDto, rows: Vec<BlockDto>) -> Self {
+        let page = PageDto {
+            id: "page-1".to_string(),
+            parent: None,
+            created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            last_edited_time: Some(last_edited_time.to_string()),
+            archived: false,
+            in_trash: false,
+            properties: BTreeMap::new(),
+        };
+        let children = BTreeMap::from([
+            (
+                ("page-1".to_string(), None),
+                PaginatedListDto {
+                    results: vec![table.clone()],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                (table.id, None),
+                PaginatedListDto {
+                    results: rows,
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+        ]);
+        Self {
+            page,
+            database: DatabaseDto {
+                id: "database-1".to_string(),
+                data_sources: vec![DataSourceSummaryDto {
+                    id: "source-1".to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                ..Default::default()
+            },
+            data_source: DataSourceDto {
+                id: "source-1".to_string(),
+                name: Some("Tasks".to_string()),
+                properties: BTreeMap::new(),
+                ..Default::default()
+            },
+            children,
+            writes: Mutex::new(Vec::new()),
+            append_count: Mutex::new(0),
+        }
     }
 
     fn with_page_and_children(page: PageDto, rich_text: Vec<RichTextDto>) -> Self {
@@ -1167,6 +1980,7 @@ impl RecordingNotionApi {
                     id: "source-1".to_string(),
                     name: Some("Tasks".to_string()),
                 }],
+                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 ..Default::default()
             },
             data_source: DataSourceDto {
@@ -1429,6 +2243,75 @@ fn equation_block(id: &str, expression: &str) -> BlockDto {
     block
 }
 
+fn url_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = block(id, kind);
+    let payload = Some(UrlBlockDto {
+        url: url.to_string(),
+        caption: rich_text(caption),
+    });
+    match kind {
+        "bookmark" => block.bookmark = payload,
+        "embed" => block.embed = payload,
+        _ => {}
+    }
+    block
+}
+
+fn media_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = block(id, kind);
+    let payload = Some(FileBlockDto {
+        kind: "external".to_string(),
+        external: Some(ExternalFileDto {
+            url: url.to_string(),
+        }),
+        file: None,
+        caption: rich_text(caption),
+    });
+    match kind {
+        "image" => block.image = payload,
+        "video" => block.video = payload,
+        "file" => block.file = payload,
+        "pdf" => block.pdf = payload,
+        "audio" => block.audio = payload,
+        _ => {}
+    }
+    block
+}
+
+fn table_block(id: &str, width: u16, has_column_header: bool) -> BlockDto {
+    let mut block = block(id, "table");
+    block.has_children = true;
+    block.table = Some(TableBlockDto {
+        table_width: width,
+        has_column_header,
+        has_row_header: false,
+    });
+    block
+}
+
+fn table_row_block(id: &str, cells: &[&str]) -> BlockDto {
+    let mut block = block(id, "table_row");
+    block.table_row = Some(TableRowBlockDto {
+        cells: cells.iter().map(|cell| rich_text(cell)).collect(),
+    });
+    block
+}
+
+fn link_to_page_block(id: &str, kind: &str, target_id: &str) -> BlockDto {
+    let mut block = block(id, "link_to_page");
+    let mut payload = LinkToPageBlockDto {
+        kind: kind.to_string(),
+        ..Default::default()
+    };
+    match kind {
+        "page_id" => payload.page_id = Some(target_id.to_string()),
+        "database_id" => payload.database_id = Some(target_id.to_string()),
+        _ => {}
+    }
+    block.link_to_page = Some(payload);
+    block
+}
+
 fn rich_text(text: &str) -> Vec<RichTextDto> {
     vec![rich_text_part(text)]
 }
@@ -1474,6 +2357,19 @@ fn date_mention(text: &str, start: &str) -> RichTextDto {
                 end: None,
                 time_zone: None,
             }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+fn database_mention(text: &str, id: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "database".to_string(),
+            database: Some(IdRefDto { id: id.to_string() }),
             ..Default::default()
         }),
         plain_text: text.to_string(),
