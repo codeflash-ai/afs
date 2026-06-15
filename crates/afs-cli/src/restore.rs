@@ -11,11 +11,13 @@ use afs_core::model::{CanonicalDocument, EntityKind, HydrationState};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
+use afsd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestoreOptions {
     pub force: bool,
+    pub state_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -69,14 +71,18 @@ where
         shadow.frontmatter.clone()
     };
     let document = CanonicalDocument::new(frontmatter, shadow.rendered_body.clone());
-    write_atomic(
+    let write_path = restore_write_path(
+        options.state_root.as_deref(),
+        &mount,
+        &relative_path,
         &absolute_path,
-        render_canonical_markdown(&document).as_bytes(),
-    )
-    .map_err(|error| RestoreError::WriteFile {
-        path: absolute_path.clone(),
-        message: error.to_string(),
-    })?;
+    )?;
+    write_atomic(&write_path, render_canonical_markdown(&document).as_bytes()).map_err(
+        |error| RestoreError::WriteFile {
+            path: write_path.clone(),
+            message: error.to_string(),
+        },
+    )?;
 
     entity.hydration = HydrationState::Hydrated;
     entity.content_hash = Some(shadow.body_hash);
@@ -167,6 +173,30 @@ fn relative_entity_path(
         .strip_prefix(&mount.root)
         .map(Path::to_path_buf)
         .map_err(|_| RestoreError::MountNotFound(absolute_path.to_path_buf()))
+}
+
+fn restore_write_path(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    relative_path: &Path,
+    absolute_path: &Path,
+) -> Result<PathBuf, RestoreError> {
+    if mount.projection.uses_virtual_filesystem() {
+        let Some(state_root) = state_root else {
+            return Err(RestoreError::WriteFile {
+                path: absolute_path.to_path_buf(),
+                message: "virtual filesystem restore requires a state root".to_string(),
+            });
+        };
+        return virtual_fs_content_path(state_root, &mount.mount_id, relative_path).map_err(
+            |error| RestoreError::WriteFile {
+                path: absolute_path.to_path_buf(),
+                message: error.to_string(),
+            },
+        );
+    }
+
+    Ok(absolute_path.to_path_buf())
 }
 
 fn frontmatter_from_entity(entity: &EntityRecord) -> String {

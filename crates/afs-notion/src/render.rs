@@ -156,12 +156,7 @@ fn render_block_trees_with_indent(
 fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
     let shadow_id = Some(RemoteId::new(block.id.clone()));
     match block.kind.as_str() {
-        "paragraph" => rich_text_block(
-            block,
-            block.paragraph.as_ref(),
-            |text| text.to_string(),
-            "empty_paragraph",
-        ),
+        "paragraph" => paragraph_block(block, block.paragraph.as_ref()),
         "heading_1" => rich_text_block(
             block,
             block.heading_1.as_ref(),
@@ -292,6 +287,20 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
         "tab" | "ai_block" | "custom_block" | "button" => directive_block(block, &block.kind, None),
         "unsupported" => directive_block(block, "unsupported", None),
         other => directive_block(block, &format!("unsupported_{other}"), None),
+    }
+}
+
+fn paragraph_block(block: &BlockDto, content: Option<&RichTextBlockDto>) -> RenderedBlock {
+    let Some(content) = content else {
+        return directive_block(block, "malformed_paragraph", None);
+    };
+    let text = rich_text_to_markdown(&content.rich_text);
+
+    if text.trim().is_empty() {
+        // empty line
+        rendered_block(String::new(), None)
+    } else {
+        rendered_block(text, Some(RemoteId::new(block.id.clone())))
     }
 }
 

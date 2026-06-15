@@ -203,6 +203,73 @@ fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
 }
 
 #[test]
+fn apply_normalizes_append_after_nested_block_to_direct_child_ancestor() {
+    let mut callout = callout_block("callout-1", "Notion Tip");
+    callout.has_children = true;
+    let mut api = RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![paragraph_block("paragraph-1", "Intro.", false), callout],
+    );
+    api.children.insert(
+        ("callout-1".to_string(), None),
+        PaginatedListDto {
+            results: vec![
+                paragraph_block("nested-1", "Nested one.", false),
+                paragraph_block("nested-2", "Nested two.", false),
+            ],
+            next_cursor: None,
+            has_more: false,
+        },
+    );
+    let api = Arc::new(api);
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("nested-2")),
+            content: "Appended at page level.".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Append {
+            block_id: "page-1".to_string(),
+            body: json!({
+                "children": [{
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": rich_text_json("Appended at page level."),
+                    },
+                }],
+                "position": {
+                    "type": "after_block",
+                    "after_block": {
+                        "id": "callout-1",
+                    },
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_appends_tier_one_markdown_block_shapes() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());

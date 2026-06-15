@@ -639,6 +639,7 @@ fn restore(args: &[String], json: bool) -> i32 {
     };
     let options = RestoreOptions {
         force: has_flag(args, "--force"),
+        state_root: Some(state_root),
     };
 
     match run_restore(&mut store, PathBuf::from(path), options) {

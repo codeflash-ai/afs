@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use afs_connector::{
@@ -24,9 +24,10 @@ use afs_store::{
 };
 use afsd::execution::{DaemonExecutor, PushJob};
 use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
-use afsd::push::PushJobAction;
+use afsd::push::{PushJobAction, execute_push_job_with_content_root};
 use afsd::scheduler::PullScheduler;
 use afsd::supervisor::DaemonSupervisor;
+use afsd::virtual_fs::virtual_fs_content_path;
 use afsd::watcher::FileWatcher;
 
 #[test]
@@ -355,6 +356,135 @@ fn daemon_push_job_plans_pending_virtual_delete_from_scope() {
     );
 }
 
+#[test]
+fn daemon_push_job_plans_pending_virtual_delete_from_file_path() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save page");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "Old body."))
+        .expect("save shadow");
+    let cached_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, Path::new("Roadmap.md"))
+            .expect("cache path");
+    fs::create_dir_all(cached_path.parent().expect("cache parent")).expect("cache parent");
+    fixture.write_page_to(&cached_path, "Old body.");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "delete:page-1",
+            VirtualMutationKind::Delete,
+            Some(fixture.remote_id.clone()),
+            None,
+            "Roadmap.md",
+            None,
+        ))
+        .expect("save mutation");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("Roadmap.md"),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &FakePushSource::default(),
+        Some(&state_root),
+    )
+    .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    let plan = report.pipeline.plan.expect("plan");
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::ArchiveEntity {
+            entity_id: fixture.remote_id.clone()
+        }]
+    );
+}
+
+#[test]
+fn daemon_push_job_plans_normal_update_for_pending_virtual_rename_path() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let renamed_path = Path::new("Roadmap-renamed.md");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap renamed",
+                renamed_path,
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save renamed page");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "Old body."))
+        .expect("save shadow");
+    let cached_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, renamed_path).expect("cache path");
+    fs::create_dir_all(cached_path.parent().expect("cache parent")).expect("cache parent");
+    fixture.write_page_to(&cached_path, "New body.");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "rename:page-1",
+            VirtualMutationKind::Rename,
+            Some(fixture.remote_id.clone()),
+            None,
+            "Roadmap-renamed.md",
+            Some(cached_path),
+        ))
+        .expect("save mutation");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(renamed_path),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &FakePushSource::default(),
+        Some(&state_root),
+    )
+    .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    let plan = report.pipeline.plan.expect("plan");
+    assert!(matches!(
+        plan.operations.as_slice(),
+        [PushOperation::UpdateBlock { block_id, content }]
+            if block_id == &RemoteId::new("paragraph-1") && content == "New body."
+    ));
+}
+
 struct PushFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -418,15 +548,15 @@ impl PushFixture {
     }
 
     fn write_page(&self, body: &str) {
+        self.write_page_to(&self.root.join("Roadmap.md"), body);
+    }
+
+    fn write_page_to(&self, path: &Path, body: &str) {
         let document = CanonicalDocument::new(
             "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
             markdown_body(body),
         );
-        fs::write(
-            self.root.join("Roadmap.md"),
-            render_canonical_markdown(&document),
-        )
-        .expect("write page");
+        fs::write(path, render_canonical_markdown(&document)).expect("write page");
     }
 }
 

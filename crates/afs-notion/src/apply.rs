@@ -60,7 +60,7 @@ pub fn apply_plan(
     let create_parent_ids = create_parent_ids(&request.plan.operations);
     let bundles = fetch_affected_bundles(api, &request.plan.affected_entities, &create_parent_ids)?;
     let current_blocks = block_map(&bundles);
-    let block_parent_pages = block_parent_page_map(&bundles);
+    let block_parents = block_parent_index(&bundles);
     let mut changed_remote_ids = Vec::new();
     let mut effects = Vec::new();
     let mut append_chains: BTreeMap<(RemoteId, Option<RemoteId>), RemoteId> = BTreeMap::new();
@@ -97,11 +97,9 @@ pub fn apply_plan(
                 content,
             } => {
                 let patch = parse_supported_block(content, None, None)?;
+                let after = block_parents.normalize_after(parent_id, after.as_ref());
                 let chain_key = (parent_id.clone(), after.clone());
-                let effective_after = append_chains
-                    .get(&chain_key)
-                    .cloned()
-                    .or_else(|| after.clone());
+                let effective_after = append_chains.get(&chain_key).cloned().or(after);
                 let body = append_body(patch.append_child(), effective_after.as_ref());
                 let result = api.append_block_children(parent_id.as_str(), body)?;
                 let created = result.results.first().ok_or_else(|| {
@@ -120,16 +118,20 @@ pub fn apply_plan(
             }
             PushOperation::MoveBlock { block_id, after } => {
                 current_block(&current_blocks, block_id)?;
-                let parent_id = block_parent_pages.get(block_id).ok_or_else(|| {
-                    AfsError::InvalidState(format!(
-                        "push referenced block `{}` without a containing Notion page",
-                        block_id.0
-                    ))
-                })?;
+                let parent_id = block_parents
+                    .containing_pages
+                    .get(block_id)
+                    .ok_or_else(|| {
+                        AfsError::InvalidState(format!(
+                            "push referenced block `{}` without a containing Notion page",
+                            block_id.0
+                        ))
+                    })?;
+                let after = block_parents.normalize_after(parent_id, after.as_ref());
                 let effective_after = append_chains
                     .get(&(parent_id.clone(), after.clone()))
                     .cloned()
-                    .or_else(|| after.clone());
+                    .or(after);
                 api.move_block(
                     block_id.as_str(),
                     parent_id.as_str(),
@@ -321,26 +323,60 @@ fn block_map(bundles: &[NotionPageBundle]) -> BTreeMap<RemoteId, &BlockDto> {
     blocks
 }
 
-fn block_parent_page_map(bundles: &[NotionPageBundle]) -> BTreeMap<RemoteId, RemoteId> {
-    let mut parents = BTreeMap::new();
-    for bundle in bundles {
-        collect_block_parent_pages(
-            &bundle.blocks,
-            &RemoteId::new(bundle.page.id.clone()),
-            &mut parents,
-        );
-    }
-    parents
+#[derive(Debug, Default)]
+struct BlockParentIndex {
+    direct_parents: BTreeMap<RemoteId, RemoteId>,
+    containing_pages: BTreeMap<RemoteId, RemoteId>,
 }
 
-fn collect_block_parent_pages(
+impl BlockParentIndex {
+    fn normalize_after(&self, parent_id: &RemoteId, after: Option<&RemoteId>) -> Option<RemoteId> {
+        let original = after?.clone();
+        let mut anchor = original.clone();
+        let mut seen = BTreeSet::new();
+
+        while seen.insert(anchor.clone()) {
+            let Some(direct_parent) = self.direct_parents.get(&anchor) else {
+                return Some(original);
+            };
+            if direct_parent == parent_id {
+                return Some(anchor);
+            }
+            anchor = direct_parent.clone();
+        }
+
+        Some(original)
+    }
+}
+
+fn block_parent_index(bundles: &[NotionPageBundle]) -> BlockParentIndex {
+    let mut index = BlockParentIndex::default();
+    for bundle in bundles {
+        collect_block_parent_index(
+            &bundle.blocks,
+            &RemoteId::new(bundle.page.id.clone()),
+            &RemoteId::new(bundle.page.id.clone()),
+            &mut index,
+        );
+    }
+    index
+}
+
+fn collect_block_parent_index(
     trees: &[BlockTreeDto],
     page_id: &RemoteId,
-    parents: &mut BTreeMap<RemoteId, RemoteId>,
+    direct_parent_id: &RemoteId,
+    index: &mut BlockParentIndex,
 ) {
     for tree in trees {
-        parents.insert(RemoteId::new(tree.block.id.clone()), page_id.clone());
-        collect_block_parent_pages(&tree.children, page_id, parents);
+        let block_id = RemoteId::new(tree.block.id.clone());
+        index
+            .direct_parents
+            .insert(block_id.clone(), direct_parent_id.clone());
+        index
+            .containing_pages
+            .insert(block_id.clone(), page_id.clone());
+        collect_block_parent_index(&tree.children, page_id, &block_id, index);
     }
 }
 
