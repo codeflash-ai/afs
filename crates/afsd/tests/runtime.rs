@@ -528,13 +528,26 @@ fn runtime_drains_persisted_hydration_on_startup() {
     assert_eq!(request.reason, HydrationReason::Policy);
     runtime.shutdown();
 
-    let store = SqliteStateStore::open(config.state_root).expect("reopen store");
-    assert!(
-        store
+    assert_hydration_jobs_drained(config.state_root);
+}
+
+fn assert_hydration_jobs_drained(state_root: PathBuf) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let store = SqliteStateStore::open(state_root.clone()).expect("reopen store");
+        if store
             .list_hydration_jobs()
             .expect("list hydration jobs")
             .is_empty()
-    );
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hydration jobs did not drain"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[derive(Clone)]

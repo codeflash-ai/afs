@@ -20,23 +20,28 @@ use serde_json::{Map, Value, json};
 use crate::client::NotionApi;
 use crate::dto::{
     BlockDto, BlockTreeDto, DataSourceDto, NotionPageBundle, PageDto, PagePropertyDto,
-    RichTextAnnotationsDto, RichTextDto,
+    RichTextAnnotationsDto, RichTextDto, TableBlockDto,
 };
 use crate::fetch::fetch_page_bundle;
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
+    let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
     for precondition in request.remote_preconditions {
         let Some(expected) = &precondition.remote_edited_at else {
             continue;
         };
-        let page = api.retrieve_page(precondition.remote_id.as_str())?;
-        let actual = page
-            .last_edited_time
-            .as_deref()
-            .or(page.created_time.as_deref())
-            .unwrap_or("unknown");
+        let actual = if database_create_parent_ids.contains(&precondition.remote_id) {
+            api.retrieve_database(precondition.remote_id.as_str())?
+                .last_edited_time
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            let page = api.retrieve_page(precondition.remote_id.as_str())?;
+            page.last_edited_time
+                .or(page.created_time)
+                .unwrap_or_else(|| "unknown".to_string())
+        };
 
-        if actual != expected {
+        if actual != *expected {
             return Err(AfsError::Guardrail(format!(
                 "remote entity `{}` changed since last sync (expected remote_edited_at `{expected}`, found `{actual}`)",
                 precondition.remote_id.0
@@ -64,6 +69,15 @@ pub fn apply_plan(
         match operation {
             PushOperation::UpdateBlock { block_id, content } => {
                 let current = current_block(&current_blocks, block_id)?;
+                if current.kind == "table" && looks_like_markdown_table(content) {
+                    apply_table_update(api, &bundles, block_id, current, content)?;
+                    effects.push(JournalApplyEffect::UpdatedBlock {
+                        operation_id: request.operation_ids[operation_index].clone(),
+                        operation_index,
+                        block_id: block_id.clone(),
+                    });
+                    continue;
+                }
                 let patch = parse_supported_block(
                     content,
                     Some(current.kind.as_str()),
@@ -218,6 +232,21 @@ pub fn apply_undo(
     for operation in &request.plan.operations {
         match operation {
             UndoOperation::RestoreBlockContent { block_id, content } => {
+                if looks_like_markdown_table(content) {
+                    let create_parent_ids = BTreeSet::new();
+                    let bundles = fetch_affected_bundles(
+                        api,
+                        &request.plan.affected_entities,
+                        &create_parent_ids,
+                    )?;
+                    let current_blocks = block_map(&bundles);
+                    if let Ok(current) = current_block(&current_blocks, block_id)
+                        && current.kind == "table"
+                    {
+                        apply_table_update(api, &bundles, block_id, current, content)?;
+                        continue;
+                    }
+                }
                 let patch = parse_supported_block(content, None, None)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
             }
@@ -253,6 +282,22 @@ fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
         .iter()
         .filter_map(|operation| match operation {
             PushOperation::CreateEntity { parent_id, .. } => Some(parent_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::CreateEntity {
+                parent_id,
+                parent_kind,
+                ..
+            } if !matches!(parent_kind, Some(afs_core::model::EntityKind::Page)) => {
+                Some(parent_id.clone())
+            }
             _ => None,
         })
         .collect()
@@ -340,6 +385,122 @@ fn collect_blocks<'a>(trees: &'a [BlockTreeDto], blocks: &mut BTreeMap<RemoteId,
         blocks.insert(RemoteId::new(tree.block.id.clone()), &tree.block);
         collect_blocks(&tree.children, blocks);
     }
+}
+
+fn apply_table_update(
+    api: &dyn NotionApi,
+    bundles: &[NotionPageBundle],
+    table_id: &RemoteId,
+    current: &BlockDto,
+    markdown: &str,
+) -> AfsResult<()> {
+    let table = current.table.as_ref().ok_or_else(|| {
+        AfsError::InvalidState(format!(
+            "notion table block `{}` is missing its `table` payload",
+            current.id
+        ))
+    })?;
+    let current_rows = current_table_rows(bundles, table_id)?;
+    let parsed = parse_markdown_table(markdown, table)?;
+
+    let rows_to_update = current_rows.len().min(parsed.rows.len());
+    for (row_block, cells) in current_rows
+        .iter()
+        .zip(parsed.rows.iter())
+        .take(rows_to_update)
+    {
+        let current_row = row_block.table_row.as_ref().ok_or_else(|| {
+            AfsError::InvalidState(format!(
+                "notion table row block `{}` is missing its `table_row` payload",
+                row_block.id
+            ))
+        })?;
+        if cells.len() != current_row.cells.len() {
+            return Err(AfsError::Unsupported("writing Notion table width changes"));
+        }
+
+        let cells = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                rich_text_payload(
+                    cell,
+                    current_row.cells.get(index).map(|cell| cell.as_slice()),
+                )
+            })
+            .collect::<AfsResult<Vec<_>>>()?;
+        api.update_block(
+            &row_block.id,
+            json!({
+                "table_row": {
+                    "cells": cells,
+                },
+            }),
+        )?;
+    }
+
+    let mut append_after = current_rows.last().map(|row| RemoteId::new(row.id.clone()));
+    for cells in parsed.rows.iter().skip(current_rows.len()) {
+        let cells = cells
+            .iter()
+            .map(|cell| rich_text_payload(cell, None))
+            .collect::<AfsResult<Vec<_>>>()?;
+        let result = api.append_block_children(
+            table_id.as_str(),
+            append_body(table_row_append_child(cells), append_after.as_ref()),
+        )?;
+        append_after = result
+            .results
+            .first()
+            .map(|row| RemoteId::new(row.id.clone()))
+            .or(append_after);
+    }
+
+    for row_block in current_rows.iter().skip(parsed.rows.len()) {
+        api.delete_block(&row_block.id)?;
+    }
+
+    Ok(())
+}
+
+fn current_table_rows<'a>(
+    bundles: &'a [NotionPageBundle],
+    table_id: &RemoteId,
+) -> AfsResult<Vec<&'a BlockDto>> {
+    let tree = bundles
+        .iter()
+        .find_map(|bundle| find_block_tree(&bundle.blocks, table_id))
+        .ok_or_else(|| {
+            AfsError::InvalidState(format!(
+                "push referenced table `{}` that is absent from current Notion page content",
+                table_id.0
+            ))
+        })?;
+
+    tree.children
+        .iter()
+        .map(|child| {
+            if child.block.kind == "table_row" && child.children.is_empty() {
+                Ok(&child.block)
+            } else {
+                Err(AfsError::Unsupported(
+                    "writing Notion tables with non-row children",
+                ))
+            }
+        })
+        .collect()
+}
+
+fn find_block_tree<'a>(trees: &'a [BlockTreeDto], block_id: &RemoteId) -> Option<&'a BlockTreeDto> {
+    for tree in trees {
+        if tree.block.id == block_id.0 {
+            return Some(tree);
+        }
+        if let Some(found) = find_block_tree(&tree.children, block_id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn current_block<'a>(
@@ -537,13 +698,16 @@ fn property_update_value(
     value: &PropertyValue,
     key: &str,
 ) -> AfsResult<Value> {
-    property_value_for_kind(&property.kind, value, key)
+    match property.kind.as_str() {
+        "rich_text" => rich_text_property(value, key, Some(property.rich_text.as_slice())),
+        _ => property_value_for_kind(&property.kind, value, key),
+    }
 }
 
 fn property_value_for_kind(kind: &str, value: &PropertyValue, key: &str) -> AfsResult<Value> {
     match kind {
         "title" => Ok(json!({ "title": rich_text(&required_string(value, key)?) })),
-        "rich_text" => Ok(json!({ "rich_text": rich_text(&required_string(value, key)?) })),
+        "rich_text" => rich_text_property(value, key, None),
         "number" => number_property(value, key),
         "select" => option_property("select", value, key),
         "status" => option_property("status", value, key),
@@ -551,8 +715,20 @@ fn property_value_for_kind(kind: &str, value: &PropertyValue, key: &str) -> AfsR
         "checkbox" => bool_property(value, key),
         "date" => date_property(value, key),
         "url" | "email" | "phone_number" => nullable_string_property(kind, value, key),
+        "files" => files_property(value, key),
+        "people" => people_property(value, key),
+        "relation" => relation_property(value, key),
         _ => Err(AfsError::Unsupported("updating this Notion property type")),
     }
+}
+
+fn rich_text_property(
+    value: &PropertyValue,
+    key: &str,
+    preimage: Option<&[RichTextDto]>,
+) -> AfsResult<Value> {
+    let content = required_string(value, key)?;
+    Ok(json!({ "rich_text": rich_text_payload(&content, preimage)? }))
 }
 
 fn number_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
@@ -648,6 +824,145 @@ fn single_property(kind: &str, value: Value) -> Value {
     Value::Object(object)
 }
 
+fn files_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    let entries = match value {
+        PropertyValue::Null => Vec::new(),
+        PropertyValue::String(value) if value.trim().is_empty() => Vec::new(),
+        PropertyValue::String(value) => vec![value.as_str()],
+        PropertyValue::List(values) => values.iter().map(String::as_str).collect(),
+        _ => return Err(property_type_error(key, "file URL string or list")),
+    };
+
+    let files = entries
+        .into_iter()
+        .map(|entry| external_file_property_value(entry, key))
+        .collect::<AfsResult<Vec<_>>>()?;
+    Ok(json!({ "files": files }))
+}
+
+fn external_file_property_value(entry: &str, key: &str) -> AfsResult<Value> {
+    let (name, url) = parse_external_file_entry(entry);
+    if url.trim().is_empty() || !valid_url(url) {
+        return Err(AfsError::Validation(vec![property_issue(
+            key,
+            "notion_property_file_url_invalid",
+            "Notion file properties must be HTTP(S) URLs or `name <url>` entries",
+        )]));
+    }
+    let name = if name.trim().is_empty() {
+        file_name_from_url(url)
+    } else {
+        name.trim().to_string()
+    };
+
+    Ok(json!({
+        "name": name,
+        "type": "external",
+        "external": {
+            "url": url,
+        },
+    }))
+}
+
+fn parse_external_file_entry(entry: &str) -> (&str, &str) {
+    let trimmed = entry.trim();
+    if let Some(without_close) = trimmed.strip_suffix('>')
+        && let Some((name, url)) = without_close.rsplit_once(" <")
+    {
+        return (name, url);
+    }
+    ("", trimmed)
+}
+
+fn file_name_from_url(url: &str) -> String {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("File")
+        .to_string()
+}
+
+fn valid_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+fn people_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    let entries = match value {
+        PropertyValue::Null => Vec::new(),
+        PropertyValue::String(value) if value.trim().is_empty() => Vec::new(),
+        PropertyValue::String(value) => vec![value.as_str()],
+        PropertyValue::List(values) => values.iter().map(String::as_str).collect(),
+        _ => return Err(property_type_error(key, "Notion user ID string or list")),
+    };
+
+    let people = entries
+        .into_iter()
+        .map(|entry| people_property_value(entry, key))
+        .collect::<AfsResult<Vec<_>>>()?;
+    Ok(json!({ "people": people }))
+}
+
+fn people_property_value(entry: &str, key: &str) -> AfsResult<Value> {
+    let id = parse_named_id_entry(entry).trim();
+    if !valid_notion_id(id) {
+        return Err(AfsError::Validation(vec![property_issue(
+            key,
+            "notion_property_people_id_invalid",
+            "Notion people properties must contain user IDs",
+        )]));
+    }
+
+    Ok(json!({ "id": id }))
+}
+
+fn relation_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {
+    let entries = match value {
+        PropertyValue::Null => Vec::new(),
+        PropertyValue::String(value) if value.trim().is_empty() => Vec::new(),
+        PropertyValue::String(value) => vec![value.as_str()],
+        PropertyValue::List(values) => values.iter().map(String::as_str).collect(),
+        _ => return Err(property_type_error(key, "Notion page ID string or list")),
+    };
+
+    let relations = entries
+        .into_iter()
+        .map(|entry| relation_property_value(entry, key))
+        .collect::<AfsResult<Vec<_>>>()?;
+    Ok(json!({ "relation": relations }))
+}
+
+fn relation_property_value(entry: &str, key: &str) -> AfsResult<Value> {
+    let id = parse_named_id_entry(entry).trim();
+    if !valid_notion_id(id) {
+        return Err(AfsError::Validation(vec![property_issue(
+            key,
+            "notion_property_relation_id_invalid",
+            "Notion relation properties must contain page IDs",
+        )]));
+    }
+
+    Ok(json!({ "id": id }))
+}
+
+fn parse_named_id_entry(entry: &str) -> &str {
+    let trimmed = entry.trim();
+    if let Some(without_close) = trimmed.strip_suffix('>')
+        && let Some((_, id)) = without_close.rsplit_once(" <")
+    {
+        return id;
+    }
+    trimmed
+}
+
+fn valid_notion_id(value: &str) -> bool {
+    let compact = value.replace('-', "");
+    compact.len() == 32 && compact.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn required_string(value: &PropertyValue, key: &str) -> AfsResult<String> {
     match value {
         PropertyValue::String(value) => Ok(value.clone()),
@@ -735,6 +1050,16 @@ fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>
             .map(|block| block.rich_text.as_slice()),
         "to_do" => block.to_do.as_ref().map(|block| block.rich_text.as_slice()),
         "code" => block.code.as_ref().map(|block| block.rich_text.as_slice()),
+        "bookmark" => block
+            .bookmark
+            .as_ref()
+            .map(|block| block.caption.as_slice()),
+        "embed" => block.embed.as_ref().map(|block| block.caption.as_slice()),
+        "image" => block.image.as_ref().map(|block| block.caption.as_slice()),
+        "video" => block.video.as_ref().map(|block| block.caption.as_slice()),
+        "file" => block.file.as_ref().map(|block| block.caption.as_slice()),
+        "pdf" => block.pdf.as_ref().map(|block| block.caption.as_slice()),
+        "audio" => block.audio.as_ref().map(|block| block.caption.as_slice()),
         "divider" | "equation" => return Ok(None),
         _ => return Ok(None),
     }
@@ -772,6 +1097,95 @@ impl NotionBlockPatch {
     }
 }
 
+struct ParsedMarkdownTable {
+    rows: Vec<Vec<String>>,
+}
+
+fn parse_markdown_table(
+    markdown: &str,
+    current_table: &TableBlockDto,
+) -> AfsResult<ParsedMarkdownTable> {
+    let lines = markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() < 2 {
+        return Err(AfsError::Unsupported("writing malformed Notion tables"));
+    }
+
+    let header = parse_markdown_table_row(lines[0])?;
+    validate_markdown_table_separator(lines[1], header.len())?;
+    let mut data_rows = lines[2..]
+        .iter()
+        .map(|line| parse_markdown_table_row(line))
+        .collect::<AfsResult<Vec<_>>>()?;
+    let width = usize::from(current_table.table_width);
+    if width == 0 || header.len() != width || data_rows.iter().any(|row| row.len() != width) {
+        return Err(AfsError::Unsupported("writing Notion table width changes"));
+    }
+
+    let rows = if current_table.has_column_header {
+        let mut rows = Vec::with_capacity(data_rows.len() + 1);
+        rows.push(header);
+        rows.append(&mut data_rows);
+        rows
+    } else {
+        if header.iter().any(|cell| !cell.trim().is_empty()) {
+            return Err(AfsError::Unsupported(
+                "writing Notion table header-mode changes",
+            ));
+        }
+        data_rows
+    };
+
+    Ok(ParsedMarkdownTable { rows })
+}
+
+fn parse_markdown_table_row(line: &str) -> AfsResult<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') || trimmed.len() < 2 {
+        return Err(AfsError::Unsupported("writing malformed Notion tables"));
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if ch == '|' && !escaped {
+            cells.push(unescape_markdown_table_cell(current.trim()));
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+        escaped = ch == '\\' && !escaped;
+        if ch != '\\' {
+            escaped = false;
+        }
+    }
+    cells.push(unescape_markdown_table_cell(current.trim()));
+
+    Ok(cells)
+}
+
+fn validate_markdown_table_separator(line: &str, width: usize) -> AfsResult<()> {
+    let cells = parse_markdown_table_row(line)?;
+    let valid = cells.len() == width
+        && cells.iter().all(|cell| {
+            let trimmed = cell.trim();
+            trimmed.contains('-') && trimmed.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(AfsError::Unsupported("writing malformed Notion tables"))
+    }
+}
+
+fn unescape_markdown_table_cell(cell: &str) -> String {
+    cell.replace("\\|", "|").replace("<br>", "\n")
+}
+
 fn parse_supported_block(
     markdown: &str,
     current_kind: Option<&str>,
@@ -781,6 +1195,12 @@ fn parse_supported_block(
 
     if trimmed.trim().is_empty() {
         return Err(AfsError::Unsupported("empty Notion block writes"));
+    }
+
+    if current_kind == Some("link_to_page") {
+        return Err(AfsError::Unsupported(
+            "retargeting Notion link_to_page blocks; Notion ignores direct target updates and replacement needs undo-aware block identity support",
+        ));
     }
 
     if let Some((language, code)) = parse_code_fence(trimmed) {
@@ -866,6 +1286,46 @@ fn parse_supported_block(
         ));
     }
 
+    if let Some(kind @ ("bookmark" | "embed")) = current_kind
+        && let Some((label, href, consumed)) = parse_markdown_link(trimmed)
+        && consumed == trimmed.len()
+    {
+        let kind = match kind {
+            "bookmark" => "bookmark",
+            "embed" => "embed",
+            _ => unreachable!("matched URL block kind"),
+        };
+        return Ok(NotionBlockPatch::new(
+            kind,
+            json!({
+                "url": href,
+                "caption": rich_text_payload(label, preimage)?,
+            }),
+        ));
+    }
+
+    if let Some(kind @ ("image" | "video" | "file" | "pdf" | "audio")) = current_kind
+        && let Some((label, href)) = parse_media_markdown(kind, trimmed)
+    {
+        let kind = match kind {
+            "image" => "image",
+            "video" => "video",
+            "file" => "file",
+            "pdf" => "pdf",
+            "audio" => "audio",
+            _ => unreachable!("matched media block kind"),
+        };
+        return Ok(NotionBlockPatch::new(
+            kind,
+            json!({
+                "external": {
+                    "url": href,
+                },
+                "caption": rich_text_payload(label, preimage)?,
+            }),
+        ));
+    }
+
     if looks_like_markdown_table(trimmed) {
         return Err(AfsError::Unsupported("writing Notion tables"));
     }
@@ -894,6 +1354,16 @@ fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
             },
         }),
     }
+}
+
+fn table_row_append_child(cells: Vec<Value>) -> Value {
+    json!({
+        "object": "block",
+        "type": "table_row",
+        "table_row": {
+            "cells": cells,
+        },
+    })
 }
 
 fn rich_text(content: &str) -> Value {
@@ -941,6 +1411,20 @@ enum RichTextWritePart {
         id: String,
         annotations: InlineAnnotations,
     },
+    DatabaseMention {
+        id: String,
+        annotations: InlineAnnotations,
+    },
+    DateMention {
+        start: String,
+        end: Option<String>,
+        time_zone: Option<String>,
+        annotations: InlineAnnotations,
+    },
+    UserMention {
+        id: String,
+        annotations: InlineAnnotations,
+    },
     Preimage(Box<RichTextDto>),
 }
 
@@ -949,7 +1433,10 @@ impl RichTextWritePart {
         match self {
             Self::Text { annotations, .. }
             | Self::Equation { annotations, .. }
-            | Self::PageMention { annotations, .. } => apply(annotations),
+            | Self::PageMention { annotations, .. }
+            | Self::DatabaseMention { annotations, .. }
+            | Self::DateMention { annotations, .. }
+            | Self::UserMention { annotations, .. } => apply(annotations),
             Self::Preimage(part) => {
                 let mut annotations = InlineAnnotations::from(&part.annotations);
                 apply(&mut annotations);
@@ -1014,6 +1501,56 @@ impl RichTextWritePart {
                     "mention": {
                         "type": "page",
                         "page": {
+                            "id": id,
+                        },
+                    },
+                });
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::DatabaseMention { id, annotations } => {
+                let mut value = json!({
+                    "type": "mention",
+                    "mention": {
+                        "type": "database",
+                        "database": {
+                            "id": id,
+                        },
+                    },
+                });
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::DateMention {
+                start,
+                end,
+                time_zone,
+                annotations,
+            } => {
+                let mut value = json!({
+                    "type": "mention",
+                    "mention": {
+                        "type": "date",
+                        "date": {
+                            "start": start,
+                        },
+                    },
+                });
+                if let Some(end) = end {
+                    value["mention"]["date"]["end"] = json!(end);
+                }
+                if let Some(time_zone) = time_zone {
+                    value["mention"]["date"]["time_zone"] = json!(time_zone);
+                }
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::UserMention { id, annotations } => {
+                let mut value = json!({
+                    "type": "mention",
+                    "mention": {
+                        "type": "user",
+                        "user": {
                             "id": id,
                         },
                     },
@@ -1200,13 +1737,76 @@ impl InlineParser<'_> {
             )));
         }
 
+        if rest.starts_with("@date(")
+            && let Some(end) = find_closing(rest, 6, ")")
+        {
+            let (start, end_date, time_zone) = parse_date_mention_args(&rest[6..end])?;
+            return Ok(Some((
+                vec![RichTextWritePart::DateMention {
+                    start,
+                    end: end_date,
+                    time_zone,
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
+        if rest.starts_with("@page(")
+            && let Some(end) = find_closing(rest, 6, ")")
+        {
+            let id = parse_page_mention_arg(&rest[6..end])?;
+            return Ok(Some((
+                vec![RichTextWritePart::PageMention {
+                    id,
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
+        if rest.starts_with("@database(")
+            && let Some(end) = find_closing(rest, 10, ")")
+        {
+            let id = parse_database_mention_arg(&rest[10..end])?;
+            return Ok(Some((
+                vec![RichTextWritePart::DatabaseMention {
+                    id,
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
+        if rest.starts_with("@user(")
+            && let Some(end) = find_closing(rest, 6, ")")
+        {
+            let id = parse_user_mention_arg(&rest[6..end])?;
+            return Ok(Some((
+                vec![RichTextWritePart::UserMention {
+                    id,
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
         if rest.starts_with('[')
             && let Some((label, href, consumed)) = parse_markdown_link(rest)
         {
-            if let Some(id) = href.strip_prefix("afs://") {
+            if let Some(id) = notion_page_id_from_href(href) {
+                if self.preimage_has_mention("database", &id) {
+                    return Ok(Some((
+                        vec![RichTextWritePart::DatabaseMention {
+                            id,
+                            annotations: InlineAnnotations::default(),
+                        }],
+                        consumed,
+                    )));
+                }
                 return Ok(Some((
                     vec![RichTextWritePart::PageMention {
-                        id: id.to_string(),
+                        id,
                         annotations: InlineAnnotations::default(),
                     }],
                     consumed,
@@ -1233,9 +1833,41 @@ impl InlineParser<'_> {
         Ok(None)
     }
 
+    fn preimage_has_mention(&self, kind: &str, id: &str) -> bool {
+        self.preimage_tokens.iter().any(|token| {
+            let Some(mention) = token.part.mention.as_ref() else {
+                return false;
+            };
+            if mention.kind != kind {
+                return false;
+            }
+            let preimage_id = match kind {
+                "page" => mention.page.as_ref().map(|page| page.id.as_str()),
+                "database" => mention
+                    .database
+                    .as_ref()
+                    .map(|database| database.id.as_str()),
+                _ => None,
+            };
+            preimage_id.is_some_and(|preimage_id| notion_ids_equal(preimage_id, id))
+        })
+    }
+
     fn next_special_or_preimage(&self, start: usize, closing: Option<&str>) -> usize {
         let mut next = self.input.len();
-        for marker in ["**", "~~", "<u>", "`", "$", "[", "_"] {
+        for marker in [
+            "**",
+            "~~",
+            "<u>",
+            "`",
+            "$",
+            "@date(",
+            "@page(",
+            "@database(",
+            "@user(",
+            "[",
+            "_",
+        ] {
             if let Some(offset) = self.input[start..].find(marker) {
                 next = next.min(start + offset);
             }
@@ -1273,7 +1905,100 @@ fn find_closing(input: &str, start: usize, marker: &str) -> Option<usize> {
     input[start..].find(marker).map(|offset| start + offset)
 }
 
+fn parse_date_mention_args(input: &str) -> AfsResult<(String, Option<String>, Option<String>)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(invalid_date_mention_syntax());
+    }
+
+    let (range, time_zone) = if let Some((range, time_zone)) = input
+        .rsplit_once(", tz=")
+        .or_else(|| input.rsplit_once(", timezone="))
+    {
+        let time_zone = time_zone.trim();
+        if time_zone.is_empty() {
+            return Err(invalid_date_mention_syntax());
+        }
+        (range.trim(), Some(time_zone.to_string()))
+    } else {
+        (input, None)
+    };
+
+    let (start, end) = if let Some((start, end)) = range.split_once(" to ") {
+        let start = start.trim();
+        let end = end.trim();
+        if start.is_empty() || end.is_empty() {
+            return Err(invalid_date_mention_syntax());
+        }
+        (start.to_string(), Some(end.to_string()))
+    } else {
+        (range.trim().to_string(), None)
+    };
+
+    if !looks_like_date_literal(&start)
+        || end
+            .as_deref()
+            .is_some_and(|end| !looks_like_date_literal(end))
+    {
+        return Err(invalid_date_mention_syntax());
+    }
+
+    Ok((start, end, time_zone))
+}
+
+fn looks_like_date_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 10
+        && bytes[0..4].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn invalid_date_mention_syntax() -> AfsError {
+    AfsError::Unsupported(
+        "date mention syntax; use @date(YYYY-MM-DD) or @date(YYYY-MM-DD to YYYY-MM-DD)",
+    )
+}
+
+fn parse_user_mention_arg(input: &str) -> AfsResult<String> {
+    let id = parse_named_id_entry(input).trim();
+    if valid_notion_id(id) {
+        Ok(id.to_string())
+    } else {
+        Err(AfsError::Unsupported(
+            "user mention syntax; use @user(<notion-user-id>)",
+        ))
+    }
+}
+
+fn parse_page_mention_arg(input: &str) -> AfsResult<String> {
+    let id = parse_named_id_entry(input).trim();
+    if valid_notion_id(id) {
+        Ok(id.to_string())
+    } else {
+        Err(AfsError::Unsupported(
+            "page mention syntax; use @page(<notion-page-id>)",
+        ))
+    }
+}
+
+fn parse_database_mention_arg(input: &str) -> AfsResult<String> {
+    let id = parse_named_id_entry(input).trim();
+    if valid_notion_id(id) {
+        Ok(id.to_string())
+    } else {
+        Err(AfsError::Unsupported(
+            "database mention syntax; use @database(<notion-database-id>)",
+        ))
+    }
+}
+
 fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
+    if !input.starts_with('[') {
+        return None;
+    }
     let label_end = input.find("](")?;
     let href_start = label_end + 2;
     let href_end = input[href_start..]
@@ -1284,6 +2009,89 @@ fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
         &input[href_start..href_end],
         href_end + 1,
     ))
+}
+
+fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(&'a str, &'a str)> {
+    let (label, href, consumed) = match kind {
+        "image" => {
+            let link = input.strip_prefix('!')?;
+            let (label, href, consumed) = parse_markdown_link(link)?;
+            (label, href, consumed + 1)
+        }
+        "video" | "file" | "pdf" | "audio" => parse_markdown_link(input)?,
+        _ => return None,
+    };
+
+    if consumed == input.len() {
+        Some((label, href))
+    } else {
+        None
+    }
+}
+
+fn notion_page_id_from_href(href: &str) -> Option<String> {
+    if let Some(id) = href.strip_prefix("afs://") {
+        return Some(id.to_string());
+    }
+
+    let trimmed = href.trim();
+    if !is_notion_url(trimmed) {
+        return None;
+    }
+
+    let without_query = trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    without_query
+        .rsplit('/')
+        .find_map(notion_id_from_url_segment)
+}
+
+fn is_notion_url(href: &str) -> bool {
+    let lower = href.to_ascii_lowercase();
+    lower.starts_with("https://www.notion.so/")
+        || lower.starts_with("https://notion.so/")
+        || lower.starts_with("https://app.notion.com/")
+}
+
+fn notion_id_from_url_segment(segment: &str) -> Option<String> {
+    if segment.is_empty() {
+        return None;
+    }
+
+    let without_hyphens = segment.replace('-', "");
+    if without_hyphens.len() == 32
+        && without_hyphens
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Some(without_hyphens);
+    }
+
+    let trailing_hex = segment
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_hexdigit())
+        .collect::<Vec<_>>();
+    if trailing_hex.len() >= 32 {
+        return Some(trailing_hex.iter().take(32).rev().copied().collect());
+    }
+
+    None
+}
+
+fn notion_ids_equal(left: &str, right: &str) -> bool {
+    let left = left
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    let right = right
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    !left.is_empty() && left.eq_ignore_ascii_case(&right)
 }
 
 fn unescape_markdown_text(value: &str) -> String {
@@ -1451,7 +2259,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", page.id),
+                        &notion_object_url(&page.id),
                     ),
                     true,
                 )
@@ -1464,7 +2272,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", database.id),
+                        &notion_object_url(&database.id),
                     ),
                     true,
                 )
@@ -1591,6 +2399,18 @@ fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
     wrap_preserving_whitespace(label, |value| {
         format!("[{}]({href})", escape_markdown_link_label(value))
     })
+}
+
+fn notion_object_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", notion_url_id(id))
+}
+
+fn notion_url_id(id: &str) -> String {
+    let hex = id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    if hex.len() == 32 { hex } else { id.to_string() }
 }
 
 fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) -> String {

@@ -707,7 +707,13 @@ function MainShell({
           )}
           {view === "mount" && <MountDetailView snapshot={snapshot} onReview={() => onViewChange("pending")} />}
           {view === "pending" && <PendingView snapshot={snapshot} onReview={() => onViewChange("review")} />}
-          {view === "review" && <ReviewView snapshot={snapshot} onDone={() => onViewChange("activity")} />}
+          {view === "review" && (
+            <ReviewView
+              snapshot={snapshot}
+              onRefresh={onRefresh}
+              onDone={() => onViewChange("activity")}
+            />
+          )}
           {view === "activity" && <ActivityView snapshot={snapshot} />}
           {view === "settings" && <SettingsView snapshot={snapshot} onRefresh={onRefresh} />}
         </section>
@@ -1026,9 +1032,19 @@ function PendingView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onRevi
   );
 }
 
-function ReviewView({ snapshot, onDone }: { snapshot: DesktopSnapshot; onDone: () => void }) {
+function ReviewView({
+  snapshot,
+  onRefresh,
+  onDone,
+}: {
+  snapshot: DesktopSnapshot;
+  onRefresh: () => Promise<void>;
+  onDone: () => void;
+}) {
   const [plan, setPlan] = useState<PushPlan>(samplePushPlan);
   const [complete, setComplete] = useState(false);
+  const [pushState, setPushState] = useState<"idle" | "pushing" | "success" | "error">("idle");
+  const [pushMessage, setPushMessage] = useState("");
 
   useEffect(() => {
     void callCommand<PushPlan>("review_push_plan", undefined, samplePushPlan)
@@ -1036,28 +1052,76 @@ function ReviewView({ snapshot, onDone }: { snapshot: DesktopSnapshot; onDone: (
       .catch(() => setPlan(samplePushPlan));
   }, []);
 
+  useEffect(() => {
+    if (pushState !== "success") {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => setComplete(true), 1200);
+    return () => window.clearTimeout(timer);
+  }, [pushState]);
+
   async function push() {
-    await callCommand("push_to_notion", undefined, { ok: true });
-    setComplete(true);
+    if (pushState === "pushing" || pushState === "success") {
+      return;
+    }
+
+    setPushState("pushing");
+    setPushMessage("");
+    try {
+      const report = await callCommand<ActionReport>("push_to_notion", undefined, {
+        ok: true,
+        message: "Pushed changes to Notion.",
+      });
+      if (!report.ok) {
+        setPushState("error");
+        setPushMessage(report.message);
+        return;
+      }
+      await onRefresh().catch(() => undefined);
+      setPushMessage(report.message || "Pushed changes to Notion.");
+      setPushState("success");
+    } catch (error) {
+      setPushState("error");
+      setPushMessage(errorMessage(error));
+    }
   }
 
   if (complete) {
+    const updatedCount = plan.pagesUpdated + plan.databaseRowsUpdated;
+    const fileLabel = updatedCount === 1 ? "file" : "files";
     return (
       <div className="center-result">
         <BrandTile variant="ready" />
         <h1>Pushed to Notion</h1>
-        <p>3 files updated successfully.</p>
+        <p>{updatedCount} {fileLabel} updated successfully.</p>
         <PrimaryButton onClick={onDone}>Done</PrimaryButton>
       </div>
     );
   }
 
+  const isPushing = pushState === "pushing";
+  const pushSucceeded = pushState === "success";
+
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Review Push" title={plan.title}>
-        <StatusPill tone="ready">Safe</StatusPill>
+        <StatusPill tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}>
+          {pushState === "error" ? "Needs Attention" : isPushing ? "Pushing" : pushSucceeded ? "Pushed" : "Safe"}
+        </StatusPill>
       </ViewHeader>
       <p className="view-copy">{plan.summary}</p>
+      {isPushing && (
+        <p className="quiet-note inline-note">
+          Writing changes to Notion. You can keep reviewing this window while AFS finishes.
+        </p>
+      )}
+      {pushSucceeded && (
+        <p className="success-note inline-note">
+          {pushMessage || "Pushed changes to Notion."}
+        </p>
+      )}
+      {pushState === "error" && pushMessage && <p className="field-error">{pushMessage}</p>}
 
       <section className="summary-grid">
         <Metric label="Pages updated" value={plan.pagesUpdated} />
@@ -1068,10 +1132,14 @@ function ReviewView({ snapshot, onDone }: { snapshot: DesktopSnapshot; onDone: (
       <FileChangeList changes={plan.files} mountPath={snapshot.mount.localPath} />
 
       <div className="footer-actions">
-        <PrimaryButton disabled={!plan.canPush} icon={<ShieldCheck />} onClick={push}>
-          Push to Notion
+        <PrimaryButton
+          disabled={!plan.canPush || isPushing || pushSucceeded}
+          icon={isPushing ? <Loader2 className="spin-icon" /> : pushSucceeded ? <Check /> : <ShieldCheck />}
+          onClick={push}
+        >
+          {isPushing ? "Pushing..." : pushSucceeded ? "Pushed" : "Push to Notion"}
         </PrimaryButton>
-        <SecondaryButton>Cancel</SecondaryButton>
+        <SecondaryButton disabled={isPushing || pushSucceeded}>Cancel</SecondaryButton>
       </div>
     </div>
   );

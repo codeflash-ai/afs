@@ -252,9 +252,9 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
             "toggle",
         ),
         "equation" => equation_block(block, block.equation.as_ref()),
-        "embed" => url_directive_block(block, "embed", block.embed.as_ref()),
-        "bookmark" => url_directive_block(block, "bookmark", block.bookmark.as_ref()),
-        "link_preview" => url_directive_block(block, "link_preview", block.link_preview.as_ref()),
+        "embed" => url_markdown_block(block, "embed", block.embed.as_ref()),
+        "bookmark" => url_markdown_block(block, "bookmark", block.bookmark.as_ref()),
+        "link_preview" => url_markdown_block(block, "link_preview", block.link_preview.as_ref()),
         "image" => file_media_block(block, "image", block.image.as_ref(), options),
         "video" => file_media_block(block, "video", block.video.as_ref(), options),
         "file" => file_media_block(block, "file", block.file.as_ref(), options),
@@ -336,20 +336,25 @@ fn equation_block(block: &BlockDto, equation: Option<&EquationBlockDto>) -> Rend
     )
 }
 
-fn url_directive_block(
+fn url_markdown_block(
     block: &BlockDto,
-    directive_type: &'static str,
+    malformed_type: &'static str,
     payload: Option<&UrlBlockDto>,
 ) -> RenderedBlock {
-    let attrs = payload
-        .map(|payload| {
-            directive_attrs(
-                rich_text_list_title(&payload.caption).map(|title| ("title", title)),
-                Some(("url", payload.url.clone())),
-            )
-        })
-        .unwrap_or_default();
-    directive_block_with_attrs(block, directive_type, attrs)
+    let Some(payload) = payload else {
+        return directive_block(block, &format!("malformed_{malformed_type}"), None);
+    };
+    if payload.url.trim().is_empty() {
+        return directive_block(block, &format!("malformed_{malformed_type}"), None);
+    }
+
+    let label = rich_text_list_title(&payload.caption)
+        .filter(|caption| !caption.trim().is_empty())
+        .unwrap_or_else(|| payload.url.clone());
+    rendered_block(
+        markdown_link_preserving_whitespace(&label, &payload.url),
+        Some(RemoteId::new(block.id.clone())),
+    )
 }
 
 fn file_media_block(
@@ -415,17 +420,29 @@ fn synced_block_directive(block: &BlockDto, payload: Option<&SyncedBlockDto>) ->
 }
 
 fn link_to_page_directive(block: &BlockDto, payload: Option<&LinkToPageBlockDto>) -> RenderedBlock {
-    let attrs = payload
-        .and_then(|payload| match payload.kind.as_str() {
-            "page_id" => payload.page_id.clone().map(|id| vec![("page_id", id)]),
-            "database_id" => payload
-                .database_id
-                .clone()
-                .map(|id| vec![("database_id", id)]),
-            _ => None,
-        })
-        .unwrap_or_default();
-    directive_block_with_attrs(block, "link_to_page", attrs)
+    let Some(payload) = payload else {
+        return directive_block(block, "malformed_link_to_page", None);
+    };
+
+    let link = match payload.kind.as_str() {
+        "page_id" => payload
+            .page_id
+            .as_deref()
+            .map(|id| ("Linked page", notion_object_url(id))),
+        "database_id" => payload
+            .database_id
+            .as_deref()
+            .map(|id| ("Linked database", notion_object_url(id))),
+        _ => None,
+    };
+
+    match link {
+        Some((label, href)) => rendered_block(
+            markdown_link_preserving_whitespace(label, &href),
+            Some(RemoteId::new(block.id.clone())),
+        ),
+        None => directive_block(block, "malformed_link_to_page", None),
+    }
 }
 
 fn titled_directive(
@@ -495,13 +512,6 @@ fn indent_rendered_block(mut block: RenderedBlock, indent_level: usize) -> Rende
         .collect::<Vec<_>>()
         .join("\n");
     block
-}
-
-fn directive_attrs(
-    first: Option<(&'static str, String)>,
-    second: Option<(&'static str, String)>,
-) -> Vec<(&'static str, String)> {
-    first.into_iter().chain(second).collect()
 }
 
 fn rich_text_block_title(block: &RichTextBlockDto) -> Option<String> {
@@ -704,7 +714,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", page.id),
+                        &notion_object_url(&page.id),
                     ),
                     true,
                 )
@@ -717,7 +727,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", database.id),
+                        &notion_object_url(&database.id),
                     ),
                     true,
                 )
@@ -841,6 +851,18 @@ fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
     })
 }
 
+fn notion_object_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", notion_url_id(id))
+}
+
+fn notion_url_id(id: &str) -> String {
+    let hex = id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    if hex.len() == 32 { hex } else { id.to_string() }
+}
+
 fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) -> String {
     let Some(start) = value
         .char_indices()
@@ -905,7 +927,7 @@ fn append_property_frontmatter(out: &mut String, page: &PageDto) {
 fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterValue> {
     match property.kind.as_str() {
         "rich_text" => Some(FrontmatterValue::Scalar(yaml_string(
-            &rich_text_plain_text(&property.rich_text),
+            &rich_text_to_markdown(&property.rich_text),
         ))),
         "number" => Some(number_value(property.number.as_ref())),
         "select" => Some(option_name(property.select.as_ref())),
@@ -931,11 +953,7 @@ fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterV
             property.files.iter().map(file_property_label).collect(),
         )),
         "people" => Some(FrontmatterValue::List(
-            property
-                .people
-                .iter()
-                .map(|user| user.name.as_deref().unwrap_or(user.id.as_str()).to_string())
-                .collect(),
+            property.people.iter().map(user_property_label).collect(),
         )),
         "relation" => Some(FrontmatterValue::List(
             property
@@ -1016,6 +1034,17 @@ fn file_property_label(file: &crate::dto::FilePropertyDto) -> String {
         (false, false) => format!("{name} <{url}>"),
         (false, true) => name.to_string(),
         (true, false) => url.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
+fn user_property_label(user: &crate::dto::UserMentionDto) -> String {
+    let id = user.id.as_str();
+    let name = user.name.as_deref().unwrap_or_default();
+    match (name.is_empty(), id.is_empty()) {
+        (false, false) => format!("{name} <{id}>"),
+        (false, true) => name.to_string(),
+        (true, false) => id.to_string(),
         (true, true) => String::new(),
     }
 }

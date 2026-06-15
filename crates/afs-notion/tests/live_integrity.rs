@@ -80,11 +80,27 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     assert!(rendered.document.body.contains(
         "[External audio](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)"
     ));
-    assert!(rendered.document.body.contains("type=embed"));
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[https://example.com/embed](https://example.com/embed)")
+    );
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[https://example.com/](https://example.com/)")
+    );
     assert!(rendered.document.body.contains("type=table_of_contents"));
     assert!(rendered.document.body.contains("type=breadcrumb"));
     assert!(rendered.document.body.contains("type=column_list"));
-    assert!(rendered.document.body.contains("type=link_to_page"));
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[Linked page](https://www.notion.so/")
+    );
     assert!(rendered.document.body.contains("type=child_page"));
     assert!(
         rendered.media_assets.iter().any(|asset| {
@@ -227,19 +243,48 @@ fn live_database_row_property_create_edit_verify_integrity() {
     let api = Arc::new(LiveNotion::new(env.token.clone()));
     let mut cleanup = LiveCleanup::new(api.clone());
     let connector = NotionConnector::new(NotionConfig::default());
+    let people_user_id = cleanup.current_user_id();
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("AFS live database scratch {}", unique_suffix()),
         Vec::new(),
     );
-    let database =
-        cleanup.create_database(&scratch.id, &format!("AFS live rows {}", unique_suffix()));
+    let related_database = cleanup.create_database(
+        &scratch.id,
+        &format!("AFS live related rows {}", unique_suffix()),
+    );
+    let related_data_source_id = related_database
+        .data_sources
+        .first()
+        .expect("related data source")
+        .id
+        .clone();
+    let related_row_initial = cleanup.create_database_row(
+        &related_database,
+        &format!("AFS live related initial {}", unique_suffix()),
+        serde_json::Map::new(),
+        Vec::new(),
+    );
+    let related_row_updated = cleanup.create_database_row(
+        &related_database,
+        &format!("AFS live related updated {}", unique_suffix()),
+        serde_json::Map::new(),
+        Vec::new(),
+    );
+    let database = cleanup.create_database_with_relation(
+        &scratch.id,
+        &format!("AFS live rows {}", unique_suffix()),
+        &related_data_source_id,
+    );
     let database_id = RemoteId::new(database.id.clone());
     let schema_yaml = connector
         .database_schema_yaml(&database_id)
         .expect("live schema");
     let valid_row = parse_canonical_markdown(
-        "---\ntitle: AFS created row\nNotes: Rich row notes\nPoints: 42\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\n  - Beta\nDone: false\nDue: \"2026-06-10\"\nURL: https://example.com/afs-live\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\n---\n# Row body\n",
+        &format!(
+            "---\ntitle: AFS created row\nNotes: Rich row notes\nPoints: 42\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\n  - Beta\nDone: false\nDue: \"2026-06-10\"\nURL: https://example.com/afs-live\nEmail: agentfs@example.com\nPhone: \"+1 415 555 0100\"\nFiles:\n  - Spec <https://example.com/spec.pdf>\nPeople:\n  - \"{}\"\nRelated:\n  - \"{}\"\n---\n# Row body\n",
+            people_user_id, related_row_initial.id
+        ),
     )
     .expect("valid row frontmatter");
     assert!(validate_create_row_frontmatter(&schema_yaml, &valid_row, "Rows/valid.md").is_clean());
@@ -301,6 +346,18 @@ fn live_database_row_property_create_edit_verify_integrity() {
                     "Phone".to_string(),
                     PropertyValue::String("+1 415 555 0100".to_string()),
                 ),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec!["Spec <https://example.com/spec.pdf>".to_string()]),
+                ),
+                (
+                    "People".to_string(),
+                    PropertyValue::List(vec![people_user_id.clone()]),
+                ),
+                (
+                    "Related".to_string(),
+                    PropertyValue::List(vec![related_row_initial.id.clone()]),
+                ),
             ]),
             body: "# Row body\n\nCreated from live integration.\n".to_string(),
             source_path: "Rows/afs-created-row.md".into(),
@@ -346,6 +403,19 @@ fn live_database_row_property_create_edit_verify_integrity() {
             .frontmatter
             .contains("\"URL\": \"https://example.com/afs-live\"")
     );
+    assert!(
+        rendered
+            .document
+            .frontmatter
+            .contains("\"Spec <https://example.com/spec.pdf>\"")
+    );
+    assert!(rendered.document.frontmatter.contains(&people_user_id));
+    assert!(
+        rendered
+            .document
+            .frontmatter
+            .contains(&format!("\"{}\"", related_row_initial.id))
+    );
 
     let update = PushPlan::new(
         vec![row_id.clone()],
@@ -364,6 +434,17 @@ fn live_database_row_property_create_edit_verify_integrity() {
                 (
                     "URL".to_string(),
                     PropertyValue::String("https://example.com/afs-live-updated".to_string()),
+                ),
+                (
+                    "Files".to_string(),
+                    PropertyValue::List(vec![
+                        "Spec updated <https://example.com/spec-updated.pdf>".to_string(),
+                    ]),
+                ),
+                ("People".to_string(), PropertyValue::List(Vec::new())),
+                (
+                    "Related".to_string(),
+                    PropertyValue::List(vec![related_row_updated.id.clone()]),
                 ),
             ]),
         }],
@@ -399,6 +480,30 @@ fn live_database_row_property_create_edit_verify_integrity() {
             .document
             .frontmatter
             .contains("\"URL\": \"https://example.com/afs-live-updated\"")
+    );
+    assert!(
+        verified_render
+            .document
+            .frontmatter
+            .contains("\"Spec updated <https://example.com/spec-updated.pdf>\"")
+    );
+    assert!(
+        verified_render
+            .document
+            .frontmatter
+            .contains("\"People\": []")
+    );
+    assert!(
+        !verified_render
+            .document
+            .frontmatter
+            .contains(&people_user_id)
+    );
+    assert!(
+        verified_render
+            .document
+            .frontmatter
+            .contains(&format!("\"{}\"", related_row_updated.id))
     );
 }
 
@@ -464,7 +569,89 @@ impl LiveCleanup {
         page
     }
 
+    fn current_user_id(&self) -> String {
+        self.api
+            .current_user_id()
+            .expect("retrieve current user id")
+    }
+
     fn create_database(&mut self, parent_page_id: &str, title: &str) -> DatabaseDto {
+        self.create_database_with_optional_relation(parent_page_id, title, None)
+    }
+
+    fn create_database_with_relation(
+        &mut self,
+        parent_page_id: &str,
+        title: &str,
+        related_data_source_id: &str,
+    ) -> DatabaseDto {
+        self.create_database_with_optional_relation(
+            parent_page_id,
+            title,
+            Some(related_data_source_id),
+        )
+    }
+
+    fn create_database_with_optional_relation(
+        &mut self,
+        parent_page_id: &str,
+        title: &str,
+        related_data_source_id: Option<&str>,
+    ) -> DatabaseDto {
+        let unique_prefix = unique_id_prefix();
+        let mut properties = serde_json::Map::from_iter([
+            ("Name".to_string(), json!({ "title": {} })),
+            ("Notes".to_string(), json!({ "rich_text": {} })),
+            (
+                "Points".to_string(),
+                json!({ "number": { "format": "number" } }),
+            ),
+            (
+                "Status".to_string(),
+                json!({
+                    "select": {
+                        "options": [
+                            { "name": "Todo", "color": "gray" },
+                            { "name": "Done", "color": "green" }
+                        ]
+                    }
+                }),
+            ),
+            ("State".to_string(), json!({ "status": {} })),
+            (
+                "Tags".to_string(),
+                json!({
+                    "multi_select": {
+                        "options": [
+                            { "name": "Alpha", "color": "blue" },
+                            { "name": "Beta", "color": "purple" }
+                        ]
+                    }
+                }),
+            ),
+            ("Done".to_string(), json!({ "checkbox": {} })),
+            ("Due".to_string(), json!({ "date": {} })),
+            ("URL".to_string(), json!({ "url": {} })),
+            ("Email".to_string(), json!({ "email": {} })),
+            ("Phone".to_string(), json!({ "phone_number": {} })),
+            ("Files".to_string(), json!({ "files": {} })),
+            ("People".to_string(), json!({ "people": {} })),
+            (
+                "Unique".to_string(),
+                json!({ "unique_id": { "prefix": unique_prefix } }),
+            ),
+        ]);
+        if let Some(data_source_id) = related_data_source_id {
+            properties.insert(
+                "Related".to_string(),
+                json!({
+                    "relation": {
+                        "data_source_id": data_source_id,
+                        "single_property": {},
+                    }
+                }),
+            );
+        }
         let database = self
             .api
             .create_database(json!({
@@ -475,41 +662,42 @@ impl LiveCleanup {
                 "title": rich_text(title),
                 "initial_data_source": {
                     "title": rich_text("Rows"),
-                    "properties": {
-                        "Name": { "title": {} },
-                        "Notes": { "rich_text": {} },
-                        "Points": { "number": { "format": "number" } },
-                        "Status": {
-                            "select": {
-                                "options": [
-                                    { "name": "Todo", "color": "gray" },
-                                    { "name": "Done", "color": "green" }
-                                ]
-                            }
-                        },
-                        "State": { "status": {} },
-                        "Tags": {
-                            "multi_select": {
-                                "options": [
-                                    { "name": "Alpha", "color": "blue" },
-                                    { "name": "Beta", "color": "purple" }
-                                ]
-                            }
-                        },
-                        "Done": { "checkbox": {} },
-                        "Due": { "date": {} },
-                        "URL": { "url": {} },
-                        "Email": { "email": {} },
-                        "Phone": { "phone_number": {} },
-                        "Files": { "files": {} },
-                        "People": { "people": {} },
-                        "Unique": { "unique_id": { "prefix": "AFS" } }
-                    }
+                    "properties": Value::Object(properties)
                 }
             }))
             .expect("create live database");
         self.block_ids.push(database.id.clone());
         database
+    }
+
+    fn create_database_row(
+        &mut self,
+        database: &DatabaseDto,
+        title: &str,
+        mut properties: serde_json::Map<String, Value>,
+        children: Vec<Value>,
+    ) -> PageDto {
+        let data_source = database
+            .data_sources
+            .first()
+            .expect("created database data source");
+        properties.insert("Name".to_string(), json!({ "title": rich_text(title) }));
+        let mut body = json!({
+            "parent": {
+                "type": "data_source_id",
+                "data_source_id": data_source.id,
+            },
+            "properties": Value::Object(properties),
+        });
+        if !children.is_empty() {
+            body["children"] = Value::Array(children);
+        }
+        let page = self
+            .api
+            .create_page(body)
+            .expect("create live database row");
+        self.block_ids.push(page.id.clone());
+        page
     }
 }
 
@@ -541,6 +729,14 @@ impl LiveNotion {
 
     fn create_database(&self, body: Value) -> Result<DatabaseDto, String> {
         self.send_json(reqwest::Method::POST, "/v1/databases", Some(body))
+    }
+
+    fn current_user_id(&self) -> Result<String, String> {
+        let user = self.send_json::<Value, Value>(reqwest::Method::GET, "/v1/users/me", None)?;
+        user.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "current Notion user response had no id".to_string())
     }
 
     fn archive_block(&self, block_id: &str) -> Result<Value, String> {
@@ -905,4 +1101,23 @@ fn unique_suffix() -> String {
         .expect("clock")
         .as_nanos();
     format!("{}-{nanos}", std::process::id())
+}
+
+fn unique_id_prefix() -> String {
+    let mut value = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let first_alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut prefix = String::new();
+    let first_index = (value % first_alphabet.len() as u128) as usize;
+    prefix.push(first_alphabet[first_index] as char);
+    value /= first_alphabet.len() as u128;
+    for _ in 0..6 {
+        let index = (value % alphabet.len() as u128) as usize;
+        prefix.push(alphabet[index] as char);
+        value /= alphabet.len() as u128;
+    }
+    prefix
 }

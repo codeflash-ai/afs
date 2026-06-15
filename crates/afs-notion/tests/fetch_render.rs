@@ -291,11 +291,11 @@ fn render_richer_notion_block_coverage() {
             "#### Heading four\n\n",
             "- Toggle summary\n\n",
             "$$\nE=mc^2\n$$\n\n",
-            "::afs{id=embed-1 type=embed title=\"Embed caption\" url=\"https://example.com/embed\"}\n\n",
-            "::afs{id=bookmark-1 type=bookmark title=\"Bookmark caption\" url=\"https://example.com/bookmark\"}\n\n",
+            "[Embed caption](https://example.com/embed)\n\n",
+            "[Bookmark caption](https://example.com/bookmark)\n\n",
             "![Image caption](https://example.com/image.png)\n\n",
             "::afs{id=synced-1 type=synced_block source_block_id=\"source-block-1\"}\n\n",
-            "::afs{id=link-to-page-1 type=link_to_page page_id=\"target-page-1\"}\n\n",
+            "[Linked page](https://www.notion.so/target-page-1)\n\n",
             "::afs{id=toc-1 type=table_of_contents color=\"default\"}\n\n",
             "::afs{id=breadcrumb-1 type=breadcrumb}\n\n",
             "::afs{id=column-list-1 type=column_list}\n\n",
@@ -588,9 +588,9 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "- Toggle summary",
         "    Toggle child",
         "$$\nE=mc^2\n$$",
-        "::afs{id=embed-1 type=embed title=\"Embed\" url=\"https://example.com/embed\"}",
-        "::afs{id=bookmark-1 type=bookmark title=\"Bookmark\" url=\"https://example.com/bookmark\"}",
-        "::afs{id=link-preview-1 type=link_preview title=\"Preview\" url=\"https://example.com/preview\"}",
+        "[Embed](https://example.com/embed)",
+        "[Bookmark](https://example.com/bookmark)",
+        "[Preview](https://example.com/preview)",
         "![Image](https://example.com/image.png)",
         "[Video](https://example.com/video.mp4)",
         "[File](https://example.com/file.txt)",
@@ -598,8 +598,8 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "[Audio](https://example.com/audio.mp3)",
         "::afs{id=synced-original-1 type=synced_block}",
         "::afs{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
-        "::afs{id=link-page-1 type=link_to_page page_id=\"target-page-1\"}",
-        "::afs{id=link-db-1 type=link_to_page database_id=\"target-db-1\"}",
+        "[Linked page](https://www.notion.so/target-page-1)",
+        "[Linked database](https://www.notion.so/target-db-1)",
         "::afs{id=toc-1 type=table_of_contents color=\"default\"}",
         "::afs{id=breadcrumb-1 type=breadcrumb}",
         "::afs{id=column-list-1 type=column_list}",
@@ -870,7 +870,7 @@ fn render_rich_text_annotations_links_mentions_and_equations() {
 
     assert_eq!(
         rendered.document.body,
-        "**Bold** _italic_ ~~strike~~ <u>underline</u> `code` [external link](https://example.com/) after link. 2026-06-10 and inline equation $E=mc^2$ plus page mention [Roadmap](afs://page-1) database mention [Tasks](afs://database-1) user mention @Ada preview [Example](https://example.com/preview) unknown Fallback\n"
+        "**Bold** _italic_ ~~strike~~ <u>underline</u> `code` [external link](https://example.com/) after link. 2026-06-10 and inline equation $E=mc^2$ plus page mention [Roadmap](https://www.notion.so/page-1) database mention [Tasks](https://www.notion.so/database-1) user mention @Ada preview [Example](https://example.com/preview) unknown Fallback\n"
     );
 }
 
@@ -959,12 +959,21 @@ fn render_database_row_properties_as_frontmatter() {
 #[test]
 fn render_all_supported_page_property_values_as_frontmatter() {
     let mut row = page("row-1", "Property Coverage");
+    let mut rich_property = rich_text("Notes");
+    rich_property.annotations = RichTextAnnotationsDto {
+        bold: true,
+        ..Default::default()
+    };
     row.properties.extend(BTreeMap::from([
         (
             "Rich Text".to_string(),
             PagePropertyDto {
                 kind: "rich_text".to_string(),
-                rich_text: vec![rich_text("Notes")],
+                rich_text: vec![
+                    rich_property,
+                    rich_text(" and "),
+                    linked_text("docs", "https://example.com/docs"),
+                ],
                 ..Default::default()
             },
         ),
@@ -1216,7 +1225,7 @@ fn render_all_supported_page_property_values_as_frontmatter() {
     let frontmatter = &rendered.document.frontmatter;
 
     for expected in [
-        "\"Rich Text\": \"Notes\"",
+        "\"Rich Text\": \"**Notes** and [docs](https://example.com/docs)\"",
         "\"Number\": 7",
         "\"Select\": \"Selected\"",
         "\"Multi Select\":\n  - \"Alpha\"\n  - \"Beta\"",
@@ -1227,7 +1236,7 @@ fn render_all_supported_page_property_values_as_frontmatter() {
         "\"Email\": \"agentfs@example.com\"",
         "\"Phone\": \"+1 415 555 0100\"",
         "\"Files\":\n  - \"Spec <https://example.com/spec.pdf>\"\n  - \"https://example.com/hosted.png\"",
-        "\"People\":\n  - \"Ada\"",
+        "\"People\":\n  - \"Ada <user-1>\"",
         "\"Relation\":\n  - \"related-page-1\"",
         "\"Created Time\": \"2026-06-10T00:00:00.000Z\"",
         "\"Last Edited Time\": \"2026-06-11T00:00:00.000Z\"",
