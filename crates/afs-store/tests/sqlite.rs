@@ -10,6 +10,7 @@ use afs_core::journal::{
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
+use afs_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, EntityRecord, EntityRepository,
@@ -18,6 +19,7 @@ use afs_store::{
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use rusqlite::{Connection, params};
+use serde_json::json;
 
 #[test]
 fn sqlite_store_initializes_idempotently() {
@@ -692,6 +694,167 @@ fn journal_status_survives_reopen() {
     assert_eq!(entry.preimages.len(), 1);
     assert_eq!(entry.apply_effects, apply_effects("push-1"));
     assert_eq!(reopened.list_journal().expect("list journal").len(), 1);
+}
+
+#[test]
+fn journal_reader_tolerates_legacy_entity_content_operations() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "INSERT INTO journals (
+                push_id,
+                mount_id,
+                remote_ids_json,
+                plan_json,
+                preimages_json,
+                apply_effects_json,
+                status_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "push-legacy",
+                "notion-main",
+                serde_json::to_string(&vec![RemoteId::new("page-1")]).expect("remote ids json"),
+                json!({
+                    "affected_entities": ["page-1"],
+                    "operations": [{
+                        "type": "update_entity_content",
+                        "entity_id": "page-1",
+                        "content": "legacy replacement body"
+                    }],
+                    "summary": {
+                        "blocks_created": 0,
+                        "blocks_updated": 1,
+                        "blocks_moved": 0,
+                        "blocks_archived": 0,
+                        "entities_created": 0,
+                        "entities_archived": 0,
+                        "properties_updated": 0
+                    },
+                    "degradations": []
+                })
+                .to_string(),
+                "[]",
+                json!([{
+                    "type": "updated_entity_content",
+                    "operation_id": "push-legacy:0:update_entity_content:page-1",
+                    "operation_index": 0,
+                    "entity_id": "page-1"
+                }])
+                .to_string(),
+                serde_json::to_string(&JournalStatus::Reconciled).expect("status json"),
+            ],
+        )
+        .expect("insert legacy journal");
+
+    let journal = store
+        .get_journal(&PushId("push-legacy".to_string()))
+        .expect("get legacy journal")
+        .expect("legacy journal");
+
+    assert_eq!(journal.remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(
+        journal.plan.affected_entities,
+        vec![RemoteId::new("page-1")]
+    );
+    assert!(journal.plan.operations.is_empty());
+    assert!(journal.apply_effects.is_empty());
+    assert_eq!(store.list_journal().expect("list journals").len(), 1);
+}
+
+#[test]
+fn journal_reader_remaps_mixed_legacy_operation_indexes_for_undo() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    let legacy_plan = json!({
+        "affected_entities": ["page-1"],
+        "operations": [
+            {
+                "type": "update_entity_content",
+                "entity_id": "page-1",
+                "content": "legacy replacement body"
+            },
+            {
+                "type": "append_block",
+                "parent_id": "page-1",
+                "after": null,
+                "content": "New paragraph."
+            }
+        ],
+        "summary": {
+            "blocks_created": 1,
+            "blocks_updated": 1,
+            "blocks_moved": 0,
+            "blocks_archived": 0,
+            "entities_created": 0,
+            "entities_archived": 0,
+            "properties_updated": 0
+        },
+        "degradations": []
+    });
+    let effects = vec![JournalApplyEffect::CreatedBlock {
+        operation_id: PushOperationId("push-mixed:1:append_block:page-1".to_string()),
+        operation_index: 1,
+        parent_id: RemoteId::new("page-1"),
+        block_id: RemoteId::new("created-block-1"),
+    }];
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "INSERT INTO journals (
+                push_id,
+                mount_id,
+                remote_ids_json,
+                plan_json,
+                preimages_json,
+                apply_effects_json,
+                status_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "push-mixed",
+                "notion-main",
+                serde_json::to_string(&vec![RemoteId::new("page-1")]).expect("remote ids json"),
+                legacy_plan.to_string(),
+                "[]",
+                serde_json::to_string(&effects).expect("effects json"),
+                serde_json::to_string(&JournalStatus::Reconciled).expect("status json"),
+            ],
+        )
+        .expect("insert mixed legacy journal");
+
+    let journal = store
+        .get_journal(&PushId("push-mixed".to_string()))
+        .expect("get mixed legacy journal")
+        .expect("mixed legacy journal");
+
+    assert_eq!(journal.plan.operations.len(), 1);
+    assert_eq!(journal.plan.summary.blocks_created, 1);
+    assert_eq!(journal.plan.summary.blocks_updated, 0);
+    assert_eq!(journal.apply_effects.len(), 1);
+    assert!(matches!(
+        journal.apply_effects[0],
+        JournalApplyEffect::CreatedBlock {
+            operation_index: 0,
+            ..
+        }
+    ));
+
+    let undo = plan_journal_undo(&journal);
+
+    assert_eq!(undo.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        undo.operations,
+        vec![UndoOperation::ArchiveCreatedBlock {
+            block_id: RemoteId::new("created-block-1")
+        }]
+    );
 }
 
 #[test]

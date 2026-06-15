@@ -45,27 +45,67 @@ pub fn enumerate_root_page_tree(
 }
 
 pub fn enumerate_shared_pages(api: &dyn NotionApi, mount_id: MountId) -> AfsResult<Vec<TreeEntry>> {
-    let mut cursor = None;
     let mut used_paths = BTreeSet::new();
     let mut entries = Vec::new();
 
-    loop {
-        let page = api.search_pages(cursor.as_deref())?;
-        for result in page.results {
-            let title = page_title(&result);
-            let path = allocate_page_path(Path::new(""), &title, &result.id, &mut used_paths);
-            entries.push(page_entry(mount_id.clone(), &result, title, path));
-        }
+    let pages = search_all_pages(api)?;
+    let databases = search_all_databases(api)?;
+    let accessible_page_ids = pages
+        .iter()
+        .map(|page| page.id.as_str())
+        .collect::<BTreeSet<_>>();
 
-        if !page.has_more {
-            break;
-        }
-        cursor = page.next_cursor;
-        if cursor.is_none() {
-            return Err(AfsError::InvalidState(
-                "notion search page had has_more without next_cursor".to_string(),
-            ));
-        }
+    for page in pages
+        .iter()
+        .filter(|page| is_workspace_root_page(page, &accessible_page_ids))
+    {
+        let title = page_title(page);
+        let path = allocate_page_path(Path::new(""), &title, &page.id, &mut used_paths);
+        entries.push(page_entry(mount_id.clone(), page, title, path.clone()));
+        enumerate_page_children(
+            api,
+            &mount_id,
+            page.id.as_str(),
+            page_child_dir(&path),
+            &mut used_paths,
+            &mut entries,
+        )?;
+    }
+
+    for database in databases
+        .iter()
+        .filter(|database| is_workspace_root_parent(database.parent.as_ref(), &accessible_page_ids))
+    {
+        let title = database_title(database).unwrap_or_else(|| "Untitled database".to_string());
+        let path = allocate_directory_path(Path::new(""), &title, &database.id, &mut used_paths);
+        entries.push(database_entry(
+            mount_id.clone(),
+            database,
+            title,
+            path.clone(),
+        ));
+        enumerate_database_rows(
+            api,
+            &mount_id,
+            database,
+            &path,
+            &mut used_paths,
+            &mut entries,
+        )?;
+    }
+
+    let projected_page_ids = entries
+        .iter()
+        .filter(|entry| entry.kind == EntityKind::Page)
+        .map(|entry| entry.remote_id.0.clone())
+        .collect::<BTreeSet<_>>();
+    for page in pages
+        .iter()
+        .filter(|page| !projected_page_ids.contains(&page.id))
+    {
+        let title = page_title(page);
+        let path = allocate_page_path(Path::new(""), &title, &page.id, &mut used_paths);
+        entries.push(page_entry(mount_id.clone(), page, title, path));
     }
 
     Ok(entries)

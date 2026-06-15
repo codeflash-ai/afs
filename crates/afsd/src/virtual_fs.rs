@@ -1284,9 +1284,18 @@ fn refreshed_entity_record(
 ) -> EntityRecord {
     let mut record = EntityRecord::from(entry);
     if let Some(existing) = existing {
-        record.path = existing.path.clone();
-        record.hydration = existing.hydration.clone();
-        record.content_hash = existing.content_hash.clone();
+        let path_changed = record.path != existing.path;
+        if matches!(
+            existing.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            record.path = existing.path.clone();
+            record.hydration = existing.hydration.clone();
+            record.content_hash = existing.content_hash.clone();
+        } else if !path_changed {
+            record.hydration = existing.hydration.clone();
+            record.content_hash = existing.content_hash.clone();
+        }
     }
     record
 }
@@ -1600,6 +1609,7 @@ mod tests {
                 remote_edited_at: None,
                 stub_frontmatter: None,
             }],
+            expected_parent_path: PathBuf::new(),
         };
 
         let saved = refresh_virtual_fs_children(
@@ -1629,8 +1639,176 @@ mod tests {
         assert_eq!(saved, 0);
     }
 
+    #[test]
+    fn refresh_database_children_moves_existing_row_into_database_directory() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Root/Tasks",
+            ))
+            .expect("save database");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("row-1"),
+                EntityKind::Page,
+                "Fix login bug",
+                "fix-login-bug.md",
+            ))
+            .expect("save root-level row");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("row-1"),
+                kind: EntityKind::Page,
+                title: "Fix login bug".to_string(),
+                path: "Root/Tasks/fix-login-bug.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::from("Root/Tasks"),
+        };
+
+        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
+            .expect("refresh database rows");
+
+        assert_eq!(saved, 1);
+        let row = store
+            .get_entity(&mount_id, &RemoteId::new("row-1"))
+            .expect("get row")
+            .expect("row");
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug.md"));
+        let children = virtual_fs_children(&store, &mount_id, "database-1").expect("children");
+        assert!(children.children.iter().any(
+            |child| child.identifier == "row-1" && child.path == "Root/Tasks/fix-login-bug.md"
+        ));
+    }
+
+    #[test]
+    fn refresh_database_children_keeps_dirty_existing_row_at_cached_path() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Root/Tasks",
+            ))
+            .expect("save database");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("row-1"),
+                    EntityKind::Page,
+                    "Fix login bug",
+                    "fix-login-bug.md",
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty root-level row");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("row-1"),
+                kind: EntityKind::Page,
+                title: "Fix login bug".to_string(),
+                path: "Root/Tasks/fix-login-bug.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::from("Root/Tasks"),
+        };
+
+        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
+            .expect("refresh database rows");
+
+        assert_eq!(saved, 1);
+        let row = store
+            .get_entity(&mount_id, &RemoteId::new("row-1"))
+            .expect("get row")
+            .expect("row");
+        assert_eq!(row.path, PathBuf::from("fix-login-bug.md"));
+        assert_eq!(row.hydration, HydrationState::Dirty);
+    }
+
+    #[test]
+    fn refresh_database_children_demotes_clean_moved_row_to_stub() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Root/Tasks",
+            ))
+            .expect("save database");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("row-1"),
+                    EntityKind::Page,
+                    "Fix login bug",
+                    "fix-login-bug.md",
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_content_hash("old-cache-hash"),
+            )
+            .expect("save hydrated root-level row");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("row-1"),
+                kind: EntityKind::Page,
+                title: "Fix login bug".to_string(),
+                path: "Root/Tasks/fix-login-bug.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::from("Root/Tasks"),
+        };
+
+        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
+            .expect("refresh database rows");
+
+        assert_eq!(saved, 1);
+        let row = store
+            .get_entity(&mount_id, &RemoteId::new("row-1"))
+            .expect("get row")
+            .expect("row");
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug.md"));
+        assert_eq!(row.hydration, HydrationState::Stub);
+        assert_eq!(row.content_hash, None);
+    }
+
     struct StaticChildrenConnector {
         entries: Vec<TreeEntry>,
+        expected_parent_path: PathBuf,
     }
 
     impl Connector for StaticChildrenConnector {
@@ -1654,7 +1832,7 @@ mod tests {
             &self,
             request: ListChildrenRequest,
         ) -> afs_core::AfsResult<ListChildrenResult> {
-            assert_eq!(request.parent_path, PathBuf::new());
+            assert_eq!(request.parent_path, self.expected_parent_path);
             Ok(ListChildrenResult {
                 entries: self.entries.clone(),
             })
@@ -2121,6 +2299,7 @@ mod tests {
             &mut store,
             &StaticChildrenConnector {
                 entries: Vec::new(),
+                expected_parent_path: PathBuf::new(),
             },
             &mount_id,
             ROOT_CONTAINER_IDENTIFIER,

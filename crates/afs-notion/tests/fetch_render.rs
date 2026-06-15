@@ -1362,6 +1362,61 @@ fn list_children_fetches_database_rows_under_database_directory() {
 }
 
 #[test]
+fn enumerate_shared_workspace_projects_nested_pages_and_database_rows_under_parent_pages() {
+    let api = FixtureNotionApi::workspace_nested_tree();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let entries = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("enumerate workspace tree");
+
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0].path, Path::new("root ~aaaaaa.md"));
+    assert_eq!(entries[0].kind, EntityKind::Page);
+    assert_eq!(
+        entries[1].path,
+        Path::new("root ~aaaaaa/design-notes ~bbbbbb.md")
+    );
+    assert_eq!(entries[1].kind, EntityKind::Page);
+    assert_eq!(
+        entries[2].path,
+        Path::new("root ~aaaaaa/toggle-child ~ababab.md")
+    );
+    assert_eq!(entries[2].kind, EntityKind::Page);
+    assert_eq!(entries[3].path, Path::new("root ~aaaaaa/tasks ~cccccc"));
+    assert_eq!(entries[3].kind, EntityKind::Database);
+    assert_eq!(
+        entries[4].path,
+        Path::new("root ~aaaaaa/tasks ~cccccc/fix-login-bug ~eeeeee.md")
+    );
+    assert_eq!(entries[4].kind, EntityKind::Page);
+}
+
+#[test]
+fn enumerate_shared_workspace_keeps_shared_database_row_when_database_is_not_shared() {
+    let api = FixtureNotionApi::shared_orphan_database_row();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let entries = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("enumerate shared orphan row");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].remote_id,
+        RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+    );
+    assert_eq!(entries[0].path, Path::new("shared-row ~eeeeee.md"));
+    assert_eq!(entries[0].kind, EntityKind::Page);
+}
+
+#[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_PAGE_ID"]
 fn live_fetch_and_render_page_from_environment() {
     let page_id = std::env::var("AFS_NOTION_PAGE_ID").expect("AFS_NOTION_PAGE_ID");
@@ -1561,6 +1616,139 @@ impl FixtureNotionApi {
             ]),
             children: BTreeMap::new(),
             databases: BTreeMap::from([(root_database.id.clone(), root_database)]),
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
+        }
+    }
+
+    fn workspace_nested_tree() -> Self {
+        let root_page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let database_id = "cccccccccccccccccccccccccccccccc";
+        let data_source_id = "dddddddddddddddddddddddddddddddd";
+        let row_page_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let toggle_child_page_id = "abababababababababababababababab";
+        let root_page = page_with_parent(
+            root_page_id,
+            "Root",
+            Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+        );
+        let child_page = page_with_parent(
+            child_page_id,
+            "Design Notes",
+            Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some(root_page_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let toggle_child_page = page_with_parent(
+            toggle_child_page_id,
+            "Toggle Child",
+            Some(ParentDto {
+                kind: "block_id".to_string(),
+                block_id: Some("toggle-1".to_string()),
+                ..Default::default()
+            }),
+        );
+        let row_page = page_with_parent(
+            row_page_id,
+            "Fix login bug",
+            Some(ParentDto {
+                kind: "data_source_id".to_string(),
+                data_source_id: Some(data_source_id.to_string()),
+                database_id: Some(database_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let database = DatabaseDto {
+            id: database_id.to_string(),
+            parent: Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some(root_page_id.to_string()),
+                ..Default::default()
+            }),
+            title: vec![rich_text("Tasks")],
+            data_sources: vec![DataSourceSummaryDto {
+                id: data_source_id.to_string(),
+                name: Some("Tasks".to_string()),
+            }],
+            ..Default::default()
+        };
+        let children = BTreeMap::from([
+            (
+                (root_page_id.to_string(), None),
+                PaginatedListDto {
+                    results: vec![
+                        child_page_block(child_page_id, "Design Notes"),
+                        toggle_block("toggle-1", "Details").with_children(),
+                        child_database_block(database_id, "Tasks"),
+                    ],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                ("toggle-1".to_string(), None),
+                PaginatedListDto {
+                    results: vec![child_page_block(toggle_child_page_id, "Toggle Child")],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                (child_page_id.to_string(), None),
+                PaginatedListDto::default(),
+            ),
+            (
+                (toggle_child_page_id.to_string(), None),
+                PaginatedListDto::default(),
+            ),
+            ((row_page_id.to_string(), None), PaginatedListDto::default()),
+        ]);
+        let data_source_pages = BTreeMap::from([(
+            (data_source_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![row_page.clone()],
+                next_cursor: None,
+                has_more: false,
+            },
+        )]);
+
+        Self {
+            pages: BTreeMap::from([
+                (root_page.id.clone(), root_page),
+                (child_page.id.clone(), child_page),
+                (toggle_child_page.id.clone(), toggle_child_page),
+                (row_page.id.clone(), row_page),
+            ]),
+            children,
+            databases: BTreeMap::from([(database.id.clone(), database)]),
+            data_sources: BTreeMap::new(),
+            data_source_pages,
+        }
+    }
+
+    fn shared_orphan_database_row() -> Self {
+        let row_page = page_with_parent(
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "Shared Row",
+            Some(ParentDto {
+                kind: "data_source_id".to_string(),
+                data_source_id: Some("private-data-source".to_string()),
+                database_id: Some("private-database".to_string()),
+                ..Default::default()
+            }),
+        );
+
+        Self {
+            pages: BTreeMap::from([(row_page.id.clone(), row_page)]),
+            children: BTreeMap::new(),
+            databases: BTreeMap::new(),
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
         }

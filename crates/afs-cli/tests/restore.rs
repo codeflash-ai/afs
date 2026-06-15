@@ -8,8 +8,9 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ShadowRepository,
+    ProjectionMode, ShadowRepository,
 };
+use afsd::virtual_fs::virtual_fs_content_path;
 
 #[test]
 fn restore_rewrites_file_from_shadow_and_marks_entity_hydrated() {
@@ -45,8 +46,50 @@ fn restore_requires_force_for_conflicted_entity() {
     assert_eq!(error.code(), "restore_conflicted_requires_force");
 }
 
+#[test]
+fn restore_virtual_projection_writes_content_cache_instead_of_mount_file() {
+    let fixture = RestoreFixture::new();
+    let mut store = fixture.store_with_projection(HydrationState::Dirty, ProjectionMode::LinuxFuse);
+    let mount_path = fixture.write_page("# Roadmap\n\nFUSE projection body.");
+    let cache_path = virtual_fs_content_path(
+        &fixture.state_root,
+        &fixture.mount_id,
+        "Roadmap.md".as_ref(),
+    )
+    .expect("content cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        canonical_markdown("# Roadmap\n\nLocal cache edit."),
+    )
+    .expect("write cache");
+
+    let report = run_restore(
+        &mut store,
+        &mount_path,
+        RestoreOptions {
+            force: false,
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("restore report");
+
+    assert!(report.ok);
+    assert!(
+        fs::read_to_string(&cache_path)
+            .expect("restored cache")
+            .contains("# Roadmap\n\nSynced body.")
+    );
+    assert!(
+        fs::read_to_string(&mount_path)
+            .expect("mount file")
+            .contains("FUSE projection body.")
+    );
+}
+
 struct RestoreFixture {
     root: PathBuf,
+    state_root: PathBuf,
     mount_id: MountId,
 }
 
@@ -58,25 +101,36 @@ impl RestoreFixture {
             .expect("clock")
             .as_nanos();
         let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let base = std::env::temp_dir().join(format!(
             "afs-cli-restore-{}-{unique}-{suffix}",
             std::process::id()
         ));
+        let root = base.join("mount");
+        let state_root = base.join("state");
         fs::create_dir_all(&root).expect("fixture root");
+        fs::create_dir_all(&state_root).expect("fixture state root");
         Self {
             root,
+            state_root,
             mount_id: MountId::new("notion-main"),
         }
     }
 
     fn store(&self, hydration: HydrationState) -> InMemoryStateStore {
+        self.store_with_projection(hydration, ProjectionMode::PlainFiles)
+    }
+
+    fn store_with_projection(
+        &self,
+        hydration: HydrationState,
+        projection: ProjectionMode,
+    ) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
         store
-            .save_mount(MountConfig::new(
-                self.mount_id.clone(),
-                "notion",
-                self.root.clone(),
-            ))
+            .save_mount(
+                MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
+                    .projection(projection),
+            )
             .expect("save mount");
         store
             .save_entity(
@@ -107,7 +161,9 @@ impl RestoreFixture {
 
 impl Drop for RestoreFixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if let Some(base) = self.root.parent() {
+            let _ = fs::remove_dir_all(base);
+        }
     }
 }
 

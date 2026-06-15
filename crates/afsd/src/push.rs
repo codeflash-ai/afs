@@ -241,25 +241,41 @@ where
         .cloned()
         .ok_or_else(|| PushPrepareError::MountNotFound(absolute_path.clone()))?;
     let relative_path = relative_entity_path(&mount, &absolute_path)?;
+    if let Some(pending) = store
+        .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
+        .map_err(PushPrepareError::Store)?
+    {
+        match pending.mutation_kind {
+            VirtualMutationKind::Create => {
+                return prepare_pending_create(
+                    store,
+                    job,
+                    state_root,
+                    absolute_path,
+                    mount,
+                    pending,
+                    validator,
+                );
+            }
+            VirtualMutationKind::Delete => {
+                return prepare_pending_scope(
+                    store,
+                    job,
+                    state_root,
+                    absolute_path,
+                    mount,
+                    relative_path,
+                    validator,
+                );
+            }
+            VirtualMutationKind::Rename => {}
+        }
+    }
     let entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
         .map_err(PushPrepareError::Store)?;
 
     let Some(entity) = entity else {
-        if let Some(pending) = store
-            .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
-            .map_err(PushPrepareError::Store)?
-        {
-            return prepare_pending_create(
-                store,
-                job,
-                state_root,
-                absolute_path,
-                mount,
-                pending,
-                validator,
-            );
-        }
         if relative_path.as_os_str().is_empty() || absolute_path.is_dir() {
             return prepare_pending_scope(
                 store,

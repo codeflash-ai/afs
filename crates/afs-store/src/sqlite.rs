@@ -13,10 +13,12 @@ use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::planner::{PlanSummary, PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
@@ -1292,15 +1294,108 @@ fn journal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRow> {
 }
 
 fn journal_from_row(row: JournalRow) -> StoreResult<JournalEntry> {
+    let (plan, operation_index_map) = journal_plan_from_json(&row.3)?;
     Ok(JournalEntry {
         push_id: PushId(row.0),
         mount_id: MountId(row.1),
         remote_ids: from_json::<Vec<RemoteId>>(&row.2)?,
-        plan: from_json(&row.3)?,
+        plan,
         preimages: from_json::<Vec<JournalPreimage>>(&row.4)?,
-        apply_effects: from_json::<Vec<JournalApplyEffect>>(&row.5)?,
+        apply_effects: journal_apply_effects_from_json(&row.5, &operation_index_map)?,
         status: from_json(&row.6)?,
     })
+}
+
+fn journal_plan_from_json(value: &str) -> StoreResult<(PushPlan, Vec<Option<usize>>)> {
+    let mut plan = serde_json::from_str::<Value>(value)?;
+    let mut operation_index_map = Vec::new();
+    if let Some(operations) = plan.get_mut("operations").and_then(Value::as_array_mut) {
+        let mut supported = Vec::with_capacity(operations.len());
+        operation_index_map = vec![None; operations.len()];
+        for (operation_index, operation) in operations.iter().enumerate() {
+            match serde_json::from_value::<PushOperation>(operation.clone()) {
+                Ok(_) => {
+                    operation_index_map[operation_index] = Some(supported.len());
+                    supported.push(operation.clone());
+                }
+                Err(_) if json_type(operation) == Some("update_entity_content") => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        *operations = supported;
+    }
+
+    let mut plan = serde_json::from_value::<PushPlan>(plan)?;
+    plan.summary = PlanSummary::from_operations(&plan.operations);
+    Ok((plan, operation_index_map))
+}
+
+fn journal_apply_effects_from_json(
+    value: &str,
+    operation_index_map: &[Option<usize>],
+) -> StoreResult<Vec<JournalApplyEffect>> {
+    let effects = serde_json::from_str::<Vec<Value>>(value)?;
+    let mut supported = Vec::with_capacity(effects.len());
+
+    for effect in effects {
+        match serde_json::from_value::<JournalApplyEffect>(effect.clone()) {
+            Ok(mut effect) => {
+                if remap_apply_effect_operation_index(&mut effect, operation_index_map) {
+                    supported.push(effect);
+                }
+            }
+            Err(_) if json_type(&effect) == Some("updated_entity_content") => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Ok(supported)
+}
+
+fn remap_apply_effect_operation_index(
+    effect: &mut JournalApplyEffect,
+    operation_index_map: &[Option<usize>],
+) -> bool {
+    if operation_index_map.is_empty() {
+        return true;
+    }
+
+    let operation_index = match effect {
+        JournalApplyEffect::UpdatedBlock {
+            operation_index, ..
+        }
+        | JournalApplyEffect::CreatedBlock {
+            operation_index, ..
+        }
+        | JournalApplyEffect::MovedBlock {
+            operation_index, ..
+        }
+        | JournalApplyEffect::ArchivedBlock {
+            operation_index, ..
+        }
+        | JournalApplyEffect::ArchivedEntity {
+            operation_index, ..
+        }
+        | JournalApplyEffect::UpdatedProperties {
+            operation_index, ..
+        }
+        | JournalApplyEffect::CreatedEntity {
+            operation_index, ..
+        } => operation_index,
+    };
+
+    match operation_index_map.get(*operation_index) {
+        Some(Some(new_index)) => {
+            *operation_index = *new_index;
+            true
+        }
+        Some(None) => false,
+        None => true,
+    }
+}
+
+fn json_type(value: &Value) -> Option<&str> {
+    value.get("type").and_then(Value::as_str)
 }
 
 fn seed_default_notion_profile(connection: &Connection) -> StoreResult<()> {
