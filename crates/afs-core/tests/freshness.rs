@@ -1,8 +1,9 @@
 use afs_core::freshness::{
-    ChangeHintKind, FreshnessTier, RemoteVersion, SyncJob, SyncJobCost, SyncJobKind,
-    WorkingCopyState, classify_working_copy,
+    ChangeHintKind, FreshnessActivity, FreshnessDecision, FreshnessOptimizationPolicy,
+    FreshnessTier, RemoteVersion, SyncJob, SyncJobCost, SyncJobKind, WorkingCopyState,
+    classify_working_copy,
 };
-use afs_core::model::{MountId, RemoteId};
+use afs_core::model::{HydrationState, MountId, RemoteId};
 
 #[test]
 fn remote_versions_are_opaque_stable_values() {
@@ -59,6 +60,59 @@ fn change_hints_map_to_default_freshness_tiers() {
         ChangeHintKind::BackgroundPoll.recommended_tier(),
         FreshnessTier::Cold
     );
+}
+
+#[test]
+fn activity_scoring_promotes_pending_and_recent_activity() {
+    let policy = FreshnessOptimizationPolicy::default();
+
+    let pending = FreshnessActivity {
+        local_pending: true,
+        ..FreshnessActivity::default()
+    };
+    let recent_open = FreshnessActivity {
+        last_opened_age_ms: Some(policy.hot_after_activity_ms),
+        ..FreshnessActivity::default()
+    };
+    let older_open = FreshnessActivity {
+        last_opened_age_ms: Some(policy.hot_after_activity_ms + 1),
+        ..FreshnessActivity::default()
+    };
+
+    assert_eq!(pending.recommended_tier(&policy), FreshnessTier::Hot);
+    assert_eq!(recent_open.recommended_tier(&policy), FreshnessTier::Hot);
+    assert_eq!(older_open.recommended_tier(&policy), FreshnessTier::Warm);
+    assert!(
+        pending.score(&policy)
+            > FreshnessActivity::for_hydration(HydrationState::Stub).score(&policy)
+    );
+}
+
+#[test]
+fn inactive_deep_subtrees_decay_to_dormant() {
+    let policy = FreshnessOptimizationPolicy {
+        cold_after_check_ms: 10,
+        dormant_subtree_depth: 3,
+        ..FreshnessOptimizationPolicy::default()
+    };
+    let activity = FreshnessActivity {
+        hydration: Some(HydrationState::Virtual),
+        last_checked_age_ms: Some(11),
+        subtree_depth: 3,
+        ..FreshnessActivity::default()
+    };
+    let decision = FreshnessDecision::from_activity(&activity, &policy);
+
+    assert_eq!(decision.tier, FreshnessTier::Dormant);
+    assert_eq!(decision.activity_score, 0);
+}
+
+#[test]
+fn hydrated_entities_remain_warm_without_recent_activity() {
+    let policy = FreshnessOptimizationPolicy::default();
+    let activity = FreshnessActivity::for_hydration(HydrationState::Hydrated);
+
+    assert_eq!(activity.recommended_tier(&policy), FreshnessTier::Warm);
 }
 
 #[test]

@@ -298,6 +298,10 @@ afs status ~/afs/notion
 ## `afs daemon status`
 
 `afs daemon status [--json]` checks the configured Unix socket and, when the daemon is running, requests a daemon status snapshot. JSON output includes process-manager state, runtime queue counts, scheduler mode, watched mount count, and watched roots.
+Runtime queue counts include mutating requests, hydration work, scheduled pulls,
+and freshness work. Freshness metrics report pending/ready/deferred jobs plus
+ready and total budget units, which helps diagnose sync pressure without
+requiring a full workspace scan.
 
 `afs daemon reload [--json]` tells a running daemon to reconcile its watched mount roots with the current SQLite mount table. `afs mount` sends the same IPC request after saving a new mount, so a persistent daemon starts watching newly mounted directories without a restart.
 

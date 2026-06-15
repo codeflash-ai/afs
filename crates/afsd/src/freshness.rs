@@ -7,16 +7,34 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_core::AfsResult;
-use afs_core::freshness::{FreshnessTier, SyncJob};
+use afs_core::freshness::{
+    FreshnessActivity, FreshnessDecision, FreshnessOptimizationPolicy, FreshnessTier, SyncJob,
+};
 use afs_core::model::HydrationState;
 use afs_store::{EntityRecord, FreshnessStateRecord, FreshnessStateRepository};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FreshnessQueue {
     jobs: BTreeMap<String, SyncJob>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FreshnessQueueMetrics {
+    pub total_jobs: usize,
+    pub ready_jobs: usize,
+    pub deferred_jobs: usize,
+    pub total_budget_units: u16,
+    pub ready_budget_units: u16,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FreshnessBatch {
+    pub jobs: Vec<SyncJob>,
+    pub metrics_before: FreshnessQueueMetrics,
 }
 
 impl FreshnessQueue {
@@ -78,6 +96,43 @@ impl FreshnessQueue {
         None
     }
 
+    pub fn drain_ready_batch(
+        &mut self,
+        now: Option<&str>,
+        budget_units: u16,
+        max_jobs: usize,
+    ) -> FreshnessBatch {
+        let metrics_before = self.metrics(now);
+        let mut keys = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| is_ready(job, now))
+            .map(|(key, job)| (key.clone(), job.clone()))
+            .collect::<Vec<_>>();
+        keys.sort_by(|(_, left), (_, right)| compare_jobs(left, right));
+
+        let mut remaining = budget_units;
+        let mut jobs = Vec::new();
+        for (key, job) in keys {
+            if jobs.len() >= max_jobs {
+                break;
+            }
+
+            let cost = job.estimated_cost.budget_units();
+            if cost > remaining {
+                continue;
+            }
+            remaining -= cost;
+            self.jobs.remove(&key);
+            jobs.push(job);
+        }
+
+        FreshnessBatch {
+            jobs,
+            metrics_before,
+        }
+    }
+
     pub fn drain_ready_budget(&mut self, now: Option<&str>, budget_units: u16) -> Vec<SyncJob> {
         let mut keys = self
             .jobs
@@ -100,6 +155,24 @@ impl FreshnessQueue {
         }
 
         drained
+    }
+
+    pub fn metrics(&self, now: Option<&str>) -> FreshnessQueueMetrics {
+        let mut metrics = FreshnessQueueMetrics {
+            total_jobs: self.jobs.len(),
+            ..FreshnessQueueMetrics::default()
+        };
+        for job in self.jobs.values() {
+            let units = job.estimated_cost.budget_units();
+            metrics.total_budget_units = metrics.total_budget_units.saturating_add(units);
+            if is_ready(job, now) {
+                metrics.ready_jobs += 1;
+                metrics.ready_budget_units = metrics.ready_budget_units.saturating_add(units);
+            } else {
+                metrics.deferred_jobs += 1;
+            }
+        }
+        metrics
     }
 }
 
@@ -125,6 +198,48 @@ where
         promote_tier(state, FreshnessTier::Hot);
         state.last_local_change_at = Some(now);
     })
+}
+
+pub fn optimized_freshness_decision(
+    state: &FreshnessStateRecord,
+    entity: Option<&EntityRecord>,
+    now_ms: u64,
+    policy: &FreshnessOptimizationPolicy,
+) -> FreshnessDecision {
+    let activity = activity_from_state(state, entity, now_ms);
+    FreshnessDecision::from_activity(&activity, policy)
+}
+
+pub fn refresh_optimized_tier(
+    state: &mut FreshnessStateRecord,
+    entity: Option<&EntityRecord>,
+    now_ms: u64,
+    policy: &FreshnessOptimizationPolicy,
+) -> FreshnessDecision {
+    let decision = optimized_freshness_decision(state, entity, now_ms, policy);
+    state.tier = decision.tier.clone();
+    decision
+}
+
+fn activity_from_state(
+    state: &FreshnessStateRecord,
+    entity: Option<&EntityRecord>,
+    now_ms: u64,
+) -> FreshnessActivity {
+    let hydration = entity.map(|entity| entity.hydration.clone());
+    let local_pending = matches!(
+        hydration,
+        Some(HydrationState::Dirty | HydrationState::Conflicted)
+    );
+    FreshnessActivity {
+        hydration,
+        local_pending,
+        remote_hint_pending: state.remote_hint_pending,
+        last_opened_age_ms: age_ms(state.last_opened_at.as_deref(), now_ms),
+        last_local_change_age_ms: age_ms(state.last_local_change_at.as_deref(), now_ms),
+        last_checked_age_ms: age_ms(state.last_checked_at.as_deref(), now_ms),
+        subtree_depth: entity.map_or(0, |entity| path_depth(&entity.path)),
+    }
 }
 
 fn update_freshness_state<S, F>(store: &mut S, entity: &EntityRecord, update: F) -> AfsResult<()>
@@ -167,6 +282,27 @@ pub fn freshness_timestamp() -> String {
     }
 }
 
+pub fn parse_freshness_timestamp(value: &str) -> Option<u64> {
+    value.strip_prefix("unix_ms:")?.parse().ok()
+}
+
+pub fn freshness_unix_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().try_into().unwrap_or(u64::MAX),
+        Err(_) => 0,
+    }
+}
+
+fn age_ms(timestamp: Option<&str>, now_ms: u64) -> Option<u64> {
+    timestamp
+        .and_then(parse_freshness_timestamp)
+        .map(|then| now_ms.saturating_sub(then))
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
+}
+
 fn compare_jobs(left: &SyncJob, right: &SyncJob) -> Ordering {
     left.tier
         .cmp(&right.tier)
@@ -196,10 +332,13 @@ fn earlier_next_eligible(candidate: Option<&String>, current: Option<&String>) -
 
 #[cfg(test)]
 mod tests {
-    use afs_core::freshness::{ChangeHintKind, FreshnessTier, SyncJob, SyncJobKind};
-    use afs_core::model::{MountId, RemoteId};
+    use afs_core::freshness::{
+        ChangeHintKind, FreshnessOptimizationPolicy, FreshnessTier, SyncJob, SyncJobKind,
+    };
+    use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+    use afs_store::{EntityRecord, FreshnessStateRecord};
 
-    use super::FreshnessQueue;
+    use super::{FreshnessQueue, optimized_freshness_decision, refresh_optimized_tier};
 
     #[test]
     fn queue_drains_urgent_and_cheap_jobs_within_budget() {
@@ -298,6 +437,94 @@ mod tests {
         assert_eq!(queue.len(), 1);
     }
 
+    #[test]
+    fn queue_metrics_report_ready_and_deferred_work() {
+        let mut queue = FreshnessQueue::new();
+        queue.upsert(job(
+            "page-ready",
+            SyncJobKind::ObserveEntity,
+            ChangeHintKind::LocalEdited,
+        ));
+        queue.upsert(
+            job(
+                "page-later",
+                SyncJobKind::HydrateEntity,
+                ChangeHintKind::BackgroundPoll,
+            )
+            .next_eligible_at("unix_ms:20"),
+        );
+
+        let metrics = queue.metrics(Some("unix_ms:10"));
+
+        assert_eq!(metrics.total_jobs, 2);
+        assert_eq!(metrics.ready_jobs, 1);
+        assert_eq!(metrics.deferred_jobs, 1);
+        assert_eq!(metrics.ready_budget_units, 1);
+        assert_eq!(metrics.total_budget_units, 21);
+    }
+
+    #[test]
+    fn queue_drains_bounded_batches() {
+        let mut queue = FreshnessQueue::new();
+        queue.upsert(job(
+            "page-1",
+            SyncJobKind::ObserveEntity,
+            ChangeHintKind::LocalEdited,
+        ));
+        queue.upsert(job(
+            "page-2",
+            SyncJobKind::ObserveEntity,
+            ChangeHintKind::LocalEdited,
+        ));
+
+        let batch = queue.drain_ready_batch(Some("unix_ms:10"), 10, 1);
+
+        assert_eq!(batch.metrics_before.total_jobs, 2);
+        assert_eq!(batch.jobs.len(), 1);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn freshness_decision_keeps_dirty_entities_hot() {
+        let entity = entity("Projects/Q4/Roadmap.md", HydrationState::Dirty);
+        let state = FreshnessStateRecord::new(
+            entity.mount_id.clone(),
+            entity.remote_id.clone(),
+            FreshnessTier::Cold,
+        )
+        .local_change_at("unix_ms:1000");
+
+        let decision = optimized_freshness_decision(
+            &state,
+            Some(&entity),
+            10_000,
+            &FreshnessOptimizationPolicy::default(),
+        );
+
+        assert_eq!(decision.tier, FreshnessTier::Hot);
+    }
+
+    #[test]
+    fn refresh_optimized_tier_decays_deep_inactive_virtual_entities() {
+        let entity = entity("A/B/C/D/Page.md", HydrationState::Virtual);
+        let mut state = FreshnessStateRecord::new(
+            entity.mount_id.clone(),
+            entity.remote_id.clone(),
+            FreshnessTier::Cold,
+        )
+        .checked_at("unix_ms:0");
+        let policy = FreshnessOptimizationPolicy {
+            cold_after_check_ms: 10,
+            dormant_subtree_depth: 4,
+            ..FreshnessOptimizationPolicy::default()
+        };
+
+        let decision = refresh_optimized_tier(&mut state, Some(&entity), 11, &policy);
+
+        assert_eq!(decision.tier, FreshnessTier::Dormant);
+        assert_eq!(state.tier, FreshnessTier::Dormant);
+    }
+
     fn job(remote_id: &str, kind: SyncJobKind, reason: ChangeHintKind) -> SyncJob {
         SyncJob::new(
             MountId::new("notion-main"),
@@ -305,5 +532,16 @@ mod tests {
             kind,
             reason,
         )
+    }
+
+    fn entity(path: &str, hydration: HydrationState) -> EntityRecord {
+        EntityRecord::new(
+            MountId::new("notion-main"),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Roadmap",
+            path,
+        )
+        .with_hydration(hydration)
     }
 }

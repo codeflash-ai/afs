@@ -34,6 +34,7 @@ use crate::repository::{
 
 const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 11;
+const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -1742,20 +1743,20 @@ fn seed_default_notion_profile(connection: &Connection) -> StoreResult<()> {
             created_at,
             updated_at
          )
-         VALUES (
-            'notion-token-default',
-            'notion',
-            'Notion token auth',
-            'token',
-            '[]',
-            '{}',
-            '[\"read\",\"write\"]',
-            'notion.v1',
-            'active',
-            '0',
-            '0'
-         )",
-        [],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            "notion-token-default",
+            "notion",
+            "Notion token auth",
+            "token",
+            "[]",
+            DEFAULT_NOTION_CAPABILITIES_JSON,
+            "[\"read\",\"write\"]",
+            "notion.v1",
+            "active",
+            "0",
+            "0",
+        ],
     )?;
     Ok(())
 }

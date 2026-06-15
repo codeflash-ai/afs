@@ -158,6 +158,11 @@ impl Connector for NotionConnector {
             supports_block_updates: true,
             supports_databases: true,
             supports_oauth: true,
+            supports_remote_observation: true,
+            supports_lazy_child_enumeration: true,
+            supports_media_download: true,
+            supports_undo: true,
+            supports_batch_observation: false,
         }
     }
 

@@ -2367,10 +2367,18 @@ fn print_daemon_report(report: &DaemonControlReport) {
     if let Some(status) = &report.daemon_status {
         println!("  watched mounts: {}", status.watches.watched_mounts);
         println!(
-            "  jobs: active={}, pending={}, hydration={}",
+            "  jobs: active={}, pending={}, hydration={}, freshness={}",
             status.runtime.active_job,
             status.runtime.pending_requests,
-            status.runtime.pending_hydrations
+            status.runtime.pending_hydrations,
+            status.runtime.pending_freshness
+        );
+        println!(
+            "  freshness: ready={}, deferred={}, ready_budget={}, total_budget={}",
+            status.runtime.ready_freshness,
+            status.runtime.deferred_freshness,
+            status.runtime.ready_freshness_budget_units,
+            status.runtime.freshness_budget_units
         );
         if let Some(active) = &status.runtime.active_job_detail {
             println!(

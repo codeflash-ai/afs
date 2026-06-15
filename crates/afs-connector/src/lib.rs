@@ -12,15 +12,35 @@ use afs_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
 use afs_core::planner::{PushOperationKind, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorKind(pub &'static str);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorCapabilities {
     pub supports_block_updates: bool,
     pub supports_databases: bool,
     pub supports_oauth: bool,
+    pub supports_remote_observation: bool,
+    pub supports_lazy_child_enumeration: bool,
+    pub supports_media_download: bool,
+    pub supports_undo: bool,
+    pub supports_batch_observation: bool,
+}
+
+impl ConnectorCapabilities {
+    pub fn read_only() -> Self {
+        Self {
+            supports_remote_observation: true,
+            supports_lazy_child_enumeration: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn supports_local_only_stage10(&self) -> bool {
+        self.supports_remote_observation || self.supports_lazy_child_enumeration
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

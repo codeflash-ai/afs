@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{EntityKind, MountId, RemoteId};
+use crate::model::{EntityKind, HydrationState, MountId, RemoteId};
 
 /// Opaque connector-owned token for a remote entity version.
 ///
@@ -99,6 +99,16 @@ pub enum FreshnessTier {
 }
 
 impl FreshnessTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Hot => "hot",
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+            Self::Dormant => "dormant",
+        }
+    }
+
     pub fn is_more_urgent_than(&self, other: &Self) -> bool {
         self.priority() < other.priority()
     }
@@ -111,6 +121,120 @@ impl FreshnessTier {
             Self::Cold => 3,
             Self::Dormant => 4,
         }
+    }
+}
+
+/// Local-only policy knobs for decaying freshness tiers.
+///
+/// The scheduler should spend budget where humans and agents are active, while
+/// large unused subtrees should naturally cool down. Durations are in
+/// milliseconds so callers can use monotonic or wall-clock sources without
+/// bringing time handling into core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessOptimizationPolicy {
+    pub hot_after_activity_ms: u64,
+    pub warm_after_activity_ms: u64,
+    pub cold_after_check_ms: u64,
+    pub dormant_subtree_depth: usize,
+}
+
+impl Default for FreshnessOptimizationPolicy {
+    fn default() -> Self {
+        Self {
+            hot_after_activity_ms: 5 * 60 * 1000,
+            warm_after_activity_ms: 60 * 60 * 1000,
+            cold_after_check_ms: 24 * 60 * 60 * 1000,
+            dormant_subtree_depth: 4,
+        }
+    }
+}
+
+/// Connector-neutral activity facts used to score sync priority.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessActivity {
+    pub hydration: Option<HydrationState>,
+    pub local_pending: bool,
+    pub remote_hint_pending: bool,
+    pub last_opened_age_ms: Option<u64>,
+    pub last_local_change_age_ms: Option<u64>,
+    pub last_checked_age_ms: Option<u64>,
+    pub subtree_depth: usize,
+}
+
+impl FreshnessActivity {
+    pub fn for_hydration(hydration: HydrationState) -> Self {
+        Self {
+            hydration: Some(hydration),
+            ..Self::default()
+        }
+    }
+
+    pub fn score(&self, policy: &FreshnessOptimizationPolicy) -> u16 {
+        match self.recommended_tier(policy) {
+            FreshnessTier::Immediate => 100,
+            FreshnessTier::Hot => 80,
+            FreshnessTier::Warm => 50,
+            FreshnessTier::Cold => 20,
+            FreshnessTier::Dormant => 0,
+        }
+    }
+
+    pub fn recommended_tier(&self, policy: &FreshnessOptimizationPolicy) -> FreshnessTier {
+        if self.local_pending || self.remote_hint_pending {
+            return FreshnessTier::Hot;
+        }
+
+        let newest_activity = newest_age(self.last_opened_age_ms, self.last_local_change_age_ms);
+        if let Some(age) = newest_activity {
+            if age <= policy.hot_after_activity_ms {
+                return FreshnessTier::Hot;
+            }
+            if age <= policy.warm_after_activity_ms {
+                return FreshnessTier::Warm;
+            }
+        }
+
+        if matches!(self.hydration, Some(HydrationState::Hydrated)) {
+            return FreshnessTier::Warm;
+        }
+
+        if self.subtree_depth >= policy.dormant_subtree_depth
+            && self
+                .last_checked_age_ms
+                .is_some_and(|age| age > policy.cold_after_check_ms)
+        {
+            return FreshnessTier::Dormant;
+        }
+
+        FreshnessTier::Cold
+    }
+}
+
+/// Result of applying the optimization policy to one entity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessDecision {
+    pub tier: FreshnessTier,
+    pub activity_score: u16,
+}
+
+impl FreshnessDecision {
+    pub fn from_activity(
+        activity: &FreshnessActivity,
+        policy: &FreshnessOptimizationPolicy,
+    ) -> Self {
+        Self {
+            tier: activity.recommended_tier(policy),
+            activity_score: activity.score(policy),
+        }
+    }
+}
+
+fn newest_age(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 

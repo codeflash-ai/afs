@@ -429,6 +429,20 @@ observe, hydrate, or ignore it based on budget and tier.
 Add connector capability flags, fake connector tests, cold subtree decay,
 activity scoring, media pruning, deep refresh, batching, and metrics.
 
+Current local-only implementation:
+
+- Connector capabilities now include explicit flags for remote observation,
+  lazy child enumeration, media download, undo, and future batch observation.
+- `afs-core::freshness` defines activity scoring and tier decay policy so
+  recently opened/edited or hinted entities stay hot, hydrated files stay warm,
+  and deep inactive virtual subtrees can cool to dormant.
+- The daemon freshness queue exposes bounded batch draining and queue metrics
+  for pending, ready, deferred, and budgeted work. Runtime status reports those
+  metrics so future UI/diagnostics can observe sync pressure without exposing
+  hydration internals in the normal product UI.
+- Relay/webhook delivery remains intentionally unimplemented; Stage 10 only
+  improves local scheduling and connector contracts.
+
 ## Recommended Build Order
 
 ```text

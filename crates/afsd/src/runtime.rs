@@ -1355,12 +1355,18 @@ impl RuntimeState {
     }
 
     fn status(&self) -> DaemonRuntimeStatus {
+        let freshness_metrics = self.freshness.metrics(Some(&freshness_timestamp()));
         DaemonRuntimeStatus {
             active_job: self.active_job.is_some(),
             active_job_detail: self.active_job.as_ref().map(ActiveRuntimeJob::status),
             pending_requests: self.pending_requests.len(),
             pending_hydrations: self.hydration.len(),
             deferred_hydrations: self.deferred_hydration.len(),
+            pending_freshness: freshness_metrics.total_jobs,
+            ready_freshness: freshness_metrics.ready_jobs,
+            deferred_freshness: freshness_metrics.deferred_jobs,
+            freshness_budget_units: freshness_metrics.total_budget_units,
+            ready_freshness_budget_units: freshness_metrics.ready_budget_units,
             pending_scheduled_pull: self.pending_scheduled_tick.is_some(),
             scheduler_mode: match self.scheduler.config.mode {
                 PullMode::Polling => "polling",

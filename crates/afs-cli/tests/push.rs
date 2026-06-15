@@ -579,6 +579,7 @@ impl Connector for FakePushSource {
             supports_block_updates: true,
             supports_databases: false,
             supports_oauth: false,
+            ..ConnectorCapabilities::default()
         }
     }
 

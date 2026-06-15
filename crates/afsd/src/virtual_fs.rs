@@ -1861,6 +1861,8 @@ mod tests {
                 supports_block_updates: false,
                 supports_databases: false,
                 supports_oauth: false,
+                supports_lazy_child_enumeration: true,
+                ..ConnectorCapabilities::default()
             }
         }
 

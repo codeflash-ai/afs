@@ -23,6 +23,8 @@ use afs_store::{
 use rusqlite::{Connection, params};
 use serde_json::json;
 
+const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
+
 #[test]
 fn sqlite_store_initializes_idempotently() {
     let fixture = SqliteFixture::new();
@@ -1228,7 +1230,7 @@ fn default_profile() -> ConnectorProfileRecord {
         display_name: "Notion token auth".to_string(),
         auth_kind: "token".to_string(),
         scopes: vec![],
-        capabilities_json: "{}".to_string(),
+        capabilities_json: DEFAULT_NOTION_CAPABILITIES_JSON.to_string(),
         enabled_actions_json: "[\"read\",\"write\"]".to_string(),
         connector_version: "notion.v1".to_string(),
         status: "active".to_string(),

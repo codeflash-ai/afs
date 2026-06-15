@@ -328,6 +328,9 @@ impl Connector for FakeSource {
             supports_block_updates: true,
             supports_databases: true,
             supports_oauth: false,
+            supports_remote_observation: true,
+            supports_lazy_child_enumeration: true,
+            ..ConnectorCapabilities::default()
         }
     }
 
