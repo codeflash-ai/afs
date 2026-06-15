@@ -1717,25 +1717,47 @@ fn virtual_mount_for_path(path: &Path) -> Option<MountConfig> {
 
 fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
     match mount.projection {
-        ProjectionMode::MacosFileProvider => open_macos_virtual_projection(&mount.mount_id.0),
+        ProjectionMode::MacosFileProvider => open_macos_virtual_projection(mount),
         ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => open_in_file_manager(&mount.root),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn open_macos_virtual_projection(mount_id: &str) -> Result<(), String> {
-    open_macos_file_provider_domain(mount_id)
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "Could not open macOS File Provider mount: {}",
-                error.message()
-            )
-        })
+fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
+    match open_macos_file_provider_domain(&mount.mount_id.0) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let first_error = error.message();
+            eprintln!(
+                "afs desktop could not open macOS File Provider domain `{}`: {first_error}",
+                mount.mount_id.0
+            );
+
+            if let Err(error) = register_macos_virtual_projection(
+                &mount.mount_id.0,
+                &mount.root.display().to_string(),
+            ) {
+                eprintln!("afs desktop could not re-register macOS File Provider domain: {error}");
+            } else if open_macos_file_provider_domain(&mount.mount_id.0).is_ok() {
+                return Ok(());
+            }
+
+            if let Err(error) = install_virtual_projection_shortcut(mount) {
+                eprintln!("afs desktop could not refresh File Provider shortcut: {error}");
+            }
+
+            open_in_file_manager(&mount.root).map_err(|fallback_error| {
+                format!(
+                    "Could not open macOS File Provider mount ({first_error}). Also could not open fallback folder `{}`: {fallback_error}",
+                    mount.root.display()
+                )
+            })
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_macos_virtual_projection(_mount_id: &str) -> Result<(), String> {
+fn open_macos_virtual_projection(_mount: &MountConfig) -> Result<(), String> {
     Err("macOS File Provider mounts can only be opened on macOS.".to_string())
 }
 

@@ -1371,6 +1371,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
+  const [quitOptionsOpen, setQuitOptionsOpen] = useState(false);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
 
   async function locatePage() {
@@ -1492,15 +1493,19 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
 
       <footer className="tray-footer">
         <button onClick={() => openMain("settings")}>Settings</button>
-        <details>
-          <summary>Quit Options</summary>
-          <button onClick={() => void callCommand("hide_menubar", undefined, { ok: true })}>
-            Don't Show in Menubar
-          </button>
-          <button className="danger" onClick={() => void callCommand("quit_completely", undefined, { ok: true })}>
-            Quit Completely
-          </button>
-        </details>
+        <div className="tray-quit-options">
+          <button onClick={() => setQuitOptionsOpen((open) => !open)}>Quit Options</button>
+          {quitOptionsOpen && (
+            <div className="tray-quit-menu">
+              <button onClick={() => void callCommand("hide_menubar", undefined, { ok: true })}>
+                Don't Show in Menubar
+              </button>
+              <button className="danger" onClick={() => void callCommand("quit_completely", undefined, { ok: true })}>
+                Quit Completely
+              </button>
+            </div>
+          )}
+        </div>
       </footer>
     </main>
   );

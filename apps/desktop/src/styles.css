@@ -876,7 +876,25 @@ p {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
+  flex: 0 0 196px;
   gap: 10px;
+  width: 196px;
+}
+
+.mount-actions .primary-button,
+.mount-actions .secondary-button {
+  justify-content: center;
+  width: 100%;
+  margin-top: 0;
+}
+
+.mount-actions .secondary-button.compact {
+  min-height: 40px;
+}
+
+.mount-actions .primary-button span,
+.mount-actions .secondary-button span {
+  white-space: nowrap;
 }
 
 .detail-grid {
@@ -1442,26 +1460,41 @@ p {
   padding-top: 4px;
 }
 
-.tray-footer details {
+.tray-quit-options {
   position: relative;
 }
 
-.tray-footer summary {
+.tray-quit-options > button {
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
-  list-style: none;
 }
 
-.tray-footer details[open] {
+.tray-quit-menu {
+  position: absolute;
+  right: 0;
+  bottom: 30px;
+  z-index: 2;
+  display: grid;
+  gap: 4px;
+  min-width: 178px;
   padding: 8px;
+  border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgba(248, 252, 251, 0.96);
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 14px 36px rgba(20, 30, 43, 0.16);
 }
 
-.tray-footer details[open] button {
-  display: block;
-  margin-top: 8px;
+.tray-quit-menu button {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 8px;
+  border-radius: 7px;
+  text-align: left;
+}
+
+.tray-quit-menu button:hover:not(:disabled) {
+  background: rgba(248, 252, 251, 0.96);
 }
 
 .tray-footer .danger {
