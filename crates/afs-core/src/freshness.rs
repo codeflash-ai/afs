@@ -129,6 +129,21 @@ pub enum ChangeHintKind {
     Webhook,
 }
 
+impl ChangeHintKind {
+    pub fn recommended_tier(&self) -> FreshnessTier {
+        match self {
+            Self::PushRequested => FreshnessTier::Immediate,
+            Self::FileOpened
+            | Self::LocalEdited
+            | Self::RemoteMaybeChanged
+            | Self::UrlLocated
+            | Self::Webhook => FreshnessTier::Hot,
+            Self::DirectoryListed | Self::ExplicitRefresh => FreshnessTier::Warm,
+            Self::BackgroundPoll => FreshnessTier::Cold,
+        }
+    }
+}
+
 /// Advisory signal that an entity or container may need observation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeHint {
@@ -154,5 +169,94 @@ pub fn classify_working_copy(local_changed: bool, remote_changed: bool) -> Worki
         (false, true) => WorkingCopyState::RemoteChanged,
         (true, false) => WorkingCopyState::LocalPending,
         (true, true) => WorkingCopyState::Diverged,
+    }
+}
+
+/// Bounded daemon work type for freshness scheduling.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncJobKind {
+    ObserveEntity,
+    EnumerateChildren,
+    HydrateEntity,
+    FetchAsset,
+    PushPreflight,
+    ExplainRemoteChange,
+}
+
+impl SyncJobKind {
+    pub fn estimated_cost(&self) -> SyncJobCost {
+        match self {
+            Self::ObserveEntity | Self::PushPreflight => SyncJobCost::Cheap,
+            Self::EnumerateChildren | Self::ExplainRemoteChange => SyncJobCost::Medium,
+            Self::HydrateEntity | Self::FetchAsset => SyncJobCost::Expensive,
+        }
+    }
+}
+
+/// Coarse cost class used by the daemon to spend bounded sync budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncJobCost {
+    Cheap,
+    Medium,
+    Expensive,
+}
+
+impl SyncJobCost {
+    pub fn budget_units(self) -> u16 {
+        match self {
+            Self::Cheap => 1,
+            Self::Medium => 5,
+            Self::Expensive => 20,
+        }
+    }
+}
+
+/// Connector-neutral freshness work item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncJob {
+    pub mount_id: MountId,
+    pub remote_id: Option<RemoteId>,
+    pub kind: SyncJobKind,
+    pub tier: FreshnessTier,
+    pub reason: ChangeHintKind,
+    pub estimated_cost: SyncJobCost,
+    pub next_eligible_at: Option<String>,
+}
+
+impl SyncJob {
+    pub fn new(
+        mount_id: MountId,
+        remote_id: Option<RemoteId>,
+        kind: SyncJobKind,
+        reason: ChangeHintKind,
+    ) -> Self {
+        let tier = reason.recommended_tier();
+        let estimated_cost = kind.estimated_cost();
+        Self {
+            mount_id,
+            remote_id,
+            kind,
+            tier,
+            reason,
+            estimated_cost,
+            next_eligible_at: None,
+        }
+    }
+
+    pub fn with_tier(mut self, tier: FreshnessTier) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    pub fn next_eligible_at(mut self, next_eligible_at: impl Into<String>) -> Self {
+        self.next_eligible_at = Some(next_eligible_at.into());
+        self
+    }
+
+    pub fn dedupe_key(&self) -> String {
+        let remote_id = self.remote_id.as_ref().map_or("-", RemoteId::as_str);
+        format!("{}:{remote_id}:{:?}", self.mount_id.as_str(), self.kind)
     }
 }

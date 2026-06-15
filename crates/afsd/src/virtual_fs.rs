@@ -6,12 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use afs_connector::{ChildContainer, Connector, ListChildrenRequest};
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::conflict::has_unresolved_conflict_markers;
+use afs_core::freshness::FreshnessTier;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
-    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
+    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 
@@ -342,7 +344,11 @@ pub fn materialize_virtual_fs_item_with_content_root<S, Source>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
     Source: HydrationSource + ?Sized,
 {
     let mount = require_virtual_mount(store, mount_id)?;
@@ -452,7 +458,11 @@ pub fn commit_virtual_fs_write<S>(
     contents: &[u8],
 ) -> AfsResult<VirtualFsWriteReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -523,6 +533,12 @@ where
         entity.hydration = HydrationState::Dirty;
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
+    if matches!(
+        entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    ) {
+        record_virtual_local_change(store, &entity)?;
+    }
 
     Ok(VirtualFsWriteReport {
         mount_id: mount_id.0.clone(),
@@ -542,7 +558,7 @@ pub fn create_virtual_fs_file<S>(
     filename: &str,
 ) -> AfsResult<VirtualFsMutationReport>
 where
-    S: MountRepository + EntityRepository + VirtualMutationRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -599,7 +615,7 @@ pub fn rename_virtual_fs_item<S>(
     new_filename: &str,
 ) -> AfsResult<VirtualFsMutationReport>
 where
-    S: MountRepository + EntityRepository + VirtualMutationRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -667,6 +683,7 @@ where
         entity.hydration = HydrationState::Dirty;
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
+    record_virtual_local_change(store, &entity)?;
     let now = now_string();
     let mutation = VirtualMutationRecord {
         mount_id: mount_id.clone(),
@@ -702,7 +719,7 @@ pub fn trash_virtual_fs_item<S>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMutationReport>
 where
-    S: MountRepository + EntityRepository + VirtualMutationRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -750,6 +767,7 @@ where
     store
         .save_virtual_mutation(mutation.clone())
         .map_err(AfsError::from)?;
+    record_virtual_local_change(store, &entity)?;
     let index = ProviderIndex::new(&entities);
     let item = entity_item(&mount, &entity, &index);
     Ok(VirtualFsMutationReport {
@@ -963,6 +981,27 @@ fn rename_cached_file_if_present(from: &Path, to: &Path) -> AfsResult<()> {
 
 fn new_local_id() -> String {
     format!("{}{}", LOCAL_PREFIX, unique_suffix())
+}
+
+fn record_virtual_local_change<S>(store: &mut S, entity: &EntityRecord) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    let mut state = store
+        .get_freshness_state(&entity.mount_id, &entity.remote_id)
+        .map_err(AfsError::from)?
+        .unwrap_or_else(|| {
+            afs_store::FreshnessStateRecord::new(
+                entity.mount_id.clone(),
+                entity.remote_id.clone(),
+                FreshnessTier::Hot,
+            )
+        });
+    if FreshnessTier::Hot.is_more_urgent_than(&state.tier) {
+        state.tier = FreshnessTier::Hot;
+    }
+    state.last_local_change_at = Some(now_string());
+    store.save_freshness_state(state).map_err(AfsError::from)
 }
 
 fn unique_suffix() -> String {
@@ -1490,12 +1529,13 @@ mod tests {
     };
     use afs_core::{
         AfsError,
+        freshness::FreshnessTier,
         hydration::HydrationRequest,
         model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
     };
     use afs_store::{
-        EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-        ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
+        EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
+        MountRepository, ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
     };
 
     use crate::hydration::{HydratedEntity, HydrationSource};
@@ -2022,6 +2062,12 @@ mod tests {
                 .hydration,
             HydrationState::Dirty
         );
+        let freshness = store
+            .get_freshness_state(&mount_id, &remote_id)
+            .expect("get freshness")
+            .expect("freshness");
+        assert_eq!(freshness.tier, FreshnessTier::Hot);
+        assert!(freshness.last_local_change_at.is_some());
         let _ = std::fs::remove_dir_all(state_root);
     }
 
