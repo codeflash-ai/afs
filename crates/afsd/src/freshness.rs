@@ -7,8 +7,12 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_core::freshness::SyncJob;
+use afs_core::AfsResult;
+use afs_core::freshness::{FreshnessTier, SyncJob};
+use afs_core::model::HydrationState;
+use afs_store::{EntityRecord, FreshnessStateRecord, FreshnessStateRepository};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FreshnessQueue {
@@ -51,6 +55,29 @@ impl FreshnessQueue {
         self.drain_ready_budget(None, budget_units)
     }
 
+    pub fn pop_ready(&mut self, budget_units: u16) -> Option<SyncJob> {
+        self.pop_ready_at(None, budget_units)
+    }
+
+    pub fn pop_ready_at(&mut self, now: Option<&str>, budget_units: u16) -> Option<SyncJob> {
+        let mut keys = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| is_ready(job, now))
+            .map(|(key, job)| (key.clone(), job.clone()))
+            .collect::<Vec<_>>();
+        keys.sort_by(|(_, left), (_, right)| compare_jobs(left, right));
+
+        for (key, job) in keys {
+            if job.estimated_cost.budget_units() <= budget_units {
+                self.jobs.remove(&key);
+                return Some(job);
+            }
+        }
+
+        None
+    }
+
     pub fn drain_ready_budget(&mut self, now: Option<&str>, budget_units: u16) -> Vec<SyncJob> {
         let mut keys = self
             .jobs
@@ -73,6 +100,70 @@ impl FreshnessQueue {
         }
 
         drained
+    }
+}
+
+/// Record that a local file became user-visible.
+///
+/// This affects scheduling only. It does not imply local content changed.
+pub fn record_file_opened<S>(store: &mut S, entity: &EntityRecord) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    update_freshness_state(store, entity, |state, now| {
+        promote_tier(state, FreshnessTier::Hot);
+        state.last_opened_at = Some(now);
+    })
+}
+
+/// Record that local content may differ from the last accepted shadow.
+pub fn record_local_change<S>(store: &mut S, entity: &EntityRecord) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    update_freshness_state(store, entity, |state, now| {
+        promote_tier(state, FreshnessTier::Hot);
+        state.last_local_change_at = Some(now);
+    })
+}
+
+fn update_freshness_state<S, F>(store: &mut S, entity: &EntityRecord, update: F) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+    F: FnOnce(&mut FreshnessStateRecord, String),
+{
+    let mut state = store
+        .get_freshness_state(&entity.mount_id, &entity.remote_id)?
+        .unwrap_or_else(|| {
+            FreshnessStateRecord::new(
+                entity.mount_id.clone(),
+                entity.remote_id.clone(),
+                default_freshness_tier(entity),
+            )
+        });
+    update(&mut state, freshness_timestamp());
+    store.save_freshness_state(state)?;
+    Ok(())
+}
+
+fn promote_tier(state: &mut FreshnessStateRecord, tier: FreshnessTier) {
+    if tier.is_more_urgent_than(&state.tier) {
+        state.tier = tier;
+    }
+}
+
+fn default_freshness_tier(entity: &EntityRecord) -> FreshnessTier {
+    match entity.hydration {
+        HydrationState::Dirty | HydrationState::Conflicted => FreshnessTier::Hot,
+        HydrationState::Hydrated => FreshnessTier::Warm,
+        HydrationState::Virtual | HydrationState::Stub => FreshnessTier::Cold,
+    }
+}
+
+pub fn freshness_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix_ms:{}", duration.as_millis()),
+        Err(_) => "unix_ms:0".to_string(),
     }
 }
 
@@ -185,6 +276,26 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn pop_ready_returns_one_job_without_drain_side_effects() {
+        let mut queue = FreshnessQueue::new();
+        queue.upsert(job(
+            "page-hot",
+            SyncJobKind::ObserveEntity,
+            ChangeHintKind::LocalEdited,
+        ));
+        queue.upsert(job(
+            "page-cold",
+            SyncJobKind::HydrateEntity,
+            ChangeHintKind::BackgroundPoll,
+        ));
+
+        let popped = queue.pop_ready(1).expect("cheap hot job");
+
+        assert_eq!(popped.remote_id.expect("remote id").as_str(), "page-hot");
+        assert_eq!(queue.len(), 1);
     }
 
     fn job(remote_id: &str, kind: SyncJobKind, reason: ChangeHintKind) -> SyncJob {

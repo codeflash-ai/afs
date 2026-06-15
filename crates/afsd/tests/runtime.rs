@@ -6,21 +6,23 @@ use std::time::Duration;
 
 use afs_core::AfsError;
 use afs_core::canonical::render_canonical_markdown;
+use afs_core::freshness::{ChangeHintKind, FreshnessTier, SyncJob, SyncJobKind};
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
-    EntityRecord, EntityRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
-    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+    EntityRecord, EntityRepository, FreshnessStateRepository, HydrationJobRecord,
+    HydrationJobRepository, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
+    SqliteStateStore,
 };
 use afsd::DaemonConfig;
 use afsd::execution::{DaemonEventReport, PushJob};
 use afsd::hydration::HydrationOutcome;
 use afsd::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use afsd::runtime::{
-    DaemonRuntime, DefaultRuntimeJobRunner, FileEventRuntimeReport, RuntimeJobRunner,
-    ScheduledPullRuntimeReport,
+    DaemonRuntime, DefaultRuntimeJobRunner, FileEventRuntimeReport, FreshnessRuntimeReport,
+    RuntimeJobRunner, ScheduledPullRuntimeReport,
 };
 use afsd::scheduler::PullSchedulerTick;
 use afsd::virtual_fs::{ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport};
@@ -359,12 +361,25 @@ fn default_runner_marks_hydrated_write_dirty() {
         .expect("run file event");
 
     assert_eq!(report.report.marked_dirty, 1);
+    assert_eq!(report.freshness_jobs.len(), 1);
+    assert_eq!(
+        report.freshness_jobs[0].remote_id,
+        Some(fixture.remote_id.clone())
+    );
+    assert_eq!(report.freshness_jobs[0].kind, SyncJobKind::ObserveEntity);
+    assert_eq!(report.freshness_jobs[0].reason, ChangeHintKind::LocalEdited);
     let store = SqliteStateStore::open(fixture.state_root).expect("open store");
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.remote_id)
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Dirty);
+    let freshness = store
+        .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+        .expect("get freshness")
+        .expect("freshness");
+    assert_eq!(freshness.tier, FreshnessTier::Hot);
+    assert!(freshness.last_local_change_at.is_some());
 }
 
 #[test]
@@ -417,12 +432,25 @@ fn default_runner_queues_stub_read_hydration() {
 
     assert_eq!(report.report.queued_hydrations, 1);
     assert_eq!(report.queued_hydrations.len(), 1);
+    assert_eq!(report.freshness_jobs.len(), 1);
+    assert_eq!(
+        report.freshness_jobs[0].remote_id,
+        Some(fixture.remote_id.clone())
+    );
+    assert_eq!(report.freshness_jobs[0].reason, ChangeHintKind::FileOpened);
     let request = &report.queued_hydrations[0];
     assert_eq!(request.mount_id, fixture.mount_id);
     assert_eq!(request.remote_id, fixture.remote_id);
     assert_eq!(request.path, fixture.page_path());
     assert_eq!(request.target_state, HydrationState::Hydrated);
     assert_eq!(request.reason, HydrationReason::StubRead);
+    let store = SqliteStateStore::open(fixture.state_root).expect("open store");
+    let freshness = store
+        .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+        .expect("get freshness")
+        .expect("freshness");
+    assert_eq!(freshness.tier, FreshnessTier::Hot);
+    assert!(freshness.last_opened_at.is_some());
 }
 
 #[test]
@@ -483,6 +511,61 @@ fn runtime_drains_hydration_queued_by_read_event() {
     assert_eq!(request.mount_id, MountId::new("notion-main"));
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
     assert_eq!(request.reason, HydrationReason::StubRead);
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_drains_freshness_queued_by_file_event() {
+    let (freshness_tx, freshness_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("file-event-freshness"),
+        FreshnessFromEventRunner { freshness_tx },
+    )
+    .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .file_event(FileEvent {
+            path: PathBuf::from("Roadmap.md"),
+            kind: FileEventKind::Write,
+        })
+        .expect("submit write event");
+
+    let job = freshness_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("freshness drained");
+    assert_eq!(job.mount_id, MountId::new("notion-main"));
+    assert_eq!(job.remote_id, Some(RemoteId::new("page-1")));
+    assert_eq!(job.kind, SyncJobKind::ObserveEntity);
+    assert_eq!(job.reason, ChangeHintKind::LocalEdited);
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_drains_freshness_queued_by_virtual_write() {
+    let (freshness_tx, freshness_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("virtual-write-freshness"),
+        FreshnessFromEventRunner { freshness_tx },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime
+        .handle()
+        .request(DaemonRequest::VirtualFsCommitWrite {
+            mount_id: "notion-main".to_string(),
+            identifier: "page-1".to_string(),
+            contents_base64: "ZWRpdGVk".to_string(),
+        });
+
+    assert!(response.ok);
+    let job = freshness_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("freshness drained");
+    assert_eq!(job.mount_id, MountId::new("notion-main"));
+    assert_eq!(job.remote_id, Some(RemoteId::new("page-1")));
+    assert_eq!(job.kind, SyncJobKind::ObserveEntity);
+    assert_eq!(job.reason, ChangeHintKind::LocalEdited);
     runtime.shutdown();
 }
 
@@ -785,6 +868,10 @@ struct ReadHydrationRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
 }
 
+struct FreshnessFromEventRunner {
+    freshness_tx: mpsc::Sender<SyncJob>,
+}
+
 struct PushRequestRunner {
     push_tx: mpsc::Sender<PushJob>,
 }
@@ -862,7 +949,7 @@ impl RuntimeJobRunner for EventRunner {
                 ignored_events: 1,
                 ..Default::default()
             },
-            queued_hydrations: Vec::new(),
+            ..Default::default()
         })
     }
 }
@@ -913,6 +1000,85 @@ impl RuntimeJobRunner for ReadHydrationRunner {
                 HydrationState::Hydrated,
                 HydrationReason::StubRead,
             )],
+            ..Default::default()
+        })
+    }
+}
+
+impl RuntimeJobRunner for FreshnessFromEventRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        _event: FileEvent,
+    ) -> afs_core::AfsResult<FileEventRuntimeReport> {
+        Ok(FileEventRuntimeReport {
+            freshness_jobs: vec![SyncJob::new(
+                MountId::new("notion-main"),
+                Some(RemoteId::new("page-1")),
+                SyncJobKind::ObserveEntity,
+                ChangeHintKind::LocalEdited,
+            )],
+            ..Default::default()
+        })
+    }
+
+    fn run_virtual_fs_commit_write(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+        _contents_base64: String,
+    ) -> DaemonResponse {
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "identifier": identifier,
+            "remote_id": "page-1",
+            "path": "Roadmap.md",
+            "bytes_written": 6,
+            "hydration": "dirty"
+        }))
+    }
+
+    fn run_freshness_job(
+        &self,
+        _state_root: PathBuf,
+        job: SyncJob,
+    ) -> afs_core::AfsResult<FreshnessRuntimeReport> {
+        self.freshness_tx
+            .send(job.clone())
+            .expect("notify freshness");
+        Ok(FreshnessRuntimeReport {
+            job,
+            remote_hint_pending: false,
         })
     }
 }

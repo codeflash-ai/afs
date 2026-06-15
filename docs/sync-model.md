@@ -331,6 +331,16 @@ workspace unless explicitly requested.
 When local content changes, mark the file pending, promote it to hot, schedule a
 remote metadata check soon, and keep push preflight strict.
 
+Current daemon implementation:
+
+- Plain-file read/write watcher events update `freshness_states` and enqueue
+  cheap `observe_entity` jobs.
+- FileProvider/FUSE read/write/mutation responses enqueue the same observation
+  jobs, so online-only mounts do not depend on host file watcher events.
+- Freshness workers call the connector observation API and persist
+  `remote_observations` plus updated `freshness_states`.
+- These observations do not hydrate content and do not replace local files yet.
+
 ### Stage 6: Observability, Safety States, And Optional Barriers
 
 The daemon remains primary. Users and agents should not need manual freshness
