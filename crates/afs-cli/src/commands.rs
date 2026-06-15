@@ -44,6 +44,7 @@ use crate::history::{
     undo_report_exit_code,
 };
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
+use crate::inspect::{InspectError, InspectOptions, InspectReport, run_inspect};
 use crate::local_oauth::{
     LocalOAuthAuthorization, LocalOAuthError, local_redirect, notion_authorize_url, random_state,
     run_local_oauth_authorization,
@@ -114,6 +115,8 @@ enum AfsCommand {
     Info(PathArg),
     #[command(about = "Show local sync state for mounts or paths")]
     Status(PathArg),
+    #[command(about = "Explain local and remote sync state for a path")]
+    Inspect(PathArg),
     #[command(about = "Pull remote content into the local projection")]
     Pull(RequiredPathArg),
     #[command(about = "Push local changes back to the remote source")]
@@ -456,6 +459,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         AfsCommand::Mount { .. } => mount(&legacy_args[1..], json),
         AfsCommand::Info(_) => info(&legacy_args[1..], json),
         AfsCommand::Status(_) => status(&legacy_args[1..], json),
+        AfsCommand::Inspect(_) => inspect(&legacy_args[1..], json),
         AfsCommand::Pull(_) => pull(&legacy_args[1..], json),
         AfsCommand::Push(_) => push(&legacy_args[1..], json),
         AfsCommand::Diff(_) => diff(&legacy_args[1..], json),
@@ -573,6 +577,10 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
         }
         AfsCommand::Status(options) => {
             args.push("status".to_string());
+            push_optional_positional(&mut args, options.path.as_deref());
+        }
+        AfsCommand::Inspect(options) => {
+            args.push("inspect".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
         }
         AfsCommand::Pull(options) => {
@@ -1426,6 +1434,49 @@ fn status(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn inspect(args: &[String], json: bool) -> i32 {
+    let Some(path) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new("inspect", "usage", "usage: afs inspect <path> [--json]"),
+            EXIT_USAGE,
+        );
+    };
+
+    let state_root = default_state_root();
+    let store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("inspect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let connector = match resolve_source_for_path(&store, credentials.as_ref(), path) {
+        Ok(connector) => connector,
+        Err(error) => return connector_command_error("inspect", json, error),
+    };
+    let options = InspectOptions {
+        path: PathBuf::from(path),
+        state_root: Some(state_root),
+    };
+
+    match run_inspect(&store, &connector, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_inspect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => inspect_command_error(json, error),
+    }
+}
+
 fn info(args: &[String], json: bool) -> i32 {
     let state_root = default_state_root();
     let store = match SqliteStateStore::open(state_root.clone()) {
@@ -2193,6 +2244,51 @@ fn print_status_report(report: &StatusReport) {
             report.summary.checking_freshness
         );
     }
+}
+
+fn print_inspect_report(report: &InspectReport) {
+    println!("inspect {}", report.path);
+    println!("  mount: {}  entity: {}", report.mount_id, report.entity_id);
+    println!("  title: {}", report.title);
+    if let Some(remote_version) = &report.remote_version {
+        println!("  remote version: {remote_version}");
+    }
+    if report.local_read_path != report.path {
+        println!("  local cache: {}", report.local_read_path);
+    }
+    println!(
+        "  state: {}  action: {}",
+        report.explanation.state.as_str(),
+        report.explanation.action.as_str()
+    );
+    println!(
+        "  local: {}",
+        inspect_side_summary(&report.explanation.local)
+    );
+    println!(
+        "  remote: {}",
+        inspect_side_summary(&report.explanation.remote)
+    );
+    for issue in &report.explanation.issues {
+        println!("  issue: {} - {}", issue.code, issue.message);
+    }
+}
+
+fn inspect_side_summary(side: &afs_core::explain::RemoteChangeSide) -> String {
+    if let Some(issue) = &side.issue {
+        return format!("needs review ({} - {})", issue.code, issue.message);
+    }
+
+    let operations = side
+        .plan
+        .as_ref()
+        .map(|plan| plan.operations.len())
+        .unwrap_or(0);
+    format!(
+        "{} ({operations} operation{})",
+        if side.changed { "changed" } else { "unchanged" },
+        plural(operations)
+    )
 }
 
 fn print_info_report(report: &InfoReport) {
@@ -3143,6 +3239,24 @@ fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> 
     command_error(
         json,
         CommandError::new("status", error.code(), message),
+        exit_code,
+    )
+}
+
+fn inspect_command_error(json: bool, error: InspectError) -> i32 {
+    let exit_code = match &error {
+        InspectError::MountNotFound(_)
+        | InspectError::Store(afs_store::StoreError::EntityPathMissing { .. })
+        | InspectError::UnsupportedEntity { .. } => EXIT_USAGE,
+        InspectError::CurrentDir(_)
+        | InspectError::ProjectionReadPath { .. }
+        | InspectError::ReadFile { .. }
+        | InspectError::Store(_)
+        | InspectError::RemoteFetch(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("inspect", error.code(), error.message()),
         exit_code,
     )
 }

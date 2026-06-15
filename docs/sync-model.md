@@ -405,6 +405,19 @@ local file
 Produce machine-readable states such as remote-changed-only, local-changed-only,
 both-changed, safe-to-fast-forward, and needs-review.
 
+Current implementation:
+
+- `afs-core::explain` compares the stored shadow against an available local
+  render and an available remote render, or records side-specific issues when a
+  render is unavailable.
+- The output separates state from recommended action: for example,
+  `remote_changed_only` maps to `safe_to_fast_forward`, while `both_changed`
+  maps to `review_before_push`.
+- `afs inspect <path> --json` is the first command surface. It reads the local
+  plain file or virtual projection content cache, fetches the current remote
+  render through the connector, and returns the full machine-readable
+  explanation without mutating local or remote state.
+
 ### Stage 9: Webhook / Relay Hints
 
 Wire broker or relay events into the same `ChangeHint` path. The relay should

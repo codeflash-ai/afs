@@ -13,6 +13,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs daemon status [--json]`
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
+- `afs inspect <path> [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
 - `afs daemon start|stop|status|reload|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
@@ -197,6 +198,43 @@ notion-main  initial-idea ~37b3ac.md
   issue: entity_dirty - entity is marked dirty
   issue: failed_journal - 2 push journal(s) failed
   last_failure: unsupported feature: moving Notion blocks
+```
+
+## Initial `afs inspect --json` Shape
+
+`afs inspect <path>` is an explicit remote-change explanation barrier for one
+hydrated page. Unlike `afs status`, it is allowed to call the connector. It
+compares:
+
+- the stored shadow;
+- the current local Markdown file or virtual projection content cache;
+- a freshly rendered remote document.
+
+The command does not mutate local files, shadows, freshness metadata, or remote
+content. It is intended for review flows where status already says a remote
+update may exist, or where a human/agent wants an authoritative explanation
+before deciding whether to push, pull, or manually merge.
+
+JSON output includes:
+
+- `state`: `all_synced`, `local_changed_only`, `remote_changed_only`,
+  `both_changed`, or `needs_review`;
+- `action`: `none`, `push_local_changes`, `safe_to_fast_forward`, or
+  `review_before_push`;
+- `local` and `remote`: whether each side changed relative to the shadow, plus
+  the connector-neutral plan when planning succeeds;
+- `issues`: parse, path, or planning problems that require manual review.
+
+Human output is a compact summary:
+
+```text
+inspect /Users/alice/Library/CloudStorage/AgentFS-Notion/Roadmap.md
+  mount: notion-main  entity: page-1
+  title: Roadmap
+  remote version: 2026-06-11T00:00:00Z
+  state: remote_changed_only  action: safe_to_fast_forward
+  local: unchanged (0 operations)
+  remote: changed (1 operation)
 ```
 
 ## Initial `afs diff --json` Shape
