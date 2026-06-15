@@ -361,6 +361,18 @@ push succeeded
 CLI commands such as `afs status --json`, `afs inspect <path> --json`, or
 `afs prepare <path>` are optional barriers for tests, scripts, and power users.
 
+Current implementation:
+
+- `afs status --json` now exposes both local `state` and higher-level
+  `sync_state` for each entry.
+- Entries include a `remote` object with base version, observed version,
+  observation time, freshness tier, remote-hint flag, deletion flag, and whether
+  a freshness check is pending.
+- Desktop pending-change and tray health derive from the same `sync_state`
+  values instead of interpreting local dirty files only.
+- Status remains read-only and does not call connectors; it only reports remote
+  metadata already recorded by the daemon.
+
 ### Stage 7: Safe Auto-Fast-Forward
 
 Automatically update clean inactive files when remote changes. Delay updates for

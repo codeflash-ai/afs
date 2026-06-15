@@ -54,7 +54,7 @@ use crate::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
-use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
+use crate::status::{StatusError, StatusOptions, StatusReport, StatusSyncState, run_status};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
@@ -2123,8 +2123,10 @@ fn print_status_report(report: &StatusReport) {
     let mut printed_entries = 0;
     for mount in &report.mounts {
         for entry in &mount.entries {
-            if entry.state.as_str() == "clean"
-                && entry.pending_journal_count == 0
+            if matches!(
+                entry.sync_state,
+                StatusSyncState::AllSynced | StatusSyncState::CheckingFreshness
+            ) && entry.pending_journal_count == 0
                 && entry.failed_journal_count == 0
             {
                 continue;
@@ -2133,8 +2135,9 @@ fn print_status_report(report: &StatusReport) {
             printed_entries += 1;
             println!("{}  {}", mount.mount_id, entry.path);
             println!(
-                "  state: {}  hydration: {}",
+                "  state: {}  sync: {}  hydration: {}",
                 entry.state.as_str(),
+                entry.sync_state.as_str(),
                 entry.hydration
             );
             for issue in &entry.issues {
@@ -2148,14 +2151,28 @@ fn print_status_report(report: &StatusReport) {
     }
 
     if printed_entries == 0 {
+        let checking = if report.summary.checking_freshness > 0 {
+            format!(
+                " (checking freshness for {} entr{})",
+                report.summary.checking_freshness,
+                if report.summary.checking_freshness == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "status clean: {} tracked entr{}",
+            "status clean: {} tracked entr{}{}",
             report.summary.total,
             if report.summary.total == 1 {
                 "y"
             } else {
                 "ies"
-            }
+            },
+            checking
         );
     } else {
         println!(
@@ -2166,6 +2183,14 @@ fn print_status_report(report: &StatusReport) {
             report.summary.conflicted,
             report.summary.missing,
             report.summary.error
+        );
+        println!(
+            "sync: {} remote updates, {} pending local, {} review needed, {} conflicted, {} checking",
+            report.summary.remote_update_available,
+            report.summary.pending_local_changes,
+            report.summary.review_needed,
+            report.summary.sync_conflicted,
+            report.summary.checking_freshness
         );
     }
 }

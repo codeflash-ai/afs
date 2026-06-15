@@ -18,7 +18,7 @@ use afs_cli::file_provider::{
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
-use afs_cli::status::{StatusOptions, StatusState, run_status};
+use afs_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::MountId;
 use afs_notion::oauth::{
@@ -494,7 +494,12 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let daemon_ready = send_request(&state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
-    let health_state = health_state(&pending_changes, connection.as_ref(), daemon_ready);
+    let health_state = health_state(
+        &pending_changes,
+        connection.as_ref(),
+        daemon_ready,
+        status.as_ref(),
+    );
 
     Ok(DesktopSnapshot {
         health: AppHealth {
@@ -603,6 +608,12 @@ fn pending_changes_from_status(status: &afs_cli::status::StatusReport) -> Vec<Pe
                     | StatusState::Conflicted
                     | StatusState::Missing
                     | StatusState::Error
+            ) || matches!(
+                entry.sync_state,
+                StatusSyncState::RemoteUpdateAvailable
+                    | StatusSyncState::PendingLocalChanges
+                    | StatusSyncState::ReviewNeeded
+                    | StatusSyncState::Conflicted
             ) || entry.pending_journal_count > 0
                 || entry.failed_journal_count > 0
         })
@@ -616,12 +627,17 @@ fn pending_changes_from_status(status: &afs_cli::status::StatusReport) -> Vec<Pe
 }
 
 fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str {
-    if matches!(entry.state, StatusState::Conflicted) {
+    if matches!(entry.sync_state, StatusSyncState::Conflicted) {
         "conflict"
     } else if matches!(entry.state, StatusState::Error | StatusState::Missing)
         || entry.failed_journal_count > 0
     {
         "blocked"
+    } else if matches!(
+        entry.sync_state,
+        StatusSyncState::RemoteUpdateAvailable | StatusSyncState::ReviewNeeded
+    ) {
+        "needs_review"
     } else if entry
         .issues
         .iter()
@@ -642,6 +658,17 @@ fn status_summary_for_entry(entry: &afs_cli::status::StatusEntry) -> String {
     }
     if matches!(entry.state, StatusState::Conflicted) {
         return "conflict".to_string();
+    }
+    if matches!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable) {
+        return "remote update available".to_string();
+    }
+    if matches!(entry.sync_state, StatusSyncState::ReviewNeeded)
+        && entry
+            .issues
+            .iter()
+            .any(|issue| issue.code.starts_with("remote_"))
+    {
+        return "remote changed while local edits are pending".to_string();
     }
     if let Some(issue) = entry.issues.first() {
         return issue.message.clone();
@@ -763,6 +790,7 @@ fn health_state(
     pending_changes: &[PendingChange],
     connection: Option<&ConnectionRecord>,
     daemon_ready: bool,
+    status: Option<&afs_cli::status::StatusReport>,
 ) -> &'static str {
     if connection.is_some_and(|connection| connection.status != "active") {
         "reconnect_needed"
@@ -770,6 +798,8 @@ fn health_state(
         "stopped"
     } else if !pending_changes.is_empty() {
         "needs_review"
+    } else if status.is_some_and(|status| status.summary.checking_freshness > 0) {
+        "checking_freshness"
     } else {
         "ready"
     }
@@ -820,6 +850,7 @@ fn tray_state_for_health(state: &str) -> TrayVisualState {
 fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
     match snapshot.health.state.as_str() {
         "needs_review" => format!("AFS: {} pending changes", snapshot.health.attention_count),
+        "checking_freshness" => "AFS: checking freshness".to_string(),
         "reconnect_needed" => "AFS: reconnect Notion".to_string(),
         "stopped" => "AFS: daemon stopped".to_string(),
         _ => "AFS: ready".to_string(),

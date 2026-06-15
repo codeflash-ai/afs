@@ -155,23 +155,45 @@ Human output is a compact path summary for people and agents working in nested d
 
 ## Initial `afs status --json` Shape
 
-`afs status [path]` inspects local mount state only. It resolves the target path through the stored mount/entity mapping, compares hydrated page bodies against their stored shadow snapshots, reports stubs, conflicted files with unresolved inline markers, dirty files, missing projections, and pending or failed push journals touching each entity. It does not call remote connectors.
+`afs status [path]` inspects local mount state and the latest remote metadata
+the daemon has already observed. It resolves the target path through the stored
+mount/entity mapping, compares hydrated page bodies against their stored shadow
+snapshots, reports stubs, conflicted files with unresolved inline markers, dirty
+files, missing projections, and pending or failed push journals touching each
+entity. It does not call remote connectors itself.
 
 The production state directory defaults to `~/.afs`; `AFS_STATE_DIR` is a developer/test override for isolated runs. When no path is supplied, `afs status` first checks the current working directory: inside a mount it scopes to that subtree, and outside all mounts it reports every registered mount in the active state directory.
 
 The JSON report includes:
 
 - `clean`: false when any entry is stubbed, dirty, conflicted, missing, errored, or has pending/failed journals;
-- `summary`: counts by state plus pending/failed journal counts;
-- `mounts[].entries[]`: path, entity ID, kind, title, hydration state, status state, issues, and journal counts.
+- `summary`: counts by local state, pending/failed journal counts, and sync safety states;
+- `mounts[].entries[]`: path, entity ID, kind, title, hydration state, local status state, sync safety state, latest remote observation metadata, issues, and journal counts.
 
-Human output lists only non-clean entries and ends with a compact summary, or prints a clean line when every tracked entry is clean.
+`state` is the local file/projection state: `clean`, `stub`, `dirty`,
+`conflicted`, `missing`, or `error`. `sync_state` is the higher-level safety
+state for humans and agents:
+
+- `all_synced`: no known local pending change or remote drift;
+- `checking_freshness`: AFS has local activity and is checking remote metadata;
+- `remote_update_available`: remote metadata moved while the local file is clean;
+- `pending_local_changes`: local edits are waiting for review/push;
+- `review_needed`: both local and remote changed, or the projection needs manual attention;
+- `conflicted`: unresolved conflict markers or conflicted entity state.
+
+The summary stores the conflicted sync-state count as `sync_conflicted` because
+`conflicted` already names the local file/projection state count.
+
+Human output lists entries that need attention and ends with a compact summary,
+or prints a clean line when every tracked entry is safe. If AFS is only checking
+freshness in the background, the clean line includes the number of entries being
+checked instead of listing each file.
 
 Non-clean human entries are multi-line so failed journals expose their recovery context:
 
 ```text
 notion-main  initial-idea ~37b3ac.md
-  state: dirty  hydration: dirty
+  state: dirty  sync: pending_local_changes  hydration: dirty
   issue: entity_dirty - entity is marked dirty
   issue: failed_journal - 2 push journal(s) failed
   last_failure: unsupported feature: moving Notion blocks

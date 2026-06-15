@@ -11,8 +11,8 @@ use afs_core::journal::{JournalStatus, JournalStore};
 use afs_core::model::{EntityKind, RemoteId};
 use afs_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
 use afs_store::{
-    EntityRepository, JournalRepository, MountRepository, ShadowRepository,
-    VirtualMutationRepository,
+    EntityRepository, FreshnessStateRepository, JournalRepository, MountRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 use afsd::execution::{PushJob, PushJobError, PushJobReport};
 use afsd::file_provider;
@@ -92,6 +92,8 @@ where
         + EntityRepository
         + ShadowRepository
         + JournalRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
         + VirtualMutationRepository,
 {
     let requested_path = absolute_push_target_path(target_path.as_ref())?;

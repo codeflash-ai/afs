@@ -2024,6 +2024,9 @@ function healthLabel(state: string) {
   if (state === "stopped") {
     return "Stopped";
   }
+  if (state === "checking_freshness") {
+    return "Checking";
+  }
   return "Ready";
 }
 
