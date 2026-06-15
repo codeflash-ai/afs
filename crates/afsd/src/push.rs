@@ -44,7 +44,9 @@ use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
-use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+use crate::virtual_fs::{
+    commit_virtual_fs_write, virtual_fs_content_path, virtual_fs_content_root,
+};
 
 pub fn execute_push_job<S, Source>(
     store: &mut S,
@@ -79,6 +81,7 @@ where
     Source: Connector + HydrationSource + ?Sized,
 {
     let validator = LocalSourceValidator;
+    ingest_newer_projected_virtual_file(store, &job, state_root)?;
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     let push_id = generate_push_id();
     let mut execution_request = PushExecutionRequest::new(
@@ -144,6 +147,102 @@ where
             journal_status: journal_status_after_error(store, &push_id),
             error: Some(PushJobError::from(error)),
         }),
+    }
+}
+
+fn ingest_newer_projected_virtual_file<S>(
+    store: &mut S,
+    job: &PushJob,
+    state_root: Option<&Path>,
+) -> AfsResult<()>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+{
+    let Some(state_root) = state_root else {
+        return Ok(());
+    };
+
+    let absolute_path = absolute_path(&job.target_path).map_err(AfsError::from)?;
+    if !absolute_path.is_file() {
+        return Ok(());
+    }
+
+    let mounts = store.load_mounts().map_err(AfsError::from)?;
+    let Some(mount) = find_mount_for_path(&mounts, &absolute_path).cloned() else {
+        return Ok(());
+    };
+    if !mount.projection.uses_virtual_filesystem() || mount.read_only {
+        return Ok(());
+    }
+
+    let relative_path = relative_entity_path(&mount, &absolute_path).map_err(AfsError::from)?;
+    if relative_path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if store
+        .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
+        .map_err(AfsError::from)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let Some(entity) = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(AfsError::from)?
+    else {
+        return Ok(());
+    };
+    if entity.kind != EntityKind::Page {
+        return Ok(());
+    }
+
+    let cached_path = virtual_fs_content_path(state_root, &mount.mount_id, &relative_path)?;
+    if !projected_file_is_newer_than_cache(&absolute_path, &cached_path)? {
+        return Ok(());
+    }
+
+    let contents = std::fs::read(&absolute_path).map_err(|error| {
+        AfsError::Io(format!(
+            "failed to read projected file `{}`: {error}",
+            absolute_path.display()
+        ))
+    })?;
+    let content_root = virtual_fs_content_root(state_root, &mount.mount_id);
+    commit_virtual_fs_write(
+        store,
+        &content_root,
+        &mount.mount_id,
+        &entity.remote_id.0,
+        &contents,
+    )?;
+
+    Ok(())
+}
+
+fn projected_file_is_newer_than_cache(
+    projected_path: &Path,
+    cached_path: &Path,
+) -> AfsResult<bool> {
+    if same_file_path(projected_path, cached_path) {
+        return Ok(false);
+    }
+
+    let projected_metadata = std::fs::metadata(projected_path)?;
+    let Ok(cached_metadata) = std::fs::metadata(cached_path) else {
+        return Ok(true);
+    };
+    if projected_metadata.modified()? <= cached_metadata.modified()? {
+        return Ok(false);
+    }
+
+    Ok(std::fs::read(projected_path)? != std::fs::read(cached_path)?)
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 

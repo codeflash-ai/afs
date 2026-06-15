@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use afs_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -418,6 +419,69 @@ fn daemon_push_job_plans_pending_virtual_delete_from_file_path() {
         vec![PushOperation::ArchiveEntity {
             entity_id: fixture.remote_id.clone()
         }]
+    );
+}
+
+#[test]
+fn daemon_push_job_ingests_newer_projected_virtual_file_before_planning() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save page");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "Old body."))
+        .expect("save shadow");
+    let cached_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, Path::new("Roadmap.md"))
+            .expect("cache path");
+    fs::create_dir_all(cached_path.parent().expect("cache parent")).expect("cache parent");
+    fixture.write_page_to(&cached_path, "Old body.");
+    std::thread::sleep(Duration::from_millis(10));
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote(rendered_entity("page-1", "New body."));
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("Roadmap.md"),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert_eq!(source.applied_count(), 1);
+    let cached_contents = fs::read_to_string(cached_path).expect("read cache");
+    assert!(cached_contents.contains("New body."));
+    assert!(!cached_contents.contains("Old body."));
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &fixture.remote_id)
+            .expect("get entity")
+            .expect("entity")
+            .hydration,
+        HydrationState::Hydrated
     );
 }
 
