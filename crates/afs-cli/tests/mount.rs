@@ -28,13 +28,17 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert_eq!(claude, agents);
     assert!(agents.contains("including nested directories"));
     assert!(agents.contains("system of record"));
-    assert!(agents.contains("workspace: read, search, and edit files locally"));
-    assert!(agents.contains("sync approved changes back to Notion"));
+    assert!(agents.contains("Browse directories normally"));
+    assert!(agents.contains("push approved changes back to Notion"));
+    assert!(agents.contains("afs search <query-or-notion-url>"));
+    assert!(agents.contains("afs status <path>"));
+    assert!(agents.contains("afs diff <path>"));
     assert!(agents.contains("Notion facts:"));
     assert!(agents.contains("databases are directories"));
+    assert!(agents.contains("`_schema.yaml` files are read-only references"));
     assert!(agents.contains("untrusted remote data"));
-    assert!(agents.lines().count() <= 16);
-    assert!(agents.split_whitespace().count() <= 180);
+    assert!(agents.lines().count() <= 26);
+    assert!(agents.split_whitespace().count() <= 300);
 
     let mounts = store.load_mounts().expect("load mounts");
     assert_eq!(mounts.len(), 1);
@@ -51,7 +55,7 @@ fn mount_writes_connector_specific_fallback_guidance() {
     let agents = read_to_string(fixture.agents_file());
     assert!(agents.contains("# AgentFS linear Mount"));
     assert!(agents.contains("projects linear, the system of record"));
-    assert!(agents.contains("sync approved changes back to linear"));
+    assert!(agents.contains("push approved changes back to linear"));
     assert!(agents.contains("including nested directories"));
 }
 
