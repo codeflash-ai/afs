@@ -24,6 +24,7 @@ import { useEffect, useMemo, useState } from "react";
 
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
+type OnboardingStep = 1 | 2 | 3 | 4;
 
 type DesktopSnapshot = {
   health: {
@@ -280,6 +281,10 @@ export default function App() {
   const route = window.location.hash;
   const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
   const [installReview, setInstallReview] = useState<InstallStateReview | null>(null);
+  const [onboardingKey, setOnboardingKey] = useState(0);
+  const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
+    route === "#onboarding-ready" ? 4 : 1,
+  );
   const setupIsComplete = setupComplete(snapshot);
 
   async function refreshSnapshot() {
@@ -361,10 +366,13 @@ export default function App() {
           if (!report.ok) {
             throw new Error(report.message);
           }
-          setInstallReview(null);
-          setShowOnboarding(true);
-          setView("home");
+          setSnapshotLoaded(false);
+          setOnboardingInitialStep(1);
+          setOnboardingKey((key) => key + 1);
           await refreshSnapshot();
+          setInstallReview(null);
+          setView("home");
+          setShowOnboarding(true);
         }}
         onKeep={async () => {
           const report = await callCommand<ActionReport>("acknowledge_install_state", undefined, {
@@ -385,8 +393,10 @@ export default function App() {
   if (showOnboarding) {
     return (
       <Onboarding
+        key={onboardingKey}
         snapshot={snapshot}
         snapshotLoaded={snapshotLoaded}
+        initialStep={onboardingInitialStep}
         onComplete={() => {
           void refreshSnapshot().catch(() => undefined);
           setShowOnboarding(false);
@@ -403,6 +413,8 @@ export default function App() {
       onViewChange={setView}
       onRefresh={refreshSnapshot}
       onResetComplete={() => {
+        setOnboardingInitialStep(1);
+        setOnboardingKey((key) => key + 1);
         setView("home");
         setShowOnboarding(true);
       }}
@@ -483,13 +495,15 @@ function StateResetPrompt({
 function Onboarding({
   snapshot,
   snapshotLoaded,
+  initialStep,
   onComplete,
 }: {
   snapshot: DesktopSnapshot;
   snapshotLoaded: boolean;
+  initialStep: OnboardingStep;
   onComplete: () => void;
 }) {
-  const [step, setStep] = useState(() => (window.location.hash === "#onboarding-ready" ? 4 : 1));
+  const [step, setStep] = useState<OnboardingStep>(initialStep);
   const [oauthReady, setOauthReady] = useState(false);
   const [oauthInFlight, setOauthInFlight] = useState(false);
   const [oauthError, setOauthError] = useState("");
