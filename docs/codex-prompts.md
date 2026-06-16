@@ -2,11 +2,39 @@
 
 ## Changelog
 
+- 2026-06-16: Queued the next implementation slices after local metadata search: desktop shared-search adoption, hydration-on-locate, SQLite FTS, knowledge bundles, security labels, MCP, and templates.
 - 2026-06-16: Added local metadata search direction with `afs search`, connector filtering, remote-observation safety labels, and regression coverage.
 - 2026-06-11: Added end-to-end local Notion OAuth connect flow with localhost callback, OAuth credential bundles in the credential store, PAT fallback, refresh support, and docs.
 - 2026-06-11: Started state-of-the-art connector/auth hardening by adding connector profiles/auth-config records, SQLite v9 migration, profile-aware Notion connections, and `afs profiles`.
 - 2026-06-11: Added first block-support follow-up: callout write/apply support, Tier 1 append regression coverage, and updated Notion block support docs.
 - 2026-06-11: Completed production-hardening sprint phases A-E: Notion block move apply, push preflight, restore/status recovery UX, local provider connections, daemon status/via reporting, and E2E push workflow regression coverage.
+
+## Implementation Queue
+
+Keep this queue ordered by user-visible value and risk. Each slice should remain
+small enough to ship with `cargo fmt --all -- --check`, `cargo test --workspace`,
+and clippy when the workspace is already clippy-clean.
+
+1. **Desktop shared search backend** — make the desktop locate/typeahead path use
+   `afs_cli::search` so CLI, app, and future agent surfaces share one ranking
+   and state-label contract.
+2. **Hydration on locate** — when search/locate finds an online-only entity,
+   enqueue or request high-priority hydration without waiting for a full
+   workspace sync.
+3. **Search index hardening** — add a derived SQLite search index for metadata,
+   breadcrumbs, aliases, recent activity, and frontmatter fields. It must be
+   rebuildable and must not store secrets.
+4. **Markdown body FTS** — add eventually consistent full-text search over
+   hydrated Markdown bodies, with sensitivity/trust filters before agent use.
+5. **Knowledge bundles** — introduce an OKF-inspired, file-native
+   `index.md`/`log.md` bundle pattern for agent memory, source catalogs, and
+   workflow handoff.
+6. **Security labels and quarantine** — add trust/sensitivity metadata for
+   generated, external, private, and reviewed content before broad MCP exposure.
+7. **Read-first MCP server** — expose safe search, locate, status, inspect, and
+   diff tools. Keep push/write operations approval-gated.
+8. **Template/workflow store** — package reusable expert workflows as local
+   bundles with folder scaffold, policies, prompts, and connector requirements.
 
 Actionable prompts from manual E2E testing (June 2026). Each prompt is self-contained for a Codex session. Read `plan.md` and `docs/` before starting any task.
 

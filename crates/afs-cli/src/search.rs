@@ -96,6 +96,18 @@ pub fn run_search<S>(store: &S, options: SearchOptions) -> Result<SearchReport, 
 where
     S: MountRepository + EntityRepository + RemoteObservationRepository,
 {
+    run_search_with_access_roots(store, options, |mount| mount.root.clone())
+}
+
+pub fn run_search_with_access_roots<S, F>(
+    store: &S,
+    options: SearchOptions,
+    mount_access_root: F,
+) -> Result<SearchReport, SearchError>
+where
+    S: MountRepository + EntityRepository + RemoteObservationRepository,
+    F: Fn(&MountConfig) -> PathBuf,
+{
     let query = options.query.trim().to_string();
     if query.is_empty() {
         return Err(SearchError::EmptyQuery);
@@ -121,9 +133,11 @@ where
         let entities = store
             .list_entities(&mount.mount_id)
             .map_err(SearchError::Store)?;
+        let access_root = mount_access_root(&mount);
 
         matches.extend(search_indexed_entities(
             &mount,
+            &access_root,
             &entities,
             &observations,
             &query,
@@ -146,7 +160,7 @@ where
                     .map(|remote_id| remote_id.0.clone())
                     .unwrap_or_default(),
                 path: ".".to_string(),
-                absolute_path: mount.root.display().to_string(),
+                absolute_path: access_root.display().to_string(),
                 state: "ready".to_string(),
                 remote: SearchRemoteState::default(),
                 score: 120_000,
@@ -194,6 +208,7 @@ pub fn notion_id_from_url(url: &str) -> Option<String> {
 
 pub fn search_indexed_entities(
     mount: &MountConfig,
+    access_root: &Path,
     entities: &[EntityRecord],
     observations: &BTreeMap<RemoteId, RemoteObservationRecord>,
     query: &str,
@@ -213,7 +228,7 @@ pub fn search_indexed_entities(
                 kind: entity_kind_name(&entity.kind).to_string(),
                 remote_id: entity.remote_id.0.clone(),
                 path: result_path.display().to_string(),
-                absolute_path: mount.root.join(&result_path).display().to_string(),
+                absolute_path: access_root.join(&result_path).display().to_string(),
                 state: search_state(&entity.hydration, &remote).to_string(),
                 remote,
                 score,
