@@ -2658,6 +2658,10 @@ fn print_daemon_report(report: &DaemonControlReport) {
         );
     }
     if let Some(status) = &report.daemon_status {
+        println!(
+            "  build: {} ({})",
+            status.build.version, status.build.build_id
+        );
         println!("  watched mounts: {}", status.watches.watched_mounts);
         println!(
             "  jobs: active={}, pending={}, hydration={}, freshness={}",

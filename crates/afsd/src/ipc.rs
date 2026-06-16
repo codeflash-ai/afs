@@ -83,8 +83,24 @@ pub enum DaemonRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatusReport {
     pub status: String,
+    pub build: DaemonBuildInfo,
     pub runtime: DaemonRuntimeStatus,
     pub watches: DaemonWatchStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonBuildInfo {
+    pub version: String,
+    pub build_id: String,
+}
+
+impl DaemonBuildInfo {
+    pub fn current() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: option_env!("AFS_BUILD_ID").unwrap_or("unknown").to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -97,6 +97,14 @@ type ActionReport = {
   message: string;
 };
 
+type InstallStateReview = {
+  shouldPrompt: boolean;
+  stateExists: boolean;
+  sqliteExists: boolean;
+  previousBuildId?: string | null;
+  currentBuildId: string;
+};
+
 const sampleSnapshot: DesktopSnapshot = {
   health: {
     state: "ready",
@@ -271,6 +279,7 @@ export default function App() {
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
   const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
+  const [installReview, setInstallReview] = useState<InstallStateReview | null>(null);
   const setupIsComplete = setupComplete(snapshot);
 
   async function refreshSnapshot() {
@@ -282,6 +291,13 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       if (isTauriRuntime()) {
+        const review = await callCommand<InstallStateReview>("install_state_review");
+        if (review.shouldPrompt) {
+          setInstallReview(review);
+          setSnapshotLoaded(true);
+          return;
+        }
+        await callCommand<ActionReport>("acknowledge_install_state").catch(() => undefined);
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
       await refreshSnapshot();
@@ -333,6 +349,39 @@ export default function App() {
     return <TrayPopover snapshot={snapshot} />;
   }
 
+  if (installReview?.shouldPrompt) {
+    return (
+      <StateResetPrompt
+        review={installReview}
+        onReset={async () => {
+          const report = await callCommand<ActionReport>("reset_local_afs_state", undefined, {
+            ok: true,
+            message: "AFS local state was reset.",
+          });
+          if (!report.ok) {
+            throw new Error(report.message);
+          }
+          setInstallReview(null);
+          setShowOnboarding(true);
+          setView("home");
+          await refreshSnapshot();
+        }}
+        onKeep={async () => {
+          const report = await callCommand<ActionReport>("acknowledge_install_state", undefined, {
+            ok: true,
+            message: "AFS install state recorded.",
+          });
+          if (!report.ok) {
+            throw new Error(report.message);
+          }
+          setInstallReview(null);
+          await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
+          await refreshSnapshot();
+        }}
+      />
+    );
+  }
+
   if (showOnboarding) {
     return (
       <Onboarding
@@ -347,7 +396,88 @@ export default function App() {
     );
   }
 
-  return <MainShell snapshot={snapshot} view={view} onViewChange={setView} onRefresh={refreshSnapshot} />;
+  return (
+    <MainShell
+      snapshot={snapshot}
+      view={view}
+      onViewChange={setView}
+      onRefresh={refreshSnapshot}
+      onResetComplete={() => {
+        setView("home");
+        setShowOnboarding(true);
+      }}
+    />
+  );
+}
+
+function StateResetPrompt({
+  review,
+  onReset,
+  onKeep,
+}: {
+  review: InstallStateReview;
+  onReset: () => Promise<void>;
+  onKeep: () => Promise<void>;
+}) {
+  const [state, setState] = useState<"idle" | "resetting" | "keeping" | "error">("idle");
+  const [message, setMessage] = useState("");
+
+  async function run(action: "reset" | "keep") {
+    setState(action === "reset" ? "resetting" : "keeping");
+    setMessage("");
+    try {
+      await (action === "reset" ? onReset() : onKeep());
+    } catch (error) {
+      setState("error");
+      setMessage(errorMessage(error));
+    }
+  }
+
+  return (
+    <main className="setup-shell">
+      <section className="setup-window">
+        <WindowChrome title="AFS Setup" meta="State Check" />
+        <SetupContent mark={<BrandTile variant="folder" />}>
+          <div>
+            <div className="sync-note warning">
+              <AlertTriangle />
+              Previous install found
+            </div>
+            <h1>Start this beta with clean AFS state?</h1>
+            <p>
+              AFS found an existing local database from an earlier build. During the beta, resetting
+              avoids mount and schema drift. Your local files and folders are left in place.
+            </p>
+          </div>
+          <div className="state-reset-card">
+            <SettingRow title="Local database" value={review.sqliteExists ? "~/.afs/state.sqlite3" : "Not found"} />
+            <SettingRow title="Previous build" value={review.previousBuildId ?? "Unknown"} />
+            <SettingRow title="Current build" value={review.currentBuildId} />
+          </div>
+          <div className="button-row">
+            <PrimaryButton
+              icon={state === "resetting" ? <Loader2 className="spin-icon" /> : <RotateCcw />}
+              disabled={state === "resetting" || state === "keeping"}
+              onClick={() => void run("reset")}
+            >
+              {state === "resetting" ? "Resetting" : "Reset AFS State"}
+            </PrimaryButton>
+            <SecondaryButton
+              disabled={state === "resetting" || state === "keeping"}
+              onClick={() => void run("keep")}
+            >
+              Keep Existing State
+            </SecondaryButton>
+          </div>
+          <p className="quiet-note">
+            Reset clears AFS metadata, cache, mount registration, and connector credentials. It does
+            not delete documents outside AFS state.
+          </p>
+          {state === "error" && <p className="field-error">{message}</p>}
+        </SetupContent>
+      </section>
+    </main>
+  );
 }
 
 function Onboarding({
@@ -718,11 +848,13 @@ function MainShell({
   view,
   onViewChange,
   onRefresh,
+  onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
   view: AppView;
   onViewChange: (view: AppView) => void;
   onRefresh: () => Promise<void>;
+  onResetComplete: () => void;
 }) {
   return (
     <main className="app-frame">
@@ -794,7 +926,13 @@ function MainShell({
             />
           )}
           {view === "activity" && <ActivityView snapshot={snapshot} />}
-          {view === "settings" && <SettingsView snapshot={snapshot} onRefresh={onRefresh} />}
+          {view === "settings" && (
+            <SettingsView
+              snapshot={snapshot}
+              onRefresh={onRefresh}
+              onResetComplete={onResetComplete}
+            />
+          )}
         </section>
       </div>
     </main>
@@ -1316,12 +1454,16 @@ function ActivityView({ snapshot }: { snapshot: DesktopSnapshot }) {
 function SettingsView({
   snapshot,
   onRefresh,
+  onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
   onRefresh: () => Promise<void>;
+  onResetComplete: () => void;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
   const [settingsMessage, setSettingsMessage] = useState("");
+  const [resetMessage, setResetMessage] = useState("");
+  const [resettingState, setResettingState] = useState(false);
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
@@ -1385,6 +1527,34 @@ function SettingsView({
     }
   }
 
+  async function resetLocalState() {
+    const confirmed = window.confirm(
+      "Reset local AFS state? This clears AFS metadata, cache, mount registration, and connector credentials. It does not delete your local files.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setResetMessage("");
+    setResettingState(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "reset_local_afs_state",
+        undefined,
+        { ok: true, message: "AFS local state was reset." },
+      );
+      setResetMessage(report.message);
+      if (report.ok) {
+        await onRefresh().catch(() => undefined);
+        onResetComplete();
+      }
+    } catch (error) {
+      setResetMessage(errorMessage(error));
+    } finally {
+      setResettingState(false);
+    }
+  }
+
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Settings" title="AFS controls" />
@@ -1429,6 +1599,21 @@ function SettingsView({
             </SecondaryButton>
           </div>
           {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
+        </div>
+
+        <div className="panel">
+          <PanelTitle title="Developer" />
+          <SettingRow title="Local database" value="~/.afs/state.sqlite3" />
+          <SettingRow title="Reset behavior" value="Preserve local files" />
+          <SecondaryButton
+            compact
+            icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
+            disabled={resettingState}
+            onClick={() => void resetLocalState()}
+          >
+            {resettingState ? "Resetting" : "Reset Local State"}
+          </SecondaryButton>
+          {resetMessage && <p className="quiet-note inline-note">{resetMessage}</p>}
         </div>
 
         <div className="panel">

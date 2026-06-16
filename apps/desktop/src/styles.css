@@ -189,6 +189,12 @@ p {
   color: #1d7f59;
 }
 
+.sync-note.warning {
+  border-color: rgba(217, 140, 31, 0.2);
+  background: rgba(255, 244, 223, 0.78);
+  color: #a46411;
+}
+
 .sync-note svg {
   width: 13px;
   height: 13px;
@@ -440,6 +446,20 @@ p {
   color: var(--ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
+}
+
+.state-reset-card {
+  display: grid;
+  width: min(100%, 520px);
+  margin-top: 22px;
+  padding: 4px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(246, 250, 249, 0.92);
+}
+
+.state-reset-card .setting-row:first-child {
+  border-top: 0;
 }
 
 .path-line {

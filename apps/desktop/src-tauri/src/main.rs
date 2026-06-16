@@ -13,6 +13,7 @@ use afs_cli::daemon::{DaemonRunState, run_daemon_control};
 use afs_cli::file_provider::{
     macos_file_provider_display_name, macos_file_provider_domain_url,
     open_macos_file_provider_domain, register_macos_file_provider_domain,
+    run_macos_file_provider_helper,
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
@@ -33,7 +34,7 @@ use afs_store::{
     SqliteStateStore, VirtualMutationRepository, open_credential_store,
 };
 use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
-use afsd::ipc::{DaemonRequest, send_request};
+use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::virtual_fs_content_root;
 use afsd::virtual_fs::{source_root_directory_name, source_root_identifier};
@@ -156,6 +157,23 @@ struct PushPlan {
 struct ActionReport {
     ok: bool,
     message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallStateReview {
+    should_prompt: bool,
+    state_exists: bool,
+    sqlite_exists: bool,
+    previous_build_id: Option<String>,
+    current_build_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopInstallMarker {
+    app_version: String,
+    daemon_build_id: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -284,6 +302,39 @@ fn notion_login_link() -> Option<String> {
         .lock()
         .ok()
         .and_then(|link| link.clone())
+}
+
+#[tauri::command]
+fn install_state_review() -> InstallStateReview {
+    inspect_install_state(&default_state_root())
+}
+
+#[tauri::command]
+fn acknowledge_install_state() -> ActionReport {
+    match record_current_install_marker(&default_state_root()) {
+        Ok(()) => ActionReport {
+            ok: true,
+            message: "AFS install state recorded.".to_string(),
+        },
+        Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+fn reset_local_afs_state(app: AppHandle) -> ActionReport {
+    let state_root = default_state_root();
+    match reset_local_afs_state_at(&state_root)
+        .and_then(|_| record_current_install_marker(&state_root))
+    {
+        Ok(()) => {
+            refresh_desktop_surfaces(&app);
+            ActionReport {
+                ok: true,
+                message: "AFS local state was reset. Local files were left in place.".to_string(),
+            }
+        }
+        Err(message) => ActionReport { ok: false, message },
+    }
 }
 
 #[tauri::command]
@@ -1157,6 +1208,162 @@ fn apply_launch_at_login_preference() -> Result<(), String> {
     Ok(())
 }
 
+fn inspect_install_state(state_root: &Path) -> InstallStateReview {
+    let marker = load_install_marker(state_root).ok().flatten();
+    let sqlite_exists = state_root.join("state.sqlite3").exists();
+    let state_exists = state_root.exists();
+    let current_build_id = DaemonBuildInfo::current().build_id;
+    let previous_build_id = marker.as_ref().map(|marker| marker.daemon_build_id.clone());
+    let marker_matches = marker
+        .as_ref()
+        .is_some_and(|marker| marker.daemon_build_id.as_str() == current_build_id.as_str());
+
+    InstallStateReview {
+        should_prompt: sqlite_exists && !marker_matches,
+        state_exists,
+        sqlite_exists,
+        previous_build_id,
+        current_build_id,
+    }
+}
+
+fn load_install_marker(state_root: &Path) -> Result<Option<DesktopInstallMarker>, String> {
+    let path = install_marker_path(state_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read install marker: {error}"))?;
+    serde_json::from_str(&contents)
+        .map(Some)
+        .map_err(|error| format!("Could not parse install marker: {error}"))
+}
+
+fn record_current_install_marker(state_root: &Path) -> Result<(), String> {
+    fs::create_dir_all(state_root)
+        .map_err(|error| format!("Could not create AFS state folder: {error}"))?;
+    let marker = DesktopInstallMarker {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        daemon_build_id: DaemonBuildInfo::current().build_id,
+    };
+    let contents = serde_json::to_string_pretty(&marker)
+        .map_err(|error| format!("Could not serialize install marker: {error}"))?;
+    fs::write(install_marker_path(state_root), contents)
+        .map_err(|error| format!("Could not write install marker: {error}"))
+}
+
+fn install_marker_path(state_root: &Path) -> PathBuf {
+    state_root.join("desktop-install.json")
+}
+
+fn reset_local_afs_state_at(state_root: &Path) -> Result<(), String> {
+    let secret_refs = connection_secret_refs(state_root);
+    stop_daemon_for_reset(state_root);
+    reset_platform_projection_state();
+    remove_connection_secrets(state_root, secret_refs);
+    remove_desktop_support_state()?;
+    clear_state_root_contents(state_root)?;
+    Ok(())
+}
+
+fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
+    if !state_root.exists() {
+        fs::create_dir_all(state_root)
+            .map_err(|error| format!("Could not create AFS state folder: {error}"))?;
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(state_root)
+        .map_err(|error| format!("Could not inspect AFS state folder: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Could not inspect AFS state entry: {error}"))?;
+        remove_path_if_exists(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn connection_secret_refs(state_root: &Path) -> Vec<String> {
+    let mut refs = vec![
+        "connection:notion-default".to_string(),
+        "connection:notion-main".to_string(),
+        "connection:notion-test".to_string(),
+    ];
+    if state_root.join("state.sqlite3").exists()
+        && let Ok(store) = SqliteStateStore::open(state_root.to_path_buf())
+        && let Ok(connections) = store.list_connections()
+    {
+        refs.extend(
+            connections
+                .into_iter()
+                .filter(|connection| !connection.secret_ref.is_empty())
+                .map(|connection| connection.secret_ref),
+        );
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn stop_daemon_for_reset(state_root: &Path) {
+    if let Err(error) = run_daemon_control(&daemon_control_args_any_manager("stop", state_root)) {
+        eprintln!(
+            "afs desktop could not stop afsd during local state reset: {}",
+            error.message()
+        );
+    }
+}
+
+fn reset_platform_projection_state() {
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(error) = run_macos_file_provider_helper("reset", Vec::new()) {
+            eprintln!(
+                "afs desktop could not reset macOS File Provider domains during local state reset: {}",
+                error.message()
+            );
+        }
+    }
+}
+
+fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
+    let credentials = open_credential_store(state_root);
+    for secret_ref in secret_refs {
+        if let Err(error) = credentials.delete(&secret_ref) {
+            eprintln!("afs desktop could not delete credential `{secret_ref}`: {error}");
+        }
+    }
+}
+
+fn remove_desktop_support_state() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = home_dir().map_err(|error| format!("HOME is not set: {error}"))?;
+        for path in [
+            home.join("Library/LaunchAgents/ai.codeflash.afs.afsd.plist"),
+            home.join("Library/Group Containers/group.ai.codeflash.afs"),
+            home.join("Library/Application Support/ai.codeflash.afs"),
+            home.join("Library/Caches/ai.codeflash.afs"),
+            home.join("Library/HTTPStorages/ai.codeflash.afs"),
+            home.join("Library/Saved Application State/ai.codeflash.afs.savedState"),
+        ] {
+            remove_path_if_exists(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() && !path.is_symlink() {
+        return Ok(());
+    }
+    if path.is_dir() && !path.is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .map_err(|error| format!("Could not remove `{}`: {error}", path.display()))
+}
+
 fn start_state_change_watcher(app: AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         let state_root = default_state_root();
@@ -1202,6 +1409,9 @@ fn start_state_change_watcher(app: AppHandle) {
 }
 
 fn watch_virtual_content_roots(watcher: &mut notify::RecommendedWatcher, state_root: &Path) {
+    if !state_root.join("state.sqlite3").exists() {
+        return;
+    }
     let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
         return;
     };
@@ -1721,10 +1931,27 @@ fn desktop_projection_mode() -> ProjectionMode {
 }
 
 fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
-    if daemon_is_ready(state_root) {
-        return Ok(());
+    let current_build = DaemonBuildInfo::current();
+    match running_daemon_build(state_root) {
+        Some(build) if build == current_build => return Ok(()),
+        Some(build) => {
+            eprintln!(
+                "afs desktop detected afsd build {} but app expects {}; restarting afsd",
+                build.build_id, current_build.build_id
+            );
+            return restart_daemon_for_current_binary(state_root);
+        }
+        None if daemon_is_ready(state_root) => {
+            eprintln!("afs desktop detected an older afsd without build metadata; restarting afsd");
+            return restart_daemon_for_current_binary(state_root);
+        }
+        None => {}
     }
 
+    start_daemon_for_current_binary(state_root)
+}
+
+fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
     let report = run_daemon_control(&daemon_control_args("start", state_root))
         .map_err(|error| format!("Could not start afsd: {}", error.message()))?;
     if report.state == DaemonRunState::Running {
@@ -1735,12 +1962,16 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
 }
 
 fn restart_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
-    let report = run_daemon_control(&daemon_control_args("restart", state_root))
-        .map_err(|error| format!("Could not restart afsd: {}", error.message()))?;
-    if report.state == DaemonRunState::Running {
-        Ok(())
-    } else {
-        Err("afsd did not restart.".to_string())
+    let _ = run_daemon_control(&daemon_control_args_any_manager("stop", state_root));
+    start_daemon_for_current_binary(state_root)?;
+    match running_daemon_build(state_root) {
+        Some(build) if build == DaemonBuildInfo::current() => Ok(()),
+        Some(build) => Err(format!(
+            "afsd restarted, but reported build {} instead of {}.",
+            build.build_id,
+            DaemonBuildInfo::current().build_id
+        )),
+        None => Err("afsd restarted, but did not report build metadata.".to_string()),
     }
 }
 
@@ -1760,6 +1991,21 @@ fn daemon_control_args(action: &str, state_root: &Path) -> Vec<String> {
     if let Some(afsd_bin) = bundled_afsd_binary() {
         args.push("--afsd-bin".to_string());
         args.push(afsd_bin.display().to_string());
+    }
+    args
+}
+
+fn daemon_control_args_any_manager(action: &str, state_root: &Path) -> Vec<String> {
+    let mut args = vec![
+        action.to_string(),
+        "--state-dir".to_string(),
+        state_root.display().to_string(),
+    ];
+    if let Ok(tcp_addr) = std::env::var("AFS_DAEMON_TCP_ADDR")
+        && !tcp_addr.is_empty()
+    {
+        args.push("--tcp-addr".to_string());
+        args.push(tcp_addr);
     }
     args
 }
@@ -1872,6 +2118,17 @@ fn daemon_is_ready(state_root: &Path) -> bool {
         send_request(state_root, &DaemonRequest::Ping),
         Ok(response) if response.ok
     )
+}
+
+fn running_daemon_build(state_root: &Path) -> Option<DaemonBuildInfo> {
+    let response = send_request(state_root, &DaemonRequest::Status).ok()?;
+    if !response.ok {
+        return None;
+    }
+    let payload = response.payload?;
+    serde_json::from_value::<DaemonStatusReport>(payload)
+        .ok()
+        .map(|report| report.build)
 }
 
 fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
@@ -2280,8 +2537,9 @@ mod tests {
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, ScreenBounds, TrayVisualState, connection_metadata_changed,
-        is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
+        DESKTOP_ACTIVITY_LIMIT, ScreenBounds, TrayVisualState, clear_state_root_contents,
+        connection_metadata_changed, inspect_install_state, is_unsupported_schema_version_message,
+        load_desktop_activity, notion_id_from_url, record_current_install_marker,
         record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
         tray_icon_image, tray_popover_position, validate_mount_root,
     };
@@ -2481,6 +2739,55 @@ mod tests {
         assert!(should_prioritize_located_result(&online_page));
         assert!(!should_prioritize_located_result(&hydrated_page));
         assert!(!should_prioritize_located_result(&online_database));
+    }
+
+    #[test]
+    fn install_state_prompts_for_existing_sqlite_without_current_marker() {
+        let temp = TestTempDir::new("install-state-existing-sqlite");
+        fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
+            .expect("write sqlite marker");
+
+        let review = inspect_install_state(temp.path());
+
+        assert!(review.should_prompt);
+        assert!(review.state_exists);
+        assert!(review.sqlite_exists);
+        assert_eq!(review.previous_build_id, None);
+    }
+
+    #[test]
+    fn install_state_marker_suppresses_upgrade_prompt() {
+        let temp = TestTempDir::new("install-state-current-marker");
+        fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
+            .expect("write sqlite marker");
+        record_current_install_marker(temp.path()).expect("record marker");
+
+        let review = inspect_install_state(temp.path());
+
+        assert!(!review.should_prompt);
+        assert!(review.previous_build_id.is_some());
+        assert_eq!(
+            review.previous_build_id.as_deref(),
+            Some(review.current_build_id.as_str())
+        );
+    }
+
+    #[test]
+    fn state_clear_removes_metadata_but_preserves_state_root() {
+        let temp = TestTempDir::new("clear-state-root");
+        let state_root = temp.path().join(".afs");
+        fs::create_dir_all(state_root.join("content/notion-main")).expect("create content");
+        fs::write(state_root.join("state.sqlite3"), b"db").expect("write db");
+
+        clear_state_root_contents(&state_root).expect("clear state");
+
+        assert!(state_root.exists());
+        assert!(
+            fs::read_dir(&state_root)
+                .expect("read state root")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2688,6 +2995,9 @@ fn main() {
             connect_notion,
             change_notion_access,
             notion_login_link,
+            install_state_review,
+            acknowledge_install_state,
+            reset_local_afs_state,
             choose_mount_folder,
             ensure_runtime_ready,
             create_workspace_mount,

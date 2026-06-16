@@ -12,7 +12,8 @@ use afs_store::{MountConfig, MountRepository, SqliteStateStore};
 
 use crate::DaemonConfig;
 use crate::ipc::{
-    DaemonReloadReport, DaemonRequest, DaemonResponse, DaemonStatusReport, DaemonWatchStatus,
+    DaemonBuildInfo, DaemonReloadReport, DaemonRequest, DaemonResponse, DaemonStatusReport,
+    DaemonWatchStatus,
 };
 use crate::runtime::{DaemonRuntime, DaemonRuntimeHandle};
 use crate::watcher::{FileWatcher, NotifyFileWatcher, PollingStubReadWatcher};
@@ -172,6 +173,7 @@ fn daemon_status(server: &DaemonServerHandle) -> AfsResult<DaemonStatusReport> {
 
     Ok(DaemonStatusReport {
         status: "ok".to_string(),
+        build: DaemonBuildInfo::current(),
         runtime,
         watches,
     })
