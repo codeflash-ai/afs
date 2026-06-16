@@ -156,13 +156,14 @@ where
                 notion_id.as_deref(),
             )?;
         }
-        matches.extend(mount_matches);
-
+        let has_exact_mount_entity_match =
+            has_exact_entity_match(&mount_matches, notion_id.as_deref());
         if mount.remote_root_id.as_ref().is_some_and(|remote_id| {
             notion_id
                 .as_ref()
                 .is_some_and(|id| compact_notion_id(&remote_id.0) == *id)
-        }) {
+        }) && !has_exact_mount_entity_match
+        {
             matches.push(SearchResult {
                 mount_id: mount.mount_id.0.clone(),
                 connector: mount.connector.clone(),
@@ -184,6 +185,8 @@ where
                 score: 120_000,
             });
         }
+
+        matches.extend(mount_matches);
     }
 
     matches.sort_by(|left, right| {
@@ -210,6 +213,15 @@ where
         connector: options.connector,
         count: results.len(),
         results,
+    })
+}
+
+fn has_exact_entity_match(results: &[SearchResult], notion_id: Option<&str>) -> bool {
+    let Some(notion_id) = notion_id else {
+        return false;
+    };
+    results.iter().any(|result| {
+        result.kind != "workspace" && compact_notion_id(&result.remote_id) == notion_id
     })
 }
 

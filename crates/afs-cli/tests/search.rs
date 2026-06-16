@@ -192,6 +192,56 @@ fn search_filters_connectors_and_rejects_empty_queries() {
     assert!(matches!(empty, SearchError::EmptyQuery));
 }
 
+#[test]
+fn notion_url_locate_prefers_page_file_over_workspace_fallback() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.store();
+    fixture.seed_entities(&mut store);
+    store
+        .save_mount(
+            MountConfig::new(
+                fixture.mount_id.clone(),
+                "notion",
+                fixture.root.join("notion"),
+            )
+            .with_remote_root_id(RemoteId::new("37b3ac0ebb88802cbcf4d53c9cfc4972")),
+        )
+        .expect("point mount root at indexed page");
+
+    let report = run_search(
+        &store,
+        SearchOptions::new(
+            "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972",
+        ),
+    )
+    .expect("locate root page URL");
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].kind, "page");
+    assert_eq!(report.results[0].path, "Product/Initial Idea ~37b3ac.md");
+    assert!(report.results[0].absolute_path.ends_with(".md"));
+}
+
+#[test]
+fn notion_url_locate_keeps_workspace_fallback_when_root_entity_is_unknown() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.store();
+    fixture.seed_entities(&mut store);
+
+    let report = run_search(
+        &store,
+        SearchOptions::new(
+            "https://app.notion.com/p/codeflash/Root-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    )
+    .expect("locate unknown root URL");
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].kind, "workspace");
+    assert_eq!(report.results[0].path, ".");
+    assert_eq!(report.results[0].state, "ready");
+}
+
 struct SearchFixture {
     root: PathBuf,
     mount_id: MountId,
