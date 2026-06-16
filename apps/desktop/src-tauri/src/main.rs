@@ -174,7 +174,11 @@ struct InstallStateReview {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopInstallMarker {
+    #[serde(default)]
+    state_format_version: u32,
     app_version: String,
+    #[serde(default)]
+    app_build_id: String,
     daemon_build_id: String,
 }
 
@@ -187,6 +191,7 @@ struct DesktopSettingChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+const DESKTOP_INSTALL_MARKER_VERSION: u32 = 2;
 const DESKTOP_ACTIVITY_LIMIT: usize = 20;
 const TRAY_POPOVER_WIDTH: f64 = 360.0;
 const TRAY_POPOVER_HEIGHT: f64 = 520.0;
@@ -1242,11 +1247,9 @@ fn inspect_install_state(state_root: &Path) -> InstallStateReview {
     let marker = load_install_marker(state_root).ok().flatten();
     let sqlite_exists = state_root.join("state.sqlite3").exists();
     let state_exists = state_root.exists();
-    let current_build_id = DaemonBuildInfo::current().build_id;
-    let previous_build_id = marker.as_ref().map(|marker| marker.daemon_build_id.clone());
-    let marker_matches = marker
-        .as_ref()
-        .is_some_and(|marker| marker.daemon_build_id.as_str() == current_build_id.as_str());
+    let current_build_id = current_desktop_build_id();
+    let previous_build_id = marker.as_ref().map(install_marker_display_build_id);
+    let marker_matches = marker.as_ref().is_some_and(install_marker_matches_current);
 
     InstallStateReview {
         should_prompt: sqlite_exists && !marker_matches,
@@ -1272,14 +1275,45 @@ fn load_install_marker(state_root: &Path) -> Result<Option<DesktopInstallMarker>
 fn record_current_install_marker(state_root: &Path) -> Result<(), String> {
     fs::create_dir_all(state_root)
         .map_err(|error| format!("Could not create AFS state folder: {error}"))?;
-    let marker = DesktopInstallMarker {
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        daemon_build_id: DaemonBuildInfo::current().build_id,
-    };
+    let marker = current_install_marker();
     let contents = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("Could not serialize install marker: {error}"))?;
     fs::write(install_marker_path(state_root), contents)
         .map_err(|error| format!("Could not write install marker: {error}"))
+}
+
+fn current_install_marker() -> DesktopInstallMarker {
+    DesktopInstallMarker {
+        state_format_version: DESKTOP_INSTALL_MARKER_VERSION,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        app_build_id: current_desktop_build_id(),
+        daemon_build_id: current_daemon_build_id(),
+    }
+}
+
+fn install_marker_matches_current(marker: &DesktopInstallMarker) -> bool {
+    marker.state_format_version == DESKTOP_INSTALL_MARKER_VERSION
+        && marker.app_version == env!("CARGO_PKG_VERSION")
+        && marker.app_build_id == current_desktop_build_id()
+        && marker.daemon_build_id == current_daemon_build_id()
+}
+
+fn install_marker_display_build_id(marker: &DesktopInstallMarker) -> String {
+    if marker.app_build_id.is_empty() {
+        marker.daemon_build_id.clone()
+    } else {
+        marker.app_build_id.clone()
+    }
+}
+
+fn current_desktop_build_id() -> String {
+    option_env!("AFS_DESKTOP_BUILD_ID")
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn current_daemon_build_id() -> String {
+    DaemonBuildInfo::current().build_id
 }
 
 fn install_marker_path(state_root: &Path) -> PathBuf {
@@ -2634,8 +2668,9 @@ mod tests {
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, ScreenBounds, TrayVisualState, clear_state_root_contents,
-        connection_metadata_changed, inspect_install_state, is_unsupported_schema_version_message,
+        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TrayVisualState,
+        clear_state_root_contents, connection_metadata_changed, current_daemon_build_id,
+        current_desktop_build_id, inspect_install_state, is_unsupported_schema_version_message,
         load_desktop_activity, notion_id_from_url, record_current_install_marker,
         record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
         state_event_path_requires_refresh, tray_icon_image, tray_popover_position,
@@ -2868,6 +2903,57 @@ mod tests {
             review.previous_build_id.as_deref(),
             Some(review.current_build_id.as_str())
         );
+    }
+
+    #[test]
+    fn install_state_prompts_for_legacy_marker_without_desktop_build_id() {
+        let temp = TestTempDir::new("install-state-legacy-marker");
+        fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
+            .expect("write sqlite marker");
+        let legacy_marker = serde_json::json!({
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "daemonBuildId": current_daemon_build_id(),
+        });
+        fs::write(
+            temp.path().join("desktop-install.json"),
+            serde_json::to_string_pretty(&legacy_marker).expect("serialize legacy marker"),
+        )
+        .expect("write legacy marker");
+
+        let review = inspect_install_state(temp.path());
+
+        assert!(review.should_prompt);
+        assert_eq!(
+            review.previous_build_id.as_deref(),
+            Some(current_daemon_build_id().as_str())
+        );
+    }
+
+    #[test]
+    fn install_state_prompts_when_desktop_build_changes() {
+        let temp = TestTempDir::new("install-state-new-desktop-build");
+        fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
+            .expect("write sqlite marker");
+        let old_marker = serde_json::json!({
+            "stateFormatVersion": DESKTOP_INSTALL_MARKER_VERSION,
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "appBuildId": "old-desktop-build",
+            "daemonBuildId": current_daemon_build_id(),
+        });
+        fs::write(
+            temp.path().join("desktop-install.json"),
+            serde_json::to_string_pretty(&old_marker).expect("serialize old marker"),
+        )
+        .expect("write old marker");
+
+        let review = inspect_install_state(temp.path());
+
+        assert!(review.should_prompt);
+        assert_eq!(
+            review.previous_build_id.as_deref(),
+            Some("old-desktop-build")
+        );
+        assert_eq!(review.current_build_id, current_desktop_build_id());
     }
 
     #[test]
