@@ -2,6 +2,7 @@
 
 ## Changelog
 
+- 2026-06-16: Added hydration-on-locate plumbing: explicit daemon hydration requests and desktop locate prioritization for online-only pages.
 - 2026-06-16: Queued the next implementation slices after local metadata search: desktop shared-search adoption, hydration-on-locate, SQLite FTS, knowledge bundles, security labels, MCP, and templates.
 - 2026-06-16: Added local metadata search direction with `afs search`, connector filtering, remote-observation safety labels, and regression coverage.
 - 2026-06-11: Added end-to-end local Notion OAuth connect flow with localhost callback, OAuth credential bundles in the credential store, PAT fallback, refresh support, and docs.

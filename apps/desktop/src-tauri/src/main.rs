@@ -17,17 +17,20 @@ use afs_cli::file_provider::{
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
-use afs_cli::search::{SearchOptions, notion_id_from_url, run_search_with_access_roots};
+use afs_cli::search::{
+    SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
+};
 use afs_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
+use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::{JournalEntry, JournalStatus};
-use afs_core::model::MountId;
+use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use afs_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
-    VirtualMutationRepository, open_credential_store,
+    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
+    HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    SqliteStateStore, VirtualMutationRepository, open_credential_store,
 };
 use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
@@ -956,8 +959,8 @@ fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4],
 }
 
 fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
-    let results = search_notion_index(query, 1)?;
-    results.into_iter().next().ok_or_else(|| {
+    let results = search_notion_results(query, 1)?;
+    let result = results.into_iter().next().ok_or_else(|| {
         if notion_id_from_url(query).is_some() {
             "That Notion page is not in the mounted workspace yet. Make sure it was selected during Notion authorization, then sync the workspace."
                 .to_string()
@@ -965,10 +968,19 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
             "No local Notion page matched that search yet. Try a page title, path fragment, or Notion URL."
                 .to_string()
         }
-    })
+    })?;
+    prioritize_located_notion_result(&result);
+    Ok(located_item_for_search_result(result))
 }
 
 fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, String> {
+    Ok(search_notion_results(query, limit)?
+        .into_iter()
+        .map(located_item_for_search_result)
+        .collect::<Vec<_>>())
+}
+
+fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
     let query = query.trim();
     if query.is_empty() || limit == 0 {
         return Ok(Vec::new());
@@ -986,7 +998,7 @@ fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, St
         return Err("Create a Notion folder before locating pages.".to_string());
     }
 
-    let results = run_search_with_access_roots(
+    Ok(run_search_with_access_roots(
         &store,
         SearchOptions {
             query: query.to_string(),
@@ -996,14 +1008,44 @@ fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, St
         mount_access_root,
     )
     .map_err(|error| format!("Could not search local Notion index: {}", error.message()))?
-    .results
-    .into_iter()
-    .map(located_item_for_search_result)
-    .collect::<Vec<_>>();
-    Ok(results)
+    .results)
 }
 
-fn located_item_for_search_result(result: afs_cli::search::SearchResult) -> LocatedItem {
+fn prioritize_located_notion_result(result: &SearchResult) {
+    if !should_prioritize_located_result(result) {
+        return;
+    }
+
+    let path = PathBuf::from(&result.absolute_path);
+    let request = DaemonRequest::Hydrate {
+        mount_id: result.mount_id.clone(),
+        remote_id: result.remote_id.clone(),
+        path: path.clone(),
+    };
+    if send_request(&default_state_root(), &request)
+        .map(|response| response.ok)
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let hydration = HydrationRequest::new(
+        MountId::new(result.mount_id.clone()),
+        RemoteId::new(result.remote_id.clone()),
+        path,
+        HydrationState::Hydrated,
+        HydrationReason::FileOpen,
+    );
+    if let Ok(mut store) = SqliteStateStore::open(default_state_root()) {
+        let _ = store.upsert_hydration_job(HydrationJobRecord::from(hydration));
+    }
+}
+
+fn should_prioritize_located_result(result: &SearchResult) -> bool {
+    result.kind == "page" && result.state == "online_only"
+}
+
+fn located_item_for_search_result(result: SearchResult) -> LocatedItem {
     LocatedItem {
         title: result.title,
         kind: search_kind_label(&result.kind).to_string(),
@@ -2233,14 +2275,15 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use afs_cli::search::{SearchRemoteState, SearchResult};
     use afs_store::{ConnectionId, ConnectionRecord};
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
         DESKTOP_ACTIVITY_LIMIT, ScreenBounds, TrayVisualState, connection_metadata_changed,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        record_desktop_activity, should_hide_tray_popover, tray_icon_image, tray_popover_position,
-        validate_mount_root,
+        record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
+        tray_icon_image, tray_popover_position, validate_mount_root,
     };
 
     #[test]
@@ -2430,6 +2473,17 @@ mod tests {
     }
 
     #[test]
+    fn locate_prioritizes_only_online_only_pages() {
+        let online_page = search_result("page", "online_only");
+        let hydrated_page = search_result("page", "ready");
+        let online_database = search_result("database", "online_only");
+
+        assert!(should_prioritize_located_result(&online_page));
+        assert!(!should_prioritize_located_result(&hydrated_page));
+        assert!(!should_prioritize_located_result(&online_database));
+    }
+
+    #[test]
     fn desktop_activity_records_newest_first_and_caps_entries() {
         let temp = TestTempDir::new("desktop-activity");
         for index in 0..(DESKTOP_ACTIVITY_LIMIT + 2) {
@@ -2503,6 +2557,21 @@ mod tests {
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             expires_at: None,
+        }
+    }
+
+    fn search_result(kind: &str, state: &str) -> SearchResult {
+        SearchResult {
+            mount_id: "notion-main".to_string(),
+            connector: "notion".to_string(),
+            title: "Roadmap".to_string(),
+            kind: kind.to_string(),
+            remote_id: "page-1".to_string(),
+            path: "Roadmap.md".to_string(),
+            absolute_path: "/tmp/afs/Roadmap.md".to_string(),
+            state: state.to_string(),
+            remote: SearchRemoteState::default(),
+            score: 0,
         }
     }
 }
