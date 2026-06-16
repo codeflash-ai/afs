@@ -164,7 +164,6 @@ impl Connector for NotionConnector {
         [
             PushOperationKind::UpdateBlock,
             PushOperationKind::AppendBlock,
-            PushOperationKind::MoveBlock,
             PushOperationKind::ArchiveBlock,
             PushOperationKind::ArchiveEntity,
             PushOperationKind::UpdateProperties,

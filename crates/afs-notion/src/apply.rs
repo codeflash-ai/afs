@@ -57,6 +57,16 @@ pub fn apply_plan(
     request: ApplyPlanRequest<'_>,
 ) -> AfsResult<ApplyPlanResult> {
     validate_operation_ids(&request)?;
+    if request
+        .plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, PushOperation::MoveBlock { .. }))
+    {
+        return Err(AfsError::Unsupported(
+            "Notion API does not support moving existing blocks",
+        ));
+    }
     let create_parent_ids = create_parent_ids(&request.plan.operations);
     let bundles = fetch_affected_bundles(api, &request.plan.affected_entities, &create_parent_ids)?;
     let current_blocks = block_map(&bundles);

@@ -391,7 +391,7 @@ fn apply_appends_tier_one_markdown_block_shapes() {
 }
 
 #[test]
-fn apply_moves_existing_blocks_after_mid_page_append() {
+fn apply_rejects_existing_block_moves_before_api_mutation() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
         vec![
@@ -419,7 +419,7 @@ fn apply_moves_existing_blocks_after_mid_page_append() {
     let operation_ids = operation_ids(&push_id, &plan);
     let mount_id = MountId::new("notion-main");
 
-    let result = connector
+    let error = connector
         .apply(ApplyPlanRequest {
             push_id: &push_id,
             mount_id: &mount_id,
@@ -427,54 +427,13 @@ fn apply_moves_existing_blocks_after_mid_page_append() {
             operation_ids: &operation_ids,
             remote_preconditions: &[],
         })
-        .expect("apply");
+        .expect_err("move should be rejected");
 
-    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
     assert_eq!(
-        result.effects,
-        vec![
-            JournalApplyEffect::CreatedBlock {
-                operation_id: operation_ids[0].clone(),
-                operation_index: 0,
-                parent_id: RemoteId::new("page-1"),
-                block_id: RemoteId::new("created-1"),
-            },
-            JournalApplyEffect::MovedBlock {
-                operation_id: operation_ids[1].clone(),
-                operation_index: 1,
-                block_id: RemoteId::new("directive-1"),
-            },
-        ]
+        error,
+        AfsError::Unsupported("Notion API does not support moving existing blocks")
     );
-    let writes = api.writes.lock().expect("writes");
-    assert_eq!(
-        writes.as_slice(),
-        [
-            WriteCall::Append {
-                block_id: "page-1".to_string(),
-                body: json!({
-                    "children": [{
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": rich_text_json("Inserted paragraph."),
-                        },
-                    }],
-                    "position": {
-                        "type": "after_block",
-                        "after_block": {
-                            "id": "paragraph-1",
-                        },
-                    },
-                }),
-            },
-            WriteCall::Move {
-                block_id: "directive-1".to_string(),
-                parent_id: "page-1".to_string(),
-                after: Some("created-1".to_string()),
-            },
-        ]
-    );
+    assert!(api.writes.lock().expect("writes").is_empty());
 }
 
 #[test]

@@ -67,7 +67,7 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
     let plan = diff.plan.as_ref().expect("plan");
     assert_eq!(diff.action, "confirm_plan");
     assert_eq!(plan.summary.blocks_created, 1);
-    assert!(plan.summary.blocks_moved >= 1);
+    assert_eq!(plan.summary.blocks_moved, 0);
 
     let push = run_push_with_daemon(
         &mut store,
@@ -100,7 +100,7 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
             .any(|call| matches!(call, WriteCall::Append { .. }))
     );
     assert!(
-        calls
+        !calls
             .iter()
             .any(|call| matches!(call, WriteCall::Move { .. }))
     );

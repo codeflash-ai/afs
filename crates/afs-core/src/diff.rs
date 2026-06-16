@@ -86,16 +86,25 @@ pub fn plan_block_diff(
 
     let (matches, degradations) = align_blocks(shadow, &edited_blocks);
     let mut operations = property_diff_operations(shadow, edited)?;
-    let mut matched_shadow = BTreeSet::new();
+    let retained_shadow = matches
+        .iter()
+        .filter_map(|shadow_index| *shadow_index)
+        .collect::<BTreeSet<_>>();
     let mut previous_existing_id: Option<RemoteId> = None;
 
     for (edited_index, edited_block) in edited_blocks.iter().enumerate() {
         match matches[edited_index] {
             Some(shadow_index) => {
-                matched_shadow.insert(shadow_index);
                 let shadow_block = &shadow.blocks[shadow_index];
+                let previous_retained_id =
+                    previous_retained_shadow_id(shadow, shadow_index, &retained_shadow);
 
-                if should_move_block(shadow_index, edited_index, shadow_block, edited_block) {
+                if should_move_block(
+                    shadow_block,
+                    edited_block,
+                    previous_retained_id,
+                    previous_existing_id.as_ref(),
+                ) {
                     operations.push(PushOperation::MoveBlock {
                         block_id: shadow_block.remote_id.clone(),
                         after: previous_existing_id.clone(),
@@ -122,7 +131,7 @@ pub fn plan_block_diff(
     }
 
     for (index, shadow_block) in shadow.blocks.iter().enumerate() {
-        if !matched_shadow.contains(&index) {
+        if !retained_shadow.contains(&index) {
             operations.push(PushOperation::ArchiveBlock {
                 block_id: shadow_block.remote_id.clone(),
             });
@@ -448,13 +457,24 @@ fn same_alignment_kind(left: &MarkdownBlockKind, right: &MarkdownBlockKind) -> b
     }
 }
 
-fn should_move_block(
+fn previous_retained_shadow_id<'a>(
+    shadow: &'a ShadowDocument,
     shadow_index: usize,
-    edited_index: usize,
+    retained_shadow: &BTreeSet<usize>,
+) -> Option<&'a RemoteId> {
+    (0..shadow_index)
+        .rev()
+        .find(|index| retained_shadow.contains(index))
+        .map(|index| &shadow.blocks[index].remote_id)
+}
+
+fn should_move_block(
     shadow_block: &ShadowBlock,
     edited_block: &SegmentedBlock,
+    previous_retained_id: Option<&RemoteId>,
+    previous_existing_id: Option<&RemoteId>,
 ) -> bool {
-    shadow_index != edited_index
+    previous_retained_id != previous_existing_id
         && shadow_block.kind.is_directive()
         && edited_block.is_directive()
         && shadow_block.content_hash == edited_block.content_hash

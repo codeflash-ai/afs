@@ -71,6 +71,33 @@ fn appending_a_paragraph_produces_append_after_last_existing_block() {
 }
 
 #[test]
+fn inserting_before_unchanged_directives_does_not_plan_redundant_moves() {
+    let shadow = shadow(
+        "Intro paragraph.\n\n::afs{id=column-list-1 type=column_list}\n\n::afs{id=column-1 type=column}",
+        ["paragraph-1"],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "Intro paragraph.\n\nInserted paragraph.\n\n::afs{id=column-list-1 type=column_list}\n\n::afs{id=column-1 type=column}",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: "Inserted paragraph.".to_string(),
+        }]
+    );
+    assert_eq!(plan.summary.blocks_created, 1);
+    assert_eq!(plan.summary.blocks_moved, 0);
+}
+
+#[test]
 fn deleting_a_normal_paragraph_produces_archive() {
     let shadow = shadow(
         "# Roadmap\n\nParagraph to delete.",

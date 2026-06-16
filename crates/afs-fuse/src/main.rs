@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use afs_core::model::EntityKind;
 use afsd::ipc::{DaemonRequest, DaemonResponse, send_request_with_timeout};
@@ -469,9 +469,13 @@ where
 
     fn update_cached_materialized_path(&self, identifier: &str, materialized_path: &str) {
         let mut cache = self.cache.lock().expect("fuse item cache");
+        let byte_size = std::fs::metadata(materialized_path)
+            .ok()
+            .map(|metadata| metadata.len());
         for item in cache.values_mut() {
             if item.identifier == identifier {
                 item.materialized_path = Some(materialized_path.to_string());
+                item.byte_size = byte_size;
             }
         }
     }
@@ -1065,16 +1069,16 @@ fn file_type(item: &VirtualFsItem) -> FileType {
 }
 
 fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
-    let now = SystemTime::now();
+    let attr_time = attr_time_for_item(item);
     let size = file_size_for_attr(item);
     FileAttr {
         size,
         blocks: size.div_ceil(512),
-        atime: now,
-        mtime: now,
-        ctime: now,
+        atime: attr_time,
+        mtime: attr_time,
+        ctime: attr_time,
         #[cfg(target_os = "macos")]
-        crtime: now,
+        crtime: attr_time,
         kind: file_type(item),
         perm: if item.kind == VirtualFsItemKind::Folder {
             0o755
@@ -1099,14 +1103,26 @@ fn file_size_for_attr(item: &VirtualFsItem) -> u64 {
     if item.kind != VirtualFsItemKind::File {
         return 0;
     }
-    item.byte_size
-        .or_else(|| {
-            item.materialized_path
-                .as_ref()
-                .and_then(|path| std::fs::metadata(path).ok())
-                .map(|metadata| metadata.len())
-        })
+    item.materialized_path
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .or(item.byte_size)
         .unwrap_or(0)
+}
+
+fn attr_time_for_item(item: &VirtualFsItem) -> SystemTime {
+    if item.kind == VirtualFsItemKind::File
+        && let Some(modified) = item
+            .materialized_path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+    {
+        return modified;
+    }
+
+    UNIX_EPOCH
 }
 
 #[cfg(test)]
@@ -1131,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn file_attrs_use_reported_byte_size() {
+    fn file_attrs_prefer_materialized_metadata_over_stale_reported_byte_size() {
         let path = std::env::temp_dir().join(format!(
             "afs-fuse-file-attr-{}-{}",
             std::process::id(),
@@ -1143,8 +1159,47 @@ mod tests {
         let attr = attr_for_item(&item);
 
         let _ = std::fs::remove_file(path);
+        assert_eq!(attr.size, 900);
+        assert_eq!(attr.blocks, 2);
+    }
+
+    #[test]
+    fn file_attrs_use_reported_byte_size_without_materialized_path() {
+        let item = test_item(VirtualFsItemKind::File, None, Some(1234));
+        let attr = attr_for_item(&item);
+
         assert_eq!(attr.size, 1234);
         assert_eq!(attr.blocks, 3);
+    }
+
+    #[test]
+    fn file_attrs_use_stable_materialized_modified_time() {
+        let path = std::env::temp_dir().join(format!(
+            "afs-fuse-file-attr-time-{}-{}",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        std::fs::write(&path, vec![0_u8; 16]).expect("write temp file");
+        let modified = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("modified");
+
+        let item = test_item(VirtualFsItemKind::File, Some(path.clone()), None);
+        let attr = attr_for_item(&item);
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(attr.mtime, modified);
+        assert_eq!(attr.ctime, modified);
+    }
+
+    #[test]
+    fn attrs_without_materialized_path_use_stable_epoch_time() {
+        let item = test_item(VirtualFsItemKind::File, None, Some(10));
+        let attr = attr_for_item(&item);
+
+        assert_eq!(attr.mtime, UNIX_EPOCH);
+        assert_eq!(attr.ctime, UNIX_EPOCH);
     }
 
     #[test]
