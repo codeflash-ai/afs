@@ -1748,6 +1748,7 @@ fn observable_remote_identifier(identifier: &str) -> bool {
         && !identifier.starts_with("schema:")
         && !identifier.starts_with("children:")
         && !identifier.starts_with("path:")
+        && !identifier.starts_with("source:")
         && identifier != ROOT_CONTAINER_IDENTIFIER
 }
 

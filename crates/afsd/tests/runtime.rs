@@ -306,7 +306,7 @@ fn default_runner_virtual_fs_children_is_cache_only() {
     let response = DefaultRuntimeJobRunner.run_virtual_fs_children(
         state_root,
         mount_id.0.clone(),
-        ROOT_CONTAINER_IDENTIFIER.to_string(),
+        "source:notion".to_string(),
     );
 
     assert!(

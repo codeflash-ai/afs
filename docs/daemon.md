@@ -73,6 +73,22 @@ the same time.
 
 ## Operator Guide
 
+Reset a local macOS test machine to a clean AFS install state:
+
+```bash
+make clean-start-plan
+make clean-start
+```
+
+`make clean-start-plan` is a dry run. `make clean-start` stops the desktop app,
+daemon, and File Provider extension; unregisters File Provider domains; removes
+safe AFS mount roots such as `~/Documents/AFS`, `~/Library/CloudStorage/AFS`,
+and `~/Library/CloudStorage/AFS-*`;
+deletes `~/.afs`; removes the installed `/Applications/AFS.app`; and deletes AFS
+connection credentials from the keychain. Run
+`scripts/clean-start.sh --yes --keep-credentials` when testing app install state
+without clearing OAuth/PAT credentials.
+
 Start the daemon in the foreground:
 
 ```bash

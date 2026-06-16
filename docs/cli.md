@@ -228,7 +228,7 @@ JSON output includes:
 Human output is a compact summary:
 
 ```text
-inspect /Users/alice/Library/CloudStorage/AgentFS-Notion/Roadmap.md
+inspect /Users/alice/Library/CloudStorage/AFS/notion/Roadmap.md
   mount: notion-main  entity: page-1
   title: Roadmap
   Synced Tree version: 2026-06-10T00:00:00Z
