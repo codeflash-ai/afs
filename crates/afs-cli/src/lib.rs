@@ -14,6 +14,7 @@ pub mod push;
 pub mod restore;
 pub mod search;
 pub mod status;
+pub mod templates;
 
 pub fn run(args: Vec<String>) -> i32 {
     commands::dispatch(&args)

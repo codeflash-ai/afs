@@ -14,6 +14,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
 - `afs search <query> [--connector <connector>] [--limit <n>] [--json]`
+- `afs templates list|validate|new [args] [--json]`
 - `afs inspect <path> [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
@@ -140,6 +141,34 @@ when you need the newest remote facts.
 dirty, conflicted, stale, or remotely deleted results are still returned for
 navigation, but future agent/MCP readers should treat their `safety.labels` as
 review or hydration requirements before reading file content.
+
+## Template Packs
+
+`afs templates` manages local-first workflow packs. A pack is a directory with
+`.agentfs-pack.yaml` plus Markdown templates, workflows, policies, and output
+folders. Packs are copied into local workspaces only; the command does not call
+connectors or a remote marketplace.
+
+Examples:
+
+```bash
+afs templates list
+afs templates validate ./templates/packs/founder-proof-of-work
+afs templates new founder-proof-of-work ~/afs/founder-proof
+afs templates new focused-inbox ~/afs/focused-inbox --json
+```
+
+Bundled packs today:
+
+- `founder-proof-of-work`: progress log, user evidence, investor/YC drafts,
+  proof-of-work site draft, and deck workflow notes.
+- `focused-inbox`: local queue for replies, decisions, waiting-on items, and
+  noise-cutting source filters.
+
+`afs templates new <pack> <path>` requires an empty target directory by default.
+Use `--force` to write into a non-empty target and overwrite matching files.
+The manifest records required connectors as metadata only; installing a pack
+does not connect or mount those sources.
 
 ## Initial `afs mount` and `afs pull`
 

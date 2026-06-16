@@ -2,6 +2,7 @@
 
 ## Changelog
 
+- 2026-06-17: Added the first local template-pack foundation with bundled Founder Proof of Work and Focused Inbox packs plus `afs templates list|validate|new`.
 - 2026-06-16: Added search-result safety labels so future MCP/agent readers can distinguish clean hydrated content from metadata-only, stale, dirty, conflicted, or deleted results.
 - 2026-06-16: Added a rebuildable SQLite FTS candidate index for local metadata search while preserving the shared CLI/desktop search report contract.
 - 2026-06-16: Added hydration-on-locate plumbing: explicit daemon hydration requests and desktop locate prioritization for online-only pages.
@@ -39,8 +40,9 @@ and clippy when the workspace is already clippy-clean.
    follow-up should make them policy-backed and user-editable.
 7. **Read-first MCP server** — expose safe search, locate, status, inspect, and
    diff tools. Keep push/write operations approval-gated.
-8. **Template/workflow store** — package reusable expert workflows as local
-   bundles with folder scaffold, policies, prompts, and connector requirements.
+8. **Template/workflow store follow-up** — the local pack foundation exists.
+   Next: add install-from-git, pack checksums/signatures, desktop gallery, and
+   marketplace index metadata.
 
 Actionable prompts from manual E2E testing (June 2026). Each prompt is self-contained for a Codex session. Read `plan.md` and `docs/` before starting any task.
 
