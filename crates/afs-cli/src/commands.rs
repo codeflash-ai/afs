@@ -55,6 +55,7 @@ use crate::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
+use crate::search::{SearchError, SearchOptions, SearchReport, run_search};
 use crate::status::{StatusError, StatusOptions, StatusReport, StatusSyncState, run_status};
 
 const EXIT_SUCCESS: i32 = 0;
@@ -115,6 +116,8 @@ enum AfsCommand {
     Info(PathArg),
     #[command(about = "Show local sync state for mounts or paths")]
     Status(PathArg),
+    #[command(about = "Search local mount metadata without contacting remote sources")]
+    Search(SearchArgs),
     #[command(about = "Explain local and remote sync state for a path")]
     Inspect(PathArg),
     #[command(about = "Pull remote content into the local projection")]
@@ -327,6 +330,29 @@ struct RestoreCliArgs {
     force: bool,
 }
 
+#[derive(Debug, Args)]
+struct SearchArgs {
+    #[arg(
+        value_name = "query",
+        num_args = 1..,
+        help = "Title, path fragment, remote id, or source URL to find locally."
+    )]
+    query: Vec<String>,
+    #[arg(
+        long,
+        value_name = "connector",
+        help = "Limit search to one connector."
+    )]
+    connector: Option<String>,
+    #[arg(
+        long,
+        value_name = "n",
+        default_value_t = 10,
+        help = "Maximum results."
+    )]
+    limit: usize,
+}
+
 #[derive(Debug, Subcommand)]
 enum FileProviderCommand {
     #[command(about = "Register a virtual filesystem provider for a mount")]
@@ -459,6 +485,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         AfsCommand::Mount { .. } => mount(&legacy_args[1..], json),
         AfsCommand::Info(_) => info(&legacy_args[1..], json),
         AfsCommand::Status(_) => status(&legacy_args[1..], json),
+        AfsCommand::Search(_) => search(&legacy_args[1..], json),
         AfsCommand::Inspect(_) => inspect(&legacy_args[1..], json),
         AfsCommand::Pull(_) => pull(&legacy_args[1..], json),
         AfsCommand::Push(_) => push(&legacy_args[1..], json),
@@ -578,6 +605,14 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
         AfsCommand::Status(options) => {
             args.push("status".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
+        }
+        AfsCommand::Search(options) => {
+            args.push("search".to_string());
+            for query_part in &options.query {
+                args.push(query_part.clone());
+            }
+            push_optional_flag_value(&mut args, "--connector", options.connector.as_deref());
+            push_flag_value(&mut args, "--limit", &options.limit.to_string());
         }
         AfsCommand::Inspect(options) => {
             args.push("inspect".to_string());
@@ -1423,6 +1458,54 @@ fn status(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn search(args: &[String], json: bool) -> i32 {
+    let query = positional_args(args).join(" ");
+    let limit = match flag_value(args, "--limit") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(limit) => limit,
+            Err(_) => {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "search",
+                        "invalid_limit",
+                        "--limit must be a positive integer",
+                    ),
+                    EXIT_USAGE,
+                );
+            }
+        },
+        None => 10,
+    };
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("search", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = SearchOptions {
+        query,
+        connector: flag_value(args, "--connector").map(str::to_string),
+        limit,
+    };
+
+    match run_search(&store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_search_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => search_command_error(json, error),
+    }
+}
+
 fn inspect(args: &[String], json: bool) -> i32 {
     let Some(path) = first_positional(args) else {
         return command_error(
@@ -2232,6 +2315,33 @@ fn print_status_report(report: &StatusReport) {
             report.summary.sync_conflicted,
             report.summary.checking_freshness
         );
+    }
+}
+
+fn print_search_report(report: &SearchReport) {
+    if report.results.is_empty() {
+        println!("no local matches for {:?}", report.query);
+        return;
+    }
+
+    for result in &report.results {
+        println!(
+            "{}  {}  {}  {}",
+            result.title, result.kind, result.state, result.path
+        );
+        println!(
+            "  mount: {}  connector: {}  remote: {}",
+            result.mount_id, result.connector, result.remote_id
+        );
+        println!("  path: {}", result.absolute_path);
+        if result.remote.changed {
+            let state = if result.remote.deleted {
+                "deleted"
+            } else {
+                "changed"
+            };
+            println!("  remote: {state}");
+        }
     }
 }
 
@@ -3243,6 +3353,18 @@ fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> 
     )
 }
 
+fn search_command_error(json: bool, error: SearchError) -> i32 {
+    let exit_code = match &error {
+        SearchError::EmptyQuery | SearchError::InvalidLimit => EXIT_USAGE,
+        SearchError::Store(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("search", error.code(), error.message()),
+        exit_code,
+    )
+}
+
 fn inspect_command_error(json: bool, error: InspectError) -> i32 {
     let exit_code = match &error {
         InspectError::MountNotFound(_)
@@ -3369,6 +3491,28 @@ fn pull_report_exit_code(report: &PullReport) -> i32 {
 
 fn first_positional(args: &[String]) -> Option<&str> {
     nth_positional(args, 0)
+}
+
+fn positional_args(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut skip_next = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if takes_value(arg) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        values.push(arg.clone());
+    }
+
+    values
 }
 
 fn nth_positional(args: &[String], index: usize) -> Option<&str> {
@@ -3522,6 +3666,8 @@ fn takes_value(arg: &str) -> bool {
             | "--display-name"
             | "--redirect-uri"
             | "--broker-url"
+            | "--connector"
+            | "--limit"
     )
 }
 
@@ -3720,6 +3866,15 @@ mod tests {
                 ],
             ),
             (
+                vec!["search", "--help"],
+                vec![
+                    "Usage: afs search",
+                    "Search local mount metadata",
+                    "--connector",
+                    "--limit",
+                ],
+            ),
+            (
                 vec!["pull", "--help"],
                 vec!["Usage: afs pull", "Pull remote content", "path", "--json"],
             ),
@@ -3852,6 +4007,28 @@ mod tests {
                 "/tmp/afs-state",
                 "--include-env",
                 "NOTION_TOKEN"
+            ]
+        );
+
+        let cli = parse_cli([
+            "search",
+            "initial",
+            "idea",
+            "--connector",
+            "notion",
+            "--limit",
+            "5",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "search",
+                "initial",
+                "idea",
+                "--connector",
+                "notion",
+                "--limit",
+                "5"
             ]
         );
     }

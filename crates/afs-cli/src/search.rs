@@ -1,0 +1,434 @@
+//! Local metadata search for mounted AgentFS sources.
+//!
+//! Search is intentionally store-only. It never calls a connector, so it can be
+//! used from the CLI, desktop app, and future agent surfaces without adding
+//! network latency to navigation.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use afs_core::model::{EntityKind, HydrationState, RemoteId};
+use afs_store::{
+    EntityRecord, EntityRepository, MountConfig, MountRepository, RemoteObservationRecord,
+    RemoteObservationRepository, StoreError,
+};
+use serde::Serialize;
+
+const DEFAULT_LIMIT: usize = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub query: String,
+    pub connector: Option<String>,
+    pub limit: usize,
+}
+
+impl SearchOptions {
+    pub fn new(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+            connector: None,
+            limit: DEFAULT_LIMIT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SearchReport {
+    pub ok: bool,
+    pub command: &'static str,
+    pub query: String,
+    pub connector: Option<String>,
+    pub count: usize,
+    pub results: Vec<SearchResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SearchResult {
+    pub mount_id: String,
+    pub connector: String,
+    pub title: String,
+    pub kind: String,
+    pub remote_id: String,
+    pub path: String,
+    pub absolute_path: String,
+    pub state: String,
+    pub remote: SearchRemoteState,
+    #[serde(skip_serializing)]
+    pub score: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SearchRemoteState {
+    pub observed_title: Option<String>,
+    pub observed_path: Option<String>,
+    pub observed_at: Option<String>,
+    pub changed: bool,
+    pub deleted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchError {
+    EmptyQuery,
+    InvalidLimit,
+    Store(StoreError),
+}
+
+impl SearchError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::EmptyQuery => "empty_query",
+            Self::InvalidLimit => "invalid_limit",
+            Self::Store(_) => "store_error",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::EmptyQuery => "search query cannot be empty".to_string(),
+            Self::InvalidLimit => "search limit must be greater than zero".to_string(),
+            Self::Store(error) => error.to_string(),
+        }
+    }
+}
+
+pub fn run_search<S>(store: &S, options: SearchOptions) -> Result<SearchReport, SearchError>
+where
+    S: MountRepository + EntityRepository + RemoteObservationRepository,
+{
+    let query = options.query.trim().to_string();
+    if query.is_empty() {
+        return Err(SearchError::EmptyQuery);
+    }
+    if options.limit == 0 {
+        return Err(SearchError::InvalidLimit);
+    }
+
+    let notion_id = notion_id_from_url(&query);
+    let mounts = store.load_mounts().map_err(SearchError::Store)?;
+    let mut matches = Vec::new();
+
+    for mount in mounts
+        .into_iter()
+        .filter(|mount| connector_matches(mount, options.connector.as_deref()))
+    {
+        let observations = store
+            .list_remote_observations(&mount.mount_id)
+            .map_err(SearchError::Store)?
+            .into_iter()
+            .map(|observation| (observation.remote_id.clone(), observation))
+            .collect::<BTreeMap<_, _>>();
+        let entities = store
+            .list_entities(&mount.mount_id)
+            .map_err(SearchError::Store)?;
+
+        matches.extend(search_indexed_entities(
+            &mount,
+            &entities,
+            &observations,
+            &query,
+            notion_id.as_deref(),
+        ));
+
+        if mount.remote_root_id.as_ref().is_some_and(|remote_id| {
+            notion_id
+                .as_ref()
+                .is_some_and(|id| compact_notion_id(&remote_id.0) == *id)
+        }) {
+            matches.push(SearchResult {
+                mount_id: mount.mount_id.0.clone(),
+                connector: mount.connector.clone(),
+                title: format!("{} root", source_display_name(&mount.connector)),
+                kind: "workspace".to_string(),
+                remote_id: mount
+                    .remote_root_id
+                    .as_ref()
+                    .map(|remote_id| remote_id.0.clone())
+                    .unwrap_or_default(),
+                path: ".".to_string(),
+                absolute_path: mount.root.display().to_string(),
+                state: "ready".to_string(),
+                remote: SearchRemoteState::default(),
+                score: 120_000,
+            });
+        }
+    }
+
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                normalize_search_text(&left.title).cmp(&normalize_search_text(&right.title))
+            })
+            .then_with(|| {
+                normalize_search_text(&left.path).cmp(&normalize_search_text(&right.path))
+            })
+            .then_with(|| {
+                compact_notion_id(&left.remote_id).cmp(&compact_notion_id(&right.remote_id))
+            })
+    });
+
+    let results = matches.into_iter().take(options.limit).collect::<Vec<_>>();
+
+    Ok(SearchReport {
+        ok: true,
+        command: "search",
+        query,
+        connector: options.connector,
+        count: results.len(),
+        results,
+    })
+}
+
+pub fn notion_id_from_url(url: &str) -> Option<String> {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    for segment in without_query.rsplit('/') {
+        if let Some(candidate) = compact_notion_id_suffix(segment) {
+            return Some(candidate);
+        }
+    }
+
+    compact_notion_id_suffix(url)
+}
+
+pub fn search_indexed_entities(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    observations: &BTreeMap<RemoteId, RemoteObservationRecord>,
+    query: &str,
+    notion_id: Option<&str>,
+) -> Vec<SearchResult> {
+    entities
+        .iter()
+        .filter_map(|entity| {
+            let observation = observations.get(&entity.remote_id);
+            let score = indexed_entity_score(entity, observation, query, notion_id)?;
+            let remote = remote_state(entity, observation);
+            let result_path = located_entity_path(entity);
+            Some(SearchResult {
+                mount_id: mount.mount_id.0.clone(),
+                connector: mount.connector.clone(),
+                title: entity.title.clone(),
+                kind: entity_kind_name(&entity.kind).to_string(),
+                remote_id: entity.remote_id.0.clone(),
+                path: result_path.display().to_string(),
+                absolute_path: mount.root.join(&result_path).display().to_string(),
+                state: search_state(&entity.hydration, &remote).to_string(),
+                remote,
+                score,
+            })
+        })
+        .collect()
+}
+
+fn indexed_entity_score(
+    entity: &EntityRecord,
+    observation: Option<&RemoteObservationRecord>,
+    query: &str,
+    notion_id: Option<&str>,
+) -> Option<i64> {
+    if let Some(notion_id) = notion_id {
+        if compact_notion_id(&entity.remote_id.0) == notion_id
+            || compact_path_id(&entity.path) == notion_id
+        {
+            return Some(100_000);
+        }
+        return None;
+    }
+
+    let normalized_query = normalize_search_text(query);
+    let phrase = normalized_query.trim();
+    if phrase.len() < 2 {
+        return None;
+    }
+
+    let title = normalize_search_text(&entity.title);
+    let path = normalize_search_text(&entity.path.to_string_lossy());
+    let observed_title = observation
+        .map(|observation| normalize_search_text(&observation.title))
+        .unwrap_or_default();
+    let observed_path = observation
+        .map(|observation| normalize_search_text(&observation.projected_path.to_string_lossy()))
+        .unwrap_or_default();
+    let haystack = format!("{title} {path} {observed_title} {observed_path}");
+    let tokens = phrase
+        .split_whitespace()
+        .filter(|token| token.len() >= 2)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    if title == phrase {
+        return Some(90_000);
+    }
+    if observed_title == phrase {
+        return Some(88_000);
+    }
+    if path == phrase {
+        return Some(86_000);
+    }
+    if observed_path == phrase {
+        return Some(84_000);
+    }
+    if title.starts_with(phrase) {
+        return Some(82_000);
+    }
+    if observed_title.starts_with(phrase) {
+        return Some(80_000);
+    }
+    if path.starts_with(phrase) {
+        return Some(78_000);
+    }
+    if observed_path.starts_with(phrase) {
+        return Some(76_000);
+    }
+    if title.contains(phrase) {
+        return Some(74_000);
+    }
+    if observed_title.contains(phrase) {
+        return Some(72_000);
+    }
+    if path.contains(phrase) {
+        return Some(70_000);
+    }
+    if observed_path.contains(phrase) {
+        return Some(68_000);
+    }
+
+    let matched_tokens = tokens
+        .iter()
+        .filter(|token| haystack.contains(**token))
+        .count();
+    if matched_tokens == 0 {
+        return None;
+    }
+
+    let all_tokens_matched = matched_tokens == tokens.len();
+    let title_bonus = tokens
+        .iter()
+        .filter(|token| title.contains(**token) || observed_title.contains(**token))
+        .count() as i64
+        * 500;
+    Some(if all_tokens_matched {
+        60_000 + title_bonus + matched_tokens as i64
+    } else {
+        30_000 + title_bonus + matched_tokens as i64
+    })
+}
+
+fn remote_state(
+    entity: &EntityRecord,
+    observation: Option<&RemoteObservationRecord>,
+) -> SearchRemoteState {
+    let Some(observation) = observation else {
+        return SearchRemoteState::default();
+    };
+    let title_changed = observation.title != entity.title;
+    let path_changed = observation.projected_path != entity.path;
+    let version_changed = observation
+        .remote_version
+        .as_ref()
+        .is_some_and(|version| Some(version.0.as_str()) != entity.synced_tree_remote_version());
+    let changed = observation.deleted || title_changed || path_changed || version_changed;
+
+    SearchRemoteState {
+        observed_title: title_changed.then(|| observation.title.clone()),
+        observed_path: path_changed.then(|| observation.projected_path.display().to_string()),
+        observed_at: Some(observation.observed_at.clone()),
+        changed,
+        deleted: observation.deleted,
+    }
+}
+
+fn search_state(hydration: &HydrationState, remote: &SearchRemoteState) -> &'static str {
+    if remote.deleted {
+        return "remote_deleted";
+    }
+    if matches!(hydration, HydrationState::Dirty) && remote.changed {
+        return "review_needed";
+    }
+    if remote.changed {
+        return "remote_update_available";
+    }
+
+    match hydration {
+        HydrationState::Virtual | HydrationState::Stub => "online_only",
+        HydrationState::Hydrated => "ready",
+        HydrationState::Dirty => "pending_changes",
+        HydrationState::Conflicted => "conflict",
+    }
+}
+
+fn located_entity_path(entity: &EntityRecord) -> PathBuf {
+    if entity.kind == EntityKind::Page
+        && entity
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("md")
+    {
+        return entity.path.with_extension("md");
+    }
+
+    entity.path.clone()
+}
+
+fn connector_matches(mount: &MountConfig, connector: Option<&str>) -> bool {
+    connector.is_none_or(|connector| mount.connector == connector)
+}
+
+fn source_display_name(connector: &str) -> String {
+    match connector {
+        "notion" => "Notion".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn entity_kind_name(kind: &EntityKind) -> &str {
+    match kind {
+        EntityKind::Page => "page",
+        EntityKind::Database => "database",
+        EntityKind::Directory => "directory",
+        EntityKind::Asset => "asset",
+        EntityKind::Unknown(_) => "unknown",
+    }
+}
+
+fn compact_path_id(path: &Path) -> String {
+    compact_notion_id_suffix(&path.to_string_lossy()).unwrap_or_default()
+}
+
+fn compact_notion_id_suffix(value: &str) -> Option<String> {
+    let compact = compact_notion_id(value);
+    if compact.len() < 32 {
+        return None;
+    }
+
+    Some(compact[compact.len() - 32..].to_string())
+}
+
+fn compact_notion_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn normalize_search_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}

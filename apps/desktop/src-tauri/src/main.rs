@@ -637,9 +637,7 @@ fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str
     } else if matches!(
         entry.sync_state,
         StatusSyncState::RemoteUpdateAvailable | StatusSyncState::ReviewNeeded
-    ) {
-        "needs_review"
-    } else if entry
+    ) || entry
         .issues
         .iter()
         .any(|issue| issue.code.contains("large"))
@@ -1477,7 +1475,7 @@ fn display_path(path: &Path) -> String {
 fn default_notion_mount_root() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        return macos_afs_cloud_storage_root().join(source_root_directory_name("notion"));
+        macos_afs_cloud_storage_root().join(source_root_directory_name("notion"))
     }
 
     #[cfg(not(target_os = "macos"))]

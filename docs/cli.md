@@ -13,6 +13,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs daemon status [--json]`
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
+- `afs search <query> [--connector <connector>] [--limit <n>] [--json]`
 - `afs inspect <path> [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
@@ -75,6 +76,60 @@ Auth error JSON uses stable codes:
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 
 Auth failures exit `1` and include `suggested_command` when there is an obvious recovery command.
+
+## Local Search
+
+`afs search <query>` searches local mount metadata only. It reads SQLite mount,
+entity, and remote-observation records; it does not call Notion or any other
+remote connector. This makes search safe for desktop typeahead, large-workspace
+navigation, and future agent/MCP surfaces.
+
+Examples:
+
+```bash
+afs search roadmap
+afs search "Initial Idea"
+afs search https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972
+afs search roadmap --connector notion --limit 5 --json
+```
+
+Human output lists title, entity kind, local state, projected path, mount,
+connector, and remote id. JSON output is stable enough for tools:
+
+```json
+{
+  "ok": true,
+  "command": "search",
+  "query": "roadmap",
+  "connector": "notion",
+  "count": 1,
+  "results": [
+    {
+      "mount_id": "notion-main",
+      "connector": "notion",
+      "title": "Roadmap 2026",
+      "kind": "page",
+      "remote_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "path": "Engineering/Roadmap 2026 ~aaaaaa.md",
+      "absolute_path": "/Users/alice/afs/notion/Engineering/Roadmap 2026 ~aaaaaa.md",
+      "state": "ready",
+      "remote": {
+        "observed_title": null,
+        "observed_path": null,
+        "observed_at": null,
+        "changed": false,
+        "deleted": false
+      }
+    }
+  ]
+}
+```
+
+`state` is derived from local hydration plus the latest cheap remote observation:
+`online_only`, `ready`, `pending_changes`, `conflict`,
+`remote_update_available`, `remote_deleted`, or `review_needed`. Because search
+is local-only, run `afs pull`, `afs inspect`, or use the daemon freshness queue
+when you need the newest remote facts.
 
 ## Initial `afs mount` and `afs pull`
 

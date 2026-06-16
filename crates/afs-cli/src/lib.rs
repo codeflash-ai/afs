@@ -12,6 +12,7 @@ pub mod mount;
 pub mod pull;
 pub mod push;
 pub mod restore;
+pub mod search;
 pub mod status;
 
 pub fn run(args: Vec<String>) -> i32 {
