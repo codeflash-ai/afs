@@ -52,6 +52,8 @@ fn search_ranks_title_path_and_remote_id_matches() {
     .expect("id search");
     assert_eq!(id.results.len(), 1);
     assert_eq!(id.results[0].state, "ready");
+    assert!(id.results[0].safety.agent_readable);
+    assert_eq!(id.results[0].safety.labels, vec!["ready"]);
     assert!(
         id.results[0]
             .absolute_path
@@ -83,6 +85,11 @@ fn search_uses_remote_observation_metadata_without_touching_remote() {
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].title, "Roadmap 2026");
     assert_eq!(report.results[0].state, "remote_update_available");
+    assert!(!report.results[0].safety.agent_readable);
+    assert_eq!(
+        report.results[0].safety.labels,
+        vec!["remote_changed", "stale_local"]
+    );
     assert_eq!(
         report.results[0].remote.observed_title.as_deref(),
         Some("Launch Plan")
@@ -109,6 +116,11 @@ fn search_does_not_treat_equal_versionless_observation_as_changed() {
 
     assert_eq!(report.results[0].title, "Roadmap 2026");
     assert_eq!(report.results[0].state, "online_only");
+    assert!(!report.results[0].safety.agent_readable);
+    assert_eq!(
+        report.results[0].safety.labels,
+        vec!["online_only", "metadata_only"]
+    );
     assert!(!report.results[0].remote.changed);
 }
 

@@ -2275,7 +2275,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use afs_cli::search::{SearchRemoteState, SearchResult};
+    use afs_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use afs_store::{ConnectionId, ConnectionRecord};
     use tauri::{PhysicalPosition, PhysicalSize};
 
@@ -2570,6 +2570,10 @@ mod tests {
             path: "Roadmap.md".to_string(),
             absolute_path: "/tmp/afs/Roadmap.md".to_string(),
             state: state.to_string(),
+            safety: SearchSafety {
+                agent_readable: state == "ready",
+                labels: vec![state.to_string()],
+            },
             remote: SearchRemoteState::default(),
             score: 0,
         }

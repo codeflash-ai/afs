@@ -53,9 +53,16 @@ pub struct SearchResult {
     pub path: String,
     pub absolute_path: String,
     pub state: String,
+    pub safety: SearchSafety,
     pub remote: SearchRemoteState,
     #[serde(skip_serializing)]
     pub score: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SearchSafety {
+    pub agent_readable: bool,
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -169,6 +176,10 @@ where
                 path: ".".to_string(),
                 absolute_path: access_root.display().to_string(),
                 state: "ready".to_string(),
+                safety: SearchSafety {
+                    agent_readable: false,
+                    labels: vec!["workspace".to_string(), "metadata_only".to_string()],
+                },
                 remote: SearchRemoteState::default(),
                 score: 120_000,
             });
@@ -258,6 +269,7 @@ pub fn search_indexed_entities(
             let score = indexed_entity_score(entity, observation, query, notion_id)?;
             let remote = remote_state(entity, observation);
             let result_path = located_entity_path(entity);
+            let state = search_state(&entity.hydration, &remote).to_string();
             Some(SearchResult {
                 mount_id: mount.mount_id.0.clone(),
                 connector: mount.connector.clone(),
@@ -266,7 +278,8 @@ pub fn search_indexed_entities(
                 remote_id: entity.remote_id.0.clone(),
                 path: result_path.display().to_string(),
                 absolute_path: access_root.join(&result_path).display().to_string(),
-                state: search_state(&entity.hydration, &remote).to_string(),
+                state,
+                safety: search_safety(&entity.hydration, &remote),
                 remote,
                 score,
             })
@@ -307,6 +320,7 @@ fn search_entity_result(
     let score = indexed_entity_score(entity, observation, query, notion_id)?;
     let remote = remote_state(entity, observation);
     let result_path = located_entity_path(entity);
+    let state = search_state(&entity.hydration, &remote).to_string();
     Some(SearchResult {
         mount_id: mount.mount_id.0.clone(),
         connector: mount.connector.clone(),
@@ -315,7 +329,8 @@ fn search_entity_result(
         remote_id: entity.remote_id.0.clone(),
         path: result_path.display().to_string(),
         absolute_path: access_root.join(&result_path).display().to_string(),
-        state: search_state(&entity.hydration, &remote).to_string(),
+        state,
+        safety: search_safety(&entity.hydration, &remote),
         remote,
         score,
     })
@@ -457,6 +472,28 @@ fn search_state(hydration: &HydrationState, remote: &SearchRemoteState) -> &'sta
         HydrationState::Hydrated => "ready",
         HydrationState::Dirty => "pending_changes",
         HydrationState::Conflicted => "conflict",
+    }
+}
+
+fn search_safety(hydration: &HydrationState, remote: &SearchRemoteState) -> SearchSafety {
+    let state = search_state(hydration, remote);
+    let labels = match state {
+        "ready" => vec!["ready"],
+        "online_only" => vec!["online_only", "metadata_only"],
+        "pending_changes" => vec!["local_changes", "needs_review"],
+        "conflict" => vec!["conflict", "needs_review"],
+        "remote_update_available" => vec!["remote_changed", "stale_local"],
+        "remote_deleted" => vec!["remote_deleted", "do_not_read"],
+        "review_needed" => vec!["local_and_remote_changed", "needs_review"],
+        _ => vec!["unknown"],
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+
+    SearchSafety {
+        agent_readable: state == "ready",
+        labels,
     }
 }
 

@@ -2334,6 +2334,9 @@ fn print_search_report(report: &SearchReport) {
             result.mount_id, result.connector, result.remote_id
         );
         println!("  path: {}", result.absolute_path);
+        if !result.safety.agent_readable {
+            println!("  safety: {}", result.safety.labels.join(", "));
+        }
         if result.remote.changed {
             let state = if result.remote.deleted {
                 "deleted"

@@ -94,7 +94,8 @@ afs search roadmap --connector notion --limit 5 --json
 ```
 
 Human output lists title, entity kind, local state, projected path, mount,
-connector, and remote id. JSON output is stable enough for tools:
+connector, and remote id. Results that are not safe for direct agent reads also
+print compact safety labels. JSON output is stable enough for tools:
 
 ```json
 {
@@ -113,6 +114,10 @@ connector, and remote id. JSON output is stable enough for tools:
       "path": "Engineering/Roadmap 2026 ~aaaaaa.md",
       "absolute_path": "/Users/alice/afs/notion/Engineering/Roadmap 2026 ~aaaaaa.md",
       "state": "ready",
+      "safety": {
+        "agent_readable": true,
+        "labels": ["ready"]
+      },
       "remote": {
         "observed_title": null,
         "observed_path": null,
@@ -130,6 +135,11 @@ connector, and remote id. JSON output is stable enough for tools:
 `remote_update_available`, `remote_deleted`, or `review_needed`. Because search
 is local-only, run `afs pull`, `afs inspect`, or use the daemon freshness queue
 when you need the newest remote facts.
+
+`safety.agent_readable` is true only for clean hydrated results. Online-only,
+dirty, conflicted, stale, or remotely deleted results are still returned for
+navigation, but future agent/MCP readers should treat their `safety.labels` as
+review or hydration requirements before reading file content.
 
 ## Initial `afs mount` and `afs pull`
 

@@ -2,6 +2,7 @@
 
 ## Changelog
 
+- 2026-06-16: Added search-result safety labels so future MCP/agent readers can distinguish clean hydrated content from metadata-only, stale, dirty, conflicted, or deleted results.
 - 2026-06-16: Added a rebuildable SQLite FTS candidate index for local metadata search while preserving the shared CLI/desktop search report contract.
 - 2026-06-16: Added hydration-on-locate plumbing: explicit daemon hydration requests and desktop locate prioritization for online-only pages.
 - 2026-06-16: Queued the next implementation slices after local metadata search: desktop shared-search adoption, hydration-on-locate, SQLite FTS, knowledge bundles, security labels, MCP, and templates.
@@ -32,8 +33,10 @@ and clippy when the workspace is already clippy-clean.
 5. **Knowledge bundles** — introduce an OKF-inspired, file-native
    `index.md`/`log.md` bundle pattern for agent memory, source catalogs, and
    workflow handoff.
-6. **Security labels and quarantine** — add trust/sensitivity metadata for
-   generated, external, private, and reviewed content before broad MCP exposure.
+6. **Security labels and quarantine follow-up** — persist trust/sensitivity
+   metadata for generated, external, private, and reviewed content before broad
+   MCP exposure. Search results now expose derived read-safety labels; this
+   follow-up should make them policy-backed and user-editable.
 7. **Read-first MCP server** — expose safe search, locate, status, inspect, and
    diff tools. Keep push/write operations approval-gated.
 8. **Template/workflow store** — package reusable expert workflows as local
