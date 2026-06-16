@@ -81,7 +81,7 @@ fi
 
 seed_fixture() {
   mkdir -p "$state_root" "$afs_root" "$mount_root"
-  AFS_STATE_DIR="$state_root" NOTION_TOKEN="ci-fuse-smoke-token" \
+  AFS_STATE_DIR="$state_root" AFS_DAEMON_DISABLE=1 NOTION_TOKEN="ci-fuse-smoke-token" \
     "$afs_bin" mount notion "$mount_root" \
       --workspace \
       --mount-id "$mount_id" \

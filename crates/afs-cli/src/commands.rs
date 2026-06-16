@@ -3868,7 +3868,12 @@ fn virtual_projection_registration_for_target(
 fn auto_registration_for_mounted_projection(
     projection: ProjectionMode,
     target_os: &str,
+    daemon_disabled: bool,
 ) -> Option<VirtualProjectionRegistration> {
+    if daemon_disabled {
+        return None;
+    }
+
     match (projection, target_os) {
         (ProjectionMode::LinuxFuse, "linux") => Some(VirtualProjectionRegistration::LinuxFuse),
         _ => None,
@@ -3893,9 +3898,11 @@ fn auto_register_mounted_projection(
                 ),
             )
         })?;
-    let Some(registration) =
-        auto_registration_for_mounted_projection(mount.projection.clone(), std::env::consts::OS)
-    else {
+    let Some(registration) = auto_registration_for_mounted_projection(
+        mount.projection.clone(),
+        std::env::consts::OS,
+        std::env::var_os("AFS_DAEMON_DISABLE").is_some(),
+    ) else {
         return Ok(());
     };
 
@@ -4548,15 +4555,23 @@ mod tests {
     #[test]
     fn mount_auto_registration_runs_for_linux_fuse_on_linux_only() {
         assert_eq!(
-            auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux"),
+            auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", false),
             Some(VirtualProjectionRegistration::LinuxFuse)
         );
         assert_eq!(
-            auto_registration_for_mounted_projection(ProjectionMode::PlainFiles, "linux"),
+            auto_registration_for_mounted_projection(ProjectionMode::PlainFiles, "linux", false),
             None
         );
         assert_eq!(
-            auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "macos"),
+            auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "macos", false),
+            None
+        );
+    }
+
+    #[test]
+    fn mount_auto_registration_skips_when_daemon_is_disabled() {
+        assert_eq!(
+            auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", true),
             None
         );
     }
