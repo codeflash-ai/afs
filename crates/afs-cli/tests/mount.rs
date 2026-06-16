@@ -27,12 +27,13 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     let claude = read_to_string(fixture.claude_file());
     assert_eq!(claude, agents);
     assert!(agents.contains("including nested directories"));
-    assert!(agents.contains("system of record"));
     assert!(agents.contains("Browse directories normally"));
-    assert!(agents.contains("push approved changes back to Notion"));
+    assert!(agents.contains("push approved changes to Notion"));
     assert!(agents.contains("afs search <query-or-notion-url>"));
+    assert!(agents.contains("AFS hydrates online-only files on open"));
     assert!(agents.contains("afs status <path>"));
     assert!(agents.contains("afs diff <path>"));
+    assert!(agents.contains("Use `afs push <path>` to make Notion match local edits"));
     assert!(agents.contains("Notion facts:"));
     assert!(agents.contains("databases are directories"));
     assert!(agents.contains("`_schema.yaml` files are read-only references"));
@@ -54,8 +55,8 @@ fn mount_writes_connector_specific_fallback_guidance() {
 
     let agents = read_to_string(fixture.agents_file());
     assert!(agents.contains("# AgentFS linear Mount"));
-    assert!(agents.contains("projects linear, the system of record"));
-    assert!(agents.contains("push approved changes back to linear"));
+    assert!(agents.contains("projects linear as local Markdown"));
+    assert!(agents.contains("push approved changes to linear"));
     assert!(agents.contains("including nested directories"));
 }
 

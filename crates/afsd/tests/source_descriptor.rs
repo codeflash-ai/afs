@@ -29,7 +29,7 @@ fn generic_descriptor_preserves_source_id_in_guidance() {
             .mount_guidance()
             .contains("# AgentFS linear Mount")
     );
-    assert!(descriptor.mount_guidance().contains("back to linear"));
+    assert!(descriptor.mount_guidance().contains("to linear"));
 }
 
 #[test]
