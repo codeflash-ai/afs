@@ -39,10 +39,9 @@ use afs_store::{
 use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
-use afsd::virtual_fs::{
-    source_root_directory_name, source_root_identifier, virtual_fs_content_base,
-    virtual_fs_content_root,
-};
+#[cfg(target_os = "macos")]
+use afsd::virtual_fs::source_root_directory_name;
+use afsd::virtual_fs::{source_root_identifier, virtual_fs_content_base, virtual_fs_content_root};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{

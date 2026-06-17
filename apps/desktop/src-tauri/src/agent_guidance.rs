@@ -292,12 +292,16 @@ fn replace_managed_section(existing: &str, block: &str) -> String {
 }
 
 fn normalized_mount_path(mount_path: Option<&str>) -> String {
-    mount_path
+    let trimmed = mount_path
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .unwrap_or(DEFAULT_NOTION_MOUNT)
-        .trim_end_matches('/')
-        .to_string()
+        .trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -418,6 +422,11 @@ mod tests {
             normalized_mount_path(Some("~/Library/CloudStorage/AFS/notion/")),
             "~/Library/CloudStorage/AFS/notion"
         );
+    }
+
+    #[test]
+    fn normalized_mount_preserves_root_path() {
+        assert_eq!(normalized_mount_path(Some("/")), "/");
     }
 
     #[test]
