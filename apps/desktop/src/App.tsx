@@ -21,7 +21,7 @@ import {
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
@@ -105,6 +105,14 @@ type FileDetailReport = {
   path: string;
   hasConflictMarkers: boolean;
   conflictPreview?: string | null;
+  message: string;
+};
+
+type FileEditorReport = {
+  ok: boolean;
+  path: string;
+  contents: string;
+  hasConflictMarkers: boolean;
   message: string;
 };
 
@@ -2177,6 +2185,20 @@ type FileDetailStatus = {
   message: string;
 };
 
+type FileEditorStatus = {
+  state: "loading" | "ready" | "saving" | "error";
+  contents: string;
+  savedContents: string;
+  message: string;
+  hasConflictMarkers: boolean;
+};
+
+type MarkdownEditorView = {
+  state: { doc: { toString: () => string } };
+  dispatch: (transaction: { changes: { from: number; to: number; insert: string } }) => void;
+  destroy: () => void;
+};
+
 function FileChangeList({
   changes,
   mountPath,
@@ -2191,6 +2213,7 @@ function FileChangeList({
   const [actions, setActions] = useState<Record<string, FileActionStatus>>({});
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, FileDetailStatus>>({});
+  const [editors, setEditors] = useState<Record<string, FileEditorStatus>>({});
 
   async function toggleDetails(change: PendingChange) {
     if (selectedPath === change.localPath) {
@@ -2203,11 +2226,33 @@ function FileChangeList({
       ...current,
       [change.localPath]: { state: "loading", message: "Reading local file..." },
     }));
+    setEditors((current) => ({
+      ...current,
+      [change.localPath]: {
+        state: "loading",
+        contents: "",
+        savedContents: "",
+        message: "Loading editor...",
+        hasConflictMarkers: false,
+      },
+    }));
 
     try {
-      const report = await callCommand<FileDetailReport>("inspect_notion_file", {
-        path: joinMountPath(mountPath, change.localPath),
-      });
+      const path = joinMountPath(mountPath, change.localPath);
+      const [report, editor] = await Promise.all([
+        callCommand<FileDetailReport>("inspect_notion_file", { path }),
+        callCommand<FileEditorReport>("read_notion_file", { path }),
+      ]);
+      setEditors((current) => ({
+        ...current,
+        [change.localPath]: {
+          state: editor.ok ? "ready" : "error",
+          contents: editor.contents,
+          savedContents: editor.contents,
+          message: editor.message,
+          hasConflictMarkers: editor.hasConflictMarkers,
+        },
+      }));
       setDetails((current) => ({
         ...current,
         [change.localPath]: {
@@ -2220,6 +2265,52 @@ function FileChangeList({
       setDetails((current) => ({
         ...current,
         [change.localPath]: { state: "error", message: errorMessage(error) },
+      }));
+      setEditors((current) => ({
+        ...current,
+        [change.localPath]: {
+          state: "error",
+          contents: "",
+          savedContents: "",
+          message: errorMessage(error),
+          hasConflictMarkers: false,
+        },
+      }));
+    }
+  }
+
+  async function saveEditor(change: PendingChange) {
+    const editor = editors[change.localPath];
+    if (!editor || editor.state === "loading" || editor.state === "saving") {
+      return;
+    }
+    setEditors((current) => ({
+      ...current,
+      [change.localPath]: { ...editor, state: "saving", message: "Saving local Markdown..." },
+    }));
+
+    try {
+      const report = await callCommand<ActionReport>("save_notion_file", {
+        path: joinMountPath(mountPath, change.localPath),
+        contents: editor.contents,
+      });
+      setEditors((current) => ({
+        ...current,
+        [change.localPath]: {
+          ...editor,
+          state: report.ok ? "ready" : "error",
+          savedContents: report.ok ? editor.contents : editor.savedContents,
+          message: report.message,
+          hasConflictMarkers: hasConflictMarkers(editor.contents),
+        },
+      }));
+      if (report.ok) {
+        await onRefresh?.().catch(() => undefined);
+      }
+    } catch (error) {
+      setEditors((current) => ({
+        ...current,
+        [change.localPath]: { ...editor, state: "error", message: errorMessage(error) },
       }));
     }
   }
@@ -2266,7 +2357,10 @@ function FileChangeList({
       {changes.map((change) => {
         const action = actions[change.localPath];
         const detail = details[change.localPath];
+        const editor = editors[change.localPath];
         const isWorking = action?.state === "working";
+        const isSaving = editor?.state === "saving";
+        const hasUnsavedEditorChanges = editor !== undefined && editor.contents !== editor.savedContents;
         const isSelected = selectedPath === change.localPath;
         return (
           <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
@@ -2322,10 +2416,61 @@ function FileChangeList({
             {isSelected && (
               <div className="file-detail-panel">
                 <div className="file-detail-heading">
-                  <strong>{detail?.report?.hasConflictMarkers ? "Conflict markers found" : "File details"}</strong>
-                  <span>{detail?.message ?? "Reading local file..."}</span>
+                  <strong>{editor?.hasConflictMarkers ? "Conflict markers found" : "Local Markdown editor"}</strong>
+                  <span>{editor?.message || detail?.message || "Reading local file..."}</span>
                 </div>
-                {detail?.report?.conflictPreview && <pre>{detail.report.conflictPreview}</pre>}
+                {editor?.state === "loading" && (
+                  <div className="editor-loading">
+                    <Loader2 className="spin-icon" />
+                    Loading editor...
+                  </div>
+                )}
+                {editor && editor.state !== "loading" && (
+                  <>
+                    {editor.hasConflictMarkers && (
+                      <div className="editor-warning">
+                        Resolve the marker block in the editor, then save before pushing.
+                      </div>
+                    )}
+                    <MarkdownEditor
+                      value={editor.contents}
+                      onChange={(contents) =>
+                        setEditors((current) => ({
+                          ...current,
+                          [change.localPath]: {
+                            ...editor,
+                            state: "ready",
+                            contents,
+                            message:
+                              contents === editor.savedContents
+                                ? "No unsaved editor changes."
+                                : "Unsaved local editor changes.",
+                            hasConflictMarkers: hasConflictMarkers(contents),
+                          },
+                        }))
+                      }
+                    />
+                    <div className="editor-actions">
+                      <SecondaryButton
+                        compact
+                        disabled={isSaving || !hasUnsavedEditorChanges}
+                        onClick={() => void saveEditor(change)}
+                      >
+                        {isSaving ? "Saving..." : "Save Local"}
+                      </SecondaryButton>
+                      <PrimaryButton
+                        compact
+                        disabled={isSaving || hasUnsavedEditorChanges || isWorking}
+                        onClick={() => void runFileAction(change, "push")}
+                      >
+                        Push Saved
+                      </PrimaryButton>
+                    </div>
+                  </>
+                )}
+                {detail?.report?.conflictPreview && !editor?.hasConflictMarkers && (
+                  <pre>{detail.report.conflictPreview}</pre>
+                )}
               </div>
             )}
           </article>
@@ -2333,6 +2478,123 @@ function FileChangeList({
       })}
     </section>
   );
+}
+
+function MarkdownEditor({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<MarkdownEditorView | null>(null);
+  const onChangeRef = useRef(onChange);
+
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) {
+      return undefined;
+    }
+    const editorHost = host;
+
+    let cancelled = false;
+
+    async function loadEditor() {
+      const [
+        commands,
+        markdownModule,
+        languageModule,
+        searchModule,
+        stateModule,
+        viewModule,
+      ] = await Promise.all([
+        import("@codemirror/commands"),
+        import("@codemirror/lang-markdown"),
+        import("@codemirror/language"),
+        import("@codemirror/search"),
+        import("@codemirror/state"),
+        import("@codemirror/view"),
+      ]);
+      if (cancelled) {
+        return;
+      }
+
+      const view = new viewModule.EditorView({
+        parent: editorHost,
+        state: stateModule.EditorState.create({
+          doc: value,
+          extensions: [
+            viewModule.lineNumbers(),
+            viewModule.drawSelection(),
+            viewModule.highlightActiveLine(),
+            commands.history(),
+            markdownModule.markdown(),
+            languageModule.syntaxHighlighting(languageModule.defaultHighlightStyle),
+            searchModule.highlightSelectionMatches(),
+            viewModule.keymap.of([
+              commands.indentWithTab,
+              ...commands.defaultKeymap,
+              ...commands.historyKeymap,
+              ...searchModule.searchKeymap,
+            ]),
+            viewModule.EditorView.lineWrapping,
+            viewModule.EditorView.updateListener.of((update) => {
+              if (update.docChanged) {
+                onChangeRef.current(update.state.doc.toString());
+              }
+            }),
+            viewModule.EditorView.theme({
+              "&": {
+                minHeight: "320px",
+                fontSize: "13px",
+              },
+              ".cm-content": {
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                padding: "12px",
+              },
+              ".cm-gutters": {
+                backgroundColor: "#f7f9fb",
+                color: "#8a96a6",
+                borderRight: "1px solid #dfe6eb",
+              },
+              ".cm-activeLine": {
+                backgroundColor: "rgba(49, 120, 198, 0.07)",
+              },
+              ".cm-activeLineGutter": {
+                backgroundColor: "rgba(49, 120, 198, 0.08)",
+              },
+              "&.cm-focused": {
+                outline: "none",
+              },
+            }),
+          ],
+        }),
+      });
+      viewRef.current = view;
+    }
+
+    void loadEditor();
+
+    return () => {
+      cancelled = true;
+      viewRef.current?.destroy();
+      viewRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) {
+      return;
+    }
+    const current = view.state.doc.toString();
+    if (current !== value) {
+      view.dispatch({
+        changes: { from: 0, to: current.length, insert: value },
+      });
+    }
+  }, [value]);
+
+  return <div className="markdown-editor" ref={hostRef} />;
 }
 
 function LocateBox({
@@ -2837,6 +3099,10 @@ function joinMountPath(mountPath: string, relativePath: string) {
   }
 
   return `${mountPath.replace(/\/$/, "")}/${relativePath}`;
+}
+
+function hasConflictMarkers(contents: string) {
+  return contents.includes("<<<<<<< LOCAL") && contents.includes("=======") && contents.includes(">>>>>>> REMOTE");
 }
 
 function copyText(value: string) {
