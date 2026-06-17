@@ -22,7 +22,7 @@ use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode, ShadowRepository,
 };
-use afsd::virtual_fs::virtual_fs_content_root;
+use afsd::virtual_fs::{source_root_directory_name, virtual_fs_content_root};
 
 #[test]
 fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
@@ -131,6 +131,66 @@ fn pull_virtual_file_target_does_not_stat_projection_path_as_directory() {
 
     let _ = fs::remove_dir_all(state_root);
     let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn pull_virtual_mount_accepts_source_directory_as_root_target() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.source_root(),
+        Some(&state_root),
+    )
+    .expect("pull virtual source root");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 4);
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.stubbed, 0);
+    assert!(
+        virtual_fs_content_root(&state_root, &fixture.mount_id)
+            .join("roadmap/page.md")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_virtual_file_accepts_source_directory_target() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.source_child_file("roadmap"),
+        Some(&state_root),
+    )
+    .expect("pull virtual source file target");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 0);
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.stubbed, 0);
+    assert!(
+        virtual_fs_content_root(&state_root, &fixture.mount_id)
+            .join("roadmap/design-notes/page.md")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
 }
 
 #[test]
@@ -504,6 +564,17 @@ impl PullFixture {
 
     fn child_file(&self, root_slug: &str) -> PathBuf {
         self.root
+            .join(root_slug)
+            .join("design-notes")
+            .join("page.md")
+    }
+
+    fn source_root(&self) -> PathBuf {
+        self.root.join(source_root_directory_name("notion"))
+    }
+
+    fn source_child_file(&self, root_slug: &str) -> PathBuf {
+        self.source_root()
             .join(root_slug)
             .join("design-notes")
             .join("page.md")

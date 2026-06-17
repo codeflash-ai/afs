@@ -20,6 +20,7 @@ use afs_store::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::file_provider;
 use crate::hydration::{HydratedAsset, HydratedEntity};
 use crate::source::SourceAdapter;
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
@@ -795,17 +796,13 @@ fn absolute_path(path: &Path) -> Result<PathBuf, PullError> {
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
+    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
 }
 
 fn relative_target_path(mount: &MountConfig, absolute_path: &Path) -> Result<PathBuf, PullError> {
-    absolute_path
-        .strip_prefix(&mount.root)
-        .map(Path::to_path_buf)
-        .map_err(|_| PullError::MountNotFound(absolute_path.to_path_buf()))
+    file_provider::match_mount_path(mount, absolute_path)
+        .map(|matched| matched.relative_path)
+        .ok_or_else(|| PullError::MountNotFound(absolute_path.to_path_buf()))
 }
 
 fn yaml_string(value: &str) -> String {

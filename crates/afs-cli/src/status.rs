@@ -14,12 +14,12 @@ use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
+    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use afsd::file_provider as daemon_file_provider;
-use afsd::virtual_fs::virtual_fs_content_path;
+use afsd::virtual_fs::{source_root_directory_name, virtual_fs_content_path};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -479,9 +479,7 @@ fn classify_virtual_mutation(
         .unwrap_or_else(|| mutation.local_id.clone());
 
     StatusEntry {
-        absolute_path: mount
-            .root
-            .join(&mutation.projected_path)
+        absolute_path: projected_absolute_path(mount, &mutation.projected_path)
             .display()
             .to_string(),
         path: mutation.projected_path.display().to_string(),
@@ -511,7 +509,7 @@ where
         + RemoteObservationRepository
         + FreshnessStateRepository,
 {
-    let absolute_path = mount.root.join(&entity.path);
+    let absolute_path = projected_absolute_path(mount, &entity.path);
     let mut issues = Vec::new();
     let (state, mut state_issues) =
         classify_local_state(store, mount, &entity, &absolute_path, state_root);
@@ -561,6 +559,17 @@ where
         pending_journal_count,
         failed_journal_count,
     }
+}
+
+fn projected_absolute_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
+    if mount.projection == ProjectionMode::LinuxFuse {
+        return mount
+            .root
+            .join(source_root_directory_name(&mount.connector))
+            .join(relative_path);
+    }
+
+    mount.root.join(relative_path)
 }
 
 fn classify_remote_state<S>(

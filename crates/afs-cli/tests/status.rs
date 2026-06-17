@@ -332,6 +332,15 @@ fn status_reads_virtual_projection_from_content_cache() {
     assert!(report.clean);
     assert_eq!(report.summary.clean, 1);
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
+    assert_eq!(
+        status_entry(&report, "Roadmap.md").absolute_path,
+        fixture
+            .root
+            .join("notion")
+            .join("Roadmap.md")
+            .display()
+            .to_string()
+    );
 }
 
 #[test]
@@ -450,6 +459,15 @@ fn status_reports_pending_virtual_creates_and_deletes() {
     assert_eq!(report.summary.dirty, 2);
     assert_eq!(entry_issue(&report, "Draft.md"), "pending_virtual_create");
     assert_eq!(entry_issue(&report, "Roadmap.md"), "pending_virtual_delete");
+    assert_eq!(
+        status_entry(&report, "Draft.md").absolute_path,
+        fixture
+            .root
+            .join("notion")
+            .join("Draft.md")
+            .display()
+            .to_string()
+    );
 }
 
 #[test]

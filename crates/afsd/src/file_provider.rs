@@ -6,17 +6,14 @@
 
 use afs_core::AfsResult;
 use afs_core::model::MountId;
-#[cfg(target_os = "macos")]
-use afs_store::ProjectionMode;
 use afs_store::{
-    EntityRepository, FreshnessStateRepository, MountConfig, MountRepository, ShadowRepository,
-    VirtualMutationRepository,
+    EntityRepository, FreshnessStateRepository, MountConfig, MountRepository, ProjectionMode,
+    ShadowRepository, VirtualMutationRepository,
 };
 use std::path::{Path, PathBuf};
 
 use crate::hydration::HydrationSource;
 use crate::virtual_fs;
-#[cfg(target_os = "macos")]
 use crate::virtual_fs::source_root_directory_name;
 
 pub use crate::virtual_fs::{
@@ -73,10 +70,15 @@ pub struct MountPathMatch {
 }
 
 pub fn mount_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
-    #[cfg(target_os = "macos")]
     let mut roots = vec![mount.root.clone()];
-    #[cfg(not(target_os = "macos"))]
-    let roots = vec![mount.root.clone()];
+
+    if mount.projection == ProjectionMode::LinuxFuse {
+        roots.push(
+            mount
+                .root
+                .join(source_root_directory_name(&mount.connector)),
+        );
+    }
 
     #[cfg(target_os = "macos")]
     if mount.projection == ProjectionMode::MacosFileProvider {
@@ -216,6 +218,7 @@ fn strip_file_provider_directory_prefix(name: &str) -> &str {
 mod tests {
     use super::*;
     use afs_core::model::MountId;
+    use afs_store::ProjectionMode;
 
     #[test]
     fn match_mount_path_resolves_relative_path_under_mount_root() {
@@ -238,6 +241,32 @@ mod tests {
 
         assert_eq!(mount.mount_id, MountId::new("narrow"));
         assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
+    }
+
+    #[test]
+    fn linux_fuse_source_directory_is_an_access_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+            .projection(ProjectionMode::LinuxFuse);
+
+        let matched = match_mount_path(&mount, Path::new("/tmp/AFS/notion/roadmap/page.md"))
+            .expect("path matches source directory");
+
+        assert_eq!(matched.access_root, PathBuf::from("/tmp/AFS/notion"));
+        assert_eq!(matched.relative_path, PathBuf::from("roadmap/page.md"));
+    }
+
+    #[test]
+    fn plain_mount_keeps_source_named_directory_in_relative_path() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS");
+
+        let matched = match_mount_path(&mount, Path::new("/tmp/AFS/notion/roadmap/page.md"))
+            .expect("path matches mount root");
+
+        assert_eq!(matched.access_root, PathBuf::from("/tmp/AFS"));
+        assert_eq!(
+            matched.relative_path,
+            PathBuf::from("notion/roadmap/page.md")
+        );
     }
 
     #[cfg(target_os = "macos")]
