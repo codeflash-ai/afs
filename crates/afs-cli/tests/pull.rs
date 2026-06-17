@@ -20,7 +20,8 @@ use afs_notion::dto::{
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
-    EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode, ShadowRepository,
+    EntityRepository, InMemoryStateStore, MountConfig, MountRepository, ProjectionMode,
+    ShadowRepository,
 };
 use afsd::virtual_fs::{source_root_directory_name, virtual_fs_content_root};
 
@@ -131,6 +132,54 @@ fn pull_virtual_file_target_does_not_stat_projection_path_as_directory() {
 
     let _ = fs::remove_dir_all(state_root);
     let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pull_macos_file_provider_alias_path_resolves_mount() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-macos-state");
+    let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
+    let mount_root = home
+        .join("Library")
+        .join("CloudStorage")
+        .join("AFS")
+        .join("notion");
+    let alias_root = home
+        .join("Library")
+        .join("CloudStorage")
+        .join("AFS-AFS")
+        .join("notion");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_root)
+                .with_remote_root_id(fixture.root_page_id.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save macos file provider mount");
+    let connector = fixture.connector("Roadmap");
+
+    run_pull_with_state_root(&mut store, &connector, &alias_root, Some(&state_root))
+        .expect("pull through file provider alias root");
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        alias_root.join("roadmap").join("page.md"),
+        Some(&state_root),
+    )
+    .expect("pull through file provider alias file");
+
+    assert!(report.ok);
+    assert_eq!(report.hydrated, 1);
+    assert!(
+        virtual_fs_content_root(&state_root, &fixture.mount_id)
+            .join("roadmap")
+            .join("page.md")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
 }
 
 #[test]

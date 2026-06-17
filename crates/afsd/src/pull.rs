@@ -71,10 +71,10 @@ where
 {
     let target_path = absolute_path(target_path.as_ref())?;
     let mounts = store.load_mounts().map_err(PullError::Store)?;
-    let mount = find_mount_for_path(&mounts, &target_path)
-        .cloned()
+    let (mount, matched) = find_mount_for_path(&mounts, &target_path)
         .ok_or_else(|| PullError::MountNotFound(target_path.clone()))?;
-    let relative_path = relative_target_path(&mount, &target_path)?;
+    let mount = mount.clone();
+    let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
 
     if should_pull_mount_root(&mount, &relative_path, &target_path) {
@@ -795,14 +795,11 @@ fn absolute_path(path: &Path) -> Result<PathBuf, PullError> {
     }
 }
 
-fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
-}
-
-fn relative_target_path(mount: &MountConfig, absolute_path: &Path) -> Result<PathBuf, PullError> {
-    file_provider::match_mount_path(mount, absolute_path)
-        .map(|matched| matched.relative_path)
-        .ok_or_else(|| PullError::MountNotFound(absolute_path.to_path_buf()))
+fn find_mount_for_path<'a>(
+    mounts: &'a [MountConfig],
+    path: &Path,
+) -> Option<(&'a MountConfig, file_provider::MountPathMatch)> {
+    file_provider::find_mount_for_path(mounts, path)
 }
 
 fn yaml_string(value: &str) -> String {
