@@ -1,0 +1,37 @@
+# Agent Guidance Installation
+
+AFS installs a small agent guidance pack during desktop onboarding so local agents know how to use the mounted Notion filesystem without the user repeating setup instructions.
+
+## Supported Local Agents
+
+| Agent | Install target | Status |
+| --- | --- | --- |
+| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/afs/SKILL.md` | Automatic when Claude is detected. |
+| Codex | `~/.codex/skills/afs/SKILL.md` | Automatic when Codex is detected. |
+| Warp | `~/.agents/skills/afs/SKILL.md` | Automatic when Warp is detected. Warp also reads project rules such as `AGENTS.md` and `WARP.md`; AFS keeps connector-local `AGENTS.md` under `/AFS/notion`. |
+| OpenCode | `~/.agents/skills/afs/SKILL.md` | Automatic when OpenCode is detected. |
+| Gemini CLI | `~/.gemini/GEMINI.md` | Automatic managed section when Gemini is detected. |
+| Cline / Roo Code / Cursor / Windsurf / Zed | `~/.agents/AGENTS.md` plus `/AFS/notion/AGENTS.md` | Automatic fallback when one of these agents is detected. |
+| GitHub Copilot CLI | `~/.copilot/copilot-instructions.md` | Automatic managed section when Copilot-capable local tooling is detected. |
+
+AFS does not edit opaque app databases or settings files. If an agent only supports UI-managed global rules, AFS relies on the shared `AGENTS.md` fallback and the connector-local guidance in the mounted folder.
+
+## Installed Skill Behavior
+
+The skill tells agents:
+
+- Notion files live under `~/Library/CloudStorage/AFS/notion` on macOS by default.
+- Online-only files hydrate automatically when opened.
+- Agents should edit Markdown files directly and leave changes pending for AFS review.
+- Agents should not edit AFS identity frontmatter, block IDs, `::afs{...}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
+- `afs status` is optional and only needed when the agent needs to inspect pending changes.
+
+## Onboarding UX
+
+After the Notion mount is created, the desktop app runs the installer and shows which local agents were updated. The final onboarding screen also offers this suggested prompt:
+
+```text
+Use AFS to edit my Notion workspace. Open the Notion files under ~/Library/CloudStorage/AFS/notion, make the requested edits directly in Markdown, and leave the changes pending for AFS review.
+```
+
+Users can rerun the installer from Settings > Agent Instructions after installing a new local agent.

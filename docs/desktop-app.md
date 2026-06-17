@@ -22,6 +22,11 @@ that agents can inspect and edit with the generated `AGENTS.md` and `CLAUDE.md`
 guidance already present in the mount, then having an agent safely edit those
 files and push the reviewed changes back into Notion.
 
+Onboarding also installs local agent guidance for detected agents such as Claude
+Code, Codex, Warp, Cursor-compatible tools, Gemini CLI, and Cline/Roo. See
+[agent-guidance.md](agent-guidance.md) for install targets and fallback
+behavior.
+
 ## Product Principles
 
 - Workspace first: onboarding should mount a Notion workspace or selected

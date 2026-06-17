@@ -50,6 +50,12 @@ use tauri::{
 };
 use tauri_plugin_dialog::DialogExt;
 
+mod agent_guidance;
+
+use agent_guidance::{
+    AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,
+};
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSnapshot {
@@ -394,6 +400,11 @@ fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
         }
         Err(message) => ActionReport { ok: false, message },
     }
+}
+
+#[tauri::command]
+fn install_agent_guidance(mount_path: Option<String>) -> AgentGuidanceInstallReport {
+    install_guidance_files(mount_path.as_deref())
 }
 
 #[tauri::command]
@@ -3315,6 +3326,7 @@ fn main() {
             choose_mount_folder,
             ensure_runtime_ready,
             create_workspace_mount,
+            install_agent_guidance,
             locate_notion_page,
             search_notion_pages,
             review_push_plan,

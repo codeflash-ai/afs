@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AlertTriangle,
+  Bot,
   Check,
   ChevronRight,
   Clipboard,
@@ -96,6 +97,22 @@ type PushPlan = {
 type ActionReport = {
   ok: boolean;
   message: string;
+};
+
+type AgentGuidanceStatus = "installed" | "available" | "failed";
+
+type AgentGuidanceTarget = {
+  agent: string;
+  status: AgentGuidanceStatus;
+  path?: string | null;
+  detail: string;
+};
+
+type AgentGuidanceInstallReport = {
+  ok: boolean;
+  command: string;
+  targets: AgentGuidanceTarget[];
+  prompt: string;
 };
 
 type InstallStateReview = {
@@ -206,6 +223,38 @@ const sampleSearchResults: LocatedItem[] = [
     state: "online_only",
   },
 ];
+
+function suggestedAgentPrompt(mountPath: string) {
+  return `Use AFS to edit my Notion workspace. Open the Notion files under ${mountPath}, make the requested edits directly in Markdown, and leave the changes pending for AFS review.`;
+}
+
+function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
+  return {
+    ok: true,
+    command: "install_agent_guidance",
+    prompt: suggestedAgentPrompt(mountPath),
+    targets: [
+      {
+        agent: "Claude Code / Claude Desktop / Claude Cowork",
+        status: "installed",
+        path: "~/.claude/skills/afs/SKILL.md",
+        detail: "Installed the AFS skill for Claude local agents.",
+      },
+      {
+        agent: "Codex",
+        status: "installed",
+        path: "~/.codex/skills/afs/SKILL.md",
+        detail: "Installed the AFS skill for Codex.",
+      },
+      {
+        agent: "Warp",
+        status: "installed",
+        path: "~/.agents/skills/afs/SKILL.md",
+        detail: "Installed the AFS skill for Warp.",
+      },
+    ],
+  };
+}
 
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -517,6 +566,36 @@ function Onboarding({
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [mountError, setMountError] = useState("");
+  const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
+  const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
+
+  async function installAgentGuidance(path: string) {
+    setAgentGuidanceState("installing");
+    try {
+      const report = await callCommand<AgentGuidanceInstallReport>(
+        "install_agent_guidance",
+        { mountPath: path },
+        sampleAgentGuidanceReport(path),
+      );
+      setAgentGuidanceReport(report);
+      setAgentGuidanceState(report.ok ? "ready" : "error");
+    } catch (error) {
+      setAgentGuidanceReport({
+        ok: false,
+        command: "install_agent_guidance",
+        prompt: suggestedAgentPrompt(path),
+        targets: [
+          {
+            agent: "Agent instructions",
+            status: "failed",
+            path: null,
+            detail: errorMessage(error),
+          },
+        ],
+      });
+      setAgentGuidanceState("error");
+    }
+  }
 
   useEffect(() => {
     setConnectedWorkspace(snapshot.connection.workspaceName);
@@ -562,6 +641,13 @@ function Onboarding({
       return current < 4 ? 4 : current;
     });
   }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
+
+  useEffect(() => {
+    if (step !== 4 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
+      return;
+    }
+    void installAgentGuidance(mountPath);
+  }, [agentGuidanceState, mountPath, snapshot.mount.status, step]);
 
   async function startConnect() {
     setOauthError("");
@@ -627,6 +713,7 @@ function Onboarding({
     );
     setMountPathDirty(false);
     setMountPath(nextSnapshot.mount.localPath);
+    await installAgentGuidance(nextSnapshot.mount.localPath);
     setStep(4);
   }
 
@@ -809,6 +896,7 @@ function Onboarding({
               If Finder asks to enable the AFS File Provider, click Enable once. macOS requires
               this approval before showing the Notion files.
             </p>
+            <AgentGuidanceSummary report={agentGuidanceReport} state={agentGuidanceState} />
             <LocateBox
               label="Open a Notion page"
               value={locateUrl}
@@ -835,14 +923,16 @@ function Onboarding({
               </div>
               <div className="agent-prompt-row">
                 <div className="agent-demo-command">
-                  Find the Q4 launch plan and make it sharper for leadership review.
+                  {agentGuidanceReport?.prompt ||
+                    `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`}
                 </div>
                 <SecondaryButton
                   compact
                   icon={<Copy />}
                   onClick={() =>
                     copyText(
-                      `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`,
+                      agentGuidanceReport?.prompt ||
+                        `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`,
                     )
                   }
                 >
@@ -854,6 +944,55 @@ function Onboarding({
         )}
       </section>
     </main>
+  );
+}
+
+function AgentGuidanceSummary({
+  report,
+  state,
+}: {
+  report: AgentGuidanceInstallReport | null;
+  state: "idle" | "installing" | "ready" | "error";
+}) {
+  const visibleTargets = report?.targets.filter((target) => target.status === "installed").slice(0, 5) || [];
+  const fallbackTargets = report?.targets.filter((target) => target.status === "available").slice(0, 2) || [];
+  const failed = report?.targets.some((target) => target.status === "failed") || state === "error";
+  const title =
+    state === "installing"
+      ? "Installing agent skills"
+      : failed
+        ? "Agent skills need attention"
+        : report
+          ? "Agent skills installed"
+          : "Preparing agent skills";
+
+  return (
+    <div className={`agent-guidance-card ${failed ? "warning" : ""}`}>
+      <div className="agent-demo-title">
+        {state === "installing" ? <Loader2 className="spin-icon" /> : failed ? <AlertTriangle /> : <Bot />}
+        <span>{title}</span>
+      </div>
+      {state === "installing" && <p>AFS is teaching installed local agents how to use the Notion folder.</p>}
+      {state !== "installing" && visibleTargets.length > 0 && (
+        <div className="agent-guidance-list">
+          {visibleTargets.map((target) => (
+            <div className="agent-guidance-row" key={`${target.agent}-${target.path || target.status}`}>
+              <Check />
+              <div>
+                <strong>{target.agent}</strong>
+                {target.path && <code>{target.path}</code>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {state !== "installing" && visibleTargets.length === 0 && fallbackTargets.length > 0 && (
+        <p>{fallbackTargets[0].detail}</p>
+      )}
+      {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
+        <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
+      )}
+    </div>
   );
 }
 
@@ -1477,6 +1616,8 @@ function SettingsView({
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
   const [settingsMessage, setSettingsMessage] = useState("");
   const [resetMessage, setResetMessage] = useState("");
+  const [agentMessage, setAgentMessage] = useState("");
+  const [installingAgents, setInstallingAgents] = useState(false);
   const [resettingState, setResettingState] = useState(false);
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
@@ -1569,6 +1710,29 @@ function SettingsView({
     }
   }
 
+  async function installAgentInstructions() {
+    setAgentMessage("");
+    setInstallingAgents(true);
+    try {
+      const report = await callCommand<AgentGuidanceInstallReport>(
+        "install_agent_guidance",
+        { mountPath: snapshot.mount.localPath },
+        sampleAgentGuidanceReport(snapshot.mount.localPath),
+      );
+      const installed = report.targets.filter((target) => target.status === "installed").length;
+      const failed = report.targets.filter((target) => target.status === "failed").length;
+      setAgentMessage(
+        failed > 0
+          ? `Installed ${installed} agent instruction target(s); ${failed} failed.`
+          : `Installed ${installed} agent instruction target(s).`,
+      );
+    } catch (error) {
+      setAgentMessage(errorMessage(error));
+    } finally {
+      setInstallingAgents(false);
+    }
+  }
+
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Settings" title="AFS controls" />
@@ -1597,6 +1761,21 @@ function SettingsView({
           <SettingRow title="Local edits" value="Pending until reviewed" />
           <SettingRow title="Push confirmation" value="Require for large changes" />
           <SettingRow title="Default new mount mode" value="Edit enabled" />
+        </div>
+
+        <div className="panel">
+          <PanelTitle title="Agent Instructions" />
+          <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
+          <SettingRow title="Notion guidance" value="Installed under /AFS/notion" />
+          <SecondaryButton
+            compact
+            icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
+            disabled={installingAgents}
+            onClick={() => void installAgentInstructions()}
+          >
+            {installingAgents ? "Installing" : "Install Agent Skills"}
+          </SecondaryButton>
+          {agentMessage && <p className="quiet-note inline-note">{agentMessage}</p>}
         </div>
 
         <div className="panel">
