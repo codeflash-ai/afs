@@ -204,7 +204,6 @@ const TRAY_POPOVER_WIDTH: f64 = 360.0;
 const TRAY_POPOVER_HEIGHT: f64 = 520.0;
 const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
 const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
-const TERMINAL_CLI_LINK_PATH: &str = "/usr/local/bin/afs";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TrayVisualState {
@@ -2191,7 +2190,7 @@ fn install_terminal_cli_link() -> Result<PathBuf, String> {
         return Err("The packaged AFS CLI was not found in this app bundle.".to_string());
     };
 
-    install_terminal_cli_link_at(&cli_path, Path::new(TERMINAL_CLI_LINK_PATH), true)
+    install_terminal_cli_link_in_path(&cli_path)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2200,11 +2199,7 @@ enum TerminalCliLinkState {
     NeedsInstall,
 }
 
-fn install_terminal_cli_link_at(
-    cli_path: &Path,
-    link_path: &Path,
-    allow_admin_prompt: bool,
-) -> Result<PathBuf, String> {
+fn install_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<PathBuf, String> {
     let cli_path = absolute_path(cli_path)?;
     if !cli_path.is_file() {
         return Err(format!(
@@ -2218,17 +2213,11 @@ fn install_terminal_cli_link_at(
         TerminalCliLinkState::NeedsInstall => {}
     }
 
-    match install_terminal_cli_link_direct(&cli_path, link_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied && allow_admin_prompt => {
-            install_terminal_cli_link_with_admin_prompt(&cli_path, link_path)?;
-        }
-        Err(error) => {
-            return Err(format!(
-                "Could not install the AFS terminal command at {}: {error}",
-                link_path.display()
-            ));
-        }
+    if let Err(error) = install_terminal_cli_link_direct(&cli_path, link_path) {
+        return Err(format!(
+            "Could not install the AFS terminal command at {}: {error}",
+            link_path.display()
+        ));
     }
 
     match terminal_cli_link_state(link_path, &cli_path)? {
@@ -2237,6 +2226,62 @@ fn install_terminal_cli_link_at(
             "Could not verify the AFS terminal command at {}.",
             link_path.display()
         )),
+    }
+}
+
+fn install_terminal_cli_link_in_path(cli_path: &Path) -> Result<PathBuf, String> {
+    let dirs = terminal_cli_path_dirs();
+    install_terminal_cli_link_in_path_dirs(cli_path, dirs)
+}
+
+fn install_terminal_cli_link_in_path_dirs(
+    cli_path: &Path,
+    dirs: Vec<PathBuf>,
+) -> Result<PathBuf, String> {
+    let mut errors = Vec::new();
+    let mut checked = Vec::new();
+
+    for directory in dirs {
+        checked.push(directory.display().to_string());
+        let link_path = directory.join("afs");
+        match install_terminal_cli_link_at(cli_path, &link_path) {
+            Ok(path) => return Ok(path),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    let checked = if checked.is_empty() {
+        "none".to_string()
+    } else {
+        checked.join(", ")
+    };
+    let detail = errors
+        .last()
+        .map(|error| format!(" Last error: {error}"))
+        .unwrap_or_default();
+
+    Err(format!(
+        "Could not install the AFS terminal command without administrator privileges. Add a user-writable directory such as ~/.local/bin to PATH, then try again. Checked PATH directories: {checked}.{detail}"
+    ))
+}
+
+fn terminal_cli_path_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        append_path_dirs(&mut dirs, path);
+    }
+    if let Some(path) = login_shell_path() {
+        append_path_dirs(&mut dirs, path);
+    }
+    dirs
+}
+
+fn append_path_dirs(dirs: &mut Vec<PathBuf>, path: std::ffi::OsString) {
+    for directory in std::env::split_paths(&path) {
+        if !directory.is_absolute() || dirs.iter().any(|existing| existing == &directory) {
+            continue;
+        }
+        dirs.push(directory);
     }
 }
 
@@ -2322,82 +2367,26 @@ fn install_terminal_cli_link_direct(_cli_path: &Path, _link_path: &Path) -> io::
 }
 
 #[cfg(target_os = "macos")]
-fn install_terminal_cli_link_with_admin_prompt(
-    cli_path: &Path,
-    link_path: &Path,
-) -> Result<(), String> {
-    let parent = link_path.parent().ok_or_else(|| {
-        format!(
-            "Terminal command path {} has no parent.",
-            link_path.display()
-        )
-    })?;
-    let script = format!(
-        "set -e; mkdir -p {parent}; if [ -L {link} ] || [ ! -e {link} ]; then rm -f {link}; ln -s {cli} {link}; else exit 17; fi",
-        parent = shell_quote_path(parent),
-        link = shell_quote_path(link_path),
-        cli = shell_quote_path(cli_path),
-    );
-    let expression = format!(
-        "do shell script {} with administrator privileges",
-        applescript_string(&script)
-    );
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(expression)
+fn login_shell_path() -> Option<std::ffi::OsString> {
+    let shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+    let output = Command::new(shell)
+        .args(["-lc", "printf '%s' \"$PATH\""])
         .output()
-        .map_err(|error| {
-            format!(
-                "Could not request permission to install {}: {error}",
-                link_path.display()
-            )
-        })?;
-
-    if output.status.success() {
-        return Ok(());
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
     }
-
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if output.status.code() == Some(17) {
-        return Err(format!(
-            "A file already exists at {}. Move it aside so AFS can install the bundled CLI there.",
-            link_path.display()
-        ));
-    }
-    if detail.is_empty() {
-        Err(format!(
-            "Could not install the AFS terminal command at {}.",
-            link_path.display()
-        ))
-    } else {
-        Err(format!(
-            "Could not install the AFS terminal command at {}: {detail}",
-            link_path.display()
-        ))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn install_terminal_cli_link_with_admin_prompt(
-    _cli_path: &Path,
-    link_path: &Path,
-) -> Result<(), String> {
-    Err(format!(
-        "Could not install the AFS terminal command at {} without write permission.",
-        link_path.display()
+    Some(std::ffi::OsString::from(
+        String::from_utf8_lossy(&output.stdout).to_string(),
     ))
 }
 
-fn shell_quote_path(path: &Path) -> String {
-    shell_quote(&path.display().to_string())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn applescript_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+#[cfg(not(target_os = "macos"))]
+fn login_shell_path() -> Option<std::ffi::OsString> {
+    None
 }
 
 fn find_command_in_path(command: &str) -> Option<PathBuf> {
@@ -3007,11 +2996,12 @@ mod tests {
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
         TrayVisualState, clear_state_root_contents, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, inspect_install_state,
-        install_terminal_cli_link_at, is_unsupported_schema_version_message, load_desktop_activity,
-        notion_id_from_url, record_current_install_marker, record_desktop_activity,
-        should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
-        tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
+        record_current_install_marker, record_desktop_activity, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
+        virtual_projection_refresh_signal_identifiers,
     };
 
     #[test]
@@ -3317,7 +3307,7 @@ mod tests {
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
         fs::write(&cli, b"afs cli").expect("write cli");
 
-        let installed = install_terminal_cli_link_at(&cli, &link, false).expect("install cli link");
+        let installed = install_terminal_cli_link_at(&cli, &link).expect("install cli link");
 
         assert_eq!(installed, link);
         assert_eq!(
@@ -3341,7 +3331,7 @@ mod tests {
         fs::write(&new_cli, b"new afs cli").expect("write new cli");
         std::os::unix::fs::symlink(&old_cli, &link).expect("create stale link");
 
-        install_terminal_cli_link_at(&new_cli, &link, false).expect("refresh cli link");
+        install_terminal_cli_link_at(&new_cli, &link).expect("refresh cli link");
 
         assert_eq!(fs::read_link(&link).expect("read cli link"), new_cli);
     }
@@ -3357,12 +3347,36 @@ mod tests {
         fs::write(&cli, b"afs cli").expect("write cli");
         fs::write(&link, b"existing command").expect("write existing command");
 
-        let error =
-            install_terminal_cli_link_at(&cli, &link, false).expect_err("regular file rejected");
+        let error = install_terminal_cli_link_at(&cli, &link).expect_err("regular file rejected");
 
         assert!(error.contains("A file already exists"));
         assert_eq!(
             fs::read_to_string(&link).expect("read existing command"),
+            "existing command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cli_installer_uses_later_path_directory_without_admin() {
+        let temp = TestTempDir::new("terminal-cli-path-dirs");
+        let cli = temp.path().join("app/afs");
+        let occupied = temp.path().join("occupied-bin");
+        let writable = temp.path().join("writable-bin");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::create_dir_all(&occupied).expect("create occupied dir");
+        fs::create_dir_all(&writable).expect("create writable dir");
+        fs::write(&cli, b"afs cli").expect("write cli");
+        fs::write(occupied.join("afs"), b"existing command").expect("write occupied command");
+
+        let installed =
+            install_terminal_cli_link_in_path_dirs(&cli, vec![occupied.clone(), writable.clone()])
+                .expect("install cli link in path");
+
+        assert_eq!(installed, writable.join("afs"));
+        assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
+        assert_eq!(
+            fs::read_to_string(occupied.join("afs")).expect("read occupied command"),
             "existing command"
         );
     }
