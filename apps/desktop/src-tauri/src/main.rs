@@ -42,11 +42,9 @@ use afs_store::{
 use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
-#[cfg(target_os = "macos")]
-use afsd::virtual_fs::source_root_directory_name;
 use afsd::virtual_fs::{
-    source_root_identifier, virtual_fs_content_base, virtual_fs_content_path,
-    virtual_fs_content_root,
+    source_root_directory_name, source_root_identifier, virtual_fs_content_base,
+    virtual_fs_content_path, virtual_fs_content_root,
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -797,9 +795,9 @@ fn mount_summary(
             workspace_name: connection
                 .and_then(|connection| connection.workspace_name.clone())
                 .unwrap_or_else(|| "No Notion folder".to_string()),
-            local_path: display_path(&default_notion_mount_root()),
+            local_path: display_path(&default_notion_access_root()),
             notion_url: None,
-            projection: "macOS File Provider".to_string(),
+            projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
             status: "not_mounted".to_string(),
         };
@@ -1937,6 +1935,12 @@ fn mount_access_root(mount: &MountConfig) -> PathBuf {
         }
     }
 
+    if mount.projection == ProjectionMode::LinuxFuse {
+        return mount
+            .root
+            .join(source_root_directory_name(&mount.connector));
+    }
+
     mount.root.clone()
 }
 
@@ -1987,13 +1991,29 @@ fn default_notion_mount_root() -> PathBuf {
         macos_afs_cloud_storage_root().join(source_root_directory_name("notion"))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(home) = home_dir() {
+            return home.join("Documents").join("AFS");
+        }
+        PathBuf::from("AFS")
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         if let Ok(home) = home_dir() {
             return home.join("Documents").join("AFS").join("Notion");
         }
         PathBuf::from("AFS").join("Notion")
     }
+}
+
+fn default_notion_access_root() -> PathBuf {
+    let root = default_notion_mount_root();
+    if desktop_projection_mode() == ProjectionMode::LinuxFuse {
+        return root.join(source_root_directory_name("notion"));
+    }
+    root
 }
 
 #[cfg(target_os = "macos")]
@@ -2052,6 +2072,18 @@ fn normalize_desktop_mount_root(root: &Path) -> Result<PathBuf, String> {
     {
         if root == macos_cloud_storage_dir() || root == macos_afs_cloud_storage_root() {
             return Ok(default_notion_mount_root());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(&source_root_directory_name("notion")))
+            && let Some(parent) = root.parent()
+        {
+            return Ok(parent.to_path_buf());
         }
     }
 
@@ -2954,7 +2986,8 @@ fn virtual_mount_for_path(path: &Path) -> Option<MountConfig> {
 fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
     match mount.projection {
         ProjectionMode::MacosFileProvider => open_macos_virtual_projection(mount),
-        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => open_in_file_manager(&mount.root),
+        ProjectionMode::LinuxFuse => open_in_file_manager(&mount_access_root(mount)),
+        ProjectionMode::PlainFiles => open_in_file_manager(&mount.root),
     }
 }
 
@@ -3508,6 +3541,69 @@ mod tests {
         let root = temp.path().join("Notion");
 
         validate_mount_root(&root, &temp.path().join(".afs")).expect("valid child path");
+    }
+
+    #[test]
+    fn linux_fuse_mount_access_root_points_at_connector_directory() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+            .projection(ProjectionMode::LinuxFuse);
+
+        assert_eq!(
+            super::mount_access_root(&mount),
+            std::path::PathBuf::from("/tmp/AFS/notion")
+        );
+    }
+
+    #[test]
+    fn plain_mount_access_root_stays_at_mount_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+            .projection(ProjectionMode::PlainFiles);
+
+        assert_eq!(
+            super::mount_access_root(&mount),
+            std::path::PathBuf::from("/tmp/AFS")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_notion_mount_root_is_shared_afs_root() {
+        let home = super::home_dir().expect("home dir");
+
+        assert_eq!(
+            super::default_notion_mount_root(),
+            home.join("Documents").join("AFS")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_notion_access_root_is_connector_directory() {
+        let home = super::home_dir().expect("home dir");
+
+        assert_eq!(
+            super::default_notion_access_root(),
+            home.join("Documents").join("AFS").join("notion")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mount_summary_without_mount_reports_linux_fuse_projection() {
+        assert_eq!(super::mount_summary(None, None).projection, "Linux FUSE");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_mount_normalizes_selected_connector_directory_to_shared_root() {
+        let home = super::home_dir().expect("home dir");
+        let selected = home.join("Documents").join("AFS").join("notion");
+
+        assert_eq!(
+            super::resolve_desktop_mount_root(&selected.display().to_string())
+                .expect("resolve mount root"),
+            home.join("Documents").join("AFS")
+        );
     }
 
     #[cfg(target_os = "macos")]
