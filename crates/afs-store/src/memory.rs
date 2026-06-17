@@ -193,12 +193,18 @@ impl EntityRepository for InMemoryStateStore {
     }
 
     fn list_entities(&self, mount_id: &MountId) -> StoreResult<Vec<EntityRecord>> {
-        Ok(self
+        let mut entities = self
             .entities
             .iter()
             .filter(|((entry_mount_id, _), _)| entry_mount_id == mount_id)
             .map(|(_, entity)| entity.clone())
-            .collect())
+            .collect::<Vec<_>>();
+        entities.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.remote_id.0.cmp(&right.remote_id.0))
+        });
+        Ok(entities)
     }
 
     fn delete_entity(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> StoreResult<()> {
@@ -287,12 +293,18 @@ impl VirtualMutationRepository for InMemoryStateStore {
         &self,
         mount_id: &MountId,
     ) -> StoreResult<Vec<VirtualMutationRecord>> {
-        Ok(self
+        let mut mutations = self
             .virtual_mutations
             .values()
             .filter(|mutation| mutation.mount_id == *mount_id)
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        mutations.sort_by(|left, right| {
+            left.projected_path
+                .cmp(&right.projected_path)
+                .then_with(|| left.local_id.cmp(&right.local_id))
+        });
+        Ok(mutations)
     }
 
     fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()> {
@@ -326,12 +338,18 @@ impl RemoteObservationRepository for InMemoryStateStore {
         &self,
         mount_id: &MountId,
     ) -> StoreResult<Vec<RemoteObservationRecord>> {
-        Ok(self
+        let mut observations = self
             .remote_observations
             .values()
             .filter(|observation| observation.mount_id == *mount_id)
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        observations.sort_by(|left, right| {
+            left.projected_path
+                .cmp(&right.projected_path)
+                .then_with(|| left.remote_id.0.cmp(&right.remote_id.0))
+        });
+        Ok(observations)
     }
 
     fn delete_remote_observation(

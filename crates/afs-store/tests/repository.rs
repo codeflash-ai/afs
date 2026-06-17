@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::journal::{
@@ -10,7 +10,8 @@ use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
     InMemoryStateStore, JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, StoreError,
+    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 
 #[test]
@@ -101,6 +102,29 @@ fn duplicate_entity_path_in_same_mount_is_rejected() {
 }
 
 #[test]
+fn entity_lists_are_ordered_by_projected_path() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_entity(entity_record("page-a", "Zebra.md"))
+        .expect("save first entity");
+    store
+        .save_entity(entity_record("page-b", "Alpha.md"))
+        .expect("save second entity");
+
+    let paths = store
+        .list_entities(&mount_id())
+        .expect("list entities")
+        .into_iter()
+        .map(|entity| entity.path)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        paths,
+        vec![PathBuf::from("Alpha.md"), PathBuf::from("Zebra.md")]
+    );
+}
+
+#[test]
 fn shadow_document_round_trips_through_snapshot_record() {
     let mut store = InMemoryStateStore::new();
     let shadow = shadow_document();
@@ -156,6 +180,52 @@ fn remote_observations_track_latest_seen_remote_metadata() {
             .list_remote_observations(&mount_id())
             .expect("list observations"),
         vec![observation]
+    );
+}
+
+#[test]
+fn remote_observations_are_ordered_by_projected_path() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_remote_observation(remote_observation("page-a", "Zebra.md"))
+        .expect("save first observation");
+    store
+        .save_remote_observation(remote_observation("page-b", "Alpha.md"))
+        .expect("save second observation");
+
+    let paths = store
+        .list_remote_observations(&mount_id())
+        .expect("list observations")
+        .into_iter()
+        .map(|observation| observation.projected_path)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        paths,
+        vec![PathBuf::from("Alpha.md"), PathBuf::from("Zebra.md")]
+    );
+}
+
+#[test]
+fn virtual_mutations_are_ordered_by_projected_path() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_virtual_mutation(virtual_mutation("local:a", "Zebra.md"))
+        .expect("save first mutation");
+    store
+        .save_virtual_mutation(virtual_mutation("local:z", "Alpha.md"))
+        .expect("save second mutation");
+
+    let paths = store
+        .list_virtual_mutations(&mount_id())
+        .expect("list mutations")
+        .into_iter()
+        .map(|mutation| mutation.projected_path)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        paths,
+        vec![PathBuf::from("Alpha.md"), PathBuf::from("Zebra.md")]
     );
 }
 
@@ -261,6 +331,33 @@ fn entity_record(remote_id: &str, path: &str) -> EntityRecord {
         "Roadmap",
         path,
     )
+}
+
+fn remote_observation(remote_id: &str, path: &str) -> RemoteObservationRecord {
+    RemoteObservationRecord::new(
+        mount_id(),
+        RemoteId::new(remote_id),
+        EntityKind::Page,
+        "Roadmap",
+        path,
+        "2026-06-15T00:00:00Z",
+    )
+}
+
+fn virtual_mutation(local_id: &str, path: &str) -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: mount_id(),
+        local_id: local_id.to_string(),
+        mutation_kind: VirtualMutationKind::Create,
+        target_remote_id: None,
+        parent_remote_id: None,
+        original_path: None,
+        projected_path: PathBuf::from(path),
+        title: "Roadmap".to_string(),
+        content_path: None,
+        created_at: "2026-06-15T00:00:00Z".to_string(),
+        updated_at: "2026-06-15T00:00:00Z".to_string(),
+    }
 }
 
 fn shadow_document() -> ShadowDocument {
