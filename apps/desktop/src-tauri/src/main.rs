@@ -18,6 +18,7 @@ use afs_cli::file_provider::{
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
+use afs_cli::pull::{PullReport, run_pull_with_state_root};
 use afs_cli::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
 use afs_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
@@ -465,6 +466,31 @@ async fn push_to_notion(app: AppHandle, confirm_dangerous: Option<bool>) -> Acti
         Err(error) => ActionReport {
             ok: false,
             message: format!("Push worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
+async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match pull_target_direct(&target) {
+            Ok(report) => ActionReport {
+                ok: true,
+                message: pull_report_message(&report),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Pull worker failed: {error}"),
         },
     };
 
@@ -3079,12 +3105,27 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
     .map_err(|error| error.to_string())
 }
 
+fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
+        .map_err(|error| error.message())?;
+
+    run_pull_with_state_root(&mut store, &connector, target, Some(&state_root))
+        .map_err(|error| error.message())
+}
+
 fn push_report_message(report: &PushReport) -> String {
     push_action_message(report.action.as_str(), report.ok, report.message.as_deref())
 }
 
 fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String {
     match message {
+        Some(message) if is_remote_changed_push_message(message) => {
+            "Notion has newer changes than your last sync. Click Resolve on this file to pull the latest version, resolve any conflict markers if AFS writes them, then push again.".to_string()
+        }
         Some(message) if !message.is_empty() => message.to_string(),
         _ if ok => "Pushed changes to Notion.".to_string(),
         _ if action == "confirm_dangerous_plan" => {
@@ -3098,6 +3139,26 @@ fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String 
         }
         _ => format!("Push stopped: {action}"),
     }
+}
+
+fn pull_report_message(report: &PullReport) -> String {
+    if !report.conflicts.is_empty() {
+        return "Pulled the latest Notion version and wrote conflict markers into the local file. Open the file, resolve the markers, then push again.".to_string();
+    }
+    if report.hydrated > 0 {
+        return "Synced the latest Notion version for this file.".to_string();
+    }
+    if report.skipped_dirty > 0 {
+        return "AFS kept your local edits because the file is still dirty. Review the diff, then push or restore the file.".to_string();
+    }
+    if report.enumerated > 0 || report.stubbed > 0 {
+        return "Synced the latest Notion index for this mount.".to_string();
+    }
+    "Pulled the latest Notion content.".to_string()
+}
+
+fn is_remote_changed_push_message(message: &str) -> bool {
+    message.contains("changed since last sync") && message.contains("remote entity")
 }
 
 fn join_mount_path(mount_path: &str, relative_path: &str) -> String {
@@ -3134,8 +3195,8 @@ mod tests {
         current_daemon_build_id, current_desktop_build_id, inspect_install_state,
         install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        push_action_message, record_current_install_marker, record_desktop_activity,
-        should_hide_tray_popover, should_prioritize_located_result,
+        pull_report_message, push_action_message, record_current_install_marker,
+        record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
         state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
         tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
     };
@@ -3341,6 +3402,42 @@ mod tests {
             push_action_message("confirm_dangerous_plan", false, Some("custom")),
             "custom"
         );
+    }
+
+    #[test]
+    fn push_action_message_explains_remote_changed_recovery() {
+        let message = push_action_message(
+            "apply_failed",
+            false,
+            Some(
+                "guardrail blocked push: remote entity `abc` changed since last sync (expected remote_edited_at `2026-06-17T05:45:00.000Z`, found `2026-06-17T06:21:00.000Z`)",
+            ),
+        );
+
+        assert!(message.contains("Click Resolve"));
+        assert!(message.contains("pull the latest version"));
+    }
+
+    #[test]
+    fn pull_report_message_explains_conflict_markers() {
+        let report = afs_cli::pull::PullReport {
+            ok: false,
+            command: "pull".to_string(),
+            via: "cli".to_string(),
+            mount_id: "notion-main".to_string(),
+            root: "/tmp/notion".to_string(),
+            target: "/tmp/notion/page.md".to_string(),
+            enumerated: 0,
+            stubbed: 0,
+            hydrated: 0,
+            skipped_dirty: 1,
+            conflicts: vec![afsd::pull::PullConflict {
+                path: "page.md".to_string(),
+                remote_id: "abc".to_string(),
+            }],
+        };
+
+        assert!(pull_report_message(&report).contains("conflict markers"));
     }
 
     #[test]
@@ -3833,6 +3930,7 @@ fn main() {
             search_notion_pages,
             review_push_plan,
             push_to_notion,
+            pull_notion_file,
             open_path,
             reveal_path,
             show_main_window,
