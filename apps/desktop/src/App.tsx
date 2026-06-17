@@ -1112,6 +1112,7 @@ function MainShell({
           {view === "mount" && (
             <MountDetailView
               snapshot={snapshot}
+              onHome={() => onViewChange("home")}
               onRefresh={onRefresh}
               onReview={() => onViewChange("pending")}
             />
@@ -1119,6 +1120,7 @@ function MainShell({
           {view === "pending" && (
             <PendingView
               snapshot={snapshot}
+              onHome={() => onViewChange("home")}
               onReview={() => onViewChange("review")}
               onRefresh={onRefresh}
             />
@@ -1126,14 +1128,17 @@ function MainShell({
           {view === "review" && (
             <ReviewView
               snapshot={snapshot}
+              onHome={() => onViewChange("home")}
+              onPending={() => onViewChange("pending")}
               onRefresh={onRefresh}
               onDone={() => onViewChange("activity")}
             />
           )}
-          {view === "activity" && <ActivityView snapshot={snapshot} />}
+          {view === "activity" && <ActivityView snapshot={snapshot} onHome={() => onViewChange("home")} />}
           {view === "settings" && (
             <SettingsView
               snapshot={snapshot}
+              onHome={() => onViewChange("home")}
               onRefresh={onRefresh}
               onResetComplete={onResetComplete}
             />
@@ -1346,10 +1351,12 @@ function HomeView({
 
 function MountDetailView({
   snapshot,
+  onHome,
   onRefresh,
   onReview,
 }: {
   snapshot: DesktopSnapshot;
+  onHome: () => void;
   onRefresh: () => Promise<void>;
   onReview: () => void;
 }) {
@@ -1394,6 +1401,7 @@ function MountDetailView({
 
   return (
     <div className="view-stack">
+      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mount" }]} />
       <ViewHeader eyebrow="Mount" title={snapshot.mount.workspaceName}>
         <StatusPill
           tone={healthTone(snapshot.health.state)}
@@ -1499,10 +1507,12 @@ function MountDetailView({
 
 function PendingView({
   snapshot,
+  onHome,
   onReview,
   onRefresh,
 }: {
   snapshot: DesktopSnapshot;
+  onHome: () => void;
   onReview: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -1518,10 +1528,14 @@ function PendingView({
     setPushState("pushing");
     setPushMessage("");
     try {
-      const report = await callCommand<ActionReport>("push_to_notion", undefined, {
-        ok: true,
-        message: "Pushed changes to Notion.",
-      });
+      const report = await callCommand<ActionReport>(
+        "push_to_notion",
+        { confirmDangerous: false },
+        {
+          ok: true,
+          message: "Pushed changes to Notion.",
+        },
+      );
       if (!report.ok) {
         setPushState("error");
         setPushMessage(report.message);
@@ -1540,6 +1554,7 @@ function PendingView({
 
   return (
     <div className="view-stack">
+      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending" }]} />
       <ViewHeader eyebrow="Pending" title="Pending Changes">
         <div className="button-row">
           <SecondaryButton
@@ -1579,10 +1594,14 @@ function PendingView({
 
 function ReviewView({
   snapshot,
+  onHome,
+  onPending,
   onRefresh,
   onDone,
 }: {
   snapshot: DesktopSnapshot;
+  onHome: () => void;
+  onPending: () => void;
   onRefresh: () => Promise<void>;
   onDone: () => void;
 }) {
@@ -1614,10 +1633,14 @@ function ReviewView({
     setPushState("pushing");
     setPushMessage("");
     try {
-      const report = await callCommand<ActionReport>("push_to_notion", undefined, {
-        ok: true,
-        message: "Pushed changes to Notion.",
-      });
+      const report = await callCommand<ActionReport>(
+        "push_to_notion",
+        { confirmDangerous: true },
+        {
+          ok: true,
+          message: "Pushed changes to Notion.",
+        },
+      );
       if (!report.ok) {
         setPushState("error");
         setPushMessage(report.message);
@@ -1650,6 +1673,7 @@ function ReviewView({
 
   return (
     <div className="view-stack">
+      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending", onClick: onPending }, { label: "Review" }]} />
       <ViewHeader eyebrow="Review Push" title={plan.title}>
         <StatusPill
           tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}
@@ -1693,7 +1717,7 @@ function ReviewView({
   );
 }
 
-function ActivityView({ snapshot }: { snapshot: DesktopSnapshot }) {
+function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: () => void }) {
   const grouped = useMemo(() => {
     return snapshot.activity.reduce<Record<string, ActivityItem[]>>((acc, item) => {
       acc[item.when] = [...(acc[item.when] ?? []), item];
@@ -1703,6 +1727,7 @@ function ActivityView({ snapshot }: { snapshot: DesktopSnapshot }) {
 
   return (
     <div className="view-stack">
+      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Activity" }]} />
       <ViewHeader eyebrow="Activity" title="Recent activity" />
       {Object.entries(grouped).map(([when, items]) => (
         <section className="activity-group" key={when}>
@@ -1729,10 +1754,12 @@ function ActivityView({ snapshot }: { snapshot: DesktopSnapshot }) {
 
 function SettingsView({
   snapshot,
+  onHome,
   onRefresh,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
+  onHome: () => void;
   onRefresh: () => Promise<void>;
   onResetComplete: () => void;
 }) {
@@ -1858,6 +1885,7 @@ function SettingsView({
 
   return (
     <div className="view-stack">
+      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Settings" }]} />
       <ViewHeader eyebrow="Settings" title="AFS controls" />
 
       <section className="settings-grid">
@@ -2255,6 +2283,24 @@ function AgentPrompt() {
         <p>"Edit this Notion file and make the launch plan clearer."</p>
       </div>
     </div>
+  );
+}
+
+function Breadcrumbs({ items }: { items: { label: string; onClick?: () => void }[] }) {
+  return (
+    <nav className="breadcrumbs" aria-label="Breadcrumb">
+      {items.map((item, index) => (
+        <span key={`${item.label}-${index}`}>
+          {item.onClick ? (
+            <button type="button" onClick={item.onClick}>
+              {item.label}
+            </button>
+          ) : (
+            <strong>{item.label}</strong>
+          )}
+        </span>
+      ))}
+    </nav>
   );
 }
 

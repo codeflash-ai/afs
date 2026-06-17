@@ -455,8 +455,12 @@ fn review_push_plan() -> PushPlan {
 }
 
 #[tauri::command]
-async fn push_to_notion(app: AppHandle) -> ActionReport {
-    let report = match tauri::async_runtime::spawn_blocking(push_to_notion_blocking).await {
+async fn push_to_notion(app: AppHandle, confirm_dangerous: Option<bool>) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        push_to_notion_blocking(confirm_dangerous.unwrap_or(false))
+    })
+    .await
+    {
         Ok(report) => report,
         Err(error) => ActionReport {
             ok: false,
@@ -468,7 +472,7 @@ async fn push_to_notion(app: AppHandle) -> ActionReport {
     report
 }
 
-fn push_to_notion_blocking() -> ActionReport {
+fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
     let Ok(snapshot) = load_desktop_snapshot() else {
         return ActionReport {
             ok: false,
@@ -489,7 +493,7 @@ fn push_to_notion_blocking() -> ActionReport {
             &change.local_path,
         ))
         .unwrap_or_else(|_| PathBuf::from(&change.local_path));
-        match push_target_direct(&target) {
+        match push_target_direct(&target, confirm_dangerous) {
             Ok(report) if push_report_exit_code(&report) == 0 => {
                 pushed += 1;
             }
@@ -3055,7 +3059,7 @@ fn reusable_notion_connection_id(store: &SqliteStateStore) -> Option<ConnectionI
         .map(|connection| connection.connection_id)
 }
 
-fn push_target_direct(target: &Path) -> Result<PushReport, String> {
+fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
@@ -3069,17 +3073,30 @@ fn push_target_direct(target: &Path) -> Result<PushReport, String> {
         target,
         PushOptions {
             assume_yes: true,
-            confirm_dangerous: false,
+            confirm_dangerous,
         },
     )
     .map_err(|error| error.to_string())
 }
 
 fn push_report_message(report: &PushReport) -> String {
-    match report.message.as_deref() {
+    push_action_message(report.action.as_str(), report.ok, report.message.as_deref())
+}
+
+fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String {
+    match message {
         Some(message) if !message.is_empty() => message.to_string(),
-        _ if report.ok => "Pushed changes to Notion.".to_string(),
-        _ => format!("Push stopped: {}", report.action),
+        _ if ok => "Pushed changes to Notion.".to_string(),
+        _ if action == "confirm_dangerous_plan" => {
+            "This push needs review because it may move, archive, or touch a large amount of Notion content. Open Review Push to approve it.".to_string()
+        }
+        _ if action == "confirm_plan" => {
+            "This push needs review before it writes to Notion. Open Review Push to approve it.".to_string()
+        }
+        _ if action == "read_only_blocked" => {
+            "This mount is read-only, so AFS cannot push local edits to Notion.".to_string()
+        }
+        _ => format!("Push stopped: {action}"),
     }
 }
 
@@ -3117,10 +3134,10 @@ mod tests {
         current_daemon_build_id, current_desktop_build_id, inspect_install_state,
         install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        record_current_install_marker, record_desktop_activity, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
-        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
-        virtual_projection_refresh_signal_identifiers,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
+        tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
     };
 
     #[test]
@@ -3311,6 +3328,18 @@ mod tests {
         assert_eq!(
             virtual_projection_refresh_signal_identifiers(&mount),
             vec!["root".to_string(), "source:notion".to_string()]
+        );
+    }
+
+    #[test]
+    fn push_action_message_explains_dangerous_confirmation() {
+        assert_eq!(
+            push_action_message("confirm_dangerous_plan", false, None),
+            "This push needs review because it may move, archive, or touch a large amount of Notion content. Open Review Push to approve it."
+        );
+        assert_eq!(
+            push_action_message("confirm_dangerous_plan", false, Some("custom")),
+            "custom"
         );
     }
 

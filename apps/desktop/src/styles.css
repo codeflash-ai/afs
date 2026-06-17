@@ -763,6 +763,43 @@ p {
   max-width: 860px;
 }
 
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 18px;
+  color: var(--subtle);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.breadcrumbs span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.breadcrumbs span:not(:last-child)::after {
+  color: rgba(83, 98, 115, 0.55);
+  content: "/";
+}
+
+.breadcrumbs button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+}
+
+.breadcrumbs button:hover {
+  color: var(--accent);
+}
+
+.breadcrumbs strong {
+  color: var(--ink);
+}
+
 .view-header,
 .workspace-card,
 .file-row,
