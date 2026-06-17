@@ -97,6 +97,10 @@ verify_signed_app_in_dmg() (
   hdiutil attach "${dmg}" -readonly -noverify -noautoopen -mountpoint "${mountpoint}" -quiet
   app="${mountpoint}/${PRODUCT_NAME}.app"
   codesign --verify --deep --strict --verbose=2 "${app}"
+  [[ -x "${app}/Contents/MacOS/afs" ]] \
+    || fail "${PRODUCT_NAME}.app does not include an executable afs CLI"
+  [[ -x "${app}/Contents/MacOS/afsd" ]] \
+    || fail "${PRODUCT_NAME}.app does not include an executable afsd sidecar"
   local app_signature appex_signature
   app_signature="$(codesign -dv --verbose=4 "${app}" 2>&1)"
   appex_signature="$(codesign -dv --verbose=4 "${app}/Contents/PlugIns/AgentFSFileProvider.appex" 2>&1)"
@@ -128,6 +132,10 @@ validate_notarized_dmg() {
     hdiutil attach "${dmg}" -readonly -noverify -noautoopen -mountpoint "${mountpoint}" -quiet
     app="${mountpoint}/${PRODUCT_NAME}.app"
     codesign --verify --deep --strict --verbose=2 "${app}"
+    [[ -x "${app}/Contents/MacOS/afs" ]] \
+      || fail "${PRODUCT_NAME}.app does not include an executable afs CLI"
+    [[ -x "${app}/Contents/MacOS/afsd" ]] \
+      || fail "${PRODUCT_NAME}.app does not include an executable afsd sidecar"
     spctl --assess --type execute --verbose "${app}"
   )
 }

@@ -20,6 +20,7 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Terminal,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -352,6 +353,7 @@ export default function App() {
           return;
         }
         await callCommand<ActionReport>("acknowledge_install_state").catch(() => undefined);
+        await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
       await refreshSnapshot();
@@ -432,6 +434,7 @@ export default function App() {
             throw new Error(report.message);
           }
           setInstallReview(null);
+          await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
           await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
           await refreshSnapshot();
         }}
@@ -568,6 +571,8 @@ function Onboarding({
   const [mountError, setMountError] = useState("");
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
+  const [cliInstallMessage, setCliInstallMessage] = useState("");
+  const [cliInstallError, setCliInstallError] = useState("");
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -697,6 +702,7 @@ function Onboarding({
 
   async function startMount() {
     setMountError("");
+    setCliInstallError("");
     const report = await callCommand<ActionReport>(
       "create_workspace_mount",
       { path: mountPath },
@@ -704,6 +710,10 @@ function Onboarding({
     );
     if (!report.ok) {
       setMountError(report.message);
+      return;
+    }
+    const cliReady = await ensureCliAvailable();
+    if (!cliReady) {
       return;
     }
     const nextSnapshot = await callCommand<DesktopSnapshot>(
@@ -715,6 +725,24 @@ function Onboarding({
     setMountPath(nextSnapshot.mount.localPath);
     await installAgentGuidance(nextSnapshot.mount.localPath);
     setStep(4);
+  }
+
+  async function ensureCliAvailable() {
+    const report = await callCommand<ActionReport>(
+      "ensure_terminal_cli_available",
+      undefined,
+      { ok: true, message: "AFS CLI is available." },
+    );
+    if (!report.ok) {
+      setCliInstallMessage("");
+      setCliInstallError(report.message);
+      setMountError(report.message);
+      return false;
+    }
+    setCliInstallError("");
+    setMountError("");
+    setCliInstallMessage(report.message);
+    return true;
   }
 
   async function chooseFolder() {
@@ -889,9 +917,18 @@ function Onboarding({
                 Copy
               </SecondaryButton>
             </div>
+            <div className="ready-folder">
+              <Terminal />
+              <div>
+                <span>Terminal command</span>
+                <code>afs</code>
+              </div>
+            </div>
             <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
               Open Notion Folder
             </PrimaryButton>
+            {cliInstallMessage && <p className="quiet-note">{cliInstallMessage}</p>}
+            {cliInstallError && <p className="field-error">{cliInstallError}</p>}
             <p className="quiet-note">
               If Finder asks to enable the AFS File Provider, click Enable once. macOS requires
               this approval before showing the Notion files.

@@ -33,11 +33,11 @@ The Tauri pre-bundle hook runs:
 apps/desktop/scripts/prepare-macos-file-provider.sh
 ```
 
-That script builds `afsd` plus the Swift File Provider extension, stages
+That script builds `afs`, `afsd`, and the Swift File Provider extension, stages
 `AgentFSFileProvider.appex` and `agentfs-file-providerctl` under
-`apps/desktop/src-tauri/macos/AgentFSFileProvider/`, stages `afsd` under
-`apps/desktop/src-tauri/macos/`, and Tauri copies those files into the final
-app bundle. After the Tauri DMG is created, `build-tauri` runs
+`apps/desktop/src-tauri/macos/AgentFSFileProvider/`, stages `afs` and `afsd`
+under `apps/desktop/src-tauri/macos/`, and Tauri copies those files into the
+final app bundle. After the Tauri DMG is created, `build-tauri` runs
 `apps/desktop/scripts/postprocess-dmg-volume-icon.sh` so the mounted installer
 volume uses a disk-style AFS icon instead of the application icon.
 
@@ -66,6 +66,14 @@ The desktop app also checks the running `afsd` build metadata before reusing a
 daemon. If the daemon does not report the same build ID as the app bundle, or if
 it is old enough not to report build metadata, the app stops it and starts the
 embedded `Contents/MacOS/afsd` from the current app bundle.
+
+During onboarding, the desktop app also verifies the terminal command. For DMG
+installs it creates or refreshes `/usr/local/bin/afs` as a symlink to the
+embedded `Contents/MacOS/afs`, prompting for administrator permission only when
+that standard PATH location is not writable. If the app is launched from the
+mounted DMG volume, onboarding asks the user to move AFS to Applications before
+installing the terminal command so the symlink does not point at a temporary
+volume.
 
 ## Release Signing
 
@@ -109,8 +117,9 @@ export APPLE_SIGNING_IDENTITY="Developer ID Application: Example, Inc. (TEAMID)"
 ```
 
 The File Provider staging script also reads
-`APPLE_SIGNING_IDENTITY`, so the nested File Provider extension, helper, and
-`afsd` sidecar are signed with the same release identity and hardened runtime.
+`APPLE_SIGNING_IDENTITY`, so the nested File Provider extension, helper, `afs`
+CLI, and `afsd` sidecar are signed with the same release identity and hardened
+runtime.
 
 Notarization uses a keychain profile named `afs-notary` by default:
 

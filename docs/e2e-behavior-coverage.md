@@ -54,7 +54,7 @@ Coverage labels:
 | ID | Expected e2e behavior | Current live Notion coverage | Local/CI coverage | Current gap |
 |---|---|---|---|---|
 | E2E-001 | OAuth broker connection stores a refresh handle/metadata without shipping or persisting a Notion client secret locally. | Gap | `crates/afs-cli/tests/connect.rs` covers broker secret separation with a fake broker. | Add a broker-backed live auth smoke, likely outside normal CI unless using a test OAuth integration. |
-| E2E-002 | New install/onboarding can reset stale local beta state, then proceed through connection and mount setup. | Gap | Desktop command/unit coverage plus manual DMG testing. | Needs a desktop automation harness or scripted signed-app smoke on macOS. |
+| E2E-002 | New install/onboarding can reset stale local beta state, install the terminal-visible `afs` command, then proceed through connection and mount setup. | Gap | Desktop command/unit coverage plus manual DMG testing. | Needs a desktop automation harness or scripted signed-app smoke on macOS. |
 | E2E-003 | Workspace mount is created under the macOS CloudStorage AFS root, with source folders below `AFS/notion` and no Documents symlink dependency. | Gap | Mount path validation tests in `apps/desktop/src-tauri/src/main.rs`. | Real File Provider mount behavior is manual-only on macOS. |
 | E2E-004 | A mounted workspace can expose top-level source directories and page/database entries without materializing every page body. | Covered live for virtual filesystem core | `architecture_behavior::local_virtual_mount_supports_browse_open_edit_review_push_round_trip`; `tests/linux_fuse_smoke.sh`. | Live Notion now exercises the lazy virtual filesystem path directly; kernel FUSE/File Provider registration remains local/manual. |
 | E2E-005 | Opening/listing a nested page directory lazily discovers immediate children only. | Covered live for virtual filesystem core | `architecture_behavior::local_virtual_mount_supports_browse_open_edit_review_push_round_trip`. | Kernel FUSE/File Provider shell/Finder path still needs platform e2e. |
@@ -82,7 +82,7 @@ Coverage labels:
 | E2E-027 | Push success journals the operation and enables future history/undo surfaces where possible. | Partial live | Local journal/history/undo tests. | Live pushes journal and clean status; live remote undo is not covered. |
 | E2E-028 | Desktop push runs asynchronously, does not freeze the UI, and briefly confirms success. | Manual only | Desktop command wiring and prior manual test. | Needs UI automation around a test backend or live Notion page. |
 | E2E-029 | Tray icon appears, reflects ready/pending/error state, and idle desktop CPU remains near zero. | Manual only | Tray icon unit tests and manual CPU profile. | Needs desktop runtime smoke/perf test. |
-| E2E-030 | Packaged DMG includes signed `afsd`, File Provider extension, CLI helper, tray app, and passes notarization. | Manual/publish covered | `make publish` signing/notarization validation. | Not currently a CI e2e because it requires Apple credentials. |
+| E2E-030 | Packaged DMG includes signed `afs`, `afsd`, File Provider extension, CLI helper, tray app, and passes notarization. | Manual/publish covered | `make publish` signing/notarization validation. | Not currently a CI e2e because it requires Apple credentials. |
 
 ## Live Notion Test Coverage Map
 

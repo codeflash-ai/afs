@@ -47,6 +47,7 @@
       "files": {
         "PlugIns/AgentFSFileProvider.appex": "macos/AgentFSFileProvider/AgentFSFileProvider.appex",
         "MacOS/agentfs-file-providerctl": "macos/AgentFSFileProvider/agentfs-file-providerctl",
+        "MacOS/afs": "macos/afs",
         "MacOS/afsd": "macos/afsd"
       },
       "dmg": {
