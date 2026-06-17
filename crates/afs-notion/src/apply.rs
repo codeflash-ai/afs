@@ -132,7 +132,6 @@ pub fn apply_plan(
                 let patch = NotionBlockPatch::new(
                     "image",
                     json!({
-                        "type": "file_upload",
                         "file_upload": {
                             "id": upload_id,
                         },

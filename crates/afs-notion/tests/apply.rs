@@ -1266,7 +1266,6 @@ fn apply_uploads_local_image_media_before_block_update() {
                 block_id: "image-1".to_string(),
                 body: json!({
                     "image": {
-                        "type": "file_upload",
                         "file_upload": {
                             "id": "upload-1",
                         },
