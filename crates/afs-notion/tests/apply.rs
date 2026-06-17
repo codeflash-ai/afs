@@ -14,7 +14,7 @@ use afs_notion::dto::{
     DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, IdRefDto,
     LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto,
     PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
-    TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, UrlBlockDto,
+    TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, ToDoBlockDto, UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -514,6 +514,49 @@ fn apply_updates_toggle_summary_from_rendered_list_item() {
             body: json!({
                 "toggle": {
                     "rich_text": rich_text_json("Updated toggle"),
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_updates_todo_from_empty_checkbox_shorthand() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![to_do_block("todo-1", "Call Mom", true)],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("todo-1"),
+            content: "- [] Call Mom".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "todo-1".to_string(),
+            body: json!({
+                "to_do": {
+                    "rich_text": rich_text_json("Call Mom"),
+                    "checked": false,
                 },
             }),
         }]
@@ -2224,6 +2267,16 @@ fn callout_block(id: &str, text: &str) -> BlockDto {
     let mut block = block(id, "callout");
     block.callout = Some(RichTextBlockDto {
         rich_text: rich_text(text),
+        color: None,
+    });
+    block
+}
+
+fn to_do_block(id: &str, text: &str, checked: bool) -> BlockDto {
+    let mut block = block(id, "to_do");
+    block.to_do = Some(ToDoBlockDto {
+        rich_text: rich_text(text),
+        checked,
         color: None,
     });
     block

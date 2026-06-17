@@ -2508,7 +2508,10 @@ fn parse_heading(markdown: &str) -> Option<(usize, &str)> {
 
 fn parse_to_do(markdown: &str) -> Option<(bool, &str)> {
     let trimmed = markdown.trim_start();
-    if let Some(text) = trimmed.strip_prefix("- [ ] ") {
+    if let Some(text) = trimmed
+        .strip_prefix("- [ ] ")
+        .or_else(|| trimmed.strip_prefix("- [] "))
+    {
         return Some((false, text));
     }
     if let Some(text) = trimmed
