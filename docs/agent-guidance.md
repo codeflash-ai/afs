@@ -27,6 +27,21 @@ The skill tells agents:
 - `afs status` is optional and only needed when the agent needs to inspect pending changes.
 - Agents should only push when the user explicitly asks. The safe sequence is `afs diff <file>`, then `afs push <file> -y` for safe plans.
 - If push reports that the remote changed since last sync, the recovery sequence is `afs pull <file>`, resolve any inline conflict markers, rerun `afs diff <file>`, then push again.
+- If the agent sandbox cannot execute the host `afs` CLI, it should use the MCP fallback tool named `afs` with CLI-style `argv` arguments. The daemon serves this fallback at `http://127.0.0.1:38568/mcp` by default.
+
+## MCP Fallback
+
+The daemon exposes AFS as one MCP tool named `afs` so sandboxed agents can still
+use the same CLI contract:
+
+```json
+{"argv":["status","~/Library/CloudStorage/AFS/notion","--json"]}
+```
+
+This endpoint is intended as a fallback, not the preferred path. Agents that can
+run `afs` directly should keep using the CLI. Set `AFS_MCP_ADDR=off` before
+starting `afsd` to disable the daemon-hosted MCP endpoint, or set
+`AFS_MCP_ADDR=<host:port>` to move it.
 
 ## Onboarding UX
 

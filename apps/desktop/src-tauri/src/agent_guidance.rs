@@ -210,6 +210,19 @@ AFS projects connected company sources, including Notion, into the local filesys
 6. Only push when the user explicitly asks. Run `afs diff <file>` first, then `afs push <file> -y` for safe plans.
 7. If push says the remote changed since last sync, run `afs pull <file>`, resolve any inline conflict markers in the Markdown, rerun `afs diff <file>`, then push again.
 
+## MCP fallback
+
+If your sandbox cannot run the host `afs` CLI, use the MCP tool named `afs`.
+Pass the same CLI arguments as JSON `argv`, for example:
+
+```json
+{{"argv":["status","{mount_path}","--json"]}}
+```
+
+AFS serves this fallback from the local daemon at `http://127.0.0.1:38568/mcp`
+when the desktop app or daemon is running. Prefer direct CLI execution whenever
+it is available.
+
 ## Suggested user prompt
 
 ```text
