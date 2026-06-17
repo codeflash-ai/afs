@@ -52,7 +52,8 @@ use crate::local_oauth::{
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{
-    PushOptions, PushReport, push_report_exit_code, run_push_with_daemon, select_push_targets,
+    PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
+    select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::search::{SearchError, SearchOptions, SearchReport, run_search};
@@ -2134,7 +2135,7 @@ fn run_push_target_command(
     let credentials = open_credential_store(state_root);
     let connector = resolve_source_for_path(store, credentials.as_ref(), &target_path)
         .map_err(PushCommandError::from_connector)?;
-    run_push_with_daemon(store, &connector, target_path, options)
+    run_push_with_daemon_at_state_root(store, &connector, target_path, options, Some(state_root))
         .map_err(PushCommandError::from_afs)
 }
 

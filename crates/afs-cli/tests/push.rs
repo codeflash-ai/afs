@@ -1,11 +1,12 @@
 use std::cell::Cell;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::push::{
-    PushOptions, push_report_exit_code, run_push, run_push_with_daemon, select_push_targets,
+    PushOptions, push_report_exit_code, run_push, run_push_with_daemon,
+    run_push_with_daemon_at_state_root, select_push_targets,
 };
 use afs_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -24,10 +25,11 @@ use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use afsd::hydration::{HydratedEntity, HydrationSource};
+use afsd::virtual_fs::virtual_fs_content_path;
 
 #[test]
 fn push_noop_succeeds_without_apply() {
@@ -224,6 +226,75 @@ fn push_safe_plan_with_daemon_journals_applies_and_reconciles() {
     assert_eq!(journal.apply_effects.len(), 1);
     assert_eq!(source.checks.get(), 1);
     assert_eq!(source.applies.get(), 1);
+}
+
+#[test]
+fn push_virtual_projection_direct_fallback_reconciles_content_cache() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join("state");
+    let mount_root = fixture.root.join("afs");
+    let source_root = mount_root.join("notion");
+    let target_path = source_root.join("Roadmap.md");
+    let content_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, Path::new("Roadmap.md"))
+            .expect("content path");
+    if let Some(parent) = content_path.parent() {
+        fs::create_dir_all(parent).expect("content parent");
+    }
+    fs::write(
+        &content_path,
+        canonical_markdown("page-1", "# Roadmap\n\nChanged paragraph."),
+    )
+    .expect("content cache");
+
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
+        .expect("save shadow");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("Old paragraph."),
+        rendered_entity("Changed paragraph."),
+    );
+
+    let report = run_push_with_daemon_at_state_root(
+        &mut store,
+        &source,
+        &target_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&state_root),
+    )
+    .expect("push report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "reconciled");
+    assert_eq!(source.applies.get(), 1);
+    let reconciled = fs::read_to_string(&content_path).expect("reconciled content");
+    assert!(reconciled.contains("Changed paragraph."));
+    assert!(
+        !target_path.exists(),
+        "direct fallback should reconcile the virtual content cache, not the mounted projection path"
+    );
 }
 
 #[test]

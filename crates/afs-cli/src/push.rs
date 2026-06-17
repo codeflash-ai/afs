@@ -17,7 +17,7 @@ use afs_store::{
 use afsd::execution::{PushJob, PushJobError, PushJobReport};
 use afsd::file_provider;
 use afsd::hydration::HydrationSource;
-use afsd::push::{PushJobAction, execute_push_job};
+use afsd::push::{PushJobAction, execute_push_job, execute_push_job_with_content_root};
 use serde::Serialize;
 
 use crate::diff::{
@@ -63,12 +63,39 @@ where
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
+    run_push_with_daemon_at_state_root(store, source, target_path, options, None)
+}
+
+pub fn run_push_with_daemon_at_state_root<S, Source>(
+    store: &mut S,
+    source: &Source,
+    target_path: impl AsRef<Path>,
+    options: PushOptions,
+    state_root: Option<&Path>,
+) -> AfsResult<PushReport>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository,
+    Source: Connector + HydrationSource + ?Sized,
+{
     let job = PushJob {
         target_path: target_path.as_ref().to_path_buf(),
         assume_yes: options.assume_yes,
         confirm_dangerous: options.confirm_dangerous,
     };
-    execute_push_job(store, job, source).map(PushReport::from_daemon)
+    match state_root {
+        Some(state_root) => {
+            execute_push_job_with_content_root(store, job, source, Some(state_root))
+        }
+        None => execute_push_job(store, job, source),
+    }
+    .map(PushReport::from_daemon)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

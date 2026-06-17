@@ -20,7 +20,9 @@ use afs_cli::file_provider::{
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::{PullReport, run_pull_with_state_root};
-use afs_cli::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
+use afs_cli::push::{
+    PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
+};
 use afs_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
@@ -3335,7 +3337,7 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
     let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
         .map_err(|error| error.message())?;
 
-    run_push_with_daemon(
+    run_push_with_daemon_at_state_root(
         &mut store,
         &connector,
         target,
@@ -3343,6 +3345,7 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
             assume_yes: true,
             confirm_dangerous,
         },
+        Some(&state_root),
     )
     .map_err(|error| error.to_string())
 }
