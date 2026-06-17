@@ -25,6 +25,7 @@ use afs_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
 use afs_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
+use afs_core::canonical::parse_canonical_markdown;
 use afs_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, has_unresolved_conflict_markers,
 };
@@ -37,14 +38,14 @@ use afs_notion::oauth::{
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-    SqliteStateStore, VirtualMutationRepository, open_credential_store,
+    ShadowRepository, SqliteStateStore, VirtualMutationRepository, open_credential_store,
 };
 use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::{
-    source_root_directory_name, source_root_identifier, virtual_fs_content_base,
-    virtual_fs_content_path, virtual_fs_content_root,
+    commit_virtual_fs_write, source_root_directory_name, source_root_identifier,
+    virtual_fs_content_base, virtual_fs_content_path, virtual_fs_content_root,
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -182,6 +183,16 @@ struct FileDetailReport {
     path: String,
     has_conflict_markers: bool,
     conflict_preview: Option<String>,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileEditorReport {
+    ok: bool,
+    path: String,
+    contents: String,
+    has_conflict_markers: bool,
     message: String,
 }
 
@@ -581,6 +592,48 @@ async fn inspect_notion_file(path: String) -> FileDetailReport {
             message: format!("Inspect worker failed: {error}"),
         },
     }
+}
+
+#[tauri::command]
+async fn read_notion_file(path: String) -> FileEditorReport {
+    let fallback_path = path.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        read_notion_file_blocking(&target)
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => FileEditorReport {
+            ok: false,
+            path: fallback_path,
+            contents: String::new(),
+            has_conflict_markers: false,
+            message: format!("Read worker failed: {error}"),
+        },
+    }
+}
+
+#[tauri::command]
+async fn save_notion_file(app: AppHandle, path: String, contents: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match save_notion_file_blocking(&target, &contents) {
+            Ok(message) => ActionReport { ok: true, message },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Save worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
 }
 
 fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
@@ -3340,6 +3393,116 @@ fn inspect_notion_file_blocking(target: &Path) -> FileDetailReport {
     }
 }
 
+fn read_notion_file_blocking(target: &Path) -> FileEditorReport {
+    match read_projected_file_contents(target) {
+        Ok(contents) => FileEditorReport {
+            ok: true,
+            path: target.display().to_string(),
+            has_conflict_markers: has_unresolved_conflict_markers(&contents),
+            message: "Loaded local Markdown.".to_string(),
+            contents,
+        },
+        Err(message) => FileEditorReport {
+            ok: false,
+            path: target.display().to_string(),
+            contents: String::new(),
+            has_conflict_markers: false,
+            message,
+        },
+    }
+}
+
+fn save_notion_file_blocking(target: &Path, contents: &str) -> Result<String, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not inspect AFS mounts: {error}"))?;
+    let Some((mount, matched)) = daemon_file_provider::find_mount_for_path(&mounts, target) else {
+        return Err(format!("No AFS mount contains `{}`.", target.display()));
+    };
+    let mount = mount.clone();
+    let relative_path = matched.relative_path;
+    let entity = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| format!("Could not find mounted file metadata: {error}"))?
+        .ok_or_else(|| format!("No AFS file metadata found for `{}`.", target.display()))?;
+
+    let hydration = if mount.projection.uses_virtual_filesystem() {
+        let report = commit_virtual_fs_write(
+            &mut store,
+            &virtual_fs_content_root(&state_root, &mount.mount_id),
+            &mount.mount_id,
+            &entity.remote_id.0,
+            contents.as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+        report.hydration
+    } else {
+        let write_path = mount.root.join(&relative_path);
+        write_file_atomic(&write_path, contents.as_bytes())
+            .map_err(|error| format!("Could not write `{}`: {error}", write_path.display()))?;
+        update_entity_after_editor_write(&mut store, entity, contents)?
+    };
+
+    Ok(match hydration {
+        HydrationState::Conflicted => {
+            "Saved local Markdown with unresolved conflict markers.".to_string()
+        }
+        HydrationState::Hydrated => {
+            "Saved local Markdown; it matches the synced version.".to_string()
+        }
+        _ => "Saved local Markdown as pending changes.".to_string(),
+    })
+}
+
+fn update_entity_after_editor_write(
+    store: &mut SqliteStateStore,
+    mut entity: afs_store::EntityRecord,
+    contents: &str,
+) -> Result<HydrationState, String> {
+    let next = hydration_after_editor_write(store, &entity, contents);
+    entity.hydration = next.clone();
+    store
+        .save_entity(entity)
+        .map_err(|error| format!("Could not update local file state: {error}"))?;
+    Ok(next)
+}
+
+fn hydration_after_editor_write(
+    store: &SqliteStateStore,
+    entity: &afs_store::EntityRecord,
+    contents: &str,
+) -> HydrationState {
+    if has_unresolved_conflict_markers(contents) {
+        return HydrationState::Conflicted;
+    }
+    if editor_contents_match_shadow(store, entity, contents) {
+        return HydrationState::Hydrated;
+    }
+    HydrationState::Dirty
+}
+
+fn editor_contents_match_shadow(
+    store: &SqliteStateStore,
+    entity: &afs_store::EntityRecord,
+    contents: &str,
+) -> bool {
+    parse_canonical_markdown(contents)
+        .ok()
+        .and_then(|parsed| {
+            store
+                .load_shadow(&entity.mount_id, &entity.remote_id)
+                .ok()
+                .map(|shadow| {
+                    parsed.document.frontmatter == shadow.frontmatter
+                        && parsed.document.body == shadow.rendered_body
+                })
+        })
+        .unwrap_or(false)
+}
+
 fn read_projected_file_contents(target: &Path) -> Result<String, String> {
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root.clone())
@@ -3359,6 +3522,15 @@ fn read_projected_file_contents(target: &Path) -> Result<String, String> {
 
     fs::read_to_string(&read_path)
         .map_err(|error| format!("Could not read `{}`: {error}", read_path.display()))
+}
+
+fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp-afs-desktop");
+    fs::write(&tmp, contents)?;
+    fs::rename(tmp, path)
 }
 
 fn push_report_message(report: &PushReport) -> String {
@@ -3473,21 +3645,27 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use afs_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
-    use afs_core::model::MountId;
-    use afs_store::{ConnectionId, ConnectionRecord, MountConfig, ProjectionMode};
+    use afs_core::canonical::render_canonical_markdown;
+    use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use afs_core::shadow::ShadowDocument;
+    use afs_store::{
+        ConnectionId, ConnectionRecord, EntityRecord, EntityRepository, MountConfig,
+        MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+    };
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
         TrayVisualState, clear_state_root_contents, conflict_preview, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        failed_push_summary, inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, is_unsupported_schema_version_message,
-        load_desktop_activity, notion_id_from_url, pending_changes_from_status,
-        pull_report_message, push_action_message, record_current_install_marker,
-        record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
-        tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
+        failed_push_summary, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
+        pending_changes_from_status, pull_report_message, push_action_message,
+        record_current_install_marker, record_desktop_activity, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
+        virtual_projection_refresh_signal_identifiers,
     };
 
     #[test]
@@ -3920,6 +4098,59 @@ mod tests {
         assert!(preview.contains("local body"));
         assert!(preview.contains("remote body"));
         assert!(preview.contains(">>>>>>> REMOTE"));
+    }
+
+    #[test]
+    fn editor_hydration_tracks_shadow_dirty_and_conflicted_content() {
+        let temp = TestTempDir::new("editor-hydration");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let frontmatter = "afs:\n  id: page-1\n  type: page\ntitle: Page\n";
+        let body = "Original body.\n";
+        let entity = EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "Page",
+            "page.md",
+        )
+        .with_hydration(HydrationState::Hydrated);
+        store
+            .save_mount(MountConfig::new(mount_id.clone(), "notion", temp.path()))
+            .expect("save mount");
+        store.save_entity(entity.clone()).expect("save entity");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    remote_id.clone(),
+                    body,
+                    6,
+                    vec![RemoteId::new("block-1")],
+                )
+                .expect("shadow")
+                .with_frontmatter(frontmatter),
+            )
+            .expect("save shadow");
+        let synced = render_canonical_markdown(&CanonicalDocument::new(frontmatter, body));
+
+        assert_eq!(
+            hydration_after_editor_write(&store, &entity, &synced),
+            HydrationState::Hydrated
+        );
+        assert_eq!(
+            hydration_after_editor_write(&store, &entity, "changed"),
+            HydrationState::Dirty
+        );
+        assert_eq!(
+            hydration_after_editor_write(
+                &store,
+                &entity,
+                "<<<<<<< LOCAL\nlocal\n=======\nremote\n>>>>>>> REMOTE\n",
+            ),
+            HydrationState::Conflicted
+        );
     }
 
     #[test]
@@ -4416,6 +4647,8 @@ fn main() {
             pull_notion_file,
             diff_notion_file,
             inspect_notion_file,
+            read_notion_file,
+            save_notion_file,
             open_path,
             reveal_path,
             show_main_window,

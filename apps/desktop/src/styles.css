@@ -1285,18 +1285,29 @@ p {
 
 .file-detail-heading {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 4px;
 }
 
-.file-detail-heading strong {
+.file-detail-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.file-detail-copy strong {
   color: var(--ink);
   font-size: 13px;
 }
 
-.file-detail-heading span {
+.file-detail-copy span {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.file-detail-heading .secondary-button {
+  margin-top: 0;
 }
 
 .file-detail-panel pre {
@@ -1312,6 +1323,45 @@ p {
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.editor-loading,
+.editor-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.editor-warning {
+  padding: 9px 10px;
+  border: 1px solid rgba(185, 125, 38, 0.28);
+  border-radius: 7px;
+  background: var(--amber-soft);
+  color: #8a5b12;
+}
+
+.markdown-editor {
+  overflow: hidden;
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.editor-actions .primary-button,
+.editor-actions .secondary-button {
+  margin-top: 0;
 }
 
 .summary-grid {
