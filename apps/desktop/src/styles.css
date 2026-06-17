@@ -1285,18 +1285,29 @@ p {
 
 .file-detail-heading {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 4px;
 }
 
-.file-detail-heading strong {
+.file-detail-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.file-detail-copy strong {
   color: var(--ink);
   font-size: 13px;
 }
 
-.file-detail-heading span {
+.file-detail-copy span {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.file-detail-heading .secondary-button {
+  margin-top: 0;
 }
 
 .file-detail-panel pre {

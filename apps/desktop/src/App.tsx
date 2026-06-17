@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Bot,
   Check,
+  ChevronUp,
   ChevronRight,
   Clipboard,
   Clock3,
@@ -2215,13 +2216,7 @@ function FileChangeList({
   const [details, setDetails] = useState<Record<string, FileDetailStatus>>({});
   const [editors, setEditors] = useState<Record<string, FileEditorStatus>>({});
 
-  async function toggleDetails(change: PendingChange) {
-    if (selectedPath === change.localPath) {
-      setSelectedPath(null);
-      return;
-    }
-
-    setSelectedPath(change.localPath);
+  async function loadFileDetails(change: PendingChange) {
     setDetails((current) => ({
       ...current,
       [change.localPath]: { state: "loading", message: "Reading local file..." },
@@ -2277,6 +2272,16 @@ function FileChangeList({
         },
       }));
     }
+  }
+
+  async function toggleDetails(change: PendingChange) {
+    if (selectedPath === change.localPath) {
+      setSelectedPath(null);
+      return;
+    }
+
+    setSelectedPath(change.localPath);
+    await loadFileDetails(change);
   }
 
   async function saveEditor(change: PendingChange) {
@@ -2341,6 +2346,9 @@ function FileChangeList({
           message: report.message,
         },
       }));
+      if (report.ok && action === "resolve" && selectedPath === change.localPath) {
+        await loadFileDetails(change);
+      }
       if (report.ok && action !== "diff") {
         await onRefresh?.().catch(() => undefined);
       }
@@ -2416,8 +2424,13 @@ function FileChangeList({
             {isSelected && (
               <div className="file-detail-panel">
                 <div className="file-detail-heading">
-                  <strong>{editor?.hasConflictMarkers ? "Conflict markers found" : "Local Markdown editor"}</strong>
-                  <span>{editor?.message || detail?.message || "Reading local file..."}</span>
+                  <div className="file-detail-copy">
+                    <strong>{editor?.hasConflictMarkers ? "Conflict markers found" : "Local Markdown editor"}</strong>
+                    <span>{editor?.message || detail?.message || "Reading local file..."}</span>
+                  </div>
+                  <SecondaryButton compact icon={<ChevronUp />} onClick={() => setSelectedPath(null)}>
+                    Collapse
+                  </SecondaryButton>
                 </div>
                 {editor?.state === "loading" && (
                   <div className="editor-loading">
