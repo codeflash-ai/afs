@@ -232,11 +232,7 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
             None => directive_block(block, "malformed_code", None),
         },
         "divider" => rendered_block("---".to_string(), shadow_id),
-        "child_page" => directive_block(
-            block,
-            "child_page",
-            block.child_page.as_ref().map(|child| child.title.as_str()),
-        ),
+        "child_page" => child_page_link(block),
         "child_database" => directive_block(
             block,
             "child_database",
@@ -443,6 +439,19 @@ fn link_to_page_directive(block: &BlockDto, payload: Option<&LinkToPageBlockDto>
         ),
         None => directive_block(block, "malformed_link_to_page", None),
     }
+}
+
+fn child_page_link(block: &BlockDto) -> RenderedBlock {
+    let title = block
+        .child_page
+        .as_ref()
+        .map(|child| child.title.as_str())
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("Untitled child page");
+    rendered_block(
+        markdown_link_preserving_whitespace(title, &notion_object_url(&block.id)),
+        Some(RemoteId::new(block.id.clone())),
+    )
 }
 
 fn titled_directive(

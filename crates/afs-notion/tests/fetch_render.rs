@@ -123,7 +123,16 @@ fn fetch_does_not_inline_child_page_or_database_content_into_parent_body() {
 
     assert_eq!(
         rendered.document.body,
-        "Parent body.\n\n::afs{id=child-page type=child_page title=\"Child Page\"}\n\n::afs{id=child-db type=child_database title=\"Tasks\"}\n"
+        "Parent body.\n\n[Child Page](https://www.notion.so/child-page)\n\n::afs{id=child-db type=child_database title=\"Tasks\"}\n"
+    );
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["parent-paragraph", "child-page", "child-db"]
     );
     assert!(!rendered.document.body.contains("Child body."));
     assert!(!rendered.document.body.contains("Database body."));
@@ -583,7 +592,7 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "```rust\nfn main() {}\n```",
         "| Left | Right |",
         "::afs{id=orphan-row-1 type=unsupported_table_row}",
-        "::afs{id=child-page-1 type=child_page title=\"Child Page\"}",
+        "[Child Page](https://www.notion.so/child-page-1)",
         "::afs{id=child-db-1 type=child_database title=\"Child DB\"}",
         "- Toggle summary",
         "    Toggle child",

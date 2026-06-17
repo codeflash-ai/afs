@@ -101,7 +101,12 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
             .body
             .contains("[Linked page](https://www.notion.so/")
     );
-    assert!(rendered.document.body.contains("type=child_page"));
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[AFS nested child page](https://www.notion.so/")
+    );
     assert!(
         rendered.media_assets.iter().any(|asset| {
             asset.kind == "image" && env.local_dir.join(&asset.local_path).is_file()

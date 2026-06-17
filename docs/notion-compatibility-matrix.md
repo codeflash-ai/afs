@@ -20,7 +20,7 @@ Support terms:
 |---|---|---|---|
 | Workspace page tree | Read/enumerate | Directories and Markdown files | Top-level pages and nested pages/databases can be discovered through the mounted tree. |
 | Page body | Read/write for supported blocks | Markdown file | Page content is rendered as Markdown with frontmatter for page metadata when available. |
-| Child page | Read/enumerate | Nested Markdown file | New child pages are created through entity creation, not arbitrary block edits. |
+| Child page | Read/enumerate | Parent body link plus nested Markdown file | Parent pages show a readable link with the stable Notion page URL. The child page content is edited through the projected child Markdown file. New child pages are created through entity creation, not arbitrary block edits. |
 | Database / data source | Read/enumerate | Directory | Database rows appear as Markdown files under the database directory. |
 | Data source schema | Read/validation source | `_schema.yaml` | Used to validate database row property edits before writing to Notion. |
 | Database row | Read/write/create row | Markdown file with frontmatter | Editing row body and supported properties is supported. Creating a new Markdown file under a database directory creates a row when the database has one writable data source. |
@@ -47,6 +47,7 @@ Support terms:
 | Bookmark | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
 | Embed | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
 | Link preview | Read-only | Markdown link | The current Notion API rejects safe creation/write shapes for this block. |
+| Child page link | Read; direct edit blocked | Markdown link to Notion page | The link target carries the stable page ID for lookup. Edit the child page file or title frontmatter rather than the parent link. |
 | Link to page | Read; retarget blocked | Markdown link to Notion page | Direct target PATCH is not reliable in the Notion API, so retargeting is guarded. |
 | Link to database | Read; retarget blocked | Markdown link to Notion database | Replacement needs undo-aware block identity support before AFS can write it safely. |
 | Image with external or Notion-hosted URL | Read/write for existing URL blocks | Markdown image | Existing URL/caption edits push. Local uploads are not supported yet. |

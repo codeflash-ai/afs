@@ -1213,6 +1213,12 @@ fn parse_supported_block(
         ));
     }
 
+    if current_kind == Some("child_page") {
+        return Err(AfsError::Unsupported(
+            "editing Notion child_page link blocks; edit the child page file or title frontmatter instead",
+        ));
+    }
+
     if let Some((language, code)) = parse_code_fence(trimmed) {
         let language = if language.is_empty() {
             "plain text".to_string()

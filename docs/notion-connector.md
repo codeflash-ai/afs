@@ -94,7 +94,7 @@ GitHub Actions has a manual `notion-live-e2e` workflow for these tests. The work
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, child-page links, and media blocks with URLs as Markdown. Child pages render as normal Markdown links to their stable Notion page URLs so agents and humans can follow or locate the editable child page file. It renders child databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 

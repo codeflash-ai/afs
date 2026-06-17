@@ -44,7 +44,7 @@ Sources used for the baseline:
 | `equation` | Native display math | Yes | fixture, live | `$$ ... $$`. |
 | `table` | Native Markdown table | Yes for existing tables with stable width/header mode | fixture, live read/write | Existing cell edits update table rows. Added Markdown rows append Notion `table_row` children; removed trailing rows archive row blocks. Width and header-mode changes are still blocked. |
 | `table_row` | Structural inside tables | No | fixture | Standalone/malformed rows render as directives. |
-| `child_page` | Directive and structural enumeration | No direct block write | fixture, live read | New child pages are created through page/entity creation, not block edits. |
+| `child_page` | Markdown link and structural enumeration | No direct block write | fixture, live read | Parent pages show a readable link to the child page's stable Notion URL; edit the child through its projected Markdown file. New child pages are created through page/entity creation, not block edits. |
 | `child_database` | Directive and structural enumeration | No direct block write | fixture, live read | Databases are created through the database API, not Markdown block writes. |
 | `toggle` | Directive wrapper; children render below it | No | fixture, live read | Toggle wrapper state is anchored to avoid flattening nested content. |
 | `embed` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing embed block. |

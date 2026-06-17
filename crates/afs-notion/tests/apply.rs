@@ -14,7 +14,7 @@ use afs_notion::dto::{
     DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, IdRefDto,
     LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto,
     PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
-    TableBlockDto, TableRowBlockDto, TextRichTextDto, UrlBlockDto,
+    TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -899,6 +899,41 @@ fn apply_rejects_link_to_page_retargeting_before_api_mutation() {
 
     assert!(
         matches!(error, AfsError::Unsupported(message) if message.contains("link_to_page")),
+        "{error:?}"
+    );
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn apply_rejects_child_page_link_edits_before_api_mutation() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![child_page_block("child-page-1", "Child Page")],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("child-page-1"),
+            content: "[Renamed child](https://www.notion.so/child-page-1)".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect_err("child_page link edits are intentionally unsupported");
+
+    assert!(
+        matches!(error, AfsError::Unsupported(message) if message.contains("child_page")),
         "{error:?}"
     );
     assert!(api.writes.lock().expect("writes").is_empty());
@@ -2268,6 +2303,14 @@ fn link_to_page_block(id: &str, kind: &str, target_id: &str) -> BlockDto {
         _ => {}
     }
     block.link_to_page = Some(payload);
+    block
+}
+
+fn child_page_block(id: &str, title: &str) -> BlockDto {
+    let mut block = block(id, "child_page");
+    block.child_page = Some(TitleBlockDto {
+        title: title.to_string(),
+    });
     block
 }
 
