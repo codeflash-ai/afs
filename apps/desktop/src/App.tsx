@@ -100,6 +100,14 @@ type ActionReport = {
   message: string;
 };
 
+type FileDetailReport = {
+  ok: boolean;
+  path: string;
+  hasConflictMarkers: boolean;
+  conflictPreview?: string | null;
+  message: string;
+};
+
 type AgentGuidanceStatus = "installed" | "available" | "failed";
 
 type AgentGuidanceTarget = {
@@ -2163,6 +2171,12 @@ type FileActionStatus = {
   message: string;
 };
 
+type FileDetailStatus = {
+  state: "loading" | "ready" | "error";
+  report?: FileDetailReport;
+  message: string;
+};
+
 function FileChangeList({
   changes,
   mountPath,
@@ -2175,6 +2189,40 @@ function FileChangeList({
   onRefresh?: () => Promise<void>;
 }) {
   const [actions, setActions] = useState<Record<string, FileActionStatus>>({});
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [details, setDetails] = useState<Record<string, FileDetailStatus>>({});
+
+  async function toggleDetails(change: PendingChange) {
+    if (selectedPath === change.localPath) {
+      setSelectedPath(null);
+      return;
+    }
+
+    setSelectedPath(change.localPath);
+    setDetails((current) => ({
+      ...current,
+      [change.localPath]: { state: "loading", message: "Reading local file..." },
+    }));
+
+    try {
+      const report = await callCommand<FileDetailReport>("inspect_notion_file", {
+        path: joinMountPath(mountPath, change.localPath),
+      });
+      setDetails((current) => ({
+        ...current,
+        [change.localPath]: {
+          state: report.ok ? "ready" : "error",
+          report,
+          message: report.message,
+        },
+      }));
+    } catch (error) {
+      setDetails((current) => ({
+        ...current,
+        [change.localPath]: { state: "error", message: errorMessage(error) },
+      }));
+    }
+  }
 
   async function runFileAction(change: PendingChange, action: "diff" | "push" | "resolve") {
     const path = joinMountPath(mountPath, change.localPath);
@@ -2217,9 +2265,11 @@ function FileChangeList({
     <section className="file-list">
       {changes.map((change) => {
         const action = actions[change.localPath];
+        const detail = details[change.localPath];
         const isWorking = action?.state === "working";
+        const isSelected = selectedPath === change.localPath;
         return (
-          <article className={`file-row ${change.state}`} key={change.localPath}>
+          <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
             <div className="file-state">
               {change.state === "needs_review" || change.state === "blocked" || change.state === "conflict" ? (
                 <AlertTriangle />
@@ -2227,7 +2277,18 @@ function FileChangeList({
                 <Check />
               )}
             </div>
-            <div className="file-row-content">
+            <div
+              className="file-row-content"
+              role="button"
+              tabIndex={0}
+              onClick={() => void toggleDetails(change)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  void toggleDetails(change);
+                }
+              }}
+            >
               <h3>{change.title}</h3>
               <p>{change.localPath}</p>
               <span>{change.summary}</span>
@@ -2258,6 +2319,15 @@ function FileChangeList({
                 Open
               </SecondaryButton>
             </div>
+            {isSelected && (
+              <div className="file-detail-panel">
+                <div className="file-detail-heading">
+                  <strong>{detail?.report?.hasConflictMarkers ? "Conflict markers found" : "File details"}</strong>
+                  <span>{detail?.message ?? "Reading local file..."}</span>
+                </div>
+                {detail?.report?.conflictPreview && <pre>{detail.report.conflictPreview}</pre>}
+              </div>
+            )}
           </article>
         );
       })}

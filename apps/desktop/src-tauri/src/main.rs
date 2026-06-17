@@ -25,6 +25,9 @@ use afs_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
 use afs_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, has_unresolved_conflict_markers,
+};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{HydrationState, MountId, RemoteId};
@@ -41,7 +44,10 @@ use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request
 use afsd::source::{resolve_source_for_path, source_display_name};
 #[cfg(target_os = "macos")]
 use afsd::virtual_fs::source_root_directory_name;
-use afsd::virtual_fs::{source_root_identifier, virtual_fs_content_base, virtual_fs_content_root};
+use afsd::virtual_fs::{
+    source_root_identifier, virtual_fs_content_base, virtual_fs_content_path,
+    virtual_fs_content_root,
+};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -168,6 +174,16 @@ struct PushPlan {
 #[serde(rename_all = "camelCase")]
 struct ActionReport {
     ok: bool,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileDetailReport {
+    ok: bool,
+    path: String,
+    has_conflict_markers: bool,
+    conflict_preview: Option<String>,
     message: String,
 }
 
@@ -549,6 +565,26 @@ async fn diff_notion_file(path: String) -> ActionReport {
     }
 }
 
+#[tauri::command]
+async fn inspect_notion_file(path: String) -> FileDetailReport {
+    let fallback_path = path.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        inspect_notion_file_blocking(&target)
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => FileDetailReport {
+            ok: false,
+            path: fallback_path,
+            has_conflict_markers: false,
+            conflict_preview: None,
+            message: format!("Inspect worker failed: {error}"),
+        },
+    }
+}
+
 fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
     let Ok(snapshot) = load_desktop_snapshot() else {
         return ActionReport {
@@ -904,6 +940,32 @@ fn failed_push_summary(message: &str) -> String {
         return format!("Previous push hit an unsupported Notion feature: {message}");
     }
     format!("Previous push failed: {message}")
+}
+
+fn conflict_preview(contents: &str) -> Option<String> {
+    if !has_unresolved_conflict_markers(contents) {
+        return None;
+    }
+    let lines = contents.lines().collect::<Vec<_>>();
+    let first_marker = lines
+        .iter()
+        .position(|line| line.trim() == CONFLICT_LOCAL_MARKER)
+        .unwrap_or(0);
+    let last_marker = lines
+        .iter()
+        .enumerate()
+        .skip(first_marker)
+        .find_map(|(index, line)| (line.trim() == CONFLICT_REMOTE_MARKER).then_some(index))
+        .unwrap_or_else(|| (first_marker + 40).min(lines.len().saturating_sub(1)));
+    let start = first_marker.saturating_sub(4);
+    let end = (last_marker + 5).min(lines.len());
+    let mut preview = lines[start..end].join("\n");
+    const MAX_PREVIEW_BYTES: usize = 6000;
+    if preview.len() > MAX_PREVIEW_BYTES {
+        preview.truncate(MAX_PREVIEW_BYTES);
+        preview.push_str("\n...");
+    }
+    Some(preview)
 }
 
 fn activity_from_journals(
@@ -3218,6 +3280,54 @@ fn diff_target_direct(target: &Path) -> Result<DiffReport, String> {
     run_diff(&store, target).map_err(|error| error.message())
 }
 
+fn inspect_notion_file_blocking(target: &Path) -> FileDetailReport {
+    match read_projected_file_contents(target) {
+        Ok(contents) => {
+            let conflict_preview = conflict_preview(&contents);
+            let has_conflict_markers = conflict_preview.is_some();
+            FileDetailReport {
+                ok: true,
+                path: target.display().to_string(),
+                has_conflict_markers,
+                conflict_preview,
+                message: if has_conflict_markers {
+                    "This file contains unresolved conflict markers. Choose the final Markdown content, remove the markers, then push again.".to_string()
+                } else {
+                    "No inline conflict markers were found in the local file.".to_string()
+                },
+            }
+        }
+        Err(message) => FileDetailReport {
+            ok: false,
+            path: target.display().to_string(),
+            has_conflict_markers: false,
+            conflict_preview: None,
+            message,
+        },
+    }
+}
+
+fn read_projected_file_contents(target: &Path) -> Result<String, String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not inspect AFS mounts: {error}"))?;
+    let Some((mount, matched)) = daemon_file_provider::find_mount_for_path(&mounts, target) else {
+        return Err(format!("No AFS mount contains `{}`.", target.display()));
+    };
+    let read_path = if mount.projection.uses_virtual_filesystem() {
+        virtual_fs_content_path(&state_root, &mount.mount_id, &matched.relative_path)
+            .map_err(|error| error.to_string())?
+    } else {
+        target.to_path_buf()
+    };
+
+    fs::read_to_string(&read_path)
+        .map_err(|error| format!("Could not read `{}`: {error}", read_path.display()))
+}
+
 fn push_report_message(report: &PushReport) -> String {
     push_action_message(report.action.as_str(), report.ok, report.message.as_deref())
 }
@@ -3336,7 +3446,7 @@ mod tests {
 
     use super::{
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
-        TrayVisualState, clear_state_root_contents, connection_metadata_changed,
+        TrayVisualState, clear_state_root_contents, conflict_preview, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
         failed_push_summary, inspect_install_state, install_terminal_cli_link_at,
         install_terminal_cli_link_in_path_dirs, is_unsupported_schema_version_message,
@@ -3701,6 +3811,19 @@ mod tests {
             diff_report_message(&report),
             "No local changes in this file."
         );
+    }
+
+    #[test]
+    fn conflict_preview_extracts_marker_block() {
+        let preview = conflict_preview(
+            "before\nintro\n<<<<<<< LOCAL\nlocal body\n=======\nremote body\n>>>>>>> REMOTE\nafter\n",
+        )
+        .expect("preview");
+
+        assert!(preview.contains("<<<<<<< LOCAL"));
+        assert!(preview.contains("local body"));
+        assert!(preview.contains("remote body"));
+        assert!(preview.contains(">>>>>>> REMOTE"));
     }
 
     #[test]
@@ -4196,6 +4319,7 @@ fn main() {
             push_notion_file,
             pull_notion_file,
             diff_notion_file,
+            inspect_notion_file,
             open_path,
             reveal_path,
             show_main_window,

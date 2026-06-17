@@ -1170,9 +1170,17 @@ p {
 }
 
 .file-row {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 184px;
+  align-items: center;
+  gap: 16px;
   padding: 16px;
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.58);
+}
+
+.file-row.expanded {
+  align-items: start;
 }
 
 .file-row:last-child {
@@ -1186,6 +1194,15 @@ p {
 .file-row-content {
   flex: 1;
   min-width: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-row-content:focus-visible {
+  outline: 2px solid rgba(39, 94, 254, 0.28);
+  outline-offset: 4px;
 }
 
 .file-row p {
@@ -1224,11 +1241,10 @@ p {
 }
 
 .file-row-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(76px, 1fr));
   gap: 8px;
-  min-width: 260px;
+  min-width: 184px;
 }
 
 .file-row-actions .primary-button,
@@ -1257,6 +1273,45 @@ p {
 .file-action-message svg {
   width: 13px;
   height: 13px;
+}
+
+.file-detail-panel {
+  grid-column: 2 / 4;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(247, 249, 251, 0.92);
+}
+
+.file-detail-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.file-detail-heading strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.file-detail-heading span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.file-detail-panel pre {
+  overflow: auto;
+  max-height: 260px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .summary-grid {
