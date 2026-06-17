@@ -1183,6 +1183,11 @@ p {
   font-size: 15px;
 }
 
+.file-row-content {
+  flex: 1;
+  min-width: 0;
+}
+
 .file-row p {
   margin-top: 4px;
   color: var(--muted);
@@ -1210,6 +1215,48 @@ p {
 .file-row.needs_review .file-state {
   background: var(--amber-soft);
   color: var(--amber);
+}
+
+.file-row.blocked .file-state,
+.file-row.conflict .file-state {
+  background: #fff0f0;
+  color: #b23b3b;
+}
+
+.file-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 260px;
+}
+
+.file-row-actions .primary-button,
+.file-row-actions .secondary-button {
+  margin-top: 0;
+}
+
+.file-action-message {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.file-action-message.success {
+  color: var(--green);
+}
+
+.file-action-message.error {
+  color: #b23b3b;
+}
+
+.file-action-message svg {
+  width: 13px;
+  height: 13px;
 }
 
 .summary-grid {

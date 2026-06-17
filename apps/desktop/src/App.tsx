@@ -1577,7 +1577,7 @@ function PendingView({
       {hasPendingChanges ? (
         <>
           <p className="view-copy">{snapshot.pendingChanges.length} files have pending changes.</p>
-          <FileChangeList changes={snapshot.pendingChanges} mountPath={snapshot.mount.localPath} />
+          <FileChangeList changes={snapshot.pendingChanges} mountPath={snapshot.mount.localPath} onRefresh={onRefresh} />
         </>
       ) : (
         <section className="panel muted-panel">
@@ -1701,7 +1701,12 @@ function ReviewView({
         <Metric label="Pages deleted" value={plan.pagesDeleted} />
       </section>
 
-      <FileChangeList changes={plan.files} mountPath={snapshot.mount.localPath} />
+      <FileChangeList
+        changes={plan.files}
+        mountPath={snapshot.mount.localPath}
+        confirmDangerous
+        onRefresh={onRefresh}
+      />
 
       <div className="footer-actions">
         <PrimaryButton
@@ -2153,27 +2158,109 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
   );
 }
 
-function FileChangeList({ changes, mountPath }: { changes: PendingChange[]; mountPath: string }) {
+type FileActionStatus = {
+  state: "working" | "success" | "error";
+  message: string;
+};
+
+function FileChangeList({
+  changes,
+  mountPath,
+  confirmDangerous = false,
+  onRefresh,
+}: {
+  changes: PendingChange[];
+  mountPath: string;
+  confirmDangerous?: boolean;
+  onRefresh?: () => Promise<void>;
+}) {
+  const [actions, setActions] = useState<Record<string, FileActionStatus>>({});
+
+  async function runFileAction(change: PendingChange, action: "diff" | "push" | "resolve") {
+    const path = joinMountPath(mountPath, change.localPath);
+    const workingMessage =
+      action === "diff" ? "Checking diff..." : action === "push" ? "Pushing this file..." : "Pulling latest...";
+    setActions((current) => ({
+      ...current,
+      [change.localPath]: { state: "working", message: workingMessage },
+    }));
+
+    try {
+      const command =
+        action === "diff" ? "diff_notion_file" : action === "push" ? "push_notion_file" : "pull_notion_file";
+      const args =
+        action === "push"
+          ? { path, confirmDangerous }
+          : {
+              path,
+            };
+      const report = await callCommand<ActionReport>(command, args);
+      setActions((current) => ({
+        ...current,
+        [change.localPath]: {
+          state: report.ok ? "success" : "error",
+          message: report.message,
+        },
+      }));
+      if (report.ok && action !== "diff") {
+        await onRefresh?.().catch(() => undefined);
+      }
+    } catch (error) {
+      setActions((current) => ({
+        ...current,
+        [change.localPath]: { state: "error", message: errorMessage(error) },
+      }));
+    }
+  }
+
   return (
     <section className="file-list">
-      {changes.map((change) => (
-        <article className={`file-row ${change.state}`} key={change.localPath}>
-          <div className="file-state">
-            {change.state === "needs_review" ? <AlertTriangle /> : <Check />}
-          </div>
-          <div>
-            <h3>{change.title}</h3>
-            <p>{change.localPath}</p>
-            <span>{change.summary}</span>
-          </div>
-          <SecondaryButton
-            compact
-            onClick={() => void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })}
-          >
-            Open
-          </SecondaryButton>
-        </article>
-      ))}
+      {changes.map((change) => {
+        const action = actions[change.localPath];
+        const isWorking = action?.state === "working";
+        return (
+          <article className={`file-row ${change.state}`} key={change.localPath}>
+            <div className="file-state">
+              {change.state === "needs_review" || change.state === "blocked" || change.state === "conflict" ? (
+                <AlertTriangle />
+              ) : (
+                <Check />
+              )}
+            </div>
+            <div className="file-row-content">
+              <h3>{change.title}</h3>
+              <p>{change.localPath}</p>
+              <span>{change.summary}</span>
+              {action && (
+                <div className={`file-action-message ${action.state}`}>
+                  {action.state === "working" && <Loader2 className="spin-icon" />}
+                  {action.message}
+                </div>
+              )}
+            </div>
+            <div className="file-row-actions">
+              <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "diff")}>
+                Diff
+              </SecondaryButton>
+              <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "resolve")}>
+                Resolve
+              </SecondaryButton>
+              <PrimaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "push")}>
+                Push
+              </PrimaryButton>
+              <SecondaryButton
+                compact
+                disabled={isWorking}
+                onClick={() =>
+                  void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })
+                }
+              >
+                Open
+              </SecondaryButton>
+            </div>
+          </article>
+        );
+      })}
     </section>
   );
 }

@@ -10,6 +10,7 @@ use std::sync::{
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
+use afs_cli::diff::{DiffReport, run_diff};
 #[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
     macos_file_provider_display_name, macos_file_provider_domain_url,
@@ -474,6 +475,35 @@ async fn push_to_notion(app: AppHandle, confirm_dangerous: Option<bool>) -> Acti
 }
 
 #[tauri::command]
+async fn push_notion_file(
+    app: AppHandle,
+    path: String,
+    confirm_dangerous: Option<bool>,
+) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match push_target_direct(&target, confirm_dangerous.unwrap_or(false)) {
+            Ok(report) => ActionReport {
+                ok: push_report_exit_code(&report) == 0,
+                message: push_report_message(&report),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Push worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
 async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
     let report = match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
@@ -496,6 +526,28 @@ async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
 
     refresh_desktop_surfaces(&app);
     report
+}
+
+#[tauri::command]
+async fn diff_notion_file(path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match diff_target_direct(&target) {
+            Ok(report) => ActionReport {
+                ok: report.ok,
+                message: diff_report_message(&report),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Diff worker failed: {error}"),
+        },
+    }
 }
 
 fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
@@ -3117,6 +3169,13 @@ fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
         .map_err(|error| error.message())
 }
 
+fn diff_target_direct(target: &Path) -> Result<DiffReport, String> {
+    let store = SqliteStateStore::open(default_state_root())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+
+    run_diff(&store, target).map_err(|error| error.message())
+}
+
 fn push_report_message(report: &PushReport) -> String {
     push_action_message(report.action.as_str(), report.ok, report.message.as_deref())
 }
@@ -3157,6 +3216,50 @@ fn pull_report_message(report: &PullReport) -> String {
     "Pulled the latest Notion content.".to_string()
 }
 
+fn diff_report_message(report: &DiffReport) -> String {
+    if let Some(message) = &report.message
+        && !message.is_empty()
+    {
+        return message.clone();
+    }
+    if let Some(issue) = report.validation.first() {
+        return match issue.line {
+            Some(line) => format!("{}:{}: {}", issue.file, line, issue.message),
+            None => format!("{}: {}", issue.file, issue.message),
+        };
+    }
+
+    let Some(plan) = &report.plan else {
+        return "No local changes in this file.".to_string();
+    };
+
+    let mut parts = Vec::new();
+    if plan.summary.blocks_updated > 0 {
+        parts.push(format!("{} updated", plan.summary.blocks_updated));
+    }
+    if plan.summary.blocks_created > 0 {
+        parts.push(format!("{} created", plan.summary.blocks_created));
+    }
+    if plan.summary.blocks_moved > 0 {
+        parts.push(format!("{} moved", plan.summary.blocks_moved));
+    }
+    if plan.summary.blocks_archived > 0 {
+        parts.push(format!("{} archived", plan.summary.blocks_archived));
+    }
+    if plan.summary.properties_updated > 0 {
+        parts.push(format!("{} properties", plan.summary.properties_updated));
+    }
+    if parts.is_empty() {
+        parts.push(format!("{} operations", plan.operations.len()));
+    }
+
+    let mut message = format!("Diff: {}.", parts.join(", "));
+    if report.guardrail.decision == "confirm_required" {
+        message.push_str(" Review required before pushing.");
+    }
+    message
+}
+
 fn is_remote_changed_push_message(message: &str) -> bool {
     message.contains("changed since last sync") && message.contains("remote entity")
 }
@@ -3192,13 +3295,14 @@ mod tests {
     use super::{
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
         TrayVisualState, clear_state_root_contents, connection_metadata_changed,
-        current_daemon_build_id, current_desktop_build_id, inspect_install_state,
-        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
-        is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        pull_report_message, push_action_message, record_current_install_marker,
-        record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
-        tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
+        current_daemon_build_id, current_desktop_build_id, diff_report_message,
+        inspect_install_state, install_terminal_cli_link_at,
+        install_terminal_cli_link_in_path_dirs, is_unsupported_schema_version_message,
+        load_desktop_activity, notion_id_from_url, pull_report_message, push_action_message,
+        record_current_install_marker, record_desktop_activity, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
+        virtual_projection_refresh_signal_identifiers,
     };
 
     #[test]
@@ -3438,6 +3542,33 @@ mod tests {
         };
 
         assert!(pull_report_message(&report).contains("conflict markers"));
+    }
+
+    #[test]
+    fn diff_report_message_handles_noop() {
+        let report = afs_cli::diff::DiffReport {
+            ok: true,
+            command: "diff",
+            path: "/tmp/notion/page.md".to_string(),
+            mount_id: "notion-main".to_string(),
+            entity_id: "abc".to_string(),
+            validation: Vec::new(),
+            plan: None,
+            guardrail: afs_cli::diff::GuardrailOutput {
+                decision: "proceed".to_string(),
+                reasons: Vec::new(),
+            },
+            action: "noop".to_string(),
+            unsupported: Vec::new(),
+            message: None,
+            suggested_fix: None,
+            completed_stages: Vec::new(),
+        };
+
+        assert_eq!(
+            diff_report_message(&report),
+            "No local changes in this file."
+        );
     }
 
     #[test]
@@ -3930,7 +4061,9 @@ fn main() {
             search_notion_pages,
             review_push_plan,
             push_to_notion,
+            push_notion_file,
             pull_notion_file,
+            diff_notion_file,
             open_path,
             reveal_path,
             show_main_window,
