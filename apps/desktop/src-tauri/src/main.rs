@@ -2002,8 +2002,7 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
         .ok_or_else(|| "Created mount was not found in AFS state.".to_string())?;
 
     if mount.projection.uses_virtual_filesystem() {
-        register_virtual_projection(&state_root, &mount)?;
-        prefetch_virtual_projection_root(&state_root, &mount)?;
+        activate_virtual_projection_mount(&state_root, &mount, false)?;
     }
 
     Ok(format!(
@@ -2202,6 +2201,20 @@ fn is_unsupported_schema_version_message(message: &str) -> bool {
     message.contains("unsupported schema version") && message.contains("supports up to")
 }
 
+fn activate_virtual_projection_mount(
+    state_root: &Path,
+    mount: &MountConfig,
+    wait_for_entities: bool,
+) -> Result<(), String> {
+    register_virtual_projection(state_root, mount)?;
+    prefetch_virtual_projection_root(state_root, mount)?;
+    if wait_for_entities {
+        wait_for_mount_entities(state_root, &mount.mount_id)?;
+    }
+    signal_virtual_projection_refresh(mount);
+    Ok(())
+}
+
 fn prefetch_virtual_projection_root(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
     prefetch_virtual_projection_container(
         state_root,
@@ -2260,6 +2273,62 @@ fn running_daemon_build(state_root: &Path) -> Option<DaemonBuildInfo> {
     serde_json::from_value::<DaemonStatusReport>(payload)
         .ok()
         .map(|report| report.build)
+}
+
+fn signal_virtual_projection_refresh(mount: &MountConfig) {
+    for identifier in virtual_projection_refresh_signal_identifiers(mount) {
+        if let Err(error) = signal_virtual_projection_container(mount, &identifier) {
+            eprintln!(
+                "afs desktop could not signal {}:{} refresh: {error}",
+                mount.mount_id.0, identifier
+            );
+        }
+    }
+}
+
+fn virtual_projection_refresh_signal_identifiers(mount: &MountConfig) -> Vec<String> {
+    vec![
+        ROOT_CONTAINER_IDENTIFIER.to_string(),
+        source_root_identifier(&mount.connector),
+    ]
+}
+
+fn signal_virtual_projection_container(
+    mount: &MountConfig,
+    container_identifier: &str,
+) -> Result<(), String> {
+    match mount.projection {
+        ProjectionMode::MacosFileProvider => {
+            signal_macos_virtual_projection(&mount.mount_id.0, container_identifier)
+        }
+        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
+    run_macos_file_provider_helper(
+        "signal",
+        vec![
+            "--mount-id".to_string(),
+            mount_id.to_string(),
+            "--identifier".to_string(),
+            identifier.to_string(),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "Could not signal macOS File Provider refresh for `{}`: {}",
+            identifier,
+            error.message()
+        )
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn signal_macos_virtual_projection(_mount_id: &str, _identifier: &str) -> Result<(), String> {
+    Ok(())
 }
 
 fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
@@ -2483,9 +2552,7 @@ fn refresh_notion_mount_after_connect(
     reload_daemon_mounts(state_root)?;
 
     if mount.projection.uses_virtual_filesystem() {
-        prefetch_virtual_projection_root(state_root, &mount)?;
-        wait_for_mount_entities(state_root, &mount.mount_id)?;
-        register_virtual_projection(state_root, &mount)?;
+        activate_virtual_projection_mount(state_root, &mount, true)?;
     }
 
     if connection_changed {
@@ -2664,7 +2731,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use afs_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
-    use afs_store::{ConnectionId, ConnectionRecord};
+    use afs_core::model::MountId;
+    use afs_store::{ConnectionId, ConnectionRecord, MountConfig, ProjectionMode};
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
@@ -2674,7 +2742,7 @@ mod tests {
         load_desktop_activity, notion_id_from_url, record_current_install_marker,
         record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
         state_event_path_requires_refresh, tray_icon_image, tray_popover_position,
-        validate_mount_root,
+        validate_mount_root, virtual_projection_refresh_signal_identifiers,
     };
 
     #[test]
@@ -2851,6 +2919,21 @@ mod tests {
             Some(&previous),
             Some(&previous)
         ));
+    }
+
+    #[test]
+    fn virtual_projection_refresh_signals_shared_and_connector_roots() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/CloudStorage/AFS/notion",
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+
+        assert_eq!(
+            virtual_projection_refresh_signal_identifiers(&mount),
+            vec!["root".to_string(), "source:notion".to_string()]
+        );
     }
 
     #[test]

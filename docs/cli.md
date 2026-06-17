@@ -174,6 +174,8 @@ does not connect or mount those sources.
 
 `afs mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. In virtual projections, the shared AFS root lists connector folders and the guidance appears inside the connector folder, for example `/AFS/notion/AGENTS.md` and `/AFS/notion/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
 
+Workspace Notion mounts use the access granted to the connected integration. If the integration is granted pages from multiple Notion teamspaces, AFS enumerates those accessible top-level pages and databases together under the Notion connector root. AFS does not currently create separate teamspace grouping folders.
+
 Projection choices are platform-specific. Linux binaries accept `plain-files` and
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
 Windows currently accepts `plain-files` only.
