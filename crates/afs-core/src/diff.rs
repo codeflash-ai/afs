@@ -403,7 +403,12 @@ fn align_residual_by_order(
 
     if residual_edited.len() > 1
         && residual_shadow.len() > 1
-        && !residual_kinds_match_in_order(shadow, edited_blocks, &residual_shadow, &residual_edited)
+        && !residual_kinds_match_common_prefix(
+            shadow,
+            edited_blocks,
+            &residual_shadow,
+            &residual_edited,
+        )
     {
         return Some(PlanDegradation::new(
             PlanDegradationKind::AmbiguousBlockAlignment,
@@ -419,22 +424,21 @@ fn align_residual_by_order(
     None
 }
 
-fn residual_kinds_match_in_order(
+fn residual_kinds_match_common_prefix(
     shadow: &ShadowDocument,
     edited_blocks: &[SegmentedBlock],
     residual_shadow: &[usize],
     residual_edited: &[usize],
 ) -> bool {
-    residual_shadow.len() == residual_edited.len()
-        && residual_shadow
-            .iter()
-            .zip(residual_edited)
-            .all(|(shadow_index, edited_index)| {
-                same_alignment_kind(
-                    &shadow.blocks[*shadow_index].kind,
-                    &edited_blocks[*edited_index].kind,
-                )
-            })
+    residual_shadow
+        .iter()
+        .zip(residual_edited)
+        .all(|(shadow_index, edited_index)| {
+            same_alignment_kind(
+                &shadow.blocks[*shadow_index].kind,
+                &edited_blocks[*edited_index].kind,
+            )
+        })
 }
 
 fn same_alignment_kind(left: &MarkdownBlockKind, right: &MarkdownBlockKind) -> bool {

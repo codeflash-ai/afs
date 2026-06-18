@@ -670,7 +670,7 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "[Embed](https://example.com/embed)",
         "[Bookmark](https://example.com/bookmark)",
         "[Preview](https://example.com/preview)",
-        "![Image](../.afs/media/Docs/Coverage/image-111111111111.png)",
+        "![Image](../.afs/media/Docs/Coverage/image-111111111111aaaa.png)",
         "[Video](https://example.com/video.mp4)",
         "[File](https://example.com/file.txt)",
         "[PDF](https://example.com/file.pdf)",
@@ -762,6 +762,57 @@ fn render_table_as_markdown_table_with_row_shadow_metadata() {
 }
 
 #[test]
+fn render_table_metadata_skips_blank_blocks_when_matching_shadow_blocks() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![
+            BlockTreeDto {
+                block: paragraph_block("empty-paragraph", Vec::new()),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: table_block("table-1", 2, true),
+                children: vec![
+                    BlockTreeDto {
+                        block: table_row_block("row-1", ["Decision", "Choice"]),
+                        children: Vec::new(),
+                    },
+                    BlockTreeDto {
+                        block: table_row_block("row-2", ["First connector", "Notion"]),
+                        children: Vec::new(),
+                    },
+                ],
+            },
+            BlockTreeDto {
+                block: block("divider-1", "divider"),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["table-1", "divider-1"]
+    );
+    assert_eq!(
+        rendered.shadow.blocks[0].kind,
+        MarkdownBlockKind::TableWithRows {
+            row_ids: vec![RemoteId::new("row-1"), RemoteId::new("row-2")],
+            has_column_header: true,
+            has_row_header: false,
+        }
+    );
+    assert_eq!(rendered.shadow.blocks[1].kind, MarkdownBlockKind::Paragraph);
+}
+
+#[test]
 fn render_malformed_table_as_directives() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),
@@ -823,12 +874,46 @@ fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     assert_eq!(rendered.media_assets.len(), 1);
     assert_eq!(
         rendered.media_assets[0].local_path,
-        Path::new(".afs/media/Docs/Coverage/image-0123456789ab.png")
+        Path::new(".afs/media/Docs/Coverage/image-0123456789abcdef.png")
     );
     assert_eq!(
         rendered.document.body,
-        "![Image caption](../../.afs/media/Docs/Coverage/image-0123456789ab.png)\n"
+        "![Image caption](../../.afs/media/Docs/Coverage/image-0123456789abcdef.png)\n"
     );
+}
+
+#[test]
+fn render_media_blocks_can_keep_failed_downloads_as_remote_urls() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block: file_block(
+                "0123456789abcdef",
+                "image",
+                "https://example.com/image.PNG?download=1",
+                "Image caption",
+            ),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle_with_options(
+        &bundle,
+        &afs_notion::render::RenderOptions::with_page_path("Docs/Coverage/page.md")
+            .with_local_media_block_ids(Vec::<String>::new()),
+    )
+    .expect("render");
+
+    assert_eq!(rendered.media_assets.len(), 1);
+    assert_eq!(
+        rendered.media_assets[0].local_path,
+        Path::new(".afs/media/Docs/Coverage/image-0123456789abcdef.png")
+    );
+    assert_eq!(
+        rendered.document.body,
+        "![Image caption](https://example.com/image.PNG?download=1)\n"
+    );
+    assert_eq!(rendered.shadow.rendered_body, rendered.document.body);
 }
 
 #[test]
@@ -1342,22 +1427,30 @@ fn render_all_supported_page_property_values_as_frontmatter() {
         "\"Files\":\n  - \"Spec <https://example.com/spec.pdf>\"\n  - \"https://example.com/hosted.png\"",
         "\"People\":\n  - \"Ada <user-1>\"",
         "\"Relation\":\n  - \"related-page-1\"",
-        "\"Created Time\": \"2026-06-10T00:00:00.000Z\"",
-        "\"Last Edited Time\": \"2026-06-11T00:00:00.000Z\"",
-        "\"Created By\": \"Creator\"",
-        "\"Last Edited By\": \"Editor\"",
-        "\"Formula String\": \"computed\"",
-        "\"Formula Number\": 9",
-        "\"Formula Boolean\": true",
-        "\"Formula Date\": \"2026-06-12\"",
-        "\"Rollup Number\": 11",
-        "\"Rollup Array\":",
-        "\"Unique ID\": \"AFS-12\"",
-        "\"Verification\":\n  \"state\": \"verified\"\n  \"verified_by\": \"Verifier\"\n  \"date\": \"2026-06-10\"",
     ] {
         assert!(
             frontmatter.contains(expected),
             "missing frontmatter coverage: {expected}\n{frontmatter}"
+        );
+    }
+
+    for omitted in [
+        "\"Created Time\"",
+        "\"Last Edited Time\"",
+        "\"Created By\"",
+        "\"Last Edited By\"",
+        "\"Formula String\"",
+        "\"Formula Number\"",
+        "\"Formula Boolean\"",
+        "\"Formula Date\"",
+        "\"Rollup Number\"",
+        "\"Rollup Array\"",
+        "\"Unique ID\"",
+        "\"Verification\"",
+    ] {
+        assert!(
+            !frontmatter.contains(omitted),
+            "read-only/computed property should not be editable frontmatter: {omitted}\n{frontmatter}"
         );
     }
 }

@@ -135,6 +135,18 @@ impl NotionConnector {
         )
     }
 
+    pub fn render_native_entity_for_path_with_local_media_blocks(
+        &self,
+        entity: &NativeEntity,
+        page_path: impl AsRef<Path>,
+        block_ids: impl IntoIterator<Item = String>,
+    ) -> AfsResult<NotionRenderedEntity> {
+        render_native_entity_with_options(
+            entity,
+            &RenderOptions::with_page_path(page_path.as_ref()).with_local_media_block_ids(block_ids),
+        )
+    }
+
     pub fn download_rendered_media(
         &self,
         rendered: &NotionRenderedEntity,

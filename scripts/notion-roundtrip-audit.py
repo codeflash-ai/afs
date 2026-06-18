@@ -218,8 +218,16 @@ def run_page(
     marker = f"AFS roundtrip audit marker {int(time.time())}-{os.getpid()}-{hashlib.sha1(candidate.remote_id.encode()).hexdigest()[:8]}"
 
     log("page_start", path=candidate.path, remote_id=candidate.remote_id, index=index, total=total)
-    run_cmd([str(afs_bin), "status", str(mounted_path), "--json"], page_dir / "status-before.json")
-    run_cmd([str(afs_bin), "pull", str(mounted_path), "--json"], page_dir / "pull-before.json")
+    run_cmd(
+        [str(afs_bin), "status", str(mounted_path), "--json"],
+        page_dir / "status-before.json",
+        retries=args.command_retries,
+    )
+    run_cmd(
+        [str(afs_bin), "pull", str(mounted_path), "--json"],
+        page_dir / "pull-before.json",
+        retries=args.command_retries,
+    )
     if not content_path.exists():
         raise AuditFailure(f"hydrated content cache missing: {content_path}")
 
@@ -237,8 +245,16 @@ def run_page(
     )
     write_json(page_dir / "classification.json", write_classification)
 
-    run_cmd([str(afs_bin), "inspect", str(mounted_path), "--json"], page_dir / "inspect-before.json")
-    diff_before = run_cmd([str(afs_bin), "diff", str(mounted_path), "--json"], page_dir / "diff-before.json")
+    run_cmd(
+        [str(afs_bin), "inspect", str(mounted_path), "--json"],
+        page_dir / "inspect-before.json",
+        retries=args.command_retries,
+    )
+    diff_before = run_cmd(
+        [str(afs_bin), "diff", str(mounted_path), "--json"],
+        page_dir / "diff-before.json",
+        retries=args.command_retries,
+    )
     diff_before_json = load_json_output(page_dir / "diff-before.json")
     if diff_before.returncode != 0 or not diff_is_noop(diff_before_json):
         raise AuditFailure("pre-test diff is not clean; leaving page untouched")
@@ -274,7 +290,11 @@ def run_page(
     remote_changed = False
     try:
         append_marker(content_path, marker)
-        run_cmd([str(afs_bin), "diff", str(mounted_path), "--json"], page_dir / "diff-edited.json")
+        run_cmd(
+            [str(afs_bin), "diff", str(mounted_path), "--json"],
+            page_dir / "diff-edited.json",
+            retries=args.command_retries,
+        )
         edited_diff = load_json_output(page_dir / "diff-edited.json")
         assert_single_append(edited_diff, marker)
 
@@ -286,7 +306,11 @@ def run_page(
             raise AuditFailure("Notion API snapshot did not contain pushed marker")
 
         content_path.write_bytes(original)
-        run_cmd([str(afs_bin), "diff", str(mounted_path), "--json"], page_dir / "diff-restore.json")
+        run_cmd(
+            [str(afs_bin), "diff", str(mounted_path), "--json"],
+            page_dir / "diff-restore.json",
+            retries=args.command_retries,
+        )
         restore_diff = load_json_output(page_dir / "diff-restore.json")
         assert_restore_diff(restore_diff, marker)
         run_cmd([str(afs_bin), "push", str(mounted_path), "-y", "--json"], page_dir / "push-restore.json")
@@ -298,8 +322,16 @@ def run_page(
         if normalize_notion(before_snapshot) != normalize_notion(after_restore):
             raise AuditFailure("normalized Notion snapshot differs after restore")
 
-        run_cmd([str(afs_bin), "pull", str(mounted_path), "--json"], page_dir / "pull-after-restore.json")
-        run_cmd([str(afs_bin), "diff", str(mounted_path), "--json"], page_dir / "diff-final.json")
+        run_cmd(
+            [str(afs_bin), "pull", str(mounted_path), "--json"],
+            page_dir / "pull-after-restore.json",
+            retries=args.command_retries,
+        )
+        run_cmd(
+            [str(afs_bin), "diff", str(mounted_path), "--json"],
+            page_dir / "diff-final.json",
+            retries=args.command_retries,
+        )
         final_diff = load_json_output(page_dir / "diff-final.json")
         if not diff_is_noop(final_diff):
             raise AuditFailure("final diff is not clean after restore")
@@ -341,6 +373,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--continue-on-failure", dest="stop_on_failure", action="store_false")
     parser.add_argument("--notion-min-interval-ms", type=int, default=500)
     parser.add_argument("--notion-retries", type=int, default=6)
+    parser.add_argument("--command-retries", type=int, default=3)
     return parser.parse_args()
 
 
@@ -505,15 +538,68 @@ def collect_block_type_counts(block: dict[str, Any], counts: dict[str, int]) -> 
             collect_block_type_counts(child, counts)
 
 
-def run_cmd(argv: list[str], output_path: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_cmd(
+    argv: list[str],
+    output_path: Path,
+    check: bool = True,
+    retries: int = 0,
+) -> subprocess.CompletedProcess[str]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
-    output_path.write_text(result.stdout, encoding="utf-8")
-    if result.stderr:
-        output_path.with_suffix(output_path.suffix + ".stderr").write_text(result.stderr, encoding="utf-8")
-    if check and result.returncode != 0:
-        raise AuditFailure(command_failure_message(argv, output_path, result))
-    return result
+    retries = max(0, retries)
+    for attempt in range(retries + 1):
+        result = subprocess.run(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+        output_path.write_text(result.stdout, encoding="utf-8")
+        stderr_path = output_path.with_suffix(output_path.suffix + ".stderr")
+        if result.stderr:
+            stderr_path.write_text(result.stderr, encoding="utf-8")
+        elif stderr_path.exists():
+            stderr_path.unlink()
+
+        if result.returncode == 0:
+            return result
+
+        if attempt < retries and transient_command_failure(result):
+            preserve_attempt_output(output_path, attempt + 1)
+            time.sleep(min(2**attempt, 8))
+            continue
+
+        if check:
+            raise AuditFailure(command_failure_message(argv, output_path, result))
+        return result
+
+    raise AssertionError("retry loop should return or raise")
+
+
+def preserve_attempt_output(output_path: Path, attempt: int) -> None:
+    attempt_path = output_path.with_name(f"{output_path.name}.attempt{attempt}")
+    shutil.copy2(output_path, attempt_path)
+    stderr_path = output_path.with_suffix(output_path.suffix + ".stderr")
+    if stderr_path.exists():
+        shutil.copy2(stderr_path, attempt_path.with_suffix(attempt_path.suffix + ".stderr"))
+
+
+def transient_command_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    transient_markers = [
+        "429",
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "gateway timeout",
+        "rate limit",
+        "rate_limited",
+        "temporarily unavailable",
+        "timed out",
+        "connection reset",
+    ]
+    return any(marker in text for marker in transient_markers)
 
 
 def command_failure_message(

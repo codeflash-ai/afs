@@ -84,6 +84,32 @@ fn appending_a_paragraph_produces_append_after_last_existing_block() {
 }
 
 #[test]
+fn appending_after_repeated_blocks_does_not_archive_unmodified_duplicates() {
+    let shadow = shadow(
+        "---\n\n---\n\n- Repeat\n\n- Repeat",
+        ["divider-1", "divider-2", "list-1", "list-2"],
+    );
+    let edited =
+        CanonicalDocument::new("", "---\n\n---\n\n- Repeat\n\n- Repeat\n\nAdded paragraph.");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("list-2")),
+            content: "Added paragraph.".to_string(),
+        }]
+    );
+    assert_eq!(plan.summary.blocks_created, 1);
+    assert_eq!(plan.summary.blocks_archived, 0);
+    assert!(plan.degradations.is_empty());
+}
+
+#[test]
 fn inserting_before_unchanged_directives_does_not_plan_redundant_moves() {
     let shadow = shadow(
         "Intro paragraph.\n\n::afs{id=column-list-1 type=column_list}\n\n::afs{id=column-1 type=column}",

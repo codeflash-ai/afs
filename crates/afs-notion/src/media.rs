@@ -30,6 +30,7 @@ pub struct MediaAsset {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MediaDownloadReport {
     pub downloaded: usize,
+    pub failed: usize,
     pub skipped: usize,
 }
 
@@ -40,6 +41,21 @@ pub struct DownloadedMediaAsset {
     pub source_url: String,
     pub local_path: PathBuf,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MediaFetchReport {
+    pub downloaded: Vec<DownloadedMediaAsset>,
+    pub failed: Vec<MediaDownloadFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaDownloadFailure {
+    pub block_id: String,
+    pub kind: String,
+    pub source_url: String,
+    pub local_path: PathBuf,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,10 +92,10 @@ pub fn download_media_assets(
         validate_mount_relative_path(&asset.local_path)?;
     }
 
-    let downloaded = fetch_media_assets(assets)?;
+    let fetched = fetch_media_asset_report(assets);
     let mut report = MediaDownloadReport::default();
 
-    for asset in &downloaded {
+    for asset in &fetched.downloaded {
         let destination = mount_root.join(&asset.local_path);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
@@ -87,19 +103,35 @@ pub fn download_media_assets(
         write_atomic(&destination, &asset.bytes)?;
         report.downloaded += 1;
     }
-    update_media_manifest(mount_root, &downloaded)?;
+    update_media_manifest(mount_root, &fetched.downloaded)?;
 
+    report.failed = fetched.failed.len();
     report.skipped = assets.len().saturating_sub(report.downloaded);
     Ok(report)
 }
 
 pub fn fetch_media_assets(assets: &[MediaAsset]) -> AfsResult<Vec<DownloadedMediaAsset>> {
+    Ok(fetch_media_asset_report(assets).downloaded)
+}
+
+pub fn fetch_media_asset_report(assets: &[MediaAsset]) -> MediaFetchReport {
     let client = Client::new();
-    assets
-        .iter()
-        .filter(|asset| should_download(asset))
-        .map(|asset| fetch_media_asset(&client, asset))
-        .collect()
+    let mut report = MediaFetchReport::default();
+
+    for asset in assets.iter().filter(|asset| should_download(asset)) {
+        match fetch_media_asset(&client, asset) {
+            Ok(downloaded) => report.downloaded.push(downloaded),
+            Err(error) => report.failed.push(MediaDownloadFailure {
+                block_id: asset.block_id.clone(),
+                kind: asset.kind.clone(),
+                source_url: asset.source_url.clone(),
+                local_path: asset.local_path.clone(),
+                error: error.to_string(),
+            }),
+        }
+    }
+
+    report
 }
 
 fn fetch_media_asset(client: &Client, asset: &MediaAsset) -> AfsResult<DownloadedMediaAsset> {
@@ -377,7 +409,6 @@ fn short_block_id(block_id: &str) -> String {
     let hex = block_id
         .chars()
         .filter(|ch| ch.is_ascii_hexdigit())
-        .take(12)
         .collect::<String>();
     if hex.is_empty() {
         sanitize_path_component(block_id)
@@ -461,7 +492,7 @@ mod tests {
                 "image",
                 "https://example.com/diagram.PNG?download=1",
             ),
-            Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png")
+            Path::new(".afs/media/Tasks/Fix login/image-0123456789abcdef.png")
         );
     }
 
@@ -474,7 +505,37 @@ mod tests {
                 "image",
                 "https://example.com/diagram.PNG?download=1",
             ),
-            Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png")
+            Path::new(".afs/media/Tasks/Fix login/image-0123456789abcdef.png")
+        );
+    }
+
+    #[test]
+    fn media_paths_use_full_compact_block_ids_to_avoid_same_page_collisions() {
+        let first = media_local_path(
+            Path::new("Docs/Whitepaper/page.md"),
+            "2f03ac0e-bb88-80ef-9328-c370dd88d9ba",
+            "image",
+            "https://example.com/first.png",
+        );
+        let second = media_local_path(
+            Path::new("Docs/Whitepaper/page.md"),
+            "2f03ac0e-bb88-80c1-8ed8-d4bc56b2e490",
+            "image",
+            "https://example.com/second.png",
+        );
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            Path::new(
+                ".afs/media/Docs/Whitepaper/image-2f03ac0ebb8880ef9328c370dd88d9ba.png"
+            )
+        );
+        assert_eq!(
+            second,
+            Path::new(
+                ".afs/media/Docs/Whitepaper/image-2f03ac0ebb8880c18ed8d4bc56b2e490.png"
+            )
         );
     }
 
@@ -483,16 +544,16 @@ mod tests {
         assert_eq!(
             local_media_href(
                 Path::new("Tasks/Fix login/page.md"),
-                Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png"),
+                Path::new(".afs/media/Tasks/Fix login/image-0123456789abcdef.png"),
             ),
-            "../../.afs/media/Tasks/Fix login/image-0123456789ab.png"
+            "../../.afs/media/Tasks/Fix login/image-0123456789abcdef.png"
         );
         assert_eq!(
             local_media_href(
                 Path::new("Roadmap.md"),
-                Path::new(".afs/media/Roadmap/image-0123456789ab.png"),
+                Path::new(".afs/media/Roadmap/image-0123456789abcdef.png"),
             ),
-            ".afs/media/Roadmap/image-0123456789ab.png"
+            ".afs/media/Roadmap/image-0123456789abcdef.png"
         );
     }
 

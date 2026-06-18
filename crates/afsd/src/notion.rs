@@ -8,7 +8,7 @@ use afs_core::model::MountId;
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use afs_notion::dto::NotionPageBundle;
-use afs_notion::media::fetch_media_assets;
+use afs_notion::media::fetch_media_asset_report;
 use afs_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerRefresh,
     NotionOAuthRefresh, StoredNotionCredential,
@@ -415,11 +415,25 @@ impl HydrationSource for NotionConnector {
         let native = self.fetch(FetchRequest {
             remote_id: request.remote_id.clone(),
         })?;
-        let rendered = self.render_native_entity_for_path(&native, &request.path)?;
+        let mut rendered = self.render_native_entity_for_path(&native, &request.path)?;
         let bundle = serde_json::from_slice::<NotionPageBundle>(&native.raw).map_err(|error| {
             afs_core::AfsError::Io(format!("notion native decode failed: {error}"))
         })?;
-        let assets = fetch_media_assets(&rendered.media_assets)?
+        let fetched = fetch_media_asset_report(&rendered.media_assets);
+        if !fetched.failed.is_empty() {
+            let local_media_block_ids = fetched
+                .downloaded
+                .iter()
+                .map(|asset| asset.block_id.clone())
+                .collect::<Vec<_>>();
+            rendered = self.render_native_entity_for_path_with_local_media_blocks(
+                &native,
+                &request.path,
+                local_media_block_ids,
+            )?;
+        }
+        let assets = fetched
+            .downloaded
             .into_iter()
             .map(|asset| HydratedAsset {
                 path: asset.local_path,
