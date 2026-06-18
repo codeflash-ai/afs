@@ -2201,7 +2201,11 @@ fn notion_ids_equal(left: &str, right: &str) -> bool {
 }
 
 fn unescape_markdown_text(value: &str) -> String {
-    value.replace("\\\\", "\\")
+    value
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+        .replace("\\\\", "\\")
 }
 
 fn preimage_part_to_request_value(part: &RichTextDto) -> AfsResult<Value> {
@@ -2543,11 +2547,13 @@ fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) ->
 }
 
 fn escape_markdown_text(text: &str) -> String {
-    text.replace('\\', "\\\\")
+    text.replace('\\', "\\\\").replace('\n', "<br>")
 }
 
 fn escape_markdown_link_label(text: &str) -> String {
-    text.replace('[', "\\[").replace(']', "\\]")
+    text.replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('\n', "<br>")
 }
 
 fn parse_code_fence(markdown: &str) -> Option<(String, String)> {

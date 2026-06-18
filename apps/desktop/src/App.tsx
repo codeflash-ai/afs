@@ -929,9 +929,6 @@ function Onboarding({
                 Open Notion Folder
               </PrimaryButton>
             </div>
-            <p className="quiet-note final-note">
-              Finder may ask once to enable the AFS File Provider before showing the Notion files.
-            </p>
             <LocateBox
               label="Open a Notion page"
               value={locateUrl}

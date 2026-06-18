@@ -239,7 +239,6 @@ Layout:
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Open Notion Folder ]                                      │
-│ Finder may ask once to enable the AFS File Provider.          │
 │                                                              │
 │ Open a Notion page                                           │
 │ ┌──────────────────────────────────────────────────────────┐ │
