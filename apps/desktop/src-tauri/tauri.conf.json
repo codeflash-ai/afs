@@ -7,7 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "npm run build",
-    "beforeBundleCommand": "./scripts/prepare-macos-file-provider.sh",
+    "beforeBundleCommand": "./scripts/prepare-bundle.sh",
     "frontendDist": "../dist"
   },
   "app": {
@@ -62,6 +62,24 @@
         "applicationFolderPosition": {
           "x": 480,
           "y": 190
+        }
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["fuse3", "systemd"],
+        "files": {
+          "/usr/bin/afs": "linux/afs",
+          "/usr/bin/afsd": "linux/afsd",
+          "/usr/bin/afs-fuse": "linux/afs-fuse"
+        }
+      },
+      "rpm": {
+        "depends": ["fuse3", "systemd"],
+        "files": {
+          "/usr/bin/afs": "linux/afs",
+          "/usr/bin/afsd": "linux/afsd",
+          "/usr/bin/afs-fuse": "linux/afs-fuse"
         }
       }
     }

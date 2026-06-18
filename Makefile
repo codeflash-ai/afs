@@ -45,6 +45,10 @@ build-tauri: ## Build the packaged Tauri desktop app.
 publish: setup ## Build, sign, notarize, staple, and validate a macOS DMG.
 	scripts/publish-macos.sh
 
+.PHONY: publish-linux
+publish-linux: setup ## Build and validate Linux .deb and .rpm packages.
+	scripts/publish-linux.sh
+
 .PHONY: prepare-macos-file-provider
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
 	$(DESKTOP_DIR)/scripts/prepare-macos-file-provider.sh
@@ -78,6 +82,11 @@ test-rust: ## Run all Rust workspace tests.
 .PHONY: test-linux-fuse
 test-linux-fuse: ## Run the optional Linux FUSE smoke test when enabled by env vars.
 	tests/linux_fuse_smoke.sh
+
+.PHONY: test-linux-publish-config
+test-linux-publish-config: ## Validate Linux package publish configuration.
+	tests/linux_publish_config.sh
+	tests/linux_publish_validation.sh
 
 .PHONY: fmt
 fmt: ## Format Rust code.
