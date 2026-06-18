@@ -145,6 +145,8 @@ enum AfsCommand {
     Restore(RestoreCliArgs),
     #[command(about = "Configuration commands")]
     Config,
+    #[command(about = "Run the AFS MCP stdio server")]
+    Mcp,
     #[command(
         name = "file-provider",
         about = "Manage virtual filesystem registration"
@@ -559,6 +561,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         AfsCommand::Undo(_) => undo(&legacy_args[1..], json),
         AfsCommand::Log(_) => log(&legacy_args[1..], json),
         AfsCommand::Config => stub("config", json),
+        AfsCommand::Mcp => mcp(),
         AfsCommand::FileProvider { .. } => file_provider(&legacy_args[1..], json),
     }
 }
@@ -735,6 +738,7 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
             push_flag(&mut args, "--force", options.force);
         }
         AfsCommand::Config => args.push("config".to_string()),
+        AfsCommand::Mcp => args.push("mcp".to_string()),
         AfsCommand::FileProvider { command } => {
             args.push("file-provider".to_string());
             match command {
@@ -756,6 +760,23 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
         }
     }
     args
+}
+
+fn mcp() -> i32 {
+    let config = match afsd::mcp::McpServerConfig::discover(&default_state_root()) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("afs mcp: {error}");
+            return EXIT_INTERNAL;
+        }
+    };
+    match afsd::mcp::serve_stdio(config) {
+        Ok(()) => EXIT_SUCCESS,
+        Err(error) => {
+            eprintln!("afs mcp: {error}");
+            EXIT_INTERNAL
+        }
+    }
 }
 
 fn push_daemon_args(args: &mut Vec<String>, options: &DaemonArgs) {

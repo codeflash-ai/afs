@@ -35,19 +35,21 @@ The skill tells agents:
 
 ## MCP Fallback
 
-The daemon exposes AFS as one MCP tool named `afs` so sandboxed agents can still
-use the same CLI contract:
+AFS exposes one MCP tool named `afs` so sandboxed agents can still use the same
+CLI contract:
 
 ```json
 {"argv":["status","~/Library/CloudStorage/AFS/notion","--json"]}
 ```
 
-This endpoint is intended as a fallback, not the preferred path. Agents that can
-run `afs` directly should keep using the CLI. The endpoint requires a per-install
-capability token stored under the AFS state root and copied into supported agent
-MCP configs by the desktop installer. Set `AFS_MCP_ADDR=off` before starting
-`afsd` to disable the daemon-hosted MCP endpoint, or set `AFS_MCP_ADDR=<host:port>`
-to move it.
+This bridge is intended as a fallback, not the preferred path. Agents that can
+run `afs` directly should keep using the CLI. Claude Desktop is configured as a
+local stdio MCP server by launching `afs mcp`. Other supported local agents that
+accept URL-based MCP configs use the daemon-hosted HTTP endpoint, which requires
+a per-install capability token stored under the AFS state root and copied into
+their MCP configs by the desktop installer. Set `AFS_MCP_ADDR=off` before
+starting `afsd` to disable the daemon-hosted MCP endpoint, or set
+`AFS_MCP_ADDR=<host:port>` to move it.
 
 ## Onboarding UX
 

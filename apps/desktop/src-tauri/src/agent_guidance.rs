@@ -38,6 +38,7 @@ enum InstallKind {
 
 #[derive(Clone, Copy)]
 enum McpInstallKind {
+    ClaudeDesktopJson,
     CodexToml,
     McpServersJson,
     CopilotServersJson,
@@ -228,9 +229,9 @@ fn mcp_target_specs(home: &Path) -> Vec<McpTargetSpec> {
         McpTargetSpec {
             agent: "Claude Desktop MCP",
             path: home.join("Library/Application Support/Claude/claude_desktop_config.json"),
-            kind: McpInstallKind::McpServersJson,
+            kind: McpInstallKind::ClaudeDesktopJson,
             detected: mac_app_exists(home, "Claude.app"),
-            detail: "Configured the AFS MCP fallback for Claude Desktop.",
+            detail: "Configured the local AFS MCP fallback for Claude Desktop.",
         },
         McpTargetSpec {
             agent: "Codex MCP",
@@ -291,6 +292,7 @@ fn install_target(spec: &AgentTargetSpec, mount_path: &str) -> AgentGuidanceTarg
 
 fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget {
     let result = match spec.kind {
+        McpInstallKind::ClaudeDesktopJson => install_claude_desktop_mcp_config(&spec.path),
         McpInstallKind::CodexToml => install_codex_mcp_config(&spec.path, token),
         McpInstallKind::McpServersJson => install_mcp_servers_json_config(&spec.path, token),
         McpInstallKind::CopilotServersJson => {
@@ -470,6 +472,20 @@ fn install_mcp_servers_json_config(path: &Path, token: &str) -> Result<&'static 
     write_json_config(path, &root)
 }
 
+fn install_claude_desktop_mcp_config(path: &Path) -> Result<&'static str, String> {
+    let mut root = read_json_config(path)?;
+    let object = ensure_object(&mut root);
+    let servers = object
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| json!({}));
+    let servers = ensure_object(servers);
+    servers.insert(
+        MCP_SERVER_NAME.to_string(),
+        claude_desktop_mcp_server_json(),
+    );
+    write_json_config(path, &root)
+}
+
 fn install_copilot_servers_json_config(path: &Path, token: &str) -> Result<&'static str, String> {
     let mut root = read_json_config(path)?;
     let object = ensure_object(&mut root);
@@ -499,6 +515,28 @@ fn mcp_server_json(token: &str) -> Value {
             "Authorization": format!("Bearer {token}")
         }
     })
+}
+
+fn claude_desktop_mcp_server_json() -> Value {
+    json!({
+        "command": afs_cli_command(),
+        "args": ["mcp"],
+        "env": {
+            "AFS_STATE_DIR": default_state_root().display().to_string()
+        }
+    })
+}
+
+fn afs_cli_command() -> String {
+    if let Ok(current) = env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        let sibling = parent.join("afs");
+        if sibling.is_file() {
+            return sibling.display().to_string();
+        }
+    }
+    "afs".to_string()
 }
 
 fn read_json_config(path: &Path) -> Result<Value, String> {
@@ -829,6 +867,30 @@ mod tests {
             json["mcpServers"]["afs"]["headers"]["Authorization"],
             "Bearer secret-token"
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn claude_desktop_mcp_config_uses_local_stdio_command() {
+        let temp = temp_root("afs-agent-guidance-claude-desktop-mcp");
+        let config = temp.join("claude_desktop_config.json");
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"other":{"command":"node","args":["server.js"]},"afs":{"type":"http","url":"http://127.0.0.1:38568/mcp","headers":{"Authorization":"Bearer stale"}}}}"#,
+        )
+        .expect("write config");
+
+        install_claude_desktop_mcp_config(&config).expect("install config");
+        let contents = fs::read_to_string(&config).expect("read config");
+        let json: Value = serde_json::from_str(&contents).expect("json");
+
+        assert_eq!(json["mcpServers"]["other"]["command"], "node");
+        assert_eq!(json["mcpServers"]["afs"]["command"], "afs");
+        assert_eq!(json["mcpServers"]["afs"]["args"], json!(["mcp"]));
+        assert!(json["mcpServers"]["afs"]["env"]["AFS_STATE_DIR"].is_string());
+        assert!(json["mcpServers"]["afs"].get("url").is_none());
+        assert!(json["mcpServers"]["afs"].get("headers").is_none());
+        assert!(json["mcpServers"]["afs"].get("type").is_none());
         let _ = fs::remove_dir_all(temp);
     }
 

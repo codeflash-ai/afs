@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -164,6 +164,31 @@ pub fn serve_http(listener: TcpListener, config: McpServerConfig) {
             Err(error) => eprintln!("afsd MCP accept failed: {error}"),
         }
     }
+}
+
+pub fn serve_stdio(config: McpServerConfig) -> Result<(), String> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout().lock();
+
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|error| format!("failed to read MCP stdin: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match handle_json_rpc(&line, &config) {
+            Ok(Some(response)) | Err(response) => {
+                serde_json::to_writer(&mut stdout, &response)
+                    .map_err(|error| format!("failed to encode MCP response: {error}"))?;
+                stdout
+                    .write_all(b"\n")
+                    .and_then(|_| stdout.flush())
+                    .map_err(|error| format!("failed to write MCP stdout: {error}"))?;
+            }
+            Ok(None) => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn handle_http_connection(mut stream: TcpStream, config: &McpServerConfig) {

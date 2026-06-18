@@ -69,13 +69,16 @@ CLI daemon request timeout.
 The MCP endpoint exposes one tool named `afs`. The tool accepts CLI-style
 arguments as `argv`, plus optional `cwd` and `timeoutMs`. It is a fallback for
 agent sandboxes that cannot run the host `afs` binary directly; agents that can
-run `afs` should keep using the CLI. The endpoint requires a per-install bearer
-token stored at `AFS_STATE_DIR/mcp-token` or `~/.afs/mcp-token`; the desktop
-agent installer writes that token into supported local agent MCP config files.
-The endpoint does not do work while idle; the listener thread blocks on accept
-and only spawns the host `afs` binary for actual MCP tool calls. To avoid
-exposing this host bridge to arbitrary browser origins, requests with an
-`Origin` header are accepted only from localhost origins.
+run `afs` should keep using the CLI. URL-based clients use the daemon HTTP
+endpoint with a per-install bearer token stored at `AFS_STATE_DIR/mcp-token` or
+`~/.afs/mcp-token`; the desktop agent installer writes that token into supported
+local agent MCP config files. Claude Desktop is configured differently: it
+launches `afs mcp` and communicates over stdio because Claude Desktop's local
+MCP config expects a command-shaped local server. The endpoint does not do work
+while idle; the listener thread blocks on accept and only spawns the host `afs`
+binary for actual MCP tool calls. To avoid exposing this host bridge to
+arbitrary browser origins, requests with an `Origin` header are accepted only
+from localhost origins.
 
 The socket accept loop does not run connector calls directly. It reads one JSON
 request, submits it to `DaemonRuntime`, and waits for the runtime response.
