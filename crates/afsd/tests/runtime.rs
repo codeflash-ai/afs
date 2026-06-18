@@ -281,6 +281,52 @@ fn runtime_routes_push_request_through_runner() {
 }
 
 #[test]
+fn runtime_prime_virtual_mounts_queues_root_and_source_refreshes() {
+    let config = relay_config("prime-virtual-mount");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                temp_root("prime-virtual-root"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    drop(store);
+
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(config, RefreshRecordingRunner { refresh_tx })
+        .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .prime_virtual_mounts()
+        .expect("prime virtual mounts");
+
+    let first = refresh_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("root refresh");
+    let second = refresh_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("source refresh");
+
+    assert_eq!(
+        first,
+        (
+            "notion-main".to_string(),
+            ROOT_CONTAINER_IDENTIFIER.to_string()
+        )
+    );
+    assert_eq!(
+        second,
+        ("notion-main".to_string(), "source:notion".to_string())
+    );
+    runtime.shutdown();
+}
+
+#[test]
 fn default_runner_virtual_fs_children_is_cache_only() {
     let state_root = temp_root("cache-only-children-state");
     let mount_root = temp_root("cache-only-children-mount");
@@ -980,6 +1026,10 @@ struct PushRequestRunner {
     push_tx: mpsc::Sender<PushJob>,
 }
 
+struct RefreshRecordingRunner {
+    refresh_tx: mpsc::Sender<(String, String)>,
+}
+
 impl RuntimeJobRunner for PushRequestRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
@@ -1009,6 +1059,49 @@ impl RuntimeJobRunner for PushRequestRunner {
         Err(AfsError::InvalidState(
             "hydration should not run".to_string(),
         ))
+    }
+}
+
+impl RuntimeJobRunner for RefreshRecordingRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_refresh_children(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> afs_core::AfsResult<usize> {
+        self.refresh_tx
+            .send((mount_id, container_identifier))
+            .expect("send refresh");
+        Ok(0)
     }
 }
 

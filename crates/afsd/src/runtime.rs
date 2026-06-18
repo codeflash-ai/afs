@@ -5,7 +5,7 @@
 //! worker threads, so health checks and future control-plane work stay
 //! responsive during network I/O.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -45,11 +45,12 @@ use crate::reconcile::{
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
-    ROOT_CONTAINER_IDENTIFIER, VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
-    create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
-    virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
-    virtual_fs_content_root, virtual_fs_item_with_content_root,
+    ROOT_CONTAINER_IDENTIFIER, VirtualFsItem, VirtualFsItemKind, VirtualFsMaterializeOutcome,
+    commit_virtual_fs_write, create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
+    refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
+    trash_virtual_fs_item, virtual_fs_children_refresh_needed,
+    virtual_fs_children_with_content_root, virtual_fs_content_root,
+    virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
 
@@ -98,6 +99,12 @@ impl DaemonRuntimeHandle {
 
         response
             .recv_timeout(CONTROL_RESPONSE_TIMEOUT)
+            .map_err(|_| RuntimeSendError)
+    }
+
+    pub fn prime_virtual_mounts(&self) -> Result<(), RuntimeSendError> {
+        self.sender
+            .send(RuntimeMessage::PrimeVirtualMounts)
             .map_err(|_| RuntimeSendError)
     }
 }
@@ -847,12 +854,111 @@ impl HydrationEngine for HydrationCollector {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ChildRefreshPriority {
+    Background,
+    Interactive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildRefreshRequest {
+    mount_id: String,
+    container_identifier: String,
+    priority: ChildRefreshPriority,
+}
+
+impl ChildRefreshRequest {
+    fn key(&self) -> ChildRefreshKey {
+        ChildRefreshKey {
+            mount_id: self.mount_id.clone(),
+            container_identifier: self.container_identifier.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ChildRefreshKey {
+    mount_id: String,
+    container_identifier: String,
+}
+
+#[derive(Default)]
+struct ChildRefreshQueue {
+    order: VecDeque<ChildRefreshKey>,
+    pending: BTreeMap<ChildRefreshKey, ChildRefreshRequest>,
+}
+
+impl ChildRefreshQueue {
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn queue(&mut self, request: ChildRefreshRequest) -> bool {
+        let key = request.key();
+        let inserted = !self.pending.contains_key(&key);
+        if inserted {
+            self.order.push_back(key.clone());
+            self.pending.insert(key, request);
+            return true;
+        }
+
+        if let Some(existing) = self.pending.get_mut(&key)
+            && request.priority > existing.priority
+        {
+            existing.priority = request.priority;
+        }
+        false
+    }
+
+    fn remove(&mut self, mount_id: &str, container_identifier: &str) {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.to_string(),
+            container_identifier: container_identifier.to_string(),
+        };
+        if self.pending.remove(&key).is_some() {
+            self.order.retain(|queued| queued != &key);
+        }
+    }
+
+    fn peek_priority(&self) -> Option<ChildRefreshPriority> {
+        let key = self.next_ready_key()?;
+        self.pending.get(key).map(|request| request.priority)
+    }
+
+    fn pop_ready(&mut self) -> Option<ChildRefreshRequest> {
+        let index = self.next_ready_index()?;
+        let key = self.order.remove(index)?;
+        self.pending.remove(&key)
+    }
+
+    fn next_ready_key(&self) -> Option<&ChildRefreshKey> {
+        self.next_ready_index()
+            .and_then(|index| self.order.get(index))
+    }
+
+    fn next_ready_index(&self) -> Option<usize> {
+        let mut best: Option<(usize, ChildRefreshPriority)> = None;
+        for (index, key) in self.order.iter().enumerate() {
+            let Some(request) = self.pending.get(key) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_priority)| request.priority > *best_priority)
+            {
+                best = Some((index, request.priority));
+            }
+        }
+        best.map(|(index, _)| index)
+    }
+}
+
 struct RuntimeState {
     config: DaemonConfig,
     runner: Arc<dyn RuntimeJobRunner>,
     sender: Sender<RuntimeMessage>,
     pending_requests: VecDeque<MutatingRequest>,
-    pending_child_refreshes: BTreeSet<(String, String)>,
+    child_refreshes: ChildRefreshQueue,
     hydration: HydrationQueue,
     freshness: FreshnessQueue,
     deferred_hydration: Vec<HydrationRequest>,
@@ -921,7 +1027,7 @@ impl RuntimeState {
             runner,
             sender,
             pending_requests: VecDeque::new(),
-            pending_child_refreshes: BTreeSet::new(),
+            child_refreshes: ChildRefreshQueue::default(),
             hydration,
             freshness: FreshnessQueue::new(),
             deferred_hydration: Vec::new(),
@@ -942,6 +1048,7 @@ impl RuntimeState {
                 Ok(RuntimeMessage::Status { respond_to }) => {
                     let _ = respond_to.send(self.status());
                 }
+                Ok(RuntimeMessage::PrimeVirtualMounts) => self.prime_virtual_mounts(),
                 Ok(RuntimeMessage::JobFinished(completion)) => self.handle_completion(completion),
                 Ok(RuntimeMessage::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => self.handle_timeout(),
@@ -1030,13 +1137,19 @@ impl RuntimeState {
                 let should_refresh = response.ok;
                 let _ = respond_to.send(response);
                 if should_refresh {
-                    self.queue_child_refresh(mount_id, container_identifier);
+                    self.queue_child_refresh(
+                        mount_id,
+                        container_identifier,
+                        ChildRefreshPriority::Interactive,
+                    );
                 }
             }
             DaemonRequest::FileProviderChildren {
                 mount_id,
                 container_identifier,
             } => {
+                self.child_refreshes
+                    .remove(&mount_id, &container_identifier);
                 self.pending_requests
                     .push_front(MutatingRequest::FileProviderChildren {
                         mount_id,
@@ -1166,13 +1279,24 @@ impl RuntimeState {
                 mount_id,
                 container_identifier,
                 result,
-            } => {
-                self.pending_child_refreshes
-                    .remove(&(mount_id.clone(), container_identifier.clone()));
-                if let Err(error) = result {
+            } => match result {
+                Ok(_) => self.queue_child_refresh_descendants(&mount_id, &container_identifier),
+                Err(error) => {
                     eprintln!(
                         "afsd virtual filesystem child refresh failed for `{mount_id}:{container_identifier}`: {error}"
                     );
+                }
+            },
+            JobCompletion::FileProviderChildren {
+                response,
+                respond_to,
+                mount_id,
+                container_identifier,
+            } => {
+                let ok = response.ok;
+                let _ = respond_to.send(response);
+                if ok {
+                    self.queue_child_refresh_descendants(&mount_id, &container_identifier);
                 }
             }
             JobCompletion::ScheduledPull(result) => match result {
@@ -1253,6 +1377,10 @@ impl RuntimeState {
 
         let job = if let Some(request) = self.pending_requests.pop_front() {
             Some(MutatingJob::Request(request))
+        } else if self.child_refreshes.peek_priority() == Some(ChildRefreshPriority::Interactive) {
+            self.child_refreshes
+                .pop_ready()
+                .map(|request| MutatingJob::ChildRefresh { request })
         } else if let Some(request) = self.hydration.pop_ready() {
             Some(MutatingJob::Hydration { request })
         } else if let Some(job) = self
@@ -1260,6 +1388,8 @@ impl RuntimeState {
             .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
         {
             Some(MutatingJob::Freshness { job })
+        } else if let Some(request) = self.child_refreshes.pop_ready() {
+            Some(MutatingJob::ChildRefresh { request })
         } else {
             self.pending_scheduled_tick
                 .take()
@@ -1343,17 +1473,92 @@ impl RuntimeState {
         auto_fast_forward_queue_decision(&store, &self.config.state_root, request)
     }
 
-    fn queue_child_refresh(&mut self, mount_id: String, container_identifier: String) {
-        let key = (mount_id.clone(), container_identifier.clone());
-        if !self.pending_child_refreshes.insert(key) {
-            return;
+    fn prime_virtual_mounts(&mut self) {
+        let mounts = match SqliteStateStore::open(self.config.state_root.clone())
+            .and_then(|store| store.load_mounts())
+        {
+            Ok(mounts) => mounts,
+            Err(error) => {
+                eprintln!("afsd failed to load mounts for virtual filesystem priming: {error}");
+                return;
+            }
+        };
+
+        for mount in mounts
+            .into_iter()
+            .filter(|mount| mount.projection.uses_virtual_filesystem())
+        {
+            self.queue_child_refresh(
+                mount.mount_id.0.clone(),
+                ROOT_CONTAINER_IDENTIFIER.to_string(),
+                ChildRefreshPriority::Background,
+            );
+            self.queue_child_refresh(
+                mount.mount_id.0,
+                source_root_identifier(&mount.connector),
+                ChildRefreshPriority::Background,
+            );
         }
-        self.pending_requests
-            .push_back(MutatingRequest::VirtualFsRefreshChildren {
-                mount_id,
-                container_identifier,
-            });
+    }
+
+    fn queue_child_refresh(
+        &mut self,
+        mount_id: String,
+        container_identifier: String,
+        priority: ChildRefreshPriority,
+    ) {
+        self.child_refreshes.queue(ChildRefreshRequest {
+            mount_id,
+            container_identifier,
+            priority,
+        });
         self.maybe_start_next_job();
+    }
+
+    fn queue_child_refresh_descendants(&mut self, mount_id: &str, container_identifier: &str) {
+        let child_containers = match self
+            .child_container_identifiers(mount_id, container_identifier)
+        {
+            Ok(child_containers) => child_containers,
+            Err(error) => {
+                eprintln!(
+                    "afsd could not inspect refreshed virtual filesystem children for `{mount_id}:{container_identifier}`: {error}"
+                );
+                return;
+            }
+        };
+        for child_container in child_containers {
+            self.queue_child_refresh(
+                mount_id.to_string(),
+                child_container,
+                ChildRefreshPriority::Background,
+            );
+        }
+    }
+
+    fn child_container_identifiers(
+        &self,
+        mount_id: &str,
+        container_identifier: &str,
+    ) -> afs_core::AfsResult<Vec<String>> {
+        let store =
+            SqliteStateStore::open(self.config.state_root.clone()).map_err(AfsError::from)?;
+        let mount_id = MountId::new(mount_id);
+        let content_root = virtual_fs_content_root(&self.config.state_root, &mount_id);
+        let report = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            container_identifier,
+        )?;
+
+        Ok(report
+            .children
+            .into_iter()
+            .filter(|child| child.kind == VirtualFsItemKind::Folder)
+            .filter(|child| child.identifier != container_identifier)
+            .map(|child| child.identifier)
+            .collect())
     }
 
     fn delete_hydration_job(&self, request: &HydrationRequest) {
@@ -1379,7 +1584,7 @@ impl RuntimeState {
         DaemonRuntimeStatus {
             active_job: self.active_job.is_some(),
             active_job_detail: self.active_job.as_ref().map(ActiveRuntimeJob::status),
-            pending_requests: self.pending_requests.len(),
+            pending_requests: self.pending_requests.len() + self.child_refreshes.len(),
             pending_hydrations: self.hydration.len(),
             deferred_hydrations: self.deferred_hydration.len(),
             pending_freshness: freshness_metrics.total_jobs,
@@ -1582,18 +1787,15 @@ fn run_job(
         MutatingJob::Request(MutatingRequest::FileEvent { event }) => {
             JobCompletion::FileEvent(runner.run_file_event(state_root, event))
         }
-        MutatingJob::Request(MutatingRequest::VirtualFsRefreshChildren {
-            mount_id,
-            container_identifier,
-        }) => {
+        MutatingJob::ChildRefresh { request } => {
             let result = runner.run_virtual_fs_refresh_children(
                 state_root,
-                mount_id.clone(),
-                container_identifier.clone(),
+                request.mount_id.clone(),
+                request.container_identifier.clone(),
             );
             JobCompletion::VirtualFsRefreshChildren {
-                mount_id,
-                container_identifier,
+                mount_id: request.mount_id,
+                container_identifier: request.container_identifier,
                 result,
             }
         }
@@ -1627,10 +1829,15 @@ fn run_job(
             mount_id,
             container_identifier,
             respond_to,
-        }) => JobCompletion::Response {
-            response: runner.run_file_provider_children(state_root, mount_id, container_identifier),
+        }) => JobCompletion::FileProviderChildren {
+            response: runner.run_file_provider_children(
+                state_root,
+                mount_id.clone(),
+                container_identifier.clone(),
+            ),
             respond_to,
-            freshness_jobs: Vec::new(),
+            mount_id,
+            container_identifier,
         },
         MutatingJob::Request(MutatingRequest::VirtualFsCommitWrite {
             mount_id,
@@ -1781,6 +1988,7 @@ enum RuntimeMessage {
     Status {
         respond_to: Sender<DaemonRuntimeStatus>,
     },
+    PrimeVirtualMounts,
     JobFinished(JobCompletion),
     Shutdown,
 }
@@ -1796,10 +2004,6 @@ enum MutatingRequest {
     },
     FileEvent {
         event: FileEvent,
-    },
-    VirtualFsRefreshChildren {
-        mount_id: String,
-        container_identifier: String,
     },
     VirtualFsMaterialize {
         mount_id: String,
@@ -1844,6 +2048,7 @@ enum MutatingRequest {
 
 enum MutatingJob {
     Request(MutatingRequest),
+    ChildRefresh { request: ChildRefreshRequest },
     ScheduledPull { tick: PullSchedulerTick },
     Hydration { request: HydrationRequest },
     Freshness { job: SyncJob },
@@ -1853,6 +2058,13 @@ impl MutatingJob {
     fn active_status_parts(&self) -> (String, Option<String>) {
         match self {
             Self::Request(request) => request.active_status_parts(),
+            Self::ChildRefresh { request } => (
+                "virtual_fs_refresh_children".to_string(),
+                Some(format!(
+                    "{}:{}",
+                    request.mount_id, request.container_identifier
+                )),
+            ),
             Self::ScheduledPull { .. } => ("scheduled_pull".to_string(), None),
             Self::Hydration { request } => (
                 "hydration".to_string(),
@@ -1880,13 +2092,6 @@ impl MutatingRequest {
             Self::FileEvent { event } => (
                 "file_event".to_string(),
                 Some(event.path.display().to_string()),
-            ),
-            Self::VirtualFsRefreshChildren {
-                mount_id,
-                container_identifier,
-            } => (
-                "virtual_fs_refresh_children".to_string(),
-                Some(format!("{mount_id}:{container_identifier}")),
             ),
             Self::VirtualFsMaterialize {
                 mount_id,
@@ -1968,6 +2173,12 @@ enum JobCompletion {
         mount_id: String,
         container_identifier: String,
         result: afs_core::AfsResult<usize>,
+    },
+    FileProviderChildren {
+        response: DaemonResponse,
+        respond_to: Sender<DaemonResponse>,
+        mount_id: String,
+        container_identifier: String,
     },
     ScheduledPull(afs_core::AfsResult<ScheduledPullRuntimeReport>),
     Hydration {
@@ -2326,5 +2537,51 @@ fn afs_error_code(error: &AfsError) -> &'static str {
         AfsError::Unsupported(_) => "unsupported",
         AfsError::NotImplemented(_) => "not_implemented",
         AfsError::Io(_) => "io_error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest};
+
+    #[test]
+    fn child_refresh_queue_promotes_existing_requests() {
+        let mut queue = ChildRefreshQueue::default();
+
+        assert!(queue.queue(request(
+            "notion-main",
+            "children:page-1",
+            ChildRefreshPriority::Background,
+        )));
+        assert!(queue.queue(request(
+            "notion-main",
+            "children:page-2",
+            ChildRefreshPriority::Background,
+        )));
+        assert!(!queue.queue(request(
+            "notion-main",
+            "children:page-1",
+            ChildRefreshPriority::Interactive,
+        )));
+
+        let first = queue.pop_ready().expect("first refresh");
+        assert_eq!(first.container_identifier, "children:page-1");
+        assert_eq!(first.priority, ChildRefreshPriority::Interactive);
+
+        let second = queue.pop_ready().expect("second refresh");
+        assert_eq!(second.container_identifier, "children:page-2");
+        assert_eq!(second.priority, ChildRefreshPriority::Background);
+    }
+
+    fn request(
+        mount_id: &str,
+        container_identifier: &str,
+        priority: ChildRefreshPriority,
+    ) -> ChildRefreshRequest {
+        ChildRefreshRequest {
+            mount_id: mount_id.to_string(),
+            container_identifier: container_identifier.to_string(),
+            priority,
+        }
     }
 }

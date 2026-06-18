@@ -31,6 +31,9 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
         .lock()
         .expect("daemon watch manager")
         .reload_mounts()?;
+    if runtime_handle.prime_virtual_mounts().is_err() {
+        eprintln!("afsd could not queue virtual filesystem priming: runtime stopped");
+    }
     let server = DaemonServerHandle {
         runtime: runtime_handle.clone(),
         watch_manager: Arc::clone(&watch_manager),
@@ -165,7 +168,14 @@ fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> Daemon
         DaemonRequest::ReloadMounts => {
             let mut watch_manager = server.watch_manager.lock().expect("daemon watch manager");
             match watch_manager.reload_mounts() {
-                Ok(report) => DaemonResponse::ok(report),
+                Ok(report) => {
+                    if server.runtime.prime_virtual_mounts().is_err() {
+                        eprintln!(
+                            "afsd could not queue virtual filesystem priming after mount reload: runtime stopped"
+                        );
+                    }
+                    DaemonResponse::ok(report)
+                }
                 Err(error) => DaemonResponse::error("reload_mounts_failed", error.to_string()),
             }
         }
@@ -324,11 +334,18 @@ fn remove_stale_socket(socket_path: &Path) -> AfsResult<()> {
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
+    use afs_core::AfsError;
+    use afs_core::hydration::{HydrationPolicy, HydrationRequest};
     use afs_core::model::MountId;
     use afs_core::pull::PullMode;
     use afs_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
+
+    use crate::execution::PushJob;
+    use crate::hydration::HydrationOutcome;
+    use crate::runtime::{RuntimeJobRunner, ScheduledPullRuntimeReport};
 
     use super::*;
 
@@ -398,6 +415,99 @@ mod tests {
             vec![plain_root.display().to_string()]
         );
         runtime.shutdown();
+    }
+
+    #[test]
+    fn reload_mounts_primes_virtual_directory_enumeration() {
+        let config = test_config("reload-primes-virtual");
+        let (refresh_tx, refresh_rx) = mpsc::channel();
+        let runtime =
+            DaemonRuntime::spawn_with_runner(config.clone(), RecordingRefreshRunner { refresh_tx })
+                .expect("spawn runtime");
+        let watch_manager = Arc::new(Mutex::new(
+            DaemonWatchManager::new(&config, runtime.handle()).expect("watch manager"),
+        ));
+        let server = DaemonServerHandle {
+            runtime: runtime.handle(),
+            watch_manager,
+        };
+
+        let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    temp_root("reload-prime-mount"),
+                )
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save virtual mount");
+        drop(store);
+
+        let response = handle_request(DaemonRequest::ReloadMounts, &server);
+
+        assert!(response.ok, "{response:?}");
+        assert_eq!(
+            refresh_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("root refresh"),
+            ("notion-main".to_string(), "root".to_string())
+        );
+        assert_eq!(
+            refresh_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("source refresh"),
+            ("notion-main".to_string(), "source:notion".to_string())
+        );
+        runtime.shutdown();
+    }
+
+    struct RecordingRefreshRunner {
+        refresh_tx: mpsc::Sender<(String, String)>,
+    }
+
+    impl RuntimeJobRunner for RecordingRefreshRunner {
+        fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+            DaemonResponse::error("unexpected_pull", "pull should not run")
+        }
+
+        fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+            DaemonResponse::error("unexpected_push", "push should not run")
+        }
+
+        fn run_scheduled_pull(
+            &self,
+            _state_root: PathBuf,
+            _tick: crate::scheduler::PullSchedulerTick,
+            _policy: HydrationPolicy,
+        ) -> AfsResult<ScheduledPullRuntimeReport> {
+            Err(AfsError::InvalidState(
+                "scheduled pull should not run".to_string(),
+            ))
+        }
+
+        fn run_hydration(
+            &self,
+            _state_root: PathBuf,
+            _request: HydrationRequest,
+        ) -> AfsResult<HydrationOutcome> {
+            Err(AfsError::InvalidState(
+                "hydration should not run".to_string(),
+            ))
+        }
+
+        fn run_virtual_fs_refresh_children(
+            &self,
+            _state_root: PathBuf,
+            mount_id: String,
+            container_identifier: String,
+        ) -> AfsResult<usize> {
+            self.refresh_tx
+                .send((mount_id, container_identifier))
+                .expect("send refresh request");
+            Ok(0)
+        }
     }
 
     fn test_config(name: &str) -> DaemonConfig {

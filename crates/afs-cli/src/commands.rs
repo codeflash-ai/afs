@@ -21,6 +21,7 @@ use afs_store::{
 };
 use afsd::execution::PushJobReport;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
+use afsd::virtual_fs::{VirtualFsChildrenReport, virtual_fs_ancestor_container_identifiers};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -56,7 +57,7 @@ use crate::push::{
     select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
-use crate::search::{SearchError, SearchOptions, SearchReport, run_search};
+use crate::search::{SearchError, SearchOptions, SearchReport, notion_id_from_url, run_search};
 use crate::status::{StatusError, StatusOptions, StatusReport, StatusSyncState, run_status};
 use crate::templates::{
     TemplateApplyOptions, TemplateApplyReport, TemplateListReport, TemplateNewOptions,
@@ -1590,7 +1591,8 @@ fn search(args: &[String], json: bool) -> i32 {
         },
         None => 10,
     };
-    let store = match SqliteStateStore::open(default_state_root()) {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -1606,17 +1608,241 @@ fn search(args: &[String], json: bool) -> i32 {
         limit,
     };
 
-    match run_search(&store, options) {
-        Ok(report) if json => {
-            print_json(&report);
-            EXIT_SUCCESS
-        }
-        Ok(report) => {
-            print_search_report(&report);
-            EXIT_SUCCESS
-        }
-        Err(error) => search_command_error(json, error),
+    let report = match run_search(&store, options.clone()) {
+        Ok(report) => report,
+        Err(error) => return search_command_error(json, error),
+    };
+    let report = match refresh_notion_url_search_on_miss(&state_root, &mut store, &options, report)
+    {
+        Ok(report) => report,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    if let Err(error) = prefetch_notion_url_search_result_ancestors(&state_root, &options, &report)
+    {
+        return command_error(json, error, EXIT_INTERNAL);
     }
+
+    if json {
+        print_json(&report);
+        EXIT_SUCCESS
+    } else {
+        print_search_report(&report);
+        EXIT_SUCCESS
+    }
+}
+
+fn refresh_notion_url_search_on_miss(
+    state_root: &Path,
+    store: &mut SqliteStateStore,
+    options: &SearchOptions,
+    report: SearchReport,
+) -> Result<SearchReport, CommandError> {
+    if !should_refresh_notion_url_search(options, &report) {
+        return Ok(report);
+    }
+
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| CommandError::new("search", "store_error", error.to_string()))?
+        .into_iter()
+        .filter(|mount| mount.connector == "notion")
+        .collect::<Vec<_>>();
+    if mounts.is_empty() {
+        return Ok(report);
+    }
+
+    let mut refreshed = false;
+    let mut errors = Vec::new();
+    for mount in &mounts {
+        match refresh_search_mount_metadata(state_root, store, mount) {
+            Ok(()) => refreshed = true,
+            Err(error) => errors.push(error.message),
+        }
+    }
+
+    if !refreshed {
+        let detail = errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "no Notion mounts could be refreshed".to_string());
+        return Err(CommandError::new(
+            "search",
+            "metadata_refresh_failed",
+            format!("could not refresh Notion metadata before URL search: {detail}"),
+        ));
+    }
+
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| CommandError::new("search", "store_open_failed", error.to_string()))?;
+    run_search(&store, options.clone())
+        .map_err(|error| CommandError::new("search", error.code(), error.message()))
+}
+
+fn prefetch_notion_url_search_result_ancestors(
+    state_root: &Path,
+    options: &SearchOptions,
+    report: &SearchReport,
+) -> Result<(), CommandError> {
+    let Some(notion_id) = notion_id_from_url(&options.query) else {
+        return Ok(());
+    };
+    if options
+        .connector
+        .as_deref()
+        .is_some_and(|connector| connector != "notion")
+    {
+        return Ok(());
+    }
+
+    let matching_results = report
+        .results
+        .iter()
+        .filter(|result| {
+            result.connector == "notion"
+                && result.kind != "workspace"
+                && notion_id_from_url(&result.remote_id).as_deref() == Some(notion_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matching_results.is_empty() {
+        return Ok(());
+    }
+
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| CommandError::new("search", "store_open_failed", error.to_string()))?;
+    for result in matching_results {
+        let mount_id = MountId::new(result.mount_id.clone());
+        let Some(mount) = store
+            .get_mount(&mount_id)
+            .map_err(|error| CommandError::new("search", "store_error", error.to_string()))?
+        else {
+            continue;
+        };
+        if !mount.projection.uses_virtual_filesystem() {
+            continue;
+        }
+
+        let identifiers = virtual_fs_ancestor_container_identifiers(
+            &store,
+            &mount_id,
+            &RemoteId::new(result.remote_id.clone()),
+        )
+        .map_err(|error| {
+            CommandError::new("search", "ancestor_prefetch_failed", error.to_string())
+        })?;
+        for container_identifier in identifiers {
+            prefetch_virtual_search_container(state_root, &mount, &container_identifier)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn prefetch_virtual_search_container(
+    state_root: &Path,
+    mount: &MountConfig,
+    container_identifier: &str,
+) -> Result<(), CommandError> {
+    match run_daemon_report::<VirtualFsChildrenReport>(
+        state_root,
+        &DaemonRequest::FileProviderChildren {
+            mount_id: mount.mount_id.0.clone(),
+            container_identifier: container_identifier.to_string(),
+        },
+    ) {
+        DaemonReport::Report(_) => Ok(()),
+        DaemonReport::Error(error) => Err(CommandError::new("search", error.code, error.message)),
+        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => Err(CommandError::new(
+            "search",
+            "daemon_timeout",
+            format!(
+                "afsd did not respond within {}ms while enumerating ancestor metadata for search result `{container_identifier}`",
+                daemon_request_timeout().as_millis()
+            ),
+        )
+        .with_suggested_command("afs daemon restart")),
+        DaemonReport::Unavailable(DaemonUnavailableReason::Disabled)
+        | DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable) => Err(
+            CommandError::new(
+                "search",
+                "daemon_required",
+                format!(
+                    "mount `{}` uses projection `{}`; Notion URL search must enumerate ancestor metadata through afsd",
+                    mount.mount_id.0,
+                    mount.projection.as_str()
+                ),
+            )
+            .with_suggested_command("afs daemon restart"),
+        ),
+    }
+}
+
+fn should_refresh_notion_url_search(options: &SearchOptions, report: &SearchReport) -> bool {
+    report.results.is_empty()
+        && notion_id_from_url(&options.query).is_some()
+        && options
+            .connector
+            .as_deref()
+            .is_none_or(|connector| connector == "notion")
+}
+
+fn refresh_search_mount_metadata(
+    state_root: &Path,
+    store: &mut SqliteStateStore,
+    mount: &MountConfig,
+) -> Result<(), CommandError> {
+    match run_daemon_report::<PullReport>(
+        state_root,
+        &DaemonRequest::Pull {
+            path: mount.root.clone(),
+        },
+    ) {
+        DaemonReport::Report(_) => Ok(()),
+        DaemonReport::Error(error) => Err(CommandError::new("search", error.code, error.message)),
+        DaemonReport::Unavailable(reason) => {
+            refresh_search_mount_metadata_direct(state_root, store, mount, reason)
+        }
+    }
+}
+
+fn refresh_search_mount_metadata_direct(
+    state_root: &Path,
+    store: &mut SqliteStateStore,
+    mount: &MountConfig,
+    reason: DaemonUnavailableReason,
+) -> Result<(), CommandError> {
+    match reason {
+        DaemonUnavailableReason::TimedOut => {
+            return Err(CommandError::new(
+                "search",
+                "daemon_timeout",
+                format!(
+                    "afsd did not respond within {}ms while refreshing Notion metadata for search",
+                    daemon_mutating_request_timeout().as_millis()
+                ),
+            )
+            .with_suggested_command("afs daemon restart"));
+        }
+        DaemonUnavailableReason::NotAvailable if mount.projection.uses_virtual_filesystem() => {
+            return Err(CommandError::new(
+                "search",
+                "daemon_required",
+                format!(
+                    "mount `{}` uses projection `{}`; Notion URL search metadata refresh must run through afsd",
+                    mount.mount_id.0,
+                    mount.projection.as_str()
+                ),
+            )
+            .with_suggested_command("afs daemon restart"));
+        }
+        DaemonUnavailableReason::Disabled | DaemonUnavailableReason::NotAvailable => {}
+    }
+
+    let credentials = open_credential_store(state_root);
+    let connector = resolve_source_for_mount_id(store, credentials.as_ref(), &mount.mount_id)
+        .map_err(|error| CommandError::new("search", error.code(), error.message()))?;
+    run_pull_with_state_root(store, &connector, mount.root.clone(), Some(state_root))
+        .map(|_| ())
+        .map_err(|error| CommandError::new("search", error.code(), error.message()))
 }
 
 fn templates(args: &[String], json: bool) -> i32 {
@@ -4147,6 +4373,7 @@ mod tests {
     use crate::diff::{DiffReport, GuardrailOutput};
     use crate::local_oauth::{local_redirect, notion_authorize_url, parse_oauth_callback};
     use crate::push::PushReport;
+    use crate::search::{SearchOptions, SearchReport};
 
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
@@ -4154,7 +4381,8 @@ mod tests {
         notion_oauth_broker_config, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, should_prompt_for_push_confirmation,
-        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        validate_virtual_projection_registration,
     };
 
     #[test]
@@ -4582,6 +4810,32 @@ mod tests {
     }
 
     #[test]
+    fn notion_url_search_miss_triggers_metadata_refresh() {
+        let options = SearchOptions::new(
+            "https://app.notion.com/p/codeflash/Email-Outreach-1fa3ac0ebb8880e580cbcfd7e54f9be2",
+        );
+        let report = empty_search_report(&options);
+
+        assert!(should_refresh_notion_url_search(&options, &report));
+    }
+
+    #[test]
+    fn notion_url_search_refresh_skips_non_notion_or_existing_matches() {
+        let mut options = SearchOptions::new(
+            "https://app.notion.com/p/codeflash/Email-Outreach-1fa3ac0ebb8880e580cbcfd7e54f9be2",
+        );
+        options.connector = Some("linear".to_string());
+        let report = empty_search_report(&options);
+
+        assert!(!should_refresh_notion_url_search(&options, &report));
+
+        let options = SearchOptions::new("Email Outreach");
+        let report = empty_search_report(&options);
+
+        assert!(!should_refresh_notion_url_search(&options, &report));
+    }
+
+    #[test]
     fn projection_mode_accepts_only_linux_virtual_projection_on_linux() {
         let args = vec!["--projection".to_string(), "linux-fuse".to_string()];
 
@@ -4854,6 +5108,17 @@ mod tests {
             message: None,
             unsupported: Vec::new(),
             suggested_fix: None,
+        }
+    }
+
+    fn empty_search_report(options: &SearchOptions) -> SearchReport {
+        SearchReport {
+            ok: true,
+            command: "search",
+            query: options.query.clone(),
+            connector: options.connector.clone(),
+            count: 0,
+            results: Vec::new(),
         }
     }
 

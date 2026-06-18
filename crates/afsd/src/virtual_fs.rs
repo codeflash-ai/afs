@@ -63,6 +63,44 @@ pub fn source_root_directory_name(connector: &str) -> String {
     }
 }
 
+pub fn virtual_fs_ancestor_container_identifiers<S>(
+    store: &S,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> AfsResult<Vec<String>>
+where
+    S: MountRepository + EntityRepository,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let entity = entities
+        .iter()
+        .find(|entity| entity.remote_id == *remote_id)
+        .ok_or_else(|| StoreError::EntityMissing {
+            mount_id: mount_id.clone(),
+            remote_id: remote_id.clone(),
+        })?;
+    let index = ProviderIndex::new(&entities);
+    let target_container = match entity.kind {
+        EntityKind::Page => page_container_path(&entity.path),
+        EntityKind::Database | EntityKind::Directory => entity.path.clone(),
+        EntityKind::Asset | EntityKind::Unknown(_) => parent_path(&entity.path).to_path_buf(),
+    };
+
+    let mut identifiers = vec![
+        ROOT_CONTAINER_IDENTIFIER.to_string(),
+        source_root_identifier(&mount.connector),
+    ];
+    let mut path = PathBuf::new();
+    for component in target_container.components() {
+        path.push(component.as_os_str());
+        identifiers.push(container_identifier_for_path(&mount, &path, &index));
+    }
+    identifiers.dedup();
+
+    Ok(identifiers)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualFsItemReport {
     pub mount_id: String,
@@ -1827,8 +1865,9 @@ mod tests {
         VirtualFsItemKind, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
         create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
         refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
-        trash_virtual_fs_item, virtual_fs_children, virtual_fs_children_with_content_root,
-        virtual_fs_content_path, virtual_fs_item, virtual_fs_item_with_content_root,
+        trash_virtual_fs_item, virtual_fs_ancestor_container_identifiers, virtual_fs_children,
+        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
+        virtual_fs_item_with_content_root,
     };
 
     #[test]
@@ -2009,6 +2048,50 @@ mod tests {
         assert_eq!(
             report.children[1].parent_identifier.as_deref(),
             Some("children:page-root")
+        );
+    }
+
+    #[test]
+    fn ancestor_container_identifiers_follow_virtual_page_path() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save root page");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-child"),
+                EntityKind::Page,
+                "Child",
+                "Home/Child/page.md",
+            ))
+            .expect("save child page");
+
+        let identifiers = virtual_fs_ancestor_container_identifiers(
+            &store,
+            &mount_id,
+            &RemoteId::new("page-child"),
+        )
+        .expect("ancestor identifiers");
+
+        assert_eq!(
+            identifiers,
+            vec![
+                "root".to_string(),
+                "source:notion".to_string(),
+                "children:page-root".to_string(),
+                "children:page-child".to_string(),
+            ]
         );
     }
 
