@@ -102,6 +102,38 @@ fn render_empty_paragraph_as_blank_line_without_shadow_marker() {
 }
 
 #[test]
+fn render_rich_text_line_breaks_inside_one_shadow_block() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block(
+                "paragraph-1",
+                vec![rich_text(
+                    "First line.\n\n# Still paragraph text\n- Also text",
+                )],
+            ),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "First line.<br><br># Still paragraph text<br>- Also text\n"
+    );
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["paragraph-1"]
+    );
+}
+
+#[test]
 fn fetch_does_not_inline_child_page_or_database_content_into_parent_body() {
     let api = FixtureNotionApi::parent_with_child_boundaries();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));

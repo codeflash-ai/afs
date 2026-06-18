@@ -900,11 +900,13 @@ fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) ->
 }
 
 fn escape_markdown_text(text: &str) -> String {
-    text.replace('\\', "\\\\")
+    text.replace('\\', "\\\\").replace('\n', "<br>")
 }
 
 fn escape_markdown_link_label(text: &str) -> String {
-    text.replace('[', "\\[").replace(']', "\\]")
+    text.replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('\n', "<br>")
 }
 
 fn escape_directive_value(value: &str) -> String {
