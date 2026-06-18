@@ -114,6 +114,7 @@ fn daemon_push_job_blocks_when_remote_tree_content_changed_before_apply() {
         .expect("execute push");
 
     assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(report.journal_status, Some(JournalStatus::Reverted));
     assert_eq!(source.applied_count(), 0);
     assert_eq!(report.error.as_ref().expect("error").code, "guardrail");
     assert!(
@@ -126,7 +127,7 @@ fn daemon_push_job_blocks_when_remote_tree_content_changed_before_apply() {
     );
     let journal = supervisor.store().list_journal().expect("journal");
     assert_eq!(journal.len(), 1);
-    assert!(matches!(journal[0].status, JournalStatus::Failed(_)));
+    assert_eq!(journal[0].status, JournalStatus::Reverted);
 }
 
 #[test]

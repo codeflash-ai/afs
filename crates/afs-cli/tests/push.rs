@@ -298,7 +298,7 @@ fn push_virtual_projection_direct_fallback_reconciles_content_cache() {
 }
 
 #[test]
-fn push_daemon_reports_connector_not_implemented_with_failed_journal() {
+fn push_daemon_reports_connector_not_implemented_with_reverted_journal() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();
     let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
@@ -321,17 +321,18 @@ fn push_daemon_reports_connector_not_implemented_with_failed_journal() {
 
     assert!(!report.ok);
     assert_eq!(report.action, "apply_not_implemented");
-    assert_eq!(report.journal_status.as_deref(), Some("failed"));
+    assert_eq!(report.journal_status.as_deref(), Some("reverted"));
+    assert_eq!(report.apply_effect_count, 0);
     assert_eq!(push_report_exit_code(&report), 5);
-    assert!(matches!(
+    assert_eq!(
         store
             .list_journal()
             .expect("list journal")
             .pop()
             .expect("journal")
             .status,
-        afs_core::journal::JournalStatus::Failed(_)
-    ));
+        afs_core::journal::JournalStatus::Reverted
+    );
 }
 
 #[test]
