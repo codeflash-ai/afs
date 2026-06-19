@@ -68,8 +68,37 @@ impl SqliteStateStore {
 
 impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
-        let connection = self.connection()?;
-        connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+                 FROM mounts
+                 WHERE mount_id = ?1",
+                params![&mount.mount_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(mount_from_row)
+            .transpose()?;
+        if existing
+            .as_ref()
+            .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
+        {
+            clear_mount_source_state(&transaction, &mount.mount_id)?;
+        }
+
+        transaction.execute(
             "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(mount_id) DO UPDATE SET
@@ -80,15 +109,16 @@ impl MountRepository for SqliteStateStore {
                 projection_json = excluded.projection_json,
                 connection_id = excluded.connection_id",
             params![
-                mount.mount_id.0,
-                mount.connector,
+                &mount.mount_id.0,
+                &mount.connector,
                 path_to_text(&mount.root),
-                mount.remote_root_id.map(|remote_id| remote_id.0),
+                mount.remote_root_id.as_ref().map(|remote_id| remote_id.0.as_str()),
                 bool_to_int(mount.read_only),
                 to_json(&mount.projection)?,
-                mount.connection_id.map(|connection_id| connection_id.0),
+                mount.connection_id.as_ref().map(|connection_id| connection_id.0.as_str()),
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -998,6 +1028,31 @@ impl JournalStore for SqliteStateStore {
         self.record_journal_apply_effects(push_id, effects)
             .map_err(Into::into)
     }
+}
+
+fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> bool {
+    existing.connector != next.connector
+        || existing.remote_root_id != next.remote_root_id
+        || existing.connection_id != next.connection_id
+}
+
+fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
+    for table in [
+        "entities",
+        "shadows",
+        "hydration_jobs",
+        "virtual_mutations",
+        "remote_observations",
+        "freshness_states",
+        "journals",
+        "entity_search_fts",
+    ] {
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE mount_id = ?1"),
+            params![&mount_id.0],
+        )?;
+    }
+    Ok(())
 }
 
 const ENTITY_SELECT_WITH_WHERE: &str = "

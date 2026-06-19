@@ -78,10 +78,35 @@ impl InMemoryStateStore {
     fn freshness_state_key(mount_id: &MountId, remote_id: &RemoteId) -> FreshnessStateKey {
         (mount_id.clone(), remote_id.clone())
     }
+
+    fn clear_mount_source_state(&mut self, mount_id: &MountId) {
+        self.entities
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.entities_by_path
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.shadows
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.hydration_jobs
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.virtual_mutations
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.remote_observations
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.freshness_states
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.journals.retain(|_, entry| entry.mount_id != *mount_id);
+    }
 }
 
 impl MountRepository for InMemoryStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
+        if self
+            .mounts
+            .get(&mount.mount_id)
+            .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
+        {
+            self.clear_mount_source_state(&mount.mount_id);
+        }
         self.mounts.insert(mount.mount_id.clone(), mount);
         Ok(())
     }
@@ -93,6 +118,12 @@ impl MountRepository for InMemoryStateStore {
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         Ok(self.mounts.values().cloned().collect())
     }
+}
+
+fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> bool {
+    existing.connector != next.connector
+        || existing.remote_root_id != next.remote_root_id
+        || existing.connection_id != next.connection_id
 }
 
 impl ConnectionRepository for InMemoryStateStore {

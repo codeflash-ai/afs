@@ -196,7 +196,6 @@ fn search_filters_connectors_and_rejects_empty_queries() {
 fn notion_url_locate_prefers_page_file_over_workspace_fallback() {
     let fixture = SearchFixture::new();
     let mut store = fixture.store();
-    fixture.seed_entities(&mut store);
     store
         .save_mount(
             MountConfig::new(
@@ -207,6 +206,7 @@ fn notion_url_locate_prefers_page_file_over_workspace_fallback() {
             .with_remote_root_id(RemoteId::new("37b3ac0ebb88802cbcf4d53c9cfc4972")),
         )
         .expect("point mount root at indexed page");
+    fixture.seed_entities(&mut store);
 
     let report = run_search(
         &store,

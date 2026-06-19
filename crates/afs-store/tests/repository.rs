@@ -8,7 +8,7 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    ConnectionId, EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
     InMemoryStateStore, JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
@@ -28,6 +28,124 @@ fn mount_config_round_trips_with_read_only_flag() {
         Some(mount)
     );
     assert_eq!(store.load_mounts().expect("load mounts").len(), 1);
+}
+
+#[test]
+fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "notion", "/tmp/afs/notion")
+                .with_connection_id(ConnectionId::new("old-workspace")),
+        )
+        .expect("save original mount");
+    seed_source_scoped_state(&mut store);
+
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "notion", "/tmp/afs/notion")
+                .with_connection_id(ConnectionId::new("new-workspace")),
+        )
+        .expect("remount with new connection");
+
+    assert_eq!(
+        store
+            .get_mount(&mount_id())
+            .expect("get mount")
+            .expect("mount")
+            .connection_id,
+        Some(ConnectionId::new("new-workspace"))
+    );
+    assert!(
+        store
+            .list_entities(&mount_id())
+            .expect("list entities")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_remote_observations(&mount_id())
+            .expect("list observations")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_virtual_mutations(&mount_id())
+            .expect("list mutations")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_freshness_states(&mount_id())
+            .expect("list freshness")
+            .is_empty()
+    );
+    assert!(store.list_journal().expect("list journal").is_empty());
+    assert!(matches!(
+        store.load_shadow(&mount_id(), &RemoteId::new("page-1")),
+        Err(StoreError::ShadowMissing { .. })
+    ));
+}
+
+#[test]
+fn remounting_same_mount_id_to_different_remote_root_clears_source_scoped_state() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "notion", "/tmp/afs/notion")
+                .with_connection_id(ConnectionId::new("workspace"))
+                .with_remote_root_id(RemoteId::new("old-root")),
+        )
+        .expect("save original mount");
+    seed_source_scoped_state(&mut store);
+
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "notion", "/tmp/afs/notion")
+                .with_connection_id(ConnectionId::new("workspace"))
+                .with_remote_root_id(RemoteId::new("new-root")),
+        )
+        .expect("remount with new root");
+
+    assert_eq!(
+        store
+            .get_mount(&mount_id())
+            .expect("get mount")
+            .expect("mount")
+            .remote_root_id,
+        Some(RemoteId::new("new-root"))
+    );
+    assert!(
+        store
+            .list_entities(&mount_id())
+            .expect("list entities")
+            .is_empty()
+    );
+}
+
+#[test]
+fn remounting_same_source_keeps_source_scoped_state() {
+    let mut store = InMemoryStateStore::new();
+    let mount = MountConfig::new(mount_id(), "notion", "/tmp/afs/notion")
+        .with_connection_id(ConnectionId::new("workspace"));
+    store.save_mount(mount.clone()).expect("save mount");
+    seed_source_scoped_state(&mut store);
+
+    store.save_mount(mount).expect("remount same source");
+
+    assert_eq!(
+        store
+            .list_entities(&mount_id())
+            .expect("list entities")
+            .len(),
+        1
+    );
+    assert_eq!(store.list_journal().expect("list journal").len(), 1);
+    assert!(
+        store
+            .load_shadow(&mount_id(), &RemoteId::new("page-1"))
+            .is_ok()
+    );
 }
 
 #[test]
@@ -384,6 +502,31 @@ fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
         ),
         status,
     )
+}
+
+fn seed_source_scoped_state(store: &mut InMemoryStateStore) {
+    store
+        .save_entity(entity_record("page-1", "Roadmap.md"))
+        .expect("save entity");
+    store
+        .save_shadow(&mount_id(), shadow_document())
+        .expect("save shadow");
+    store
+        .save_remote_observation(remote_observation("page-1", "Roadmap.md"))
+        .expect("save observation");
+    store
+        .save_virtual_mutation(virtual_mutation("local:1", "Draft.md"))
+        .expect("save mutation");
+    store
+        .save_freshness_state(FreshnessStateRecord::new(
+            mount_id(),
+            RemoteId::new("page-1"),
+            FreshnessTier::Hot,
+        ))
+        .expect("save freshness");
+    store
+        .append_journal(journal_entry("push-1", JournalStatus::Prepared))
+        .expect("append journal");
 }
 
 fn apply_effects() -> Vec<JournalApplyEffect> {

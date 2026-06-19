@@ -210,6 +210,121 @@ fn entity_search_candidates_use_sqlite_index() {
 }
 
 #[test]
+fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            fixture
+                .mount_config()
+                .with_connection_id(ConnectionId::new("old-workspace")),
+        )
+        .expect("save original mount");
+    seed_source_scoped_state(&mut store, &fixture.mount_id);
+
+    store
+        .save_mount(
+            fixture
+                .mount_config()
+                .with_connection_id(ConnectionId::new("new-workspace")),
+        )
+        .expect("remount with new connection");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_mount(&fixture.mount_id)
+            .expect("get mount")
+            .expect("mount")
+            .connection_id,
+        Some(ConnectionId::new("new-workspace"))
+    );
+    assert!(
+        reopened
+            .list_entities(&fixture.mount_id)
+            .expect("list entities")
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .list_remote_observations(&fixture.mount_id)
+            .expect("list observations")
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list mutations")
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .list_freshness_states(&fixture.mount_id)
+            .expect("list freshness")
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .list_hydration_jobs()
+            .expect("list hydration jobs")
+            .is_empty()
+    );
+    assert!(reopened.list_journal().expect("list journal").is_empty());
+    assert!(matches!(
+        reopened.load_shadow(&fixture.mount_id, &RemoteId::new("page-1")),
+        Err(StoreError::ShadowMissing { .. })
+    ));
+    assert_eq!(
+        reopened
+            .list_entity_search_candidates(&fixture.mount_id, "Roadmap", None)
+            .expect("search candidates"),
+        Some(Vec::new())
+    );
+}
+
+#[test]
+fn remounting_same_mount_id_to_different_remote_root_clears_source_scoped_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            fixture
+                .mount_config()
+                .with_connection_id(ConnectionId::new("workspace"))
+                .with_remote_root_id(RemoteId::new("old-root")),
+        )
+        .expect("save original mount");
+    seed_source_scoped_state(&mut store, &fixture.mount_id);
+
+    store
+        .save_mount(
+            fixture
+                .mount_config()
+                .with_connection_id(ConnectionId::new("workspace"))
+                .with_remote_root_id(RemoteId::new("new-root")),
+        )
+        .expect("remount with new root");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_mount(&fixture.mount_id)
+            .expect("get mount")
+            .expect("mount")
+            .remote_root_id,
+        Some(RemoteId::new("new-root"))
+    );
+    assert!(
+        reopened
+            .list_entities(&fixture.mount_id)
+            .expect("list entities")
+            .is_empty()
+    );
+}
+
+#[test]
 fn virtual_mutations_round_trip_and_delete_after_reopen() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
@@ -1446,6 +1561,28 @@ fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
     .with_preimages(vec![JournalPreimage::from_shadow(shadow_document(
         "# Roadmap\n\nOriginal paragraph.",
     ))])
+}
+
+fn seed_source_scoped_state(store: &mut SqliteStateStore, mount_id: &MountId) {
+    store.save_entity(entity_record()).expect("save entity");
+    store
+        .save_shadow(mount_id, shadow_document("# Roadmap\n\nSame paragraph."))
+        .expect("save shadow");
+    store
+        .save_remote_observation(remote_observation_record())
+        .expect("save observation");
+    store
+        .save_virtual_mutation(virtual_mutation_record())
+        .expect("save virtual mutation");
+    store
+        .save_freshness_state(freshness_state_record())
+        .expect("save freshness");
+    store
+        .upsert_hydration_job(hydration_job_record())
+        .expect("save hydration job");
+    store
+        .append_journal(journal_entry("push-1", JournalStatus::Prepared))
+        .expect("append journal");
 }
 
 fn apply_effects(push_id: &str) -> Vec<JournalApplyEffect> {
