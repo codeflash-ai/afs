@@ -232,7 +232,9 @@ macOS channel from a `v*` tag or manual workflow dispatch. It runs on the
 GitHub-hosted `macos-15` arm64 runner, builds the notarized DMG, produces the
 signed updater archive, renders `latest-macos.json`, renders `afs.rb`, creates
 or updates the GitHub Release, uploads all release assets, and optionally pushes
-the cask to the Homebrew tap.
+the cask to the Homebrew tap. It shares a release concurrency group with the
+Linux workflow so both workflows can target the same tag without racing while
+creating or updating the GitHub Release.
 
 Required repository secrets:
 
@@ -271,12 +273,55 @@ The workflow requires the tag to match the Tauri app version exactly.
 
 ## Mac App Store Track
 
-Mac App Store distribution should be a separate build target from the direct DMG
-and Homebrew release. The App Store build needs App Sandbox enabled, App Store
-signing/provisioning instead of Developer ID signing, App Store Connect metadata,
-and review of the File Provider extension, embedded sidecars, and CLI install
-behavior. Keep the direct DMG/Homebrew build as the fast-moving beta channel
-until the sandboxed build has its own install and update story.
+Mac App Store (MAS) distribution should be a separate build target from the
+direct DMG and Homebrew release. The App Store build needs App Sandbox enabled,
+App Store signing/provisioning instead of Developer ID signing, App Store
+Connect metadata, and review of the File Provider extension, embedded sidecars,
+and CLI install behavior. Keep the direct DMG/Homebrew build as the fast-moving
+beta channel until the sandboxed build has its own install and update story.
+
+Run the static readiness audit before attempting an App Store-signed build:
+
+```sh
+make audit-mas-readiness
+```
+
+The audit verifies that the checked-in macOS app/extension entitlements include
+App Sandbox, the shared application group, and network client access; that the
+bundle identifiers and minimum OS are consistent; and that the desktop frontend
+and backend understand the `mas` distribution channel.
+
+Build a local Mac App Store-channel `.app` bundle with:
+
+```sh
+make build-mas
+```
+
+This sets both build-time channel flags:
+
+```sh
+VITE_AFS_DISTRIBUTION_CHANNEL=mas
+AFS_DISTRIBUTION_CHANNEL=mas
+```
+
+The `mas` channel disables the in-app Tauri updater and skips automatic
+terminal-command symlink installation. The App Store build should get updates
+through the App Store, while users who need `afs` on their shell path should use
+the Homebrew or direct DMG channel.
+
+Remaining App Store work:
+
+- Create or confirm App Store App IDs for `ai.codeflash.afs` and
+  `ai.codeflash.afs.AgentFS.FileProvider`.
+- Create provisioning profiles for the containing app and File Provider
+  extension with `group.ai.codeflash.afs`.
+- Import `3rd Party Mac Developer Application` and `3rd Party Mac Developer
+  Installer` certificates into CI.
+- Add an App Store packaging workflow that re-signs nested code with the App
+  Store application identity, embeds provisioning profiles, creates the signed
+  installer package, and validates it locally before upload.
+- Upload the installer package through Transporter or Xcode, then complete
+  TestFlight/App Review metadata in App Store Connect.
 
 ## Distribution Channels
 

@@ -28,6 +28,9 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+const distributionChannel = (import.meta.env.VITE_AFS_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
+const appStoreDistribution = distributionChannel === "mas";
+
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4;
@@ -387,6 +390,17 @@ export default function App() {
   }
 
   async function checkForAppUpdate(options: { silent?: boolean } = {}) {
+    if (appStoreDistribution) {
+      if (!options.silent) {
+        setUpdateStatus({
+          state: "current",
+          message: "Updates are managed by the Mac App Store.",
+          update: null,
+        });
+      }
+      return;
+    }
+
     if (!isTauriRuntime()) {
       if (!options.silent) {
         setUpdateStatus({
@@ -425,6 +439,15 @@ export default function App() {
   }
 
   async function installAppUpdate() {
+    if (appStoreDistribution) {
+      setUpdateStatus({
+        state: "current",
+        message: "Updates are managed by the Mac App Store.",
+        update: null,
+      });
+      return;
+    }
+
     if (!isTauriRuntime()) {
       setUpdateStatus({
         state: "error",
@@ -469,7 +492,9 @@ export default function App() {
           return;
         }
         await callCommand<ActionReport>("acknowledge_install_state").catch(() => undefined);
-        await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
+        if (!appStoreDistribution) {
+          await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
+        }
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
       await refreshSnapshot();
@@ -480,7 +505,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!isTauriRuntime()) {
+    if (!isTauriRuntime() || appStoreDistribution) {
       return undefined;
     }
 
@@ -562,7 +587,9 @@ export default function App() {
             throw new Error(report.message);
           }
           setInstallReview(null);
-          await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
+          if (!appStoreDistribution) {
+            await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
+          }
           await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
           await refreshSnapshot();
         }}
@@ -596,6 +623,7 @@ export default function App() {
       onCheckForUpdate={checkForAppUpdate}
       onInstallUpdate={installAppUpdate}
       onDismissUpdate={() => setUpdateStatus(emptyUpdateStatus())}
+      appStoreDistribution={appStoreDistribution}
       onResetComplete={() => {
         setOnboardingInitialStep(1);
         setOnboardingKey((key) => key + 1);
@@ -857,6 +885,10 @@ function Onboarding({
   }
 
   async function ensureCliAvailable() {
+    if (appStoreDistribution) {
+      return true;
+    }
+
     const report = await callCommand<ActionReport>(
       "ensure_terminal_cli_available",
       undefined,
@@ -1165,6 +1197,7 @@ function MainShell({
   onCheckForUpdate,
   onInstallUpdate,
   onDismissUpdate,
+  appStoreDistribution,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
@@ -1175,6 +1208,7 @@ function MainShell({
   onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
   onInstallUpdate: () => Promise<void>;
   onDismissUpdate: () => void;
+  appStoreDistribution: boolean;
   onResetComplete: () => void;
 }) {
   const meta = snapshot.health.attentionCount > 0 ? "Pending Changes" : "Ready";
@@ -1285,6 +1319,7 @@ function MainShell({
               updateStatus={updateStatus}
               onCheckForUpdate={onCheckForUpdate}
               onInstallUpdate={onInstallUpdate}
+              appStoreDistribution={appStoreDistribution}
               onResetComplete={onResetComplete}
             />
           )}
@@ -1956,6 +1991,7 @@ function SettingsView({
   updateStatus,
   onCheckForUpdate,
   onInstallUpdate,
+  appStoreDistribution,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
@@ -1964,6 +2000,7 @@ function SettingsView({
   updateStatus: UpdateStatus;
   onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
   onInstallUpdate: () => Promise<void>;
+  appStoreDistribution: boolean;
   onResetComplete: () => void;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
@@ -1978,6 +2015,10 @@ function SettingsView({
   const checkingForUpdate = updateStatus.state === "checking";
   const installingUpdate = updateStatus.state === "installing";
   const updateAvailable = updateStatus.state === "available" || updateStatus.state === "installing";
+  const updateChannelLabel = appStoreDistribution ? "Mac App Store" : "GitHub Releases";
+  const updateStatusLabel = appStoreDistribution
+    ? "Managed by the App Store"
+    : updateStatus.message || "Ready";
 
   useEffect(() => {
     setLocalSettings(snapshot.settings);
@@ -2122,30 +2163,32 @@ function SettingsView({
 
         <div className="panel">
           <PanelTitle title="Updates" />
-          <SettingRow title="Channel" value="GitHub Releases" />
+          <SettingRow title="Channel" value={updateChannelLabel} />
           <SettingRow
             title="Status"
-            value={updateStatus.message || "Ready"}
+            value={updateStatusLabel}
           />
           {updateStatus.version && <SettingRow title="Available version" value={updateStatus.version} />}
-          <div className="button-row">
-            <SecondaryButton
-              compact
-              icon={checkingForUpdate ? <Loader2 className="spin-icon" /> : <RefreshCw />}
-              disabled={checkingForUpdate || installingUpdate}
-              onClick={() => void onCheckForUpdate()}
-            >
-              {checkingForUpdate ? "Checking" : "Check"}
-            </SecondaryButton>
-            <PrimaryButton
-              compact
-              icon={installingUpdate ? <Loader2 className="spin-icon" /> : <Download />}
-              disabled={!updateAvailable || checkingForUpdate || installingUpdate}
-              onClick={() => void onInstallUpdate()}
-            >
-              {installingUpdate ? "Installing" : "Install"}
-            </PrimaryButton>
-          </div>
+          {!appStoreDistribution && (
+            <div className="button-row">
+              <SecondaryButton
+                compact
+                icon={checkingForUpdate ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+                disabled={checkingForUpdate || installingUpdate}
+                onClick={() => void onCheckForUpdate()}
+              >
+                {checkingForUpdate ? "Checking" : "Check"}
+              </SecondaryButton>
+              <PrimaryButton
+                compact
+                icon={installingUpdate ? <Loader2 className="spin-icon" /> : <Download />}
+                disabled={!updateAvailable || checkingForUpdate || installingUpdate}
+                onClick={() => void onInstallUpdate()}
+              >
+                {installingUpdate ? "Installing" : "Install"}
+              </PrimaryButton>
+            </div>
+          )}
         </div>
 
         <div className="panel">

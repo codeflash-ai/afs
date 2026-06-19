@@ -41,6 +41,10 @@ build-desktop: $(DESKTOP_NODE_MODULES_STAMP) ## Build the desktop frontend asset
 build-tauri: ## Build the packaged Tauri desktop app.
 	$(DESKTOP_NPM) run build:mac
 
+.PHONY: build-mas
+build-mas: setup ## Build a local Mac App Store-channel .app bundle.
+	$(DESKTOP_NPM) run build:mas
+
 .PHONY: publish
 publish: setup ## Build, sign, notarize, staple, and validate a macOS DMG.
 	scripts/publish-macos.sh
@@ -56,6 +60,10 @@ render-homebrew-cask: ## Render a Homebrew cask from published macOS DMG artifac
 .PHONY: render-updater-manifest
 render-updater-manifest: ## Render the Tauri updater latest-macos.json manifest.
 	scripts/render-tauri-updater-manifest.sh
+
+.PHONY: audit-mas-readiness
+audit-mas-readiness: ## Run static checks for Mac App Store release readiness.
+	scripts/audit-mas-readiness.sh
 
 .PHONY: prepare-macos-file-provider
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.

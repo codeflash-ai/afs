@@ -83,3 +83,31 @@ behavior:
 ```sh
 AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 make test-linux-fuse
 ```
+
+## GitHub Release Workflow
+
+The GitHub workflow in `.github/workflows/release-linux.yml` publishes Linux
+packages from a `v*` tag or manual workflow dispatch. It runs on
+`ubuntu-24.04`, installs the GTK/WebKit/FUSE/AppIndicator packaging
+dependencies, runs `make publish-linux`, and uploads the resulting `.deb`,
+`.rpm`, per-artifact checksums, and `SHA256SUMS-linux` to the matching GitHub
+Release.
+
+The workflow shares the same release concurrency group as the macOS workflow so
+both jobs can target one tag without racing while creating or updating the
+GitHub Release.
+
+Release a new Linux package by updating the app version, committing the change,
+tagging that commit, and pushing the tag:
+
+```sh
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The workflow requires the tag to match `apps/desktop/src-tauri/tauri.conf.json`
+exactly. For example, version `0.1.1` must be released as `v0.1.1`.
+
+GitHub Releases are the first Linux distribution channel. Apt/Yum repository
+metadata, Snap, and Flatpak should be evaluated separately after the packaged
+FUSE and per-user systemd behavior has been tested on the target distribution.
