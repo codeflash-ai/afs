@@ -225,6 +225,12 @@ when `--session` is passed, the CLI starts a detached child process and writes
 `~/.afs/afsd.pid`; session mode inherits the current shell environment but does
 not survive logout.
 
+On Windows, the daemon manager uses detached session mode and localhost TCP
+control IPC. `--tcp-addr off` is not valid for Windows daemon start because
+there is no Unix socket fallback. A custom `--tcp-addr <host:port>` is persisted
+in daemon manager metadata so `status`, `reload`, and `stop` can find the same
+daemon later.
+
 Useful forms:
 
 ```sh
@@ -238,11 +244,12 @@ afs daemon restart
 
 `--state-dir <path>` starts or queries a daemon for an isolated state root.
 `--tcp-addr <host:port|off>` persists the TCP listener setting for that managed
-daemon. `--afsd-bin <path>` points the manager at a specific daemon binary. For
-development-only environment variables that launchd would not otherwise know
-about, `--include-env <KEY>` copies the current value into the LaunchAgent plist;
-do not use it for long-lived secrets once keychain-backed `afs connect` is
-available.
+daemon. On Windows this TCP listener is also the CLI control endpoint.
+`--afsd-bin <path>` points the manager at a specific daemon binary. For
+development-only environment variables that the process manager would not
+otherwise know about, `--include-env <KEY>` copies the current value into the
+managed daemon environment; do not use it for long-lived secrets once
+keychain-backed `afs connect` is available.
 
 ## Initial `afs info --json` Shape
 
@@ -401,7 +408,11 @@ afs status ~/afs/notion
 
 ## `afs daemon status`
 
-`afs daemon status [--json]` checks the configured Unix socket and, when the daemon is running, requests a daemon status snapshot. JSON output includes process-manager state, runtime queue counts, scheduler mode, watched mount count, and watched roots.
+`afs daemon status [--json]` checks the configured daemon control endpoint and,
+when the daemon is running, requests a daemon status snapshot. On macOS/Linux
+the CLI uses the Unix socket; on Windows it uses the configured or persisted
+localhost TCP address. JSON output includes process-manager state, runtime queue
+counts, scheduler mode, watched mount count, and watched roots.
 Runtime queue counts include mutating requests, hydration work, scheduled pulls,
 and freshness work. Freshness metrics report pending/ready/deferred jobs plus
 ready and total budget units, which helps diagnose sync pressure without
