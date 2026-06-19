@@ -11,7 +11,7 @@ use afs_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
     has_unresolved_conflict_markers,
 };
-use afs_core::model::{HydrationState, MountId, RemoteId};
+use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
@@ -20,8 +20,8 @@ use afs_notion::dto::{
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
-    EntityRepository, InMemoryStateStore, MountConfig, MountRepository, ProjectionMode,
-    ShadowRepository,
+    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
+    ProjectionMode, ShadowRepository,
 };
 use afsd::virtual_fs::{source_root_directory_name, virtual_fs_content_root};
 
@@ -238,6 +238,101 @@ fn pull_virtual_file_accepts_source_directory_target() {
             .join("roadmap/design-notes/page.md")
             .exists()
     );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_virtual_database_directory_enumerates_children_without_reading_cache_directory() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    assert!(content_root.join("roadmap").join("tasks").is_dir());
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.source_database_dir(),
+        Some(&state_root),
+    )
+    .expect("pull virtual database directory");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 1);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.stubbed, 0);
+    assert!(
+        content_root
+            .join("roadmap")
+            .join("tasks")
+            .join("_schema.yaml")
+            .exists()
+    );
+    let row = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/tasks/fix-login-bug/page.md"),
+        )
+        .expect("find row")
+        .expect("row entity");
+    assert_eq!(row.kind, EntityKind::Page);
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_virtual_database_directory_keeps_dirty_row_at_local_path() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+    let row_id = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/tasks/fix-login-bug/page.md"),
+        )
+        .expect("find original row")
+        .expect("original row")
+        .remote_id;
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                row_id.clone(),
+                EntityKind::Page,
+                "Fix login bug",
+                "local-dirty-row/page.md",
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_content_hash("local-dirty-hash"),
+        )
+        .expect("save dirty row");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.source_database_dir(),
+        Some(&state_root),
+    )
+    .expect("pull virtual database directory");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 1);
+    let row = store
+        .get_entity(&fixture.mount_id, &row_id)
+        .expect("get row")
+        .expect("row");
+    assert_eq!(row.path, PathBuf::from("local-dirty-row/page.md"));
+    assert_eq!(row.hydration, HydrationState::Dirty);
+    assert_eq!(row.content_hash.as_deref(), Some("local-dirty-hash"));
 
     let _ = fs::remove_dir_all(state_root);
 }
@@ -631,6 +726,10 @@ impl PullFixture {
 
     fn database_schema_file(&self) -> PathBuf {
         self.root.join("roadmap").join("tasks").join("_schema.yaml")
+    }
+
+    fn source_database_dir(&self) -> PathBuf {
+        self.source_root().join("roadmap").join("tasks")
     }
 
     fn row_file(&self) -> PathBuf {

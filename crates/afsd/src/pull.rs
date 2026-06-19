@@ -6,7 +6,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use afs_connector::EnumerateRequest;
+use afs_connector::{ChildContainer, EnumerateRequest, ListChildrenRequest};
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use afs_core::conflict::{
     has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
@@ -81,6 +81,15 @@ where
 
     if should_pull_mount_root(&mount, &relative_path, &target_path) {
         pull_mount_root(store, &source, &mount, target_path, state_root)
+    } else if let Some(report) = pull_virtual_directory_path(
+        store,
+        &source,
+        &mount,
+        &relative_path,
+        target_path.clone(),
+        state_root,
+    )? {
+        Ok(report)
     } else {
         pull_entity_path(
             store,
@@ -162,6 +171,144 @@ where
         skipped_dirty,
         conflicts,
     })
+}
+
+fn pull_virtual_directory_path<S, Source>(
+    store: &mut S,
+    source: &Source,
+    mount: &MountConfig,
+    relative_path: &Path,
+    target_path: PathBuf,
+    state_root: Option<&Path>,
+) -> Result<Option<PullReport>, PullError>
+where
+    S: EntityRepository,
+    Source: SourceAdapter,
+{
+    if !mount.projection.uses_virtual_filesystem() {
+        return Ok(None);
+    }
+
+    let Some(target) = virtual_directory_target(store, mount, relative_path)? else {
+        return Ok(None);
+    };
+
+    let mut enumerated = 0;
+    if let Some(container) = target.container {
+        let result = source
+            .list_children(ListChildrenRequest {
+                mount_id: mount.mount_id.clone(),
+                container,
+                parent_path: target.parent_path.clone(),
+            })
+            .map_err(PullError::Connector)?;
+        enumerated = result.entries.len();
+        for entry in result.entries {
+            let existing = store
+                .get_entity(&entry.mount_id, &entry.remote_id)
+                .map_err(PullError::Store)?;
+            let record = virtual_child_entity_record(entry, existing.as_ref());
+            store.save_entity(record).map_err(PullError::Store)?;
+        }
+    }
+
+    if let Some(database_id) = target.schema_database_id
+        && let Some(state_root) = state_root
+        && let Some(schema) = source
+            .database_schema_yaml(&database_id)
+            .map_err(PullError::Connector)?
+    {
+        let directory =
+            virtual_fs_content_root(state_root, &mount.mount_id).join(&target.parent_path);
+        write_atomic(&directory.join("_schema.yaml"), schema)?;
+    }
+
+    Ok(Some(PullReport {
+        ok: true,
+        command: "pull".to_string(),
+        via: "cli".to_string(),
+        mount_id: mount.mount_id.0.clone(),
+        root: mount.root.display().to_string(),
+        target: target_path.display().to_string(),
+        enumerated,
+        stubbed: 0,
+        hydrated: 0,
+        skipped_dirty: 0,
+        conflicts: Vec::new(),
+    }))
+}
+
+fn virtual_child_entity_record(entry: TreeEntry, existing: Option<&EntityRecord>) -> EntityRecord {
+    let mut record = EntityRecord::from(entry);
+    if let Some(existing) = existing {
+        let path_changed = record.path != existing.path;
+        if matches!(
+            existing.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            record.path = existing.path.clone();
+            record.hydration = existing.hydration.clone();
+            record.content_hash = existing.content_hash.clone();
+        } else if !path_changed {
+            record.hydration = existing.hydration.clone();
+            record.content_hash = existing.content_hash.clone();
+        }
+    }
+    record
+}
+
+#[derive(Debug)]
+struct VirtualDirectoryTarget {
+    parent_path: PathBuf,
+    container: Option<ChildContainer>,
+    schema_database_id: Option<afs_core::model::RemoteId>,
+}
+
+fn virtual_directory_target<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<Option<VirtualDirectoryTarget>, PullError>
+where
+    S: EntityRepository,
+{
+    if relative_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(entity) = store
+        .find_entity_by_path(&mount.mount_id, relative_path)
+        .map_err(PullError::Store)?
+    {
+        return Ok(match entity.kind {
+            EntityKind::Database => Some(VirtualDirectoryTarget {
+                parent_path: entity.path,
+                container: Some(ChildContainer::DatabaseRows(entity.remote_id.clone())),
+                schema_database_id: Some(entity.remote_id),
+            }),
+            EntityKind::Directory => Some(VirtualDirectoryTarget {
+                parent_path: entity.path,
+                container: None,
+                schema_database_id: None,
+            }),
+            EntityKind::Page | EntityKind::Asset | EntityKind::Unknown(_) => None,
+        });
+    }
+
+    let entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(PullError::Store)?;
+    Ok(entities.into_iter().find_map(|entity| {
+        if entity.kind == EntityKind::Page && page_container_path(&entity.path) == relative_path {
+            Some(VirtualDirectoryTarget {
+                parent_path: relative_path.to_path_buf(),
+                container: Some(ChildContainer::PageChildren(entity.remote_id)),
+                schema_database_id: None,
+            })
+        } else {
+            None
+        }
+    }))
 }
 
 fn pull_entity_path<S, Source>(
