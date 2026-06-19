@@ -200,7 +200,7 @@ impl DaemonClientError {
 }
 
 pub fn socket_path(state_root: &Path) -> PathBuf {
-    state_root.join("afsd.sock")
+    afs_platform::daemon_socket_path(state_root)
 }
 
 pub fn default_tcp_addr() -> SocketAddr {

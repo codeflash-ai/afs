@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 afs-store.workspace = true
+serde = { version = "1.0", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

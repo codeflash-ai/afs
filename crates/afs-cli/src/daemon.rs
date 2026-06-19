@@ -1,11 +1,14 @@
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use afs_platform::{DefaultSessionProcessManager, SessionProcessManager};
+use afs_platform::{
+    DaemonManager, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
+    DaemonProcessStartConfig, DaemonProcessStartReport, DaemonStartMode,
+    DefaultDaemonProcessManager,
+};
 use afsd::ipc::{
     DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
     DaemonStatusReport, send_endpoint_request_with_timeout,
@@ -13,8 +16,6 @@ use afsd::ipc::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-#[cfg(target_os = "macos")]
-const LABEL: &str = "ai.codeflash.afs.afsd";
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -78,24 +79,6 @@ impl DaemonRunState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DaemonManager {
-    Launchd,
-    Session,
-    Unknown,
-}
-
-impl DaemonManager {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Launchd => "launchd",
-            Self::Session => "session",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DaemonAction {
     Start,
@@ -128,12 +111,7 @@ impl DaemonAction {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartMode {
-    Auto,
-    Launchd,
-    Session,
-}
+type StartMode = DaemonStartMode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DaemonOptions {
@@ -145,22 +123,7 @@ struct DaemonOptions {
     include_env: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
-struct DaemonPaths {
-    state_root: PathBuf,
-    socket: PathBuf,
-    pid_file: PathBuf,
-    metadata_file: PathBuf,
-    stdout_log: PathBuf,
-    stderr_log: PathBuf,
-    launch_agent: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug)]
-struct StartArtifacts {
-    manager: DaemonManager,
-    afsd_bin: PathBuf,
-}
+type DaemonPaths = DaemonProcessPaths;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DaemonMetadata {
@@ -252,18 +215,21 @@ fn start_daemon(
     fs::create_dir_all(&paths.state_root)
         .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
     let afsd_bin = find_afsd_binary(options.afsd_bin.as_deref())?;
-    let manager = resolve_start_manager(options.mode)?;
+    let process_manager = DefaultDaemonProcessManager;
+    process_manager
+        .resolve_start_manager(options.mode)
+        .map_err(daemon_process_error)?;
     validate_start_endpoint(options)?;
-    let artifacts = match manager {
-        DaemonManager::Launchd => start_launchd(options, paths, &afsd_bin)?,
-        DaemonManager::Session => start_session(options, paths, &afsd_bin)?,
-        DaemonManager::Unknown => {
-            return Err(DaemonControlError::new(
-                "unsupported",
-                "daemon start manager could not be resolved",
-            ));
-        }
-    };
+    let environment = included_environment(options)?;
+    let artifacts = process_manager
+        .start(&DaemonProcessStartConfig {
+            mode: options.mode,
+            paths,
+            afsd_bin: &afsd_bin,
+            tcp_addr: options.tcp_addr.as_deref(),
+            environment,
+        })
+        .map_err(daemon_process_error)?;
 
     if !wait_for_state(options, paths, DaemonRunState::Running, START_TIMEOUT) {
         return Err(DaemonControlError::new(
@@ -292,22 +258,10 @@ fn stop_daemon(
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
     let was_running = is_running(options, paths);
-    let mut stopped_managed_process = false;
-
-    if should_use_launchd(options.mode)
-        && paths
-            .launch_agent
-            .as_ref()
-            .is_some_and(|path| path.exists())
-    {
-        stop_launchd(paths)?;
-        stopped_managed_process = true;
-    }
-
-    if paths.pid_file.exists() {
-        stop_session(paths)?;
-        stopped_managed_process = true;
-    }
+    let mut stopped_managed_process = DefaultDaemonProcessManager
+        .stop(options.mode, paths)
+        .map_err(daemon_process_error)?
+        .stopped_managed_process;
 
     if was_running
         && !stopped_managed_process
@@ -483,7 +437,7 @@ where
 fn write_metadata(
     options: &DaemonOptions,
     paths: &DaemonPaths,
-    artifacts: &StartArtifacts,
+    artifacts: &DaemonProcessStartReport,
 ) -> Result<(), DaemonControlError> {
     let metadata = DaemonMetadata {
         manager: artifacts.manager,
@@ -502,6 +456,26 @@ fn write_metadata(
 fn read_metadata(paths: &DaemonPaths) -> Option<DaemonMetadata> {
     let bytes = fs::read(&paths.metadata_file).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn daemon_process_error(error: DaemonProcessError) -> DaemonControlError {
+    DaemonControlError::new(error.code(), error.message())
+}
+
+fn included_environment(
+    options: &DaemonOptions,
+) -> Result<Vec<(String, String)>, DaemonControlError> {
+    let mut environment = Vec::new();
+    for key in &options.include_env {
+        let value = env::var(key).map_err(|_| {
+            DaemonControlError::new(
+                "env_missing",
+                format!("environment variable `{key}` is not set"),
+            )
+        })?;
+        environment.push((key.clone(), value));
+    }
+    Ok(environment)
 }
 
 fn validate_start_endpoint(options: &DaemonOptions) -> Result<(), DaemonControlError> {
@@ -585,173 +559,6 @@ fn parse_tcp_addr(value: &str) -> Result<std::net::SocketAddr, String> {
         .map_err(|error| format!("invalid daemon TCP address `{value}`: {error}"))
 }
 
-fn resolve_start_manager(mode: StartMode) -> Result<DaemonManager, DaemonControlError> {
-    match mode {
-        StartMode::Session => Ok(DaemonManager::Session),
-        StartMode::Launchd => {
-            if cfg!(target_os = "macos") {
-                Ok(DaemonManager::Launchd)
-            } else {
-                Err(DaemonControlError::new(
-                    "unsupported",
-                    "--launchd is only supported on macOS",
-                ))
-            }
-        }
-        StartMode::Auto => {
-            if cfg!(target_os = "macos") {
-                Ok(DaemonManager::Launchd)
-            } else {
-                Ok(DaemonManager::Session)
-            }
-        }
-    }
-}
-
-fn should_use_launchd(mode: StartMode) -> bool {
-    matches!(mode, StartMode::Auto | StartMode::Launchd) && cfg!(target_os = "macos")
-}
-
-fn start_session(
-    options: &DaemonOptions,
-    paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<StartArtifacts, DaemonControlError> {
-    fs::create_dir_all(paths.stdout_log.parent().unwrap_or(&paths.state_root))
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.stdout_log)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.stderr_log)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    let mut command = Command::new(afsd_bin);
-    command
-        .env("AFS_STATE_DIR", &paths.state_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    if let Some(tcp_addr) = &options.tcp_addr {
-        command.env("AFS_DAEMON_TCP_ADDR", tcp_addr);
-    }
-    let child = DefaultSessionProcessManager
-        .spawn_detached(&mut command)
-        .map_err(|error| DaemonControlError::new("start_failed", error.to_string()))?;
-    fs::write(&paths.pid_file, child.id().to_string())
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    Ok(StartArtifacts {
-        manager: DaemonManager::Session,
-        afsd_bin: afsd_bin.to_path_buf(),
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn start_launchd(
-    options: &DaemonOptions,
-    paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<StartArtifacts, DaemonControlError> {
-    let Some(launch_agent) = &paths.launch_agent else {
-        return Err(DaemonControlError::new(
-            "unsupported",
-            "launchd requires a user LaunchAgents directory",
-        ));
-    };
-    fs::create_dir_all(launch_agent.parent().unwrap_or(Path::new(".")))
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-    fs::create_dir_all(paths.stdout_log.parent().unwrap_or(&paths.state_root))
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    let plist = launch_agent_plist(options, paths, afsd_bin)?;
-    fs::write(launch_agent, plist)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    let domain = launchd_domain()?;
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(&domain)
-        .arg(launch_agent)
-        .output();
-    run_launchctl(
-        Command::new("launchctl")
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(launch_agent),
-    )?;
-    run_launchctl(
-        Command::new("launchctl")
-            .arg("enable")
-            .arg(format!("{domain}/{LABEL}")),
-    )?;
-    run_launchctl(
-        Command::new("launchctl")
-            .arg("kickstart")
-            .arg("-k")
-            .arg(format!("{domain}/{LABEL}")),
-    )?;
-
-    Ok(StartArtifacts {
-        manager: DaemonManager::Launchd,
-        afsd_bin: afsd_bin.to_path_buf(),
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn start_launchd(
-    _options: &DaemonOptions,
-    _paths: &DaemonPaths,
-    _afsd_bin: &Path,
-) -> Result<StartArtifacts, DaemonControlError> {
-    Err(DaemonControlError::new(
-        "unsupported",
-        "launchd is only supported on macOS",
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn stop_launchd(paths: &DaemonPaths) -> Result<(), DaemonControlError> {
-    let Some(launch_agent) = &paths.launch_agent else {
-        return Ok(());
-    };
-    let domain = launchd_domain()?;
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(&domain)
-        .arg(launch_agent)
-        .output();
-    if launch_agent.exists() {
-        fs::remove_file(launch_agent)
-            .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn stop_launchd(_paths: &DaemonPaths) -> Result<(), DaemonControlError> {
-    Ok(())
-}
-
-fn stop_session(paths: &DaemonPaths) -> Result<(), DaemonControlError> {
-    let pid = fs::read_to_string(&paths.pid_file)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?
-        .trim()
-        .to_string();
-    if !pid.is_empty() {
-        let stop_command = DefaultSessionProcessManager.stop_command(&pid);
-        let _ = Command::new(stop_command.program())
-            .args(stop_command.args())
-            .output();
-    }
-    let _ = fs::remove_file(&paths.pid_file);
-    Ok(())
-}
-
 fn is_running(options: &DaemonOptions, paths: &DaemonPaths) -> bool {
     match send_daemon_request(
         options,
@@ -787,17 +594,7 @@ fn wait_for_state(
 }
 
 fn detected_manager(paths: &DaemonPaths) -> DaemonManager {
-    if paths.pid_file.exists() {
-        return DaemonManager::Session;
-    }
-    if paths
-        .launch_agent
-        .as_ref()
-        .is_some_and(|path| path.exists())
-    {
-        return DaemonManager::Launchd;
-    }
-    DaemonManager::Unknown
+    DefaultDaemonProcessManager.detected_manager(paths)
 }
 
 fn find_afsd_binary(explicit: Option<&Path>) -> Result<PathBuf, DaemonControlError> {
@@ -868,160 +665,6 @@ fn binary_name(name: &str) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn launchd_domain() -> Result<String, DaemonControlError> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|error| DaemonControlError::new("launchctl_failed", error.to_string()))?;
-    if !output.status.success() {
-        return Err(DaemonControlError::new(
-            "launchctl_failed",
-            "could not determine current user id",
-        ));
-    }
-    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(format!("gui/{uid}"))
-}
-
-#[cfg(target_os = "macos")]
-fn run_launchctl(command: &mut Command) -> Result<(), DaemonControlError> {
-    let output = command
-        .output()
-        .map_err(|error| DaemonControlError::new("launchctl_failed", error.to_string()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if !stderr.is_empty() { stderr } else { stdout };
-    Err(DaemonControlError::new(
-        "launchctl_failed",
-        if message.is_empty() {
-            format!("launchctl exited with {}", output.status)
-        } else {
-            message
-        },
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn launch_agent_plist(
-    options: &DaemonOptions,
-    paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<String, DaemonControlError> {
-    let mut env_vars = vec![
-        ("HOME".to_string(), home_dir()?.display().to_string()),
-        (
-            "AFS_STATE_DIR".to_string(),
-            paths.state_root.display().to_string(),
-        ),
-    ];
-    if let Some(tcp_addr) = &options.tcp_addr {
-        env_vars.push(("AFS_DAEMON_TCP_ADDR".to_string(), tcp_addr.clone()));
-    }
-    for key in &options.include_env {
-        let value = env::var(key).map_err(|_| {
-            DaemonControlError::new(
-                "env_missing",
-                format!("environment variable `{key}` is not set"),
-            )
-        })?;
-        env_vars.push((key.clone(), value));
-    }
-    env_vars.sort_by(|a, b| a.0.cmp(&b.0));
-    env_vars.dedup_by(|a, b| a.0 == b.0);
-
-    let env_xml = env_vars
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "    <key>{}</key>\n    <string>{}</string>\n",
-                xml_escape(key),
-                xml_escape(value)
-            )
-        })
-        .collect::<String>();
-
-    Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{afsd_bin}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-{env_xml}  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
-</dict>
-</plist>
-"#,
-        label = LABEL,
-        afsd_bin = xml_escape(&afsd_bin.display().to_string()),
-        env_xml = env_xml,
-        stdout = xml_escape(&paths.stdout_log.display().to_string()),
-        stderr = xml_escape(&paths.stderr_log.display().to_string()),
-    ))
-}
-
-#[cfg(test)]
-fn test_launch_agent_plist(
-    options: &DaemonOptions,
-    paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<String, DaemonControlError> {
-    #[cfg(target_os = "macos")]
-    {
-        launch_agent_plist(options, paths, afsd_bin)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (options, paths, afsd_bin);
-        Ok(String::new())
-    }
-}
-
-impl DaemonPaths {
-    fn new(state_root: PathBuf) -> Self {
-        let socket = afsd::ipc::socket_path(&state_root);
-        let pid_file = state_root.join("afsd.pid");
-        let metadata_file = state_root.join("afsd.manager.json");
-        let logs_dir = state_root.join("logs");
-        let stdout_log = logs_dir.join("afsd.out.log");
-        let stderr_log = logs_dir.join("afsd.err.log");
-        #[cfg(target_os = "macos")]
-        let launch_agent = home_dir().ok().map(|home| {
-            home.join("Library/LaunchAgents")
-                .join(format!("{LABEL}.plist"))
-        });
-        #[cfg(not(target_os = "macos"))]
-        let launch_agent = None;
-        Self {
-            state_root,
-            socket,
-            pid_file,
-            metadata_file,
-            stdout_log,
-            stderr_log,
-            launch_agent,
-        }
-    }
-}
-
 fn first_positional(args: &[String]) -> Option<&str> {
     let mut skip_next = false;
     for arg in args {
@@ -1081,22 +724,6 @@ fn default_state_root() -> PathBuf {
     afs_platform::default_state_root()
 }
 
-#[cfg(target_os = "macos")]
-fn home_dir() -> Result<PathBuf, DaemonControlError> {
-    afs_platform::user_home()
-        .ok_or_else(|| DaemonControlError::new("env_missing", "home directory is not set"))
-}
-
-#[allow(dead_code)]
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,38 +756,6 @@ mod tests {
             .expect_err("parse should fail");
 
         assert_eq!(error.code(), "usage");
-    }
-
-    #[test]
-    fn escapes_xml_special_characters() {
-        assert_eq!(
-            xml_escape("a&b<c>d\"e'f"),
-            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
-        );
-    }
-
-    #[test]
-    fn launch_agent_test_hook_is_available() {
-        let options = DaemonOptions {
-            action: DaemonAction::Start,
-            mode: StartMode::Launchd,
-            state_root: PathBuf::from("/tmp/afs-state"),
-            afsd_bin: None,
-            tcp_addr: Some("127.0.0.1:38567".to_string()),
-            include_env: Vec::new(),
-        };
-        let paths = DaemonPaths::new(PathBuf::from("/tmp/afs-state"));
-
-        let plist =
-            test_launch_agent_plist(&options, &paths, Path::new("/tmp/afsd")).expect("plist");
-
-        if cfg!(target_os = "macos") {
-            assert!(plist.contains("<string>/tmp/afsd</string>"));
-            assert!(plist.contains("<key>AFS_STATE_DIR</key>"));
-            assert!(plist.contains("<string>/tmp/afs-state</string>"));
-        } else {
-            assert!(plist.is_empty());
-        }
     }
 
     #[cfg(windows)]
