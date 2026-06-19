@@ -24,20 +24,25 @@ The public Homebrew build currently requires an Apple Silicon Mac running macOS 
 
 ## Install on Linux
 
-Linux packages are published as GitHub Release assets. For a release that
-includes Linux assets, install the Debian package on Debian or Ubuntu:
+Linux packages are published through distro package repositories. On Debian or Ubuntu:
 
 ```sh
-curl -L -o /tmp/afs.deb https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.deb && sudo apt install /tmp/afs.deb
+curl -fsSL https://codeflash-ai.github.io/afs/apt/codeflash-afs.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-afs.gpg && echo "deb [signed-by=/usr/share/keyrings/codeflash-afs.gpg] https://codeflash-ai.github.io/afs/apt stable main" | sudo tee /etc/apt/sources.list.d/afs.list >/dev/null && sudo apt update && sudo apt install afs
 ```
 
 On Fedora, RHEL, or compatible distributions:
 
 ```sh
-curl -L -o /tmp/afs.rpm https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.rpm && sudo dnf install /tmp/afs.rpm
+sudo curl -fsSL -o /etc/yum.repos.d/afs.repo https://codeflash-ai.github.io/afs/rpm/afs.repo && sudo dnf install afs
 ```
 
 Linux packages require `fuse3` and `systemd`; the package metadata declares both dependencies.
+APT/DNF installs update through the system package manager. For Tauri-managed
+self-update, use the AppImage channel:
+
+```sh
+mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/AFS.AppImage https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.AppImage && chmod +x ~/.local/bin/AFS.AppImage
+```
 
 ## Development
 

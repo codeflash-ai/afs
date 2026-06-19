@@ -35,9 +35,21 @@ version_from_tauri_config() {
 platform_for_archive() {
   local archive="$1"
   case "$(basename "${archive}")" in
-    *aarch64*|*arm64*) printf 'darwin-aarch64\n' ;;
+    *.app.tar.gz)
+      case "$(basename "${archive}")" in
+        *aarch64*|*arm64*) printf 'darwin-aarch64\n' ;;
+        *) fail "macOS updater artifact name must include aarch64 or arm64: ${archive}" ;;
+      esac
+      ;;
+    *.AppImage)
+      case "$(basename "${archive}")" in
+        *x86_64*|*amd64*) printf 'linux-x86_64\n' ;;
+        *aarch64*|*arm64*) printf 'linux-aarch64\n' ;;
+        *) fail "Linux updater artifact name must include x86_64, amd64, aarch64, or arm64: ${archive}" ;;
+      esac
+      ;;
     *)
-      fail "updater manifest is Apple Silicon-only; artifact name must include aarch64 or arm64: ${archive}"
+      fail "unsupported updater artifact type: ${archive}"
       ;;
   esac
 }
@@ -59,15 +71,21 @@ main() {
   if [[ -n "${UPDATER_MACOS_AARCH64_ARTIFACT:-}" ]]; then
     archives+=("${UPDATER_MACOS_AARCH64_ARTIFACT}")
   fi
+  if [[ -n "${UPDATER_LINUX_X86_64_ARTIFACT:-}" ]]; then
+    archives+=("${UPDATER_LINUX_X86_64_ARTIFACT}")
+  fi
+  if [[ -n "${UPDATER_LINUX_AARCH64_ARTIFACT:-}" ]]; then
+    archives+=("${UPDATER_LINUX_AARCH64_ARTIFACT}")
+  fi
   if [[ "${#archives[@]}" == "0" ]]; then
     while IFS= read -r archive; do
       archives+=("${archive}")
     done < <(
       find "${UPDATER_DIR}" -maxdepth 1 -type f \
-        \( -name '*aarch64*.app.tar.gz' -o -name '*arm64*.app.tar.gz' \) | sort
+        \( -name '*.app.tar.gz' -o -name '*.AppImage' \) | sort
     )
   fi
-  [[ "${#archives[@]}" -gt 0 ]] || fail "no updater .app.tar.gz artifacts found in ${UPDATER_DIR}"
+  [[ "${#archives[@]}" -gt 0 ]] || fail "no updater artifacts found in ${UPDATER_DIR}"
 
   mkdir -p "$(dirname "${OUTPUT}")"
 

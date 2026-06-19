@@ -62,8 +62,12 @@ render-homebrew-cask: ## Render a Homebrew cask from published macOS DMG artifac
 	scripts/render-homebrew-cask.sh
 
 .PHONY: render-updater-manifest
-render-updater-manifest: ## Render the Tauri updater latest-macos.json manifest.
+render-updater-manifest: ## Render a Tauri updater manifest from updater artifacts.
 	scripts/render-tauri-updater-manifest.sh
+
+.PHONY: render-linux-repositories
+render-linux-repositories: ## Render APT and RPM repository metadata from Linux package artifacts.
+	scripts/render-linux-repositories.sh
 
 .PHONY: audit-mas-readiness
 audit-mas-readiness: ## Run static checks for Mac App Store release readiness.
