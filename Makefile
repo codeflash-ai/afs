@@ -69,6 +69,11 @@ render-updater-manifest: ## Render a Tauri updater manifest from updater artifac
 render-linux-repositories: ## Render APT and RPM repository metadata from Linux package artifacts.
 	scripts/render-linux-repositories.sh
 
+.PHONY: bump-version
+bump-version: ## Bump release version; pass VERSION=0.1.1.
+	@test -n "$(VERSION)" || (echo "Usage: make bump-version VERSION=0.1.1" >&2; exit 2)
+	node scripts/bump-version.mjs "$(VERSION)"
+
 .PHONY: audit-mas-readiness
 audit-mas-readiness: ## Run static checks for Mac App Store release readiness.
 	scripts/audit-mas-readiness.sh
