@@ -49,6 +49,10 @@ build-mas: setup ## Build a local Mac App Store-channel .app bundle.
 publish: setup ## Build, sign, notarize, staple, and validate a macOS DMG.
 	scripts/publish-macos.sh
 
+.PHONY: publish-mas
+publish-mas: setup ## Build, sign, package, and optionally upload a Mac App Store build.
+	scripts/publish-mas.sh
+
 .PHONY: publish-linux
 publish-linux: setup ## Build and validate Linux .deb and .rpm packages.
 	scripts/publish-linux.sh

@@ -22,6 +22,23 @@ brew upgrade --cask afs
 
 The public Homebrew build currently requires an Apple Silicon Mac running macOS 14 Sonoma or newer.
 
+## Install on Linux
+
+Linux packages are published as GitHub Release assets. For a release that
+includes Linux assets, install the Debian package on Debian or Ubuntu:
+
+```sh
+curl -L -o /tmp/afs.deb https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.deb && sudo apt install /tmp/afs.deb
+```
+
+On Fedora, RHEL, or compatible distributions:
+
+```sh
+curl -L -o /tmp/afs.rpm https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.rpm && sudo dnf install /tmp/afs.rpm
+```
+
+Linux packages require `fuse3` and `systemd`; the package metadata declares both dependencies.
+
 ## Development
 
 The root `Makefile` is the easiest way to run common project tasks:

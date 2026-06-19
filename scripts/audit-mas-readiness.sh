@@ -6,6 +6,8 @@ TAURI_CONF="${ROOT}/apps/desktop/src-tauri/tauri.conf.json"
 FRONTEND_APP="${ROOT}/apps/desktop/src/App.tsx"
 RUST_MAIN="${ROOT}/apps/desktop/src-tauri/src/main.rs"
 RUST_BUILD="${ROOT}/apps/desktop/src-tauri/build.rs"
+PUBLISH_SCRIPT="${ROOT}/scripts/publish-mas.sh"
+MAKEFILE="${ROOT}/Makefile"
 HOST_ENTITLEMENTS="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFS.entitlements"
 EXTENSION_ENTITLEMENTS="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFSFileProvider.entitlements"
 HOST_PLIST="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFS.Info.plist"
@@ -42,6 +44,9 @@ require_plist_string() {
 }
 
 require_command jq
+
+[[ -x "${PUBLISH_SCRIPT}" ]] || fail "missing executable Mac App Store publish script"
+grep -q '^publish-mas:' "${MAKEFILE}" || fail "Makefile is missing publish-mas target"
 
 [[ "$(json_value '.bundle.targets | index("app") != null' "${TAURI_CONF}")" == "true" ]] \
   || fail "Tauri bundle targets must include app for Mac App Store packaging"

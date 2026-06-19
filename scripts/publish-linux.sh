@@ -159,6 +159,20 @@ copy_artifact() {
   printf '%s\n' "${dest}"
 }
 
+copy_latest_alias() {
+  local src="$1"
+  local ext="$2"
+  local arch="$3"
+  local name dest sha
+
+  name="${PRODUCT_NAME}-${CHANNEL}-linux-${arch}.${ext}"
+  dest="${LINUX_OUT_DIR}/${name}"
+  cp "${src}" "${dest}"
+  sha="$(sha256sum "${dest}" | awk '{print $1}')"
+  printf '%s %s\n' "${sha}" "${dest}" > "${dest}.sha256"
+  printf '%s\n' "${dest}"
+}
+
 main() {
   trap cleanup_appindicator_pkg_config EXIT
   [[ "$(uname -s)" == "Linux" ]] || fail "Linux publishing must run on Linux"
@@ -176,7 +190,7 @@ main() {
   assert_clean_tree
   prepare_appindicator_pkg_config
 
-  local commit_short commit_full deb rpm arch final_deb final_rpm
+  local commit_short commit_full deb rpm arch final_deb final_rpm alias_deb alias_rpm
   commit_short="$(git -C "${ROOT}" rev-parse --short=7 HEAD)"
   commit_full="$(git -C "${ROOT}" rev-parse --short=12 HEAD)"
   arch="$(uname -m)"
@@ -199,12 +213,18 @@ main() {
 
   final_deb="$(copy_artifact "${deb}" "deb" "${commit_short}" "${arch}")"
   final_rpm="$(copy_artifact "${rpm}" "rpm" "${commit_short}" "${arch}")"
+  alias_deb="$(copy_latest_alias "${deb}" "deb" "${arch}")"
+  alias_rpm="$(copy_latest_alias "${rpm}" "rpm" "${arch}")"
 
   printf '\nPublished Linux packages:\n'
   printf '  %s\n' "${final_deb}"
   printf '  %s.sha256\n' "${final_deb}"
   printf '  %s\n' "${final_rpm}"
   printf '  %s.sha256\n' "${final_rpm}"
+  printf '  %s\n' "${alias_deb}"
+  printf '  %s.sha256\n' "${alias_deb}"
+  printf '  %s\n' "${alias_rpm}"
+  printf '  %s.sha256\n' "${alias_rpm}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

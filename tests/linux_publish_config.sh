@@ -51,3 +51,5 @@ grep -q 'appindicator3-0.1' "${ROOT}/scripts/publish-linux.sh" \
   || fail "publish-linux must prepare appindicator pkg-config metadata for Tauri"
 grep -q 'PKG_CONFIG_PATH' "${ROOT}/scripts/publish-linux.sh" \
   || fail "publish-linux must export PKG_CONFIG_PATH when using temporary metadata"
+grep -q 'copy_latest_alias' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must create stable latest-release artifact aliases"

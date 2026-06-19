@@ -309,19 +309,77 @@ terminal-command symlink installation. The App Store build should get updates
 through the App Store, while users who need `afs` on their shell path should use
 the Homebrew or direct DMG channel.
 
+Build a signed App Store package locally with:
+
+```sh
+make publish-mas
+```
+
+`make publish-mas` builds the `mas` channel `.app`, embeds provisioning profiles
+for the containing app and File Provider extension, re-signs nested code with
+the App Store application identity, and creates a signed `.pkg` with the App
+Store installer identity. By default it only writes and validates the package
+locally:
+
+```text
+target/release/bundle/mas/AFS-app-store-YYYYMMDD-<commit>-<arch>.pkg
+target/release/bundle/mas/AFS-app-store-YYYYMMDD-<commit>-<arch>.pkg.sha256
+```
+
+Required local inputs:
+
+- `MAS_APP_SIGNING_IDENTITY`: usually `3rd Party Mac Developer Application: ...`
+  or `Apple Distribution: ...`; auto-detected when exactly one matching
+  identity exists.
+- `MAS_INSTALLER_SIGNING_IDENTITY`: `3rd Party Mac Developer Installer: ...`;
+  auto-detected when exactly one matching identity exists.
+- `MAS_APP_PROVISIONING_PROFILE` or `MAS_APP_PROVISIONING_PROFILE_BASE64`.
+- `MAS_FILE_PROVIDER_PROVISIONING_PROFILE` or
+  `MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64`.
+
+Optional App Store Connect upload inputs:
+
+- `APP_STORE_CONNECT_API_KEY_ID`.
+- `APP_STORE_CONNECT_API_ISSUER_ID`.
+- `APP_STORE_CONNECT_API_PRIVATE_KEY` or
+  `APP_STORE_CONNECT_API_PRIVATE_KEY_PATH`.
+- `MAS_VALIDATE_WITH_APPLE=1` to validate the `.pkg` with App Store Connect.
+- `MAS_UPLOAD=1` to validate and upload the `.pkg` to App Store Connect.
+
+The GitHub workflow in `.github/workflows/release-mas.yml` is manual-only. It
+checks out an existing release tag, imports App Store application and installer
+certificates, builds the signed package, and optionally validates/uploads it to
+App Store Connect.
+
+Required repository secrets:
+
+- `MAS_APP_CERTIFICATE_P12_BASE64`.
+- `MAS_APP_CERTIFICATE_PASSWORD`.
+- `MAS_INSTALLER_CERTIFICATE_P12_BASE64`.
+- `MAS_INSTALLER_CERTIFICATE_PASSWORD`.
+- `MAS_APP_PROVISIONING_PROFILE_BASE64`.
+- `MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64`.
+
+Required for App Store Connect validation or upload:
+
+- `APP_STORE_CONNECT_API_KEY_ID`.
+- `APP_STORE_CONNECT_API_ISSUER_ID`.
+- `APP_STORE_CONNECT_API_PRIVATE_KEY`.
+
+Optional repository secrets:
+
+- `MAS_APP_SIGNING_IDENTITY`.
+- `MAS_INSTALLER_SIGNING_IDENTITY`.
+
 Remaining App Store work:
 
 - Create or confirm App Store App IDs for `ai.codeflash.afs` and
   `ai.codeflash.afs.AgentFS.FileProvider`.
 - Create provisioning profiles for the containing app and File Provider
   extension with `group.ai.codeflash.afs`.
-- Import `3rd Party Mac Developer Application` and `3rd Party Mac Developer
-  Installer` certificates into CI.
-- Add an App Store packaging workflow that re-signs nested code with the App
-  Store application identity, embeds provisioning profiles, creates the signed
-  installer package, and validates it locally before upload.
-- Upload the installer package through Transporter or Xcode, then complete
-  TestFlight/App Review metadata in App Store Connect.
+- Run the manual workflow with validation enabled.
+- Run the manual workflow with upload enabled when validation passes.
+- Complete TestFlight/App Review metadata in App Store Connect.
 
 ## Distribution Channels
 
@@ -332,4 +390,5 @@ Power-user channel: Homebrew cask that installs the same notarized DMG.
 Fast-moving channel: Tauri updater using the signed updater archive and
 `latest-macos.json` manifest from the GitHub Release.
 
-Later channel: Mac App Store after a sandboxed App Store build target is ready.
+App Store channel: manual `release-mas` workflow after App Store provisioning
+and metadata are ready.

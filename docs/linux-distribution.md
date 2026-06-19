@@ -48,6 +48,10 @@ target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.deb
 target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.deb.sha256
 target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.rpm
 target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.rpm.sha256
+target/release/bundle/linux/AFS-beta-linux-<arch>.deb
+target/release/bundle/linux/AFS-beta-linux-<arch>.deb.sha256
+target/release/bundle/linux/AFS-beta-linux-<arch>.rpm
+target/release/bundle/linux/AFS-beta-linux-<arch>.rpm.sha256
 ```
 
 Useful overrides:
@@ -92,6 +96,12 @@ packages from a `v*` tag or manual workflow dispatch. It runs on
 dependencies, runs `make publish-linux`, and uploads the resulting `.deb`,
 `.rpm`, per-artifact checksums, and `SHA256SUMS-linux` to the matching GitHub
 Release.
+
+The stable alias assets support latest-release install URLs, for example:
+
+```sh
+curl -L -o /tmp/afs.deb https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.deb && sudo apt install /tmp/afs.deb
+```
 
 The workflow shares the same release concurrency group as the macOS workflow so
 both jobs can target one tag without racing while creating or updating the
