@@ -19,7 +19,6 @@ dependencies = [
  "afs-store",
  "afsd",
  "clap",
- "libc",
  "serde",
  "serde_json",
  "yaml_serde",
@@ -95,6 +94,7 @@ name = "afs-platform"
 version = "0.1.0"
 dependencies = [
  "afs-store",
+ "libc",
 ]
 
 [[package]]

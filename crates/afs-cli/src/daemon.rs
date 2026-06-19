@@ -5,11 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
+use afs_platform::{DefaultSessionProcessManager, SessionProcessManager};
 #[cfg(not(windows))]
 use afsd::ipc::send_request_with_timeout;
 #[cfg(windows)]
@@ -639,7 +635,7 @@ fn start_session(
     if let Some(tcp_addr) = &options.tcp_addr {
         command.env("AFS_DAEMON_TCP_ADDR", tcp_addr);
     }
-    detach_session_process(&mut command);
+    DefaultSessionProcessManager.configure_detached(&mut command);
 
     let child = command
         .spawn()
@@ -652,30 +648,6 @@ fn start_session(
         afsd_bin: afsd_bin.to_path_buf(),
     })
 }
-
-#[cfg(unix)]
-fn detach_session_process(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(windows)]
-fn detach_session_process(command: &mut Command) {
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn detach_session_process(_command: &mut Command) {}
 
 #[cfg(target_os = "macos")]
 fn start_launchd(
@@ -769,31 +741,13 @@ fn stop_session(paths: &DaemonPaths) -> Result<(), DaemonControlError> {
         .trim()
         .to_string();
     if !pid.is_empty() {
-        let (program, args) = session_stop_command(&pid);
-        let _ = Command::new(program).args(args).output();
+        let stop_command = DefaultSessionProcessManager.stop_command(&pid);
+        let _ = Command::new(stop_command.program())
+            .args(stop_command.args())
+            .output();
     }
     let _ = fs::remove_file(&paths.pid_file);
     Ok(())
-}
-
-fn session_stop_command(pid: &str) -> (&'static str, Vec<String>) {
-    #[cfg(windows)]
-    {
-        (
-            "taskkill",
-            vec![
-                "/PID".to_string(),
-                pid.to_string(),
-                "/T".to_string(),
-                "/F".to_string(),
-            ],
-        )
-    }
-
-    #[cfg(not(windows))]
-    {
-        ("kill", vec![pid.to_string()])
-    }
 }
 
 fn is_running(options: &DaemonOptions, paths: &DaemonPaths) -> bool {
@@ -1261,15 +1215,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_session_stop_uses_taskkill_tree_force() {
-        let (program, args) = session_stop_command("1234");
-
-        assert_eq!(program, "taskkill");
-        assert_eq!(args, vec!["/PID", "1234", "/T", "/F"]);
     }
 
     #[cfg(windows)]

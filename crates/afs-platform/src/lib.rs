@@ -5,6 +5,7 @@
 
 pub mod capabilities;
 pub mod paths;
+pub mod process;
 
 pub use capabilities::{
     PlatformCapabilities, ProjectionModeError, mount_cli_capabilities,
@@ -14,3 +15,4 @@ pub use paths::{
     DefaultHostPaths, HostPaths, ReportPath, default_mount_root, default_state_root,
     logical_path_display, user_home,
 };
+pub use process::{DefaultSessionProcessManager, ProcessStopCommand, SessionProcessManager};
