@@ -448,17 +448,21 @@ mod tests {
         let response = handle_request(DaemonRequest::ReloadMounts, &server);
 
         assert!(response.ok, "{response:?}");
-        assert_eq!(
+        let mut refreshes = vec![
             refresh_rx
                 .recv_timeout(Duration::from_secs(1))
-                .expect("root refresh"),
-            ("notion-main".to_string(), "root".to_string())
-        );
-        assert_eq!(
+                .expect("first refresh"),
             refresh_rx
                 .recv_timeout(Duration::from_secs(1))
-                .expect("source refresh"),
-            ("notion-main".to_string(), "source:notion".to_string())
+                .expect("second refresh"),
+        ];
+        refreshes.sort();
+        assert_eq!(
+            refreshes,
+            vec![
+                ("notion-main".to_string(), "root".to_string()),
+                ("notion-main".to_string(), "source:notion".to_string()),
+            ]
         );
         runtime.shutdown();
     }

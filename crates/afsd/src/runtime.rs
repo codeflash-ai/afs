@@ -63,6 +63,8 @@ pub struct DaemonRuntimeHandle {
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const FRESHNESS_JOB_BUDGET_UNITS: u16 = 5;
 const AUTO_FAST_FORWARD_ACTIVE_LEASE_MS: u64 = 30_000;
+const MAX_CHILD_REFRESH_WORKERS: usize = 3;
+const MAX_BACKGROUND_CHILD_REFRESH_WORKERS: usize = 2;
 
 impl DaemonRuntimeHandle {
     pub fn request(&self, request: DaemonRequest) -> DaemonResponse {
@@ -866,6 +868,7 @@ struct ChildRefreshRequest {
     mount_id: String,
     container_identifier: String,
     priority: ChildRefreshPriority,
+    depth: u32,
 }
 
 impl ChildRefreshRequest {
@@ -903,10 +906,11 @@ impl ChildRefreshQueue {
             return true;
         }
 
-        if let Some(existing) = self.pending.get_mut(&key)
-            && request.priority > existing.priority
-        {
-            existing.priority = request.priority;
+        if let Some(existing) = self.pending.get_mut(&key) {
+            if request.priority > existing.priority {
+                existing.priority = request.priority;
+            }
+            existing.depth = existing.depth.min(request.depth);
         }
         false
     }
@@ -921,36 +925,37 @@ impl ChildRefreshQueue {
         }
     }
 
-    fn peek_priority(&self) -> Option<ChildRefreshPriority> {
-        let key = self.next_ready_key()?;
-        self.pending.get(key).map(|request| request.priority)
-    }
-
-    fn pop_ready(&mut self) -> Option<ChildRefreshRequest> {
-        let index = self.next_ready_index()?;
+    fn pop_ready(
+        &mut self,
+        active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+    ) -> Option<ChildRefreshRequest> {
+        let index = self.next_ready_index(active)?;
         let key = self.order.remove(index)?;
         self.pending.remove(&key)
     }
 
-    fn next_ready_key(&self) -> Option<&ChildRefreshKey> {
-        self.next_ready_index()
-            .and_then(|index| self.order.get(index))
-    }
-
-    fn next_ready_index(&self) -> Option<usize> {
-        let mut best: Option<(usize, ChildRefreshPriority)> = None;
+    fn next_ready_index(
+        &self,
+        active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+    ) -> Option<usize> {
+        let mut best: Option<(usize, ChildRefreshPriority, u32)> = None;
         for (index, key) in self.order.iter().enumerate() {
             let Some(request) = self.pending.get(key) else {
                 continue;
             };
-            if best
-                .as_ref()
-                .is_none_or(|(_, best_priority)| request.priority > *best_priority)
-            {
-                best = Some((index, request.priority));
+            if active.values().any(|active| {
+                active.request.priority == request.priority && active.request.depth < request.depth
+            }) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, best_priority, best_depth)| {
+                request.priority > *best_priority
+                    || (request.priority == *best_priority && request.depth < *best_depth)
+            }) {
+                best = Some((index, request.priority, request.depth));
             }
         }
-        best.map(|(index, _)| index)
+        best.map(|(index, _, _)| index)
     }
 }
 
@@ -960,6 +965,8 @@ struct RuntimeState {
     sender: Sender<RuntimeMessage>,
     pending_requests: VecDeque<MutatingRequest>,
     child_refreshes: ChildRefreshQueue,
+    active_child_refreshes: BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+    completed_child_refreshes: BTreeMap<ChildRefreshKey, ChildRefreshPriority>,
     hydration: HydrationQueue,
     freshness: FreshnessQueue,
     deferred_hydration: Vec<HydrationRequest>,
@@ -978,12 +985,37 @@ struct ActiveRuntimeJob {
     started_at_unix_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveChildRefresh {
+    request: ChildRefreshRequest,
+    status: ActiveRuntimeJob,
+}
+
+impl ActiveChildRefresh {
+    fn new(request: ChildRefreshRequest) -> Self {
+        let status = ActiveRuntimeJob::from_child_refresh(&request);
+        Self { request, status }
+    }
+}
+
 impl ActiveRuntimeJob {
     fn from_job(job: &MutatingJob) -> Self {
         let (kind, target) = job.active_status_parts();
         Self {
             kind,
             target,
+            started_at: Instant::now(),
+            started_at_unix_ms: unix_time_ms(),
+        }
+    }
+
+    fn from_child_refresh(request: &ChildRefreshRequest) -> Self {
+        Self {
+            kind: "virtual_fs_refresh_children".to_string(),
+            target: Some(format!(
+                "{}:{}",
+                request.mount_id, request.container_identifier
+            )),
             started_at: Instant::now(),
             started_at_unix_ms: unix_time_ms(),
         }
@@ -1029,6 +1061,8 @@ impl RuntimeState {
             sender,
             pending_requests: VecDeque::new(),
             child_refreshes: ChildRefreshQueue::default(),
+            active_child_refreshes: BTreeMap::new(),
+            completed_child_refreshes: BTreeMap::new(),
             hydration,
             freshness: FreshnessQueue::new(),
             deferred_hydration: Vec::new(),
@@ -1142,6 +1176,7 @@ impl RuntimeState {
                         mount_id,
                         container_identifier,
                         ChildRefreshPriority::Interactive,
+                        0,
                     );
                 }
             }
@@ -1253,7 +1288,20 @@ impl RuntimeState {
     }
 
     fn handle_completion(&mut self, completion: JobCompletion) {
-        self.active_job = None;
+        match &completion {
+            JobCompletion::VirtualFsRefreshChildren {
+                mount_id,
+                container_identifier,
+                ..
+            } => {
+                let key = ChildRefreshKey {
+                    mount_id: mount_id.clone(),
+                    container_identifier: container_identifier.clone(),
+                };
+                self.active_child_refreshes.remove(&key);
+            }
+            _ => self.active_job = None,
+        }
 
         match completion {
             JobCompletion::Pull {
@@ -1279,9 +1327,19 @@ impl RuntimeState {
             JobCompletion::VirtualFsRefreshChildren {
                 mount_id,
                 container_identifier,
+                depth,
+                priority,
                 result,
             } => match result {
-                Ok(_) => self.queue_child_refresh_descendants(&mount_id, &container_identifier),
+                Ok(_) => {
+                    self.mark_child_refresh_completed(&mount_id, &container_identifier, priority);
+                    self.queue_child_refresh_descendants(
+                        &mount_id,
+                        &container_identifier,
+                        depth,
+                        priority,
+                    );
+                }
                 Err(error) => {
                     eprintln!(
                         "afsd virtual filesystem child refresh failed for `{mount_id}:{container_identifier}`: {error}"
@@ -1297,7 +1355,17 @@ impl RuntimeState {
                 let ok = response.ok;
                 let _ = respond_to.send(response);
                 if ok {
-                    self.queue_child_refresh_descendants(&mount_id, &container_identifier);
+                    self.mark_child_refresh_completed(
+                        &mount_id,
+                        &container_identifier,
+                        ChildRefreshPriority::Interactive,
+                    );
+                    self.queue_child_refresh_descendants(
+                        &mount_id,
+                        &container_identifier,
+                        0,
+                        ChildRefreshPriority::Interactive,
+                    );
                 }
             }
             JobCompletion::ScheduledPull(result) => match result {
@@ -1372,35 +1440,31 @@ impl RuntimeState {
     }
 
     fn maybe_start_next_job(&mut self) {
-        if self.active_job.is_some() {
-            return;
+        if self.active_job.is_none() {
+            let job = if let Some(request) = self.pending_requests.pop_front() {
+                Some(MutatingJob::Request(request))
+            } else if let Some(request) = self.hydration.pop_ready() {
+                Some(MutatingJob::Hydration { request })
+            } else if let Some(job) = self
+                .freshness
+                .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
+            {
+                Some(MutatingJob::Freshness { job })
+            } else {
+                self.pending_scheduled_tick
+                    .take()
+                    .map(|tick| MutatingJob::ScheduledPull { tick })
+            };
+
+            if let Some(job) = job {
+                self.start_exclusive_job(job);
+            }
         }
 
-        let job = if let Some(request) = self.pending_requests.pop_front() {
-            Some(MutatingJob::Request(request))
-        } else if self.child_refreshes.peek_priority() == Some(ChildRefreshPriority::Interactive) {
-            self.child_refreshes
-                .pop_ready()
-                .map(|request| MutatingJob::ChildRefresh { request })
-        } else if let Some(request) = self.hydration.pop_ready() {
-            Some(MutatingJob::Hydration { request })
-        } else if let Some(job) = self
-            .freshness
-            .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
-        {
-            Some(MutatingJob::Freshness { job })
-        } else if let Some(request) = self.child_refreshes.pop_ready() {
-            Some(MutatingJob::ChildRefresh { request })
-        } else {
-            self.pending_scheduled_tick
-                .take()
-                .map(|tick| MutatingJob::ScheduledPull { tick })
-        };
+        self.maybe_start_child_refresh_jobs();
+    }
 
-        let Some(job) = job else {
-            return;
-        };
-
+    fn start_exclusive_job(&mut self, job: MutatingJob) {
         self.active_job = Some(ActiveRuntimeJob::from_job(&job));
         let sender = self.sender.clone();
         let runner = Arc::clone(&self.runner);
@@ -1410,6 +1474,58 @@ impl RuntimeState {
         thread::spawn(move || {
             let completion = run_job(runner, state_root, policy, job);
             let _ = sender.send(RuntimeMessage::JobFinished(completion));
+        });
+    }
+
+    fn maybe_start_child_refresh_jobs(&mut self) {
+        while self.active_job.is_none()
+            && self.active_child_refreshes.len() < MAX_CHILD_REFRESH_WORKERS
+        {
+            let Some(request) = self.child_refreshes.pop_ready(&self.active_child_refreshes) else {
+                break;
+            };
+
+            if request.priority == ChildRefreshPriority::Background
+                && self.active_background_child_refreshes() >= MAX_BACKGROUND_CHILD_REFRESH_WORKERS
+            {
+                self.child_refreshes.queue(request);
+                break;
+            }
+
+            self.start_child_refresh_job(request);
+        }
+    }
+
+    fn active_background_child_refreshes(&self) -> usize {
+        self.active_child_refreshes
+            .values()
+            .filter(|active| active.request.priority == ChildRefreshPriority::Background)
+            .count()
+    }
+
+    fn start_child_refresh_job(&mut self, request: ChildRefreshRequest) {
+        let key = request.key();
+        let sender = self.sender.clone();
+        let runner = Arc::clone(&self.runner);
+        let state_root = self.config.state_root.clone();
+        self.active_child_refreshes
+            .insert(key, ActiveChildRefresh::new(request.clone()));
+
+        thread::spawn(move || {
+            let result = runner.run_virtual_fs_refresh_children(
+                state_root,
+                request.mount_id.clone(),
+                request.container_identifier.clone(),
+            );
+            let _ = sender.send(RuntimeMessage::JobFinished(
+                JobCompletion::VirtualFsRefreshChildren {
+                    mount_id: request.mount_id,
+                    container_identifier: request.container_identifier,
+                    depth: request.depth,
+                    priority: request.priority,
+                    result,
+                },
+            ));
         });
     }
 
@@ -1484,6 +1600,7 @@ impl RuntimeState {
                 return;
             }
         };
+        self.completed_child_refreshes.clear();
 
         for mount in mounts
             .into_iter()
@@ -1493,11 +1610,13 @@ impl RuntimeState {
                 mount.mount_id.0.clone(),
                 ROOT_CONTAINER_IDENTIFIER.to_string(),
                 ChildRefreshPriority::Background,
+                0,
             );
             self.queue_child_refresh(
                 mount.mount_id.0,
                 source_root_identifier(&mount.connector),
                 ChildRefreshPriority::Background,
+                0,
             );
         }
     }
@@ -1507,16 +1626,56 @@ impl RuntimeState {
         mount_id: String,
         container_identifier: String,
         priority: ChildRefreshPriority,
+        depth: u32,
     ) {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.clone(),
+            container_identifier: container_identifier.clone(),
+        };
+        if self
+            .completed_child_refreshes
+            .get(&key)
+            .is_some_and(|completed_priority| *completed_priority >= priority)
+        {
+            return;
+        }
+        if self.active_child_refreshes.contains_key(&key) {
+            return;
+        }
         self.child_refreshes.queue(ChildRefreshRequest {
             mount_id,
             container_identifier,
             priority,
+            depth,
         });
         self.maybe_start_next_job();
     }
 
-    fn queue_child_refresh_descendants(&mut self, mount_id: &str, container_identifier: &str) {
+    fn mark_child_refresh_completed(
+        &mut self,
+        mount_id: &str,
+        container_identifier: &str,
+        priority: ChildRefreshPriority,
+    ) {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.to_string(),
+            container_identifier: container_identifier.to_string(),
+        };
+        self.completed_child_refreshes
+            .entry(key)
+            .and_modify(|completed_priority| {
+                *completed_priority = (*completed_priority).max(priority);
+            })
+            .or_insert(priority);
+    }
+
+    fn queue_child_refresh_descendants(
+        &mut self,
+        mount_id: &str,
+        container_identifier: &str,
+        parent_depth: u32,
+        parent_priority: ChildRefreshPriority,
+    ) {
         let child_containers = match self
             .child_container_identifiers(mount_id, container_identifier)
         {
@@ -1532,7 +1691,8 @@ impl RuntimeState {
             self.queue_child_refresh(
                 mount_id.to_string(),
                 child_container,
-                ChildRefreshPriority::Background,
+                parent_priority,
+                parent_depth.saturating_add(1),
             );
         }
     }
@@ -1582,9 +1742,18 @@ impl RuntimeState {
 
     fn status(&self) -> DaemonRuntimeStatus {
         let freshness_metrics = self.freshness.metrics(Some(&freshness_timestamp()));
+        let active_child_refresh = self
+            .active_child_refreshes
+            .values()
+            .next()
+            .map(|active| active.status.status());
         DaemonRuntimeStatus {
-            active_job: self.active_job.is_some(),
-            active_job_detail: self.active_job.as_ref().map(ActiveRuntimeJob::status),
+            active_job: self.active_job.is_some() || active_child_refresh.is_some(),
+            active_job_detail: self
+                .active_job
+                .as_ref()
+                .map(ActiveRuntimeJob::status)
+                .or(active_child_refresh),
             pending_requests: self.pending_requests.len() + self.child_refreshes.len(),
             pending_hydrations: self.hydration.len(),
             deferred_hydrations: self.deferred_hydration.len(),
@@ -1787,18 +1956,6 @@ fn run_job(
         },
         MutatingJob::Request(MutatingRequest::FileEvent { event }) => {
             JobCompletion::FileEvent(runner.run_file_event(state_root, event))
-        }
-        MutatingJob::ChildRefresh { request } => {
-            let result = runner.run_virtual_fs_refresh_children(
-                state_root,
-                request.mount_id.clone(),
-                request.container_identifier.clone(),
-            );
-            JobCompletion::VirtualFsRefreshChildren {
-                mount_id: request.mount_id,
-                container_identifier: request.container_identifier,
-                result,
-            }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsMaterialize {
             mount_id,
@@ -2049,7 +2206,6 @@ enum MutatingRequest {
 
 enum MutatingJob {
     Request(MutatingRequest),
-    ChildRefresh { request: ChildRefreshRequest },
     ScheduledPull { tick: PullSchedulerTick },
     Hydration { request: HydrationRequest },
     Freshness { job: SyncJob },
@@ -2059,13 +2215,6 @@ impl MutatingJob {
     fn active_status_parts(&self) -> (String, Option<String>) {
         match self {
             Self::Request(request) => request.active_status_parts(),
-            Self::ChildRefresh { request } => (
-                "virtual_fs_refresh_children".to_string(),
-                Some(format!(
-                    "{}:{}",
-                    request.mount_id, request.container_identifier
-                )),
-            ),
             Self::ScheduledPull { .. } => ("scheduled_pull".to_string(), None),
             Self::Hydration { request } => (
                 "hydration".to_string(),
@@ -2173,6 +2322,8 @@ enum JobCompletion {
     VirtualFsRefreshChildren {
         mount_id: String,
         container_identifier: String,
+        depth: u32,
+        priority: ChildRefreshPriority,
         result: afs_core::AfsResult<usize>,
     },
     FileProviderChildren {
@@ -2542,7 +2693,9 @@ fn afs_error_code(error: &AfsError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest};
+    use std::collections::BTreeMap;
+
+    use super::{ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest};
 
     #[test]
     fn child_refresh_queue_promotes_existing_requests() {
@@ -2552,36 +2705,85 @@ mod tests {
             "notion-main",
             "children:page-1",
             ChildRefreshPriority::Background,
+            0,
         )));
         assert!(queue.queue(request(
             "notion-main",
             "children:page-2",
             ChildRefreshPriority::Background,
+            0,
         )));
         assert!(!queue.queue(request(
             "notion-main",
             "children:page-1",
             ChildRefreshPriority::Interactive,
+            0,
         )));
 
-        let first = queue.pop_ready().expect("first refresh");
+        let active = BTreeMap::new();
+        let first = queue.pop_ready(&active).expect("first refresh");
         assert_eq!(first.container_identifier, "children:page-1");
         assert_eq!(first.priority, ChildRefreshPriority::Interactive);
 
-        let second = queue.pop_ready().expect("second refresh");
+        let second = queue.pop_ready(&active).expect("second refresh");
         assert_eq!(second.container_identifier, "children:page-2");
         assert_eq!(second.priority, ChildRefreshPriority::Background);
+    }
+
+    #[test]
+    fn child_refresh_queue_blocks_deeper_background_while_shallower_is_active() {
+        let mut queue = ChildRefreshQueue::default();
+        let active_request = request(
+            "notion-main",
+            "children:page-a",
+            ChildRefreshPriority::Background,
+            1,
+        );
+        let mut active = BTreeMap::new();
+        active.insert(
+            active_request.key(),
+            ActiveChildRefresh::new(active_request),
+        );
+
+        queue.queue(request(
+            "notion-main",
+            "children:page-a1",
+            ChildRefreshPriority::Background,
+            2,
+        ));
+        queue.queue(request(
+            "notion-main",
+            "children:page-b",
+            ChildRefreshPriority::Background,
+            1,
+        ));
+
+        let next = queue
+            .pop_ready(&active)
+            .expect("same-depth sibling refresh");
+        assert_eq!(next.container_identifier, "children:page-b");
+        assert_eq!(next.depth, 1);
+
+        assert!(
+            queue.pop_ready(&active).is_none(),
+            "deeper refresh should wait for active shallower work"
+        );
+        active.clear();
+        let deeper = queue.pop_ready(&active).expect("deeper refresh");
+        assert_eq!(deeper.container_identifier, "children:page-a1");
     }
 
     fn request(
         mount_id: &str,
         container_identifier: &str,
         priority: ChildRefreshPriority,
+        depth: u32,
     ) -> ChildRefreshRequest {
         ChildRefreshRequest {
             mount_id: mount_id.to_string(),
             container_identifier: container_identifier.to_string(),
             priority,
+            depth,
         }
     }
 }
