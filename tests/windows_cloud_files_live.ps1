@@ -118,7 +118,8 @@ function Invoke-Native {
         [string] $FilePath,
         [string[]] $Arguments,
         [string] $Step,
-        [int] $TimeoutSeconds = 120
+        [int] $TimeoutSeconds = 120,
+        [switch] $NoCapture
     )
     Write-Step $Step
     $process = [System.Diagnostics.Process]::new()
@@ -126,14 +127,18 @@ function Invoke-Native {
     $process.StartInfo.WorkingDirectory = (Get-Location).Path
     $process.StartInfo.UseShellExecute = $false
     $process.StartInfo.CreateNoWindow = $true
-    $process.StartInfo.RedirectStandardOutput = $true
-    $process.StartInfo.RedirectStandardError = $true
+    $process.StartInfo.RedirectStandardOutput = -not $NoCapture
+    $process.StartInfo.RedirectStandardError = -not $NoCapture
     foreach ($argument in $Arguments) {
         [void] $process.StartInfo.ArgumentList.Add($argument)
     }
     [void] $process.Start()
-    $stdout = $process.StandardOutput.ReadToEndAsync()
-    $stderr = $process.StandardError.ReadToEndAsync()
+    $stdout = $null
+    $stderr = $null
+    if (-not $NoCapture) {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+    }
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         try {
             $process.Kill($true)
@@ -142,16 +147,26 @@ function Invoke-Native {
         }
         throw "$Step timed out after $TimeoutSeconds seconds"
     }
-    $stdout.Wait()
-    $stderr.Wait()
-    $output = @($stdout.Result, $stderr.Result).Where({ -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+    $stdoutText = ""
+    $stderrText = ""
+    if (-not $NoCapture) {
+        if (-not $stdout.Wait(5000)) {
+            throw "$Step exited, but stdout did not close within 5 seconds"
+        }
+        if (-not $stderr.Wait(5000)) {
+            throw "$Step exited, but stderr did not close within 5 seconds"
+        }
+        $stdoutText = $stdout.Result
+        $stderrText = $stderr.Result
+    }
+    $output = @($stdoutText, $stderrText).Where({ -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
     if ($process.ExitCode -ne 0) {
         if ($output) {
             Write-Host $output
         }
         throw "$Step failed with exit code $($process.ExitCode)"
     }
-    return $stdout.Result
+    return $stdoutText
 }
 
 function Invoke-Notion {
@@ -417,14 +432,14 @@ try {
         "--afsd-bin", $afsdBin,
         "--include-env", "NOTION_TOKEN",
         "--json"
-    ) -Step "afs daemon start" | Out-Null
+    ) -Step "afs daemon start" -NoCapture | Out-Null
     Wait-ForCondition -Name "afsd TCP endpoint" -Condition {
         $output = Invoke-Native -FilePath $afsBin -Arguments @("daemon", "status", "--state-dir", $stateRoot, "--tcp-addr", $tcpAddr, "--json") -Step "afs daemon status"
         return $output.Contains('"state": "running"')
     }
 
     Write-Step "starting Cloud Files provider"
-    Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "afs file-provider start" | Out-Null
+    Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "afs file-provider start" -NoCapture | Out-Null
     Wait-ForCondition -Name "Cloud Files provider lifecycle" -Condition {
         $output = Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "afs file-provider status"
         return $output.Contains('"state": "running"')
