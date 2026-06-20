@@ -828,7 +828,71 @@ struct ProviderContext {
     mount_id: String,
     sync_root: PathBuf,
     state_dir: PathBuf,
-    path_identities: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, String>>>,
+    identity_index: ProviderIdentityIndex,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, Default)]
+struct ProviderIdentityIndex {
+    paths: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+}
+
+#[cfg(target_os = "windows")]
+impl ProviderIdentityIndex {
+    fn remember(&self, path: &Path, identifier: &str) {
+        if let Ok(mut paths) = self.paths.lock() {
+            paths.insert(normalized_cloud_path_string(path), identifier.to_string());
+        }
+    }
+
+    fn get(&self, path: &Path) -> Option<String> {
+        self.paths
+            .lock()
+            .ok()
+            .and_then(|paths| paths.get(&normalized_cloud_path_string(path)).cloned())
+    }
+
+    fn forget_subtree(&self, path: &Path) {
+        let path = normalized_cloud_path_string(path);
+        let prefix = format!("{path}\\");
+        if let Ok(mut paths) = self.paths.lock() {
+            let keys = paths
+                .keys()
+                .filter(|key| *key == &path || key.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in keys {
+                paths.remove(&key);
+            }
+        }
+    }
+
+    fn move_subtree(&self, source: &Path, target: &Path) {
+        let source = normalized_cloud_path_string(source);
+        let target = normalized_cloud_path_string(target);
+        if source == target {
+            return;
+        }
+        let source_prefix = format!("{source}\\");
+        let mut moved = Vec::new();
+        if let Ok(mut paths) = self.paths.lock() {
+            let keys = paths.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                if key == source {
+                    if let Some(identifier) = paths.remove(&key) {
+                        moved.push((target.clone(), identifier));
+                    }
+                } else if let Some(rest) = key.strip_prefix(&source_prefix)
+                    && let Some(identifier) = paths.remove(&key)
+                {
+                    moved.push((format!("{target}\\{rest}"), identifier));
+                }
+            }
+            for (path, identifier) in moved {
+                paths.insert(path, identifier);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -938,22 +1002,24 @@ impl ProviderContext {
     }
 
     fn remember_path_identity(&self, path: &Path, identifier: &str) {
-        if let Ok(mut identities) = self.path_identities.lock() {
-            identities.insert(absolute_cloud_path(self, path), identifier.to_string());
-        }
+        self.identity_index
+            .remember(&absolute_cloud_path(self, path), identifier);
     }
 
     fn cached_path_identity(&self, path: &Path) -> Option<String> {
-        self.path_identities
-            .lock()
-            .ok()
-            .and_then(|identities| identities.get(&absolute_cloud_path(self, path)).cloned())
+        self.identity_index.get(&absolute_cloud_path(self, path))
     }
 
-    fn forget_path_identity(&self, path: &Path) {
-        if let Ok(mut identities) = self.path_identities.lock() {
-            identities.remove(&absolute_cloud_path(self, path));
-        }
+    fn forget_path_identities(&self, path: &Path) {
+        self.identity_index
+            .forget_subtree(&absolute_cloud_path(self, path));
+    }
+
+    fn move_path_identities(&self, source: &Path, target: &Path) {
+        self.identity_index.move_subtree(
+            &absolute_cloud_path(self, source),
+            &absolute_cloud_path(self, target),
+        );
     }
 
     fn request<T>(
@@ -1203,9 +1269,9 @@ fn handle_local_remove_like_path(
     if !path_is_under_sync_root(context, &path) || same_cloud_path(&path, &context.sync_root) {
         return Ok(());
     }
-    let Some(identifier) = context.cached_path_identity(&path) else {
+    let Some(identifier) = identity_for_path(context, &path)? else {
         trace_cloud_files(format!(
-            "local remove skipped path=`{}` reason=no_cached_identity",
+            "local remove skipped path=`{}` reason=no_identity",
             path.display()
         ));
         return Ok(());
@@ -1216,11 +1282,11 @@ fn handle_local_remove_like_path(
     ));
     match context.trash(&identifier) {
         Ok(_) => {
-            context.forget_path_identity(&path);
+            context.forget_path_identities(&path);
             Ok(())
         }
         Err(error) if stale_pending_page_directory_delete(&identifier, &error) => {
-            context.forget_path_identity(&path);
+            context.forget_path_identities(&path);
             Ok(())
         }
         Err(error) => Err(error),
@@ -1240,11 +1306,83 @@ fn identity_for_path(
     context: &ProviderContext,
     path: &Path,
 ) -> Result<Option<String>, HelperError> {
-    if let Some(identifier) = placeholder_identity_for_path(path)? {
-        context.remember_path_identity(path, &identifier);
+    let path = absolute_cloud_path(context, path);
+    if let Some(identifier) = placeholder_identity_for_path(&path)? {
+        context.remember_path_identity(&path, &identifier);
         return Ok(Some(identifier));
     }
-    Ok(context.cached_path_identity(path))
+    if let Some(identifier) = context.cached_path_identity(&path) {
+        if is_local_identity(&identifier) {
+            match daemon_identity_for_path(context, &path) {
+                Ok(Some(refreshed)) => return Ok(Some(refreshed)),
+                Ok(None) => {}
+                Err(error) if error.code == "daemon_unavailable" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(Some(identifier));
+    }
+    daemon_identity_for_path(context, &path)
+}
+
+#[cfg(target_os = "windows")]
+fn is_local_identity(identifier: &str) -> bool {
+    identifier.starts_with("local:") || identifier.starts_with("children:local:")
+}
+
+#[cfg(target_os = "windows")]
+fn daemon_identity_for_path(
+    context: &ProviderContext,
+    path: &Path,
+) -> Result<Option<String>, HelperError> {
+    let relative_path = match relative_cloud_path(context, path) {
+        Some(relative_path) => relative_path,
+        None => return Ok(None),
+    };
+    if relative_path.as_os_str().is_empty() {
+        return Ok(Some(
+            afsd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
+        ));
+    }
+
+    let mut current_identifier = afsd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string();
+    let mut current_path = context.sync_root.clone();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Ok(None);
+        };
+        let Some(component) = component.to_str() else {
+            return Ok(None);
+        };
+        let children = context.children(&current_identifier)?;
+        remember_placeholder_children(context, &current_path, &children.children);
+        let Some(child) = children
+            .children
+            .iter()
+            .find(|child| child.filename.eq_ignore_ascii_case(component))
+        else {
+            return Ok(None);
+        };
+        current_path.push(&child.filename);
+        current_identifier = child.identifier.clone();
+    }
+
+    context.remember_path_identity(path, &current_identifier);
+    Ok(Some(current_identifier))
+}
+
+#[cfg(target_os = "windows")]
+fn relative_cloud_path(context: &ProviderContext, path: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(&context.sync_root) {
+        return Some(relative.to_path_buf());
+    }
+
+    let path = normalized_cloud_path_string(path);
+    let root = normalized_cloud_path_string(&context.sync_root);
+    if path == root {
+        return Some(PathBuf::new());
+    }
+    path.strip_prefix(&(root + r"\")).map(PathBuf::from)
 }
 
 #[cfg(target_os = "windows")]
@@ -1385,7 +1523,7 @@ fn connect_cloud_filter_sync_root(
         mount_id: mount_id.to_string(),
         sync_root: sync_root.to_path_buf(),
         state_dir: state_dir.to_path_buf(),
-        path_identities: Default::default(),
+        identity_index: Default::default(),
     });
     let callbacks = [
         CF_CALLBACK_REGISTRATION {
@@ -1684,6 +1822,7 @@ unsafe fn handle_rename(
         HelperError::new("invalid_callback", "rename callback parameters were null")
     })?;
     let context = unsafe { provider_context(info) }?;
+    let source_path = callback_path(context, info);
     let rename = unsafe { params.Anonymous.Rename };
     let source_in_scope = rename
         .Flags
@@ -1695,10 +1834,19 @@ unsafe fn handle_rename(
         return Ok(());
     }
 
-    let identifier = callback_identifier(info)
+    let mut identifier = callback_identifier(info)
         .ok_or_else(|| HelperError::new("invalid_callback", "rename missing file identity"))?;
+    if is_local_identity(&identifier)
+        && let Some(source_path) = source_path.as_deref()
+        && let Some(refreshed) = daemon_identity_for_path(context, source_path)?
+    {
+        identifier = refreshed;
+    }
     if !target_in_scope {
         context.trash(&identifier)?;
+        if let Some(source_path) = source_path.as_deref() {
+            context.forget_path_identities(source_path);
+        }
         return Ok(());
     }
 
@@ -1714,6 +1862,10 @@ unsafe fn handle_rename(
         .ok_or_else(|| HelperError::new("invalid_callback", "rename target missing parent"))?;
     let new_parent_identifier = parent_identifier_for_path(context, new_parent_path)?;
     context.rename(&identifier, &new_parent_identifier, new_filename)?;
+    if let Some(source_path) = source_path.as_deref() {
+        context.move_path_identities(source_path, &target_path);
+    }
+    context.remember_path_identity(&target_path, &identifier);
     Ok(())
 }
 
@@ -1738,11 +1890,28 @@ unsafe fn handle_delete(
     }
 
     let context = unsafe { provider_context(info) }?;
-    let identifier = callback_identifier(info)
+    let path = callback_path(context, info);
+    let mut identifier = callback_identifier(info)
         .ok_or_else(|| HelperError::new("invalid_callback", "delete missing file identity"))?;
+    if is_local_identity(&identifier)
+        && let Some(path) = path.as_deref()
+        && let Some(refreshed) = daemon_identity_for_path(context, path)?
+    {
+        identifier = refreshed;
+    }
     match context.trash(&identifier) {
-        Ok(_) => Ok(()),
-        Err(error) if stale_pending_page_directory_delete(&identifier, &error) => Ok(()),
+        Ok(_) => {
+            if let Some(path) = path.as_deref() {
+                context.forget_path_identities(path);
+            }
+            Ok(())
+        }
+        Err(error) if stale_pending_page_directory_delete(&identifier, &error) => {
+            if let Some(path) = path.as_deref() {
+                context.forget_path_identities(path);
+            }
+            Ok(())
+        }
         Err(error) => Err(error),
     }
 }
@@ -1837,11 +2006,7 @@ fn parent_identifier_for_path(
     if same_cloud_path(&parent, &context.sync_root) {
         return Ok(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
     }
-    if let Some(identifier) = placeholder_identity_for_path(&parent)? {
-        context.remember_path_identity(&parent, &identifier);
-        return Ok(identifier);
-    }
-    if let Some(identifier) = context.cached_path_identity(&parent) {
+    if let Some(identifier) = identity_for_path(context, &parent)? {
         return Ok(identifier);
     }
     Err(HelperError::new(
@@ -2759,7 +2924,7 @@ mod tests {
             mount_id: "notion-main".to_string(),
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
-            path_identities: Default::default(),
+            identity_index: Default::default(),
         };
 
         assert_eq!(
@@ -2775,7 +2940,7 @@ mod tests {
             mount_id: "notion-main".to_string(),
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
-            path_identities: Default::default(),
+            identity_index: Default::default(),
         };
 
         assert!(path_is_under_sync_root(
@@ -2873,7 +3038,7 @@ mod tests {
             mount_id: "notion-main".to_string(),
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
-            path_identities: Default::default(),
+            identity_index: Default::default(),
         };
         let directory = Path::new(r"C:\Users\Ada\AFS\Notion\Draft");
         context.remember_path_identity(directory, "children:local:123");
@@ -2891,7 +3056,7 @@ mod tests {
             mount_id: "notion-main".to_string(),
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
-            path_identities: Default::default(),
+            identity_index: Default::default(),
         };
         let page = Path::new(r"C:\Users\Ada\AFS\Notion\Draft\page.md");
         context.remember_path_identity(page, "local:123");
@@ -2900,5 +3065,26 @@ mod tests {
             identity_for_path(&context, page).expect("identity"),
             Some("local:123".to_string())
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn provider_identity_index_moves_renamed_subtrees() {
+        let index = ProviderIdentityIndex::default();
+        let source = Path::new(r"C:\Users\Ada\AFS\Notion\Draft");
+        let child = source.join("page.md");
+        let target = Path::new(r"C:\Users\Ada\AFS\Notion\Renamed");
+
+        index.remember(source, "children:local:123");
+        index.remember(&child, "local:123");
+        index.move_subtree(source, target);
+
+        assert_eq!(index.get(target).as_deref(), Some("children:local:123"));
+        assert_eq!(
+            index.get(&target.join("page.md")).as_deref(),
+            Some("local:123")
+        );
+        assert_eq!(index.get(source), None);
+        assert_eq!(index.get(&child), None);
     }
 }
