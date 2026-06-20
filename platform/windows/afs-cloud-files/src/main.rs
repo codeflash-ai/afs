@@ -1761,14 +1761,14 @@ unsafe fn handle_fetch_data(
     ));
 
     if info.FileSize != content_len {
+        let path = callback_path(context, info)
+            .ok_or_else(|| HelperError::new("invalid_callback", "fetch data missing path"))?;
         trace_cloud_files(format!(
-            "fetch data restart hydration identity=`{identifier}` advertised_size={} materialized_size={content_len}",
-            info.FileSize
+            "fetch data update placeholder identity=`{identifier}` path=`{}` advertised_size={} materialized_size={content_len}",
+            path.display(),
+            info.FileSize,
         ));
-        unsafe {
-            restart_hydration_with_size(callback_info, &read.item, contents.len(), &identifier)?
-        };
-        return Ok(());
+        update_placeholder_metadata(&path, &read.item, contents.len(), &identifier)?;
     }
 
     let range = required_range(&contents, fetch.RequiredFileOffset, fetch.RequiredLength)?;
@@ -2135,6 +2135,35 @@ fn set_placeholder_in_sync_state(path: &Path, in_sync: bool) -> Result<(), Helpe
 }
 
 #[cfg(target_os = "windows")]
+fn update_placeholder_metadata(
+    path: &Path,
+    item: &afsd::file_provider::FileProviderItem,
+    size: usize,
+    identifier: &str,
+) -> Result<(), HelperError> {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_OPEN_FILE_FLAG_WRITE_ACCESS, CF_UPDATE_FLAG_NONE, CfUpdatePlaceholder,
+    };
+
+    let handle = open_cloud_file(path, CF_OPEN_FILE_FLAG_WRITE_ACCESS)?;
+    let metadata = fs_metadata_for_item(item, size);
+    let identity = identifier.as_bytes();
+    unsafe {
+        CfUpdatePlaceholder(
+            handle.raw(),
+            Some(&metadata),
+            Some(identity.as_ptr().cast()),
+            identity.len() as u32,
+            None,
+            CF_UPDATE_FLAG_NONE,
+            None,
+            None,
+        )
+    }
+    .map_err(win32_error("update cloud placeholder metadata"))
+}
+
+#[cfg(target_os = "windows")]
 struct CloudFileHandle(windows::Win32::Foundation::HANDLE);
 
 #[cfg(target_os = "windows")]
@@ -2474,43 +2503,6 @@ unsafe fn acknowledge_rename_with_status(
 
     unsafe { CfExecute(&operation_info, &mut parameters) }
         .map_err(win32_error("acknowledge rename"))
-}
-
-#[cfg(target_os = "windows")]
-unsafe fn restart_hydration_with_size(
-    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
-    item: &afsd::file_provider::FileProviderItem,
-    size: usize,
-    identifier: &str,
-) -> Result<(), HelperError> {
-    use windows::Win32::Storage::CloudFilters::{
-        CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_3,
-        CF_OPERATION_RESTART_HYDRATION_FLAG_NONE, CF_OPERATION_TYPE_RESTART_HYDRATION, CfExecute,
-    };
-
-    let info = unsafe { callback_info.as_ref() }.ok_or_else(|| {
-        HelperError::new(
-            "invalid_callback",
-            "restart hydration callback info was null",
-        )
-    })?;
-    let identity = identifier.as_bytes();
-    let metadata = fs_metadata_for_item(item, size);
-    let operation_info = operation_info(info, CF_OPERATION_TYPE_RESTART_HYDRATION);
-    let mut parameters = CF_OPERATION_PARAMETERS {
-        ParamSize: operation_parameter_size::<CF_OPERATION_PARAMETERS_0_3>(),
-        Anonymous: CF_OPERATION_PARAMETERS_0 {
-            RestartHydration: CF_OPERATION_PARAMETERS_0_3 {
-                Flags: CF_OPERATION_RESTART_HYDRATION_FLAG_NONE,
-                FsMetadata: &metadata,
-                FileIdentity: identity.as_ptr().cast(),
-                FileIdentityLength: identity.len() as u32,
-            },
-        },
-    };
-
-    unsafe { CfExecute(&operation_info, &mut parameters) }
-        .map_err(win32_error("restart hydration with materialized size"))
 }
 
 #[cfg(target_os = "windows")]
