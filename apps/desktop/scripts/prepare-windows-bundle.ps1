@@ -22,7 +22,7 @@ if ([string]::IsNullOrWhiteSpace($Cargo)) {
 
 Push-Location $Root
 try {
-    & $Cargo build -p afs-cli -p afsd --release
+    & $Cargo build -p afs-cli -p afsd -p afs-cloud-files --release
 } finally {
     Pop-Location
 }
@@ -30,6 +30,8 @@ try {
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root "target\release\afs.exe") -Destination (Join-Path $Out "afs.exe") -Force
 Copy-Item -LiteralPath (Join-Path $Root "target\release\afsd.exe") -Destination (Join-Path $Out "afsd.exe") -Force
+Copy-Item -LiteralPath (Join-Path $Root "target\release\afs-cloud-files.exe") -Destination (Join-Path $Out "afs-cloud-files.exe") -Force
 
 Write-Host "Prepared Windows CLI in $(Join-Path $Out 'afs.exe')"
 Write-Host "Prepared Windows daemon in $(Join-Path $Out 'afsd.exe')"
+Write-Host "Prepared Windows Cloud Files helper in $(Join-Path $Out 'afs-cloud-files.exe')"

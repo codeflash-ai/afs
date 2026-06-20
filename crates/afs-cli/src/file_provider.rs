@@ -213,15 +213,38 @@ pub fn open_windows_cloud_files_sync_root(
     }
 }
 
+pub fn run_windows_cloud_files_provider(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    #[cfg(target_os = "windows")]
+    {
+        run_windows_cloud_files_helper("run", windows_cloud_files_run_args(state_root, mount))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = state_root;
+        Err(WindowsCloudFilesHelperError::UnsupportedPlatform(format!(
+            "Windows Cloud Files provider runtime is only supported on Windows; mount `{}` cannot run here",
+            mount.mount_id.0
+        )))
+    }
+}
+
 pub fn unregister_windows_cloud_files_sync_root(
+    state_root: &Path,
     mount_id: &str,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
     #[cfg(target_os = "windows")]
     {
-        run_windows_cloud_files_helper("unregister", windows_cloud_files_unregister_args(mount_id))
+        run_windows_cloud_files_helper(
+            "unregister",
+            windows_cloud_files_unregister_args(state_root, mount_id),
+        )
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = state_root;
         Err(WindowsCloudFilesHelperError::UnsupportedPlatform(format!(
             "Windows Cloud Files unregister is only supported on Windows for `{mount_id}`"
         )))
@@ -300,8 +323,24 @@ fn windows_cloud_files_open_args(mount: &MountConfig) -> Vec<String> {
     ]
 }
 
-fn windows_cloud_files_unregister_args(mount_id: &str) -> Vec<String> {
-    vec!["--mount-id".to_string(), mount_id.to_string()]
+fn windows_cloud_files_run_args(state_root: &Path, mount: &MountConfig) -> Vec<String> {
+    vec![
+        "--mount-id".to_string(),
+        mount.mount_id.0.clone(),
+        "--sync-root".to_string(),
+        mount.root.display().to_string(),
+        "--state-dir".to_string(),
+        state_root.display().to_string(),
+    ]
+}
+
+fn windows_cloud_files_unregister_args(state_root: &Path, mount_id: &str) -> Vec<String> {
+    vec![
+        "--mount-id".to_string(),
+        mount_id.to_string(),
+        "--state-dir".to_string(),
+        state_root.display().to_string(),
+    ]
 }
 
 #[cfg(target_os = "windows")]
@@ -764,8 +803,30 @@ mod tests {
             ]
         );
         assert_eq!(
-            super::windows_cloud_files_unregister_args("notion-main"),
-            vec!["--mount-id", "notion-main"]
+            super::windows_cloud_files_run_args(
+                std::path::Path::new(r"C:\Users\Ada\AppData\Local\AgentFS"),
+                &mount,
+            ),
+            vec![
+                "--mount-id",
+                "notion-main",
+                "--sync-root",
+                r"C:\Users\Ada\AFS",
+                "--state-dir",
+                r"C:\Users\Ada\AppData\Local\AgentFS",
+            ]
+        );
+        assert_eq!(
+            super::windows_cloud_files_unregister_args(
+                std::path::Path::new(r"C:\Users\Ada\AppData\Local\AgentFS"),
+                "notion-main"
+            ),
+            vec![
+                "--mount-id",
+                "notion-main",
+                "--state-dir",
+                r"C:\Users\Ada\AppData\Local\AgentFS",
+            ]
         );
     }
 }

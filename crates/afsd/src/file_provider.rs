@@ -5,11 +5,12 @@
 //! generic API instead of growing platform-specific daemon semantics.
 
 use afs_core::AfsResult;
-use afs_core::model::MountId;
+use afs_core::model::{HydrationState, MountId};
 use afs_store::{
     EntityRepository, FreshnessStateRepository, MountConfig, MountRepository, ProjectionMode,
     ShadowRepository, VirtualMutationRepository,
 };
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::hydration::HydrationSource;
@@ -23,6 +24,18 @@ pub use crate::virtual_fs::{
     VirtualFsMaterializeOutcome as FileProviderMaterializeOutcome,
     VirtualFsMaterializeReport as FileProviderMaterializeReport,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileProviderReadReport {
+    pub mount_id: String,
+    pub identifier: String,
+    pub remote_id: String,
+    pub path: String,
+    pub outcome: FileProviderMaterializeOutcome,
+    pub hydration: HydrationState,
+    pub item: FileProviderItem,
+    pub contents_base64: String,
+}
 
 pub fn file_provider_item<S>(
     store: &S,

@@ -424,6 +424,8 @@ struct TemplateApplyArgs {
 enum FileProviderCommand {
     #[command(about = "Register a virtual filesystem provider for a mount")]
     Register(FileProviderTargetArg),
+    #[command(about = "Run the foreground Windows Cloud Files provider for a mount")]
+    Run(FileProviderTargetArg),
     #[command(about = "Open a registered virtual filesystem mount")]
     Open(FileProviderTargetArg),
     #[command(about = "Unregister a virtual filesystem provider for a mount")]
@@ -745,6 +747,10 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
             match command {
                 FileProviderCommand::Register(options) => {
                     args.push("register".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Run(options) => {
+                    args.push("run".to_string());
                     args.push(options.target.clone());
                 }
                 FileProviderCommand::Open(options) => {
@@ -1139,7 +1145,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|open|unregister <mount-id-or-path> [--json]",
+                "usage: afs file-provider register|run|open|unregister <mount-id-or-path> [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1147,16 +1153,27 @@ fn file_provider(args: &[String], json: bool) -> i32 {
 
     match action {
         "register" => file_provider_register(args, json),
+        "run" => file_provider_run(args, json),
         "open" => file_provider_open(args, json),
         "unregister" => file_provider_unregister(args, json),
-        "list" => run_platform_file_provider_helper(json, "list", Vec::new(), None),
-        "reset" => run_platform_file_provider_helper(json, "reset", Vec::new(), None),
+        "list" => run_platform_file_provider_helper(
+            json,
+            "list",
+            windows_cloud_files_state_args_for_platform(),
+            None,
+        ),
+        "reset" => run_platform_file_provider_helper(
+            json,
+            "reset",
+            windows_cloud_files_state_args_for_platform(),
+            None,
+        ),
         _ => command_error(
             json,
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|open|unregister|list|reset",
+                "usage: afs file-provider register|run|open|unregister|list|reset",
             ),
             EXIT_USAGE,
         ),
@@ -1222,6 +1239,62 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
         VirtualProjectionRegistration::WindowsCloudFiles => {
             run_windows_cloud_files_register(json, &mount)
         }
+    }
+}
+
+fn file_provider_run(args: &[String], json: bool) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider run <mount-id-or-path> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let mount = match resolve_mount_target(&store, target) {
+        Ok(mount) => mount,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "mount_not_found", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let target_os = std::env::consts::OS;
+    let registration = match validate_virtual_projection_registration(&mount, target_os) {
+        Ok(registration) => registration,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    match registration {
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_run(json, &mount)
+        }
+        VirtualProjectionRegistration::MacosFileProvider
+        | VirtualProjectionRegistration::LinuxFuse => command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "unsupported_platform",
+                "foreground provider run is only supported for Windows Cloud Files",
+            ),
+            EXIT_USAGE,
+        ),
     }
 }
 
@@ -3126,6 +3199,23 @@ fn run_windows_cloud_files_register(json: bool, mount: &MountConfig) -> i32 {
     )
 }
 
+fn run_windows_cloud_files_run(json: bool, mount: &MountConfig) -> i32 {
+    let state_root = default_state_root();
+    let helper_report =
+        match file_provider_helper::run_windows_cloud_files_provider(&state_root, mount) {
+            Ok(report) => report,
+            Err(error) => {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", error.code(), error.message()),
+                    EXIT_INTERNAL,
+                );
+            }
+        };
+
+    file_provider_helper_success_report(json, "run", Some(mount.mount_id.0.clone()), helper_report)
+}
+
 fn run_windows_cloud_files_open(json: bool, mount: &MountConfig) -> i32 {
     let helper_report = match file_provider_helper::open_windows_cloud_files_sync_root(mount) {
         Ok(report) => report,
@@ -3142,8 +3232,10 @@ fn run_windows_cloud_files_open(json: bool, mount: &MountConfig) -> i32 {
 }
 
 fn run_windows_cloud_files_unregister(json: bool, mount_id: &str) -> i32 {
+    let state_root = default_state_root();
     let helper_report =
-        match file_provider_helper::unregister_windows_cloud_files_sync_root(mount_id) {
+        match file_provider_helper::unregister_windows_cloud_files_sync_root(&state_root, mount_id)
+        {
             Ok(report) => report,
             Err(error) => {
                 return command_error(
@@ -3160,6 +3252,17 @@ fn run_windows_cloud_files_unregister(json: bool, mount_id: &str) -> i32 {
         Some(mount_id.to_string()),
         helper_report,
     )
+}
+
+fn windows_cloud_files_state_args_for_platform() -> Vec<String> {
+    if std::env::consts::OS == "windows" {
+        vec![
+            "--state-dir".to_string(),
+            default_state_root().display().to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 fn run_windows_cloud_files_helper(

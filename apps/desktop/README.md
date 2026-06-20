@@ -64,9 +64,11 @@ Build a local NSIS installer from the repo root on Windows:
 make build-tauri-windows
 ```
 
-The build stages `afs.exe` and `afsd.exe` under `src-tauri/windows` before
-Tauri bundles the app. The installer copies those sidecars next to the desktop
-executable so the app can start the packaged daemon and locate the packaged CLI.
+The build stages `afs.exe`, `afsd.exe`, and `afs-cloud-files.exe` under
+`src-tauri/windows` before Tauri bundles the app. The installer copies those
+sidecars next to the desktop executable so the app can start the packaged
+daemon, locate the packaged CLI, and call the Windows Cloud Files registration
+and provider runtime helper.
 On uninstall, the NSIS hook removes the sidecars, the per-user Windows login
 item, and AFS-managed terminal command shims.
 

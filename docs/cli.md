@@ -24,7 +24,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs undo [push-id] [--json]`
 - `afs log [path] [--json]`
 - `afs config set <key=value>`
-- `afs file-provider register|unregister|list|reset [target] [--json]`
+- `afs file-provider register|run|open|unregister|list|reset [target] [--json]`
 
 ## Exit-code contract
 

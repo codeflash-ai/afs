@@ -22,11 +22,13 @@
   SetOutPath "$INSTDIR"
   File /oname=afs.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afs.exe"
   File /oname=afsd.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afsd.exe"
+  File /oname=afs-cloud-files.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afs-cloud-files.exe"
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
   Delete "$INSTDIR\afs.exe"
   Delete "$INSTDIR\afsd.exe"
+  Delete "$INSTDIR\afs-cloud-files.exe"
   DeleteRegValue HKCU "${AFS_RUN_KEY}" "${AFS_RUN_VALUE}"
   !insertmacro DELETE_AFS_TERMINAL_SHIM "$LOCALAPPDATA\Microsoft\WindowsApps\afs.cmd"
   !insertmacro DELETE_AFS_TERMINAL_SHIM "$LOCALAPPDATA\AgentFS\bin\afs.cmd"
