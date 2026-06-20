@@ -7,6 +7,11 @@ if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE -ne "1") {
     exit 0
 }
 
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Error "Windows Cloud Files live test requires PowerShell 7+. Run with pwsh."
+    exit 1
+}
+
 $runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )
@@ -48,6 +53,30 @@ $createdChildPageId = $null
 $tcpAddr = $null
 $failed = $false
 
+function Write-Step {
+    param([string] $Message)
+    Write-Host "[afs-live] $Message"
+}
+
+function Invoke-WithTimeout {
+    param(
+        [string] $Name,
+        [scriptblock] $Script,
+        [object[]] $ArgumentList = @(),
+        [int] $TimeoutSeconds = 60
+    )
+    $job = Start-Job -WorkingDirectory (Get-Location).Path -ScriptBlock $Script -ArgumentList $ArgumentList
+    try {
+        if (-not (Wait-Job -Job $job -Timeout $TimeoutSeconds)) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            throw "$Name timed out after $TimeoutSeconds seconds"
+        }
+        Receive-Job -Job $job -ErrorAction Stop
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Normalize-NotionId {
     param([string] $InputId)
     $trimmed = $InputId.Trim().TrimEnd("/")
@@ -77,22 +106,52 @@ function Write-Utf8NoBom {
         [string] $Path,
         [string] $Contents
     )
-    $encoding = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($Path, $Contents, $encoding)
+    Invoke-WithTimeout -Name "write $Path" -TimeoutSeconds 60 -ArgumentList @($Path, $Contents) -Script {
+        param([string] $Path, [string] $Contents)
+        $encoding = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText($Path, $Contents, $encoding)
+    } | Out-Null
 }
 
 function Invoke-Native {
     param(
         [string] $FilePath,
         [string[]] $Arguments,
-        [string] $Step
+        [string] $Step,
+        [int] $TimeoutSeconds = 120
     )
-    $output = & $FilePath @Arguments
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw "$Step failed with exit code $exitCode"
+    Write-Step $Step
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo.FileName = $FilePath
+    $process.StartInfo.WorkingDirectory = (Get-Location).Path
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        [void] $process.StartInfo.ArgumentList.Add($argument)
     }
-    return ($output -join "`n")
+    [void] $process.Start()
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try {
+            $process.Kill($true)
+        } catch {
+            $process.Kill()
+        }
+        throw "$Step timed out after $TimeoutSeconds seconds"
+    }
+    $stdout.Wait()
+    $stderr.Wait()
+    $output = @($stdout.Result, $stderr.Result).Where({ -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+    if ($process.ExitCode -ne 0) {
+        if ($output) {
+            Write-Host $output
+        }
+        throw "$Step failed with exit code $($process.ExitCode)"
+    }
+    return $stdout.Result
 }
 
 function Invoke-Notion {
@@ -108,10 +167,79 @@ function Invoke-Notion {
     }
     $uri = "https://api.notion.com/v1/$Path"
     if ($null -eq $Body) {
-        return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers
+        return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -TimeoutSec 30
     }
     $json = $Body | ConvertTo-Json -Depth 32
-    return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType "application/json" -Body $json
+    return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType "application/json" -Body $json -TimeoutSec 30
+}
+
+function Test-PathWithTimeout {
+    param(
+        [string] $Path,
+        [string] $Name = $Path
+    )
+    $result = Invoke-WithTimeout -Name "test path $Name" -TimeoutSeconds 20 -ArgumentList @($Path) -Script {
+        param([string] $Path)
+        Test-Path -LiteralPath $Path
+    }
+    return [bool] $result
+}
+
+function Get-ChildItemWithTimeout {
+    param(
+        [string] $Path,
+        [string] $Name = $Path
+    )
+    Invoke-WithTimeout -Name "enumerate $Name" -TimeoutSeconds 30 -ArgumentList @($Path) -Script {
+        param([string] $Path)
+        Get-ChildItem -LiteralPath $Path -Force | Select-Object -ExpandProperty FullName
+    }
+}
+
+function Get-ContentWithTimeout {
+    param(
+        [string] $Path,
+        [string] $Name = $Path,
+        [int] $TimeoutSeconds = 90
+    )
+    Invoke-WithTimeout -Name "read $Name" -TimeoutSeconds $TimeoutSeconds -ArgumentList @($Path) -Script {
+        param([string] $Path)
+        Get-Content -LiteralPath $Path -Raw
+    }
+}
+
+function Rename-ItemWithTimeout {
+    param(
+        [string] $Path,
+        [string] $NewName
+    )
+    Invoke-WithTimeout -Name "rename $Path" -TimeoutSeconds 60 -ArgumentList @($Path, $NewName) -Script {
+        param([string] $Path, [string] $NewName)
+        Rename-Item -LiteralPath $Path -NewName $NewName
+    } | Out-Null
+}
+
+function Remove-ItemWithTimeout {
+    param(
+        [string] $Path,
+        [switch] $Recurse
+    )
+    Invoke-WithTimeout -Name "remove $Path" -TimeoutSeconds 60 -ArgumentList @($Path, [bool] $Recurse) -Script {
+        param([string] $Path, [bool] $Recurse)
+        if ($Recurse) {
+            Remove-Item -LiteralPath $Path -Recurse -Force
+        } else {
+            Remove-Item -LiteralPath $Path -Force
+        }
+    } | Out-Null
+}
+
+function New-DirectoryWithTimeout {
+    param([string] $Path)
+    Invoke-WithTimeout -Name "create directory $Path" -TimeoutSeconds 60 -ArgumentList @($Path) -Script {
+        param([string] $Path)
+        New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    } | Out-Null
 }
 
 function Get-NotionBlockText {
@@ -201,12 +329,13 @@ function Wait-ForStatusContains {
 }
 
 try {
+    Write-Step "preparing temp state and sync root"
     New-Item -ItemType Directory -Force -Path $stateRoot, $syncRoot | Out-Null
 
     if (-not ((Test-Path -LiteralPath $afsBin) -and (Test-Path -LiteralPath $afsdBin) -and (Test-Path -LiteralPath $cloudFilesBin))) {
         Push-Location $repoRoot
         try {
-            Invoke-Native -FilePath "cargo" -Arguments @("build", "-p", "afsd", "-p", "afs-cli", "-p", "afs-cloud-files") -Step "cargo build"
+            Invoke-Native -FilePath "cargo" -Arguments @("build", "-p", "afsd", "-p", "afs-cli", "-p", "afs-cloud-files") -Step "cargo build" -TimeoutSeconds 600
         } finally {
             Pop-Location
         }
@@ -219,6 +348,7 @@ try {
     $parentPageId = Normalize-NotionId $parentPageId
     $scratchTitle = "AFS Cloud Files live $unique"
     $initialBody = "Initial paragraph created by the Windows Cloud Files live e2e."
+    Write-Step "creating scratch Notion page"
     $scratch = Invoke-Notion -Method POST -Path "pages" -Body @{
         parent = @{
             type = "page_id"
@@ -254,6 +384,7 @@ try {
     }
     $scratchPageId = Normalize-NotionId $scratch.id
 
+    Write-Step "mounting Windows Cloud Files projection"
     $previousDisable = $env:AFS_DAEMON_DISABLE
     $env:AFS_DAEMON_DISABLE = "1"
     try {
@@ -277,6 +408,7 @@ try {
         $env:AFS_CLOUD_FILES_TRACE = "1"
     }
 
+    Write-Step "starting afsd"
     Invoke-Native -FilePath $afsBin -Arguments @(
         "daemon", "start",
         "--session",
@@ -291,11 +423,13 @@ try {
         return $output.Contains('"state": "running"')
     }
 
+    Write-Step "starting Cloud Files provider"
     Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "afs file-provider start" | Out-Null
     Wait-ForCondition -Name "Cloud Files provider lifecycle" -Condition {
         $output = Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "afs file-provider status"
         return $output.Contains('"state": "running"')
     }
+    Write-Step "running afs doctor"
     $doctorOutput = Invoke-Native -FilePath $afsBin -Arguments @("doctor", "--json") -Step "afs doctor"
     $doctor = $doctorOutput | ConvertFrom-Json
     if (-not $doctor.ok) {
@@ -305,28 +439,35 @@ try {
     $sourceRoot = Join-Path $syncRoot "notion"
     $pageDir = Join-Path $sourceRoot (ConvertTo-AfsSlug $scratchTitle)
     $pageFile = Join-Path $pageDir "page.md"
+    Write-Step "waiting for source root"
     Wait-ForCondition -Name "Cloud Files source root" -Condition {
-        Test-Path -LiteralPath $sourceRoot
+        Test-PathWithTimeout -Path $sourceRoot -Name "source root"
     }
+    Write-Step "waiting for scratch page placeholder"
     Wait-ForCondition -Name "scratch page placeholder" -Condition {
-        Get-ChildItem -LiteralPath $sourceRoot -Force | Out-Null
-        Test-Path -LiteralPath $pageDir
+        Get-ChildItemWithTimeout -Path $sourceRoot -Name "source root" | Out-Null
+        Test-PathWithTimeout -Path $pageDir -Name "scratch page directory"
     }
+    Write-Step "waiting for scratch page.md placeholder"
     Wait-ForCondition -Name "scratch page.md placeholder" -Condition {
-        Get-ChildItem -LiteralPath $pageDir -Force | Out-Null
-        Test-Path -LiteralPath $pageFile
+        Get-ChildItemWithTimeout -Path $pageDir -Name "scratch page directory" | Out-Null
+        Test-PathWithTimeout -Path $pageFile -Name "scratch page.md"
     }
 
-    $hydrated = Get-Content -LiteralPath $pageFile -Raw
+    Write-Step "hydrating page.md"
+    $hydrated = Get-ContentWithTimeout -Path $pageFile -Name "scratch page.md" -TimeoutSeconds 120
     if (-not $hydrated.Contains($initialBody)) {
         throw "hydrated page.md did not contain the initial Notion paragraph"
     }
 
     $editMarker = "Windows Cloud Files live edit $unique"
+    Write-Step "editing hydrated page.md"
     Write-Utf8NoBom -Path $pageFile -Contents ($hydrated.TrimEnd() + "`n`n$editMarker`n")
     Wait-ForStatusContains -Path $pageFile -Needle '"local_body_changed"'
+    Write-Step "pushing page edit"
     Invoke-Native -FilePath $afsBin -Arguments @("push", $pageFile, "-y", "--json") -Step "push edited page" | Out-Null
     Wait-ForStatusContains -Path $pageFile -Needle '"state": "clean"'
+    Write-Step "verifying page edit in Notion"
     $remoteText = Get-NotionBlockText -PageId $scratchPageId
     if (-not $remoteText.Contains($editMarker)) {
         throw "Notion page did not contain the pushed edit marker"
@@ -334,19 +475,23 @@ try {
 
     $draftFile = Join-Path $pageDir ("draft-$unique.md")
     $renamedDraftFile = Join-Path $pageDir ("draft-renamed-$unique.md")
+    Write-Step "creating and renaming pending draft file"
     Write-Utf8NoBom -Path $draftFile -Contents "---`ntitle: `"Draft $unique`"`n---`n# Draft`n`nCreated through Cloud Files and not pushed.`n"
-    Rename-Item -LiteralPath $draftFile -NewName (Split-Path -Leaf $renamedDraftFile)
+    Rename-ItemWithTimeout -Path $draftFile -NewName (Split-Path -Leaf $renamedDraftFile)
     Wait-ForStatusContains -Path $renamedDraftFile -Needle '"pending_virtual_create"'
-    Remove-Item -LiteralPath $renamedDraftFile -Force
+    Write-Step "deleting pending draft file"
+    Remove-ItemWithTimeout -Path $renamedDraftFile
     Wait-ForStatusContains -Path $pageDir -Needle '"clean": true'
 
     $childTitle = "AFS Cloud Files child $unique"
     $childDir = Join-Path $pageDir (ConvertTo-AfsSlug $childTitle)
     $childPage = Join-Path $childDir "page.md"
     $childMarker = "Windows Cloud Files created child $unique"
-    New-Item -ItemType Directory -Force -Path $childDir | Out-Null
+    Write-Step "creating child page directory"
+    New-DirectoryWithTimeout -Path $childDir
     Write-Utf8NoBom -Path $childPage -Contents "---`ntitle: `"$childTitle`"`n---`n# Created child`n`n$childMarker`n"
     Wait-ForStatusContains -Path $childPage -Needle '"pending_virtual_create"'
+    Write-Step "pushing created child page"
     $pushChildOutput = Invoke-Native -FilePath $afsBin -Arguments @("push", $childPage, "-y", "--json") -Step "push created child page"
     $pushChild = $pushChildOutput | ConvertFrom-Json
     $createdChildPageId = @($pushChild.changed_remote_ids | Where-Object { (Normalize-NotionId $_) -ne $scratchPageId } | Select-Object -First 1)[0]
@@ -359,8 +504,10 @@ try {
         throw "created child Notion page did not contain the pushed marker"
     }
 
-    Remove-Item -LiteralPath $childDir -Recurse -Force
+    Write-Step "deleting child page directory"
+    Remove-ItemWithTimeout -Path $childDir -Recurse
     Wait-ForStatusContains -Path $pageDir -Needle '"pending_virtual_delete"'
+    Write-Step "pushing child page archive"
     Invoke-Native -FilePath $afsBin -Arguments @("push", $pageDir, "-y", "--json") -Step "push deleted child page" | Out-Null
     Assert-NotionPageArchived -PageId $createdChildPageId
 
