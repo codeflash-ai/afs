@@ -10,6 +10,13 @@ const SYNC_ROOT_ID_PREFIX: &str = "codeflash.ai.afs!default!";
 #[cfg(target_os = "windows")]
 const PROVIDER_GUID: u128 = 0xa4ee620b_cab8_4fc5_a942_68ad2854e19f;
 
+#[cfg(target_os = "windows")]
+fn trace_cloud_files(message: impl AsRef<str>) {
+    if std::env::var_os("AFS_CLOUD_FILES_TRACE").is_some() {
+        eprintln!("{COMMAND_NAME}: {}", message.as_ref());
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = COMMAND_NAME, about = "Manage AgentFS Windows Cloud Files sync roots.")]
 struct Cli {
@@ -1342,7 +1349,14 @@ unsafe fn handle_fetch_placeholders(
     let context = unsafe { provider_context(info) }?;
     let container_identifier = callback_identifier(info)
         .unwrap_or_else(|| afsd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
+    trace_cloud_files(format!(
+        "fetch placeholders start container=`{container_identifier}`"
+    ));
     let children = context.children(&container_identifier)?;
+    trace_cloud_files(format!(
+        "fetch placeholders transfer container=`{container_identifier}` count={}",
+        children.children.len()
+    ));
     let mut batch = PlaceholderBatch::from_items(&children.children);
     unsafe {
         complete_fetch_placeholders_with_status(
@@ -1372,11 +1386,23 @@ unsafe fn handle_fetch_data(
     let identifier = callback_identifier(info)
         .ok_or_else(|| HelperError::new("invalid_callback", "fetch data missing file identity"))?;
     let fetch = unsafe { params.Anonymous.FetchData };
+    trace_cloud_files(format!(
+        "fetch data start identity=`{identifier}` advertised_size={} required_offset={} required_length={}",
+        info.FileSize, fetch.RequiredFileOffset, fetch.RequiredLength
+    ));
     let read = context.read(&identifier)?;
     let contents = decode_base64(&read.contents_base64)?;
     let content_len = contents.len() as i64;
+    trace_cloud_files(format!(
+        "fetch data materialized identity=`{identifier}` bytes={content_len} advertised_size={}",
+        info.FileSize
+    ));
 
     if info.FileSize != content_len {
+        trace_cloud_files(format!(
+            "fetch data restart hydration identity=`{identifier}` advertised_size={} materialized_size={content_len}",
+            info.FileSize
+        ));
         unsafe {
             restart_hydration_with_size(callback_info, &read.item, contents.len(), &identifier)?
         };
@@ -1384,6 +1410,11 @@ unsafe fn handle_fetch_data(
     }
 
     let range = required_range(&contents, fetch.RequiredFileOffset, fetch.RequiredLength)?;
+    trace_cloud_files(format!(
+        "fetch data transfer identity=`{identifier}` offset={} length={}",
+        fetch.RequiredFileOffset,
+        range.len()
+    ));
     unsafe {
         complete_fetch_data_with_status(
             callback_info,
@@ -1741,8 +1772,35 @@ fn create_placeholders_in_directory(
         return Ok(());
     }
 
+    let mut missing_items = Vec::with_capacity(items.len());
+    for item in items {
+        let placeholder_path = directory.join(&item.filename);
+        match placeholder_path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => missing_items.push(item.clone()),
+            Err(error) => {
+                return Err(HelperError::io("inspect cloud file placeholder", error));
+            }
+        }
+    }
+
+    if missing_items.is_empty() {
+        trace_cloud_files(format!(
+            "create placeholders skipped directory=`{}` existing_count={}",
+            directory.display(),
+            items.len()
+        ));
+        return Ok(());
+    }
+
+    trace_cloud_files(format!(
+        "create placeholders directory=`{}` missing_count={} requested_count={}",
+        directory.display(),
+        missing_items.len(),
+        items.len()
+    ));
     let directory_wide = wide_path(directory);
-    let mut batch = PlaceholderBatch::from_items(items);
+    let mut batch = PlaceholderBatch::from_items(&missing_items);
     unsafe {
         CfCreatePlaceholders(
             PCWSTR::from_raw(directory_wide.as_ptr()),
@@ -1843,8 +1901,7 @@ unsafe fn complete_fetch_placeholders_with_status(
 ) -> Result<(), HelperError> {
     use windows::Win32::Storage::CloudFilters::{
         CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_4,
-        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
-        CfExecute,
+        CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS, CfExecute,
     };
 
     let info = unsafe { callback_info.as_ref() }.ok_or_else(|| {
@@ -1854,22 +1911,45 @@ unsafe fn complete_fetch_placeholders_with_status(
         )
     })?;
     let operation_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
+    let flags = transfer_placeholders_flags_for_status(status);
     let mut parameters = CF_OPERATION_PARAMETERS {
         ParamSize: operation_parameter_size::<CF_OPERATION_PARAMETERS_0_4>(),
         Anonymous: CF_OPERATION_PARAMETERS_0 {
             TransferPlaceholders: CF_OPERATION_PARAMETERS_0_4 {
-                Flags: CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+                Flags: flags,
                 CompletionStatus: status,
                 PlaceholderTotalCount: placeholder_total_count,
                 PlaceholderArray: placeholders,
                 PlaceholderCount: placeholder_count,
-                EntriesProcessed: 0,
+                EntriesProcessed: placeholder_count,
             },
         },
     };
 
-    unsafe { CfExecute(&operation_info, &mut parameters) }
-        .map_err(win32_error("complete fetch placeholders"))
+    trace_cloud_files(format!(
+        "complete fetch placeholders execute count={placeholder_count} total={placeholder_total_count} entries_processed={placeholder_count}"
+    ));
+    let result = unsafe { CfExecute(&operation_info, &mut parameters) };
+    trace_cloud_files(format!(
+        "complete fetch placeholders returned count={placeholder_count} result={result:?}"
+    ));
+    result.map_err(win32_error("complete fetch placeholders"))
+}
+
+#[cfg(target_os = "windows")]
+fn transfer_placeholders_flags_for_status(
+    status: windows::Win32::Foundation::NTSTATUS,
+) -> windows::Win32::Storage::CloudFilters::CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+    };
+
+    if status.0 == STATUS_SUCCESS_VALUE {
+        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION
+    } else {
+        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1905,8 +1985,15 @@ unsafe fn complete_fetch_data_with_status(
         },
     };
 
-    unsafe { CfExecute(&operation_info, &mut parameters) }
-        .map_err(win32_error("complete fetch data"))
+    trace_cloud_files(format!(
+        "complete fetch data execute offset={offset} length={length} status={}",
+        status.0
+    ));
+    let result = unsafe { CfExecute(&operation_info, &mut parameters) };
+    trace_cloud_files(format!(
+        "complete fetch data returned offset={offset} length={length} result={result:?}"
+    ));
+    result.map_err(win32_error("complete fetch data"))
 }
 
 #[cfg(target_os = "windows")]
@@ -2221,6 +2308,7 @@ fn register_shell_sync_root(
         .map_err(winrt_error("set hydration policy"))?;
     info.SetHydrationPolicyModifier(
         StorageProviderHydrationPolicyModifier::StreamingAllowed
+            | StorageProviderHydrationPolicyModifier::AllowFullRestartHydration
             | StorageProviderHydrationPolicyModifier::AutoDehydrationAllowed,
     )
     .map_err(winrt_error("set hydration modifier"))?;
@@ -2443,5 +2531,23 @@ mod tests {
             &context,
             Path::new(r"C:\Users\Ada\AFS\Notion Backup\Draft.md")
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn successful_placeholder_transfer_disables_on_demand_population() {
+        use windows::Win32::Storage::CloudFilters::{
+            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+        };
+
+        assert_eq!(
+            transfer_placeholders_flags_for_status(status_success()).0,
+            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION.0
+        );
+        assert_eq!(
+            transfer_placeholders_flags_for_status(status_unsuccessful()).0,
+            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE.0
+        );
     }
 }

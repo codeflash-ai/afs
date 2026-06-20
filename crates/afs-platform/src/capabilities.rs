@@ -102,7 +102,10 @@ pub fn mount_cli_capabilities_for_target(target_os: &str) -> PlatformCapabilitie
         "windows" => PlatformCapabilities {
             target_os: target_os.to_string(),
             default_projection: ProjectionMode::PlainFiles,
-            supported_projections: vec![ProjectionMode::PlainFiles],
+            supported_projections: vec![
+                ProjectionMode::PlainFiles,
+                ProjectionMode::WindowsCloudFiles,
+            ],
             virtual_registration: Some(ProjectionMode::WindowsCloudFiles),
             supports_daemon_service: false,
             supports_secure_os_credentials: true,
@@ -131,7 +134,7 @@ fn supported_target_for_projection(projection: &str) -> &'static str {
     match projection {
         "macos-file-provider" => "macOS",
         "linux-fuse" => "Linux",
-        "windows-cloud-files" => "Windows after the Cloud Files provider is implemented",
+        "windows-cloud-files" => "Windows",
         _ => "this platform",
     }
 }
@@ -142,11 +145,14 @@ mod tests {
     use afs_store::ProjectionMode;
 
     #[test]
-    fn windows_cli_supports_plain_files_only_for_now() {
+    fn windows_cli_supports_cloud_files() {
         let capabilities = mount_cli_capabilities_for_target("windows");
 
         assert_eq!(capabilities.default_projection, ProjectionMode::PlainFiles);
-        assert_eq!(capabilities.projection_usage_options(), "plain-files");
+        assert_eq!(
+            capabilities.projection_usage_options(),
+            "plain-files|windows-cloud-files"
+        );
         assert_eq!(
             capabilities.virtual_registration,
             Some(ProjectionMode::WindowsCloudFiles)
@@ -154,9 +160,8 @@ mod tests {
         assert_eq!(
             capabilities
                 .projection_from_cli_value(Some("windows-cloud-files"))
-                .expect_err("cloud files is not wired yet")
-                .message(),
-            "--projection windows-cloud-files is only supported on Windows after the Cloud Files provider is implemented; this binary is running on windows"
+                .expect("cloud files projection"),
+            ProjectionMode::WindowsCloudFiles
         );
     }
 

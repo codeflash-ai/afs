@@ -288,7 +288,7 @@ struct MountNotionArgs {
     #[arg(
         long,
         value_name = "mode",
-        help = "Projection mode: plain-files, macos-file-provider, or linux-fuse."
+        help = "Projection mode. Supported values depend on the host platform."
     )]
     projection: Option<String>,
     #[arg(
@@ -5124,8 +5124,19 @@ mod tests {
             ProjectionMode::PlainFiles
         );
         assert_eq!(
+            projection_mode_for_target(
+                &[
+                    "--projection".to_string(),
+                    "windows-cloud-files".to_string()
+                ],
+                "windows"
+            )
+            .expect("windows cloud files projection"),
+            ProjectionMode::WindowsCloudFiles
+        );
+        assert_eq!(
             projection_usage_options_for_target("windows"),
-            "plain-files"
+            "plain-files|windows-cloud-files"
         );
     }
 
