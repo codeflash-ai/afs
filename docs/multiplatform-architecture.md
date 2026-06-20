@@ -295,6 +295,12 @@ Responsibilities:
 - Map local create/rename/delete notifications to daemon virtual mutations.
 - Surface sync/provider status in a Windows-native way where possible.
 
+Implementation note: Cloud Files native callbacks cover close, rename, delete,
+placeholder enumeration, and data fetch. Local creates are observed with a
+sync-root filesystem watcher, converted to placeholders after the daemon records
+the virtual mutation, and then tracked through the same placeholder identity path
+as existing cloud items.
+
 Open design questions:
 
 - Whether the provider is a Rust helper using Win32 bindings directly, a small

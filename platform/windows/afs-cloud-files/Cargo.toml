@@ -11,6 +11,7 @@ name = "afs-cloud-files"
 path = "src/main.rs"
 
 [dependencies]
+afs-core = { path = "../../../crates/afs-core" }
 afsd = { path = "../../../crates/afsd" }
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
@@ -29,3 +30,4 @@ windows = { version = "0.61.3", features = [
   "Win32_System_CorrelationVector",
   "Win32_System_IO",
 ] }
+notify = "8"

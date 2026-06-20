@@ -805,12 +805,14 @@ const METADATA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 #[cfg(target_os = "windows")]
 const MATERIALIZE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(target_os = "windows")]
+const MUTATION_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(target_os = "windows")]
 const STATUS_SUCCESS_VALUE: i32 = 0;
 #[cfg(target_os = "windows")]
 const STATUS_UNSUCCESSFUL_VALUE: i32 = 0xC0000001_u32 as i32;
 
 #[cfg(target_os = "windows")]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ProviderContext {
     mount_id: String,
     sync_root: PathBuf,
@@ -845,6 +847,84 @@ impl ProviderContext {
         )
     }
 
+    fn commit_write(
+        &self,
+        identifier: &str,
+        contents: &[u8],
+    ) -> Result<afsd::virtual_fs::VirtualFsWriteReport, HelperError> {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        self.request(
+            &afsd::ipc::DaemonRequest::VirtualFsCommitWrite {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+                contents_base64: BASE64.encode(contents),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn create_file(
+        &self,
+        parent_identifier: &str,
+        filename: &str,
+    ) -> Result<afsd::virtual_fs::VirtualFsMutationReport, HelperError> {
+        self.request(
+            &afsd::ipc::DaemonRequest::VirtualFsCreateFile {
+                mount_id: self.mount_id.clone(),
+                parent_identifier: parent_identifier.to_string(),
+                filename: filename.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn create_directory(
+        &self,
+        parent_identifier: &str,
+        dirname: &str,
+    ) -> Result<afsd::virtual_fs::VirtualFsMutationReport, HelperError> {
+        self.request(
+            &afsd::ipc::DaemonRequest::VirtualFsCreateDirectory {
+                mount_id: self.mount_id.clone(),
+                parent_identifier: parent_identifier.to_string(),
+                dirname: dirname.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn rename(
+        &self,
+        identifier: &str,
+        new_parent_identifier: &str,
+        new_filename: &str,
+    ) -> Result<afsd::virtual_fs::VirtualFsMutationReport, HelperError> {
+        self.request(
+            &afsd::ipc::DaemonRequest::VirtualFsRename {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+                new_parent_identifier: new_parent_identifier.to_string(),
+                new_filename: new_filename.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn trash(
+        &self,
+        identifier: &str,
+    ) -> Result<afsd::virtual_fs::VirtualFsMutationReport, HelperError> {
+        self.request(
+            &afsd::ipc::DaemonRequest::VirtualFsTrash {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
+    }
+
     fn request<T>(
         &self,
         request: &afsd::ipc::DaemonRequest,
@@ -863,6 +943,7 @@ impl ProviderContext {
 struct ConnectedCloudProvider {
     connection_key: windows::Win32::Storage::CloudFilters::CF_CONNECTION_KEY,
     context: Box<ProviderContext>,
+    local_change_watcher: Option<LocalChangeWatcher>,
 }
 
 #[cfg(target_os = "windows")]
@@ -876,14 +957,125 @@ impl Drop for ConnectedCloudProvider {
 }
 
 #[cfg(target_os = "windows")]
+struct LocalChangeWatcher {
+    _watcher: notify::RecommendedWatcher,
+}
+
+#[cfg(target_os = "windows")]
+fn start_local_change_watcher(context: ProviderContext) -> Result<LocalChangeWatcher, HelperError> {
+    use notify::Watcher;
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |result| {
+        let _ = sender.send(result);
+    })
+    .map_err(|error| HelperError::new("watcher_failed", error.to_string()))?;
+    watcher
+        .watch(&context.sync_root, notify::RecursiveMode::Recursive)
+        .map_err(|error| HelperError::new("watcher_failed", error.to_string()))?;
+    std::thread::Builder::new()
+        .name("afs-cloud-files-local-changes".to_string())
+        .spawn(move || local_change_worker(context, receiver))
+        .map_err(|error| HelperError::new("watcher_failed", error.to_string()))?;
+    Ok(LocalChangeWatcher { _watcher: watcher })
+}
+
+#[cfg(target_os = "windows")]
+fn local_change_worker(
+    context: ProviderContext,
+    receiver: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+) {
+    for result in receiver {
+        match result {
+            Ok(event) if is_create_like_event(&event.kind) => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                for path in event.paths {
+                    if let Err(error) = handle_local_create_like_path(&context, &path) {
+                        eprintln!(
+                            "{COMMAND_NAME}: local create mapping failed for `{}`: {error}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("{COMMAND_NAME}: local change watcher failed: {error}"),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_create_like_event(kind: &notify::event::EventKind) -> bool {
+    use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
+
+    matches!(
+        kind,
+        EventKind::Create(CreateKind::Any | CreateKind::File | CreateKind::Folder)
+            | EventKind::Modify(ModifyKind::Name(
+                RenameMode::Any | RenameMode::To | RenameMode::Both
+            ))
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn handle_local_create_like_path(
+    context: &ProviderContext,
+    path: &Path,
+) -> Result<(), HelperError> {
+    let path = absolute_cloud_path(context, path);
+    if !path_is_under_sync_root(context, &path) || same_cloud_path(&path, &context.sync_root) {
+        return Ok(());
+    }
+    if placeholder_identity_for_path(&path)?.is_some() {
+        return Ok(());
+    }
+
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(HelperError::io("inspect local create", error)),
+    };
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| HelperError::new("invalid_path", "created path has no UTF-8 filename"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| HelperError::new("invalid_path", "created path has no parent"))?;
+    let parent_identifier = parent_identifier_for_path(context, parent)?;
+
+    if metadata.is_dir() {
+        let created = context.create_directory(&parent_identifier, filename)?;
+        convert_to_placeholder(&path, &created.identifier, false)?;
+        let _ = set_placeholder_in_sync_state(&path, false);
+        return Ok(());
+    }
+
+    if metadata.is_file() {
+        let created = context.create_file(&parent_identifier, filename)?;
+        convert_to_placeholder(&path, &created.identifier, false)?;
+        let _ = set_placeholder_in_sync_state(&path, false);
+        let contents =
+            std::fs::read(&path).map_err(|error| HelperError::io("read created file", error))?;
+        if !contents.is_empty() {
+            commit_local_bytes(context, &created.identifier, &path, &contents)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn run_cloud_filter_provider(
     mount_id: &str,
     sync_root: &Path,
     state_dir: &Path,
 ) -> Result<(), HelperError> {
     wait_for_daemon(state_dir)?;
-    let connected = connect_cloud_filter_sync_root(mount_id, sync_root, state_dir)?;
+    let mut connected = connect_cloud_filter_sync_root(mount_id, sync_root, state_dir)?;
     let seeded = seed_root_placeholders(&connected.context)?;
+    connected.local_change_watcher = Some(start_local_change_watcher(
+        connected.context.as_ref().clone(),
+    )?);
     eprintln!(
         "{COMMAND_NAME}: connected `{mount_id}` at `{}` and seeded {seeded} root placeholder{}",
         sync_root.display(),
@@ -957,7 +1149,9 @@ fn connect_cloud_filter_sync_root(
 ) -> Result<ConnectedCloudProvider, HelperError> {
     use windows::Win32::Storage::CloudFilters::{
         CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_FETCH_DATA, CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
-        CF_CALLBACK_TYPE_NONE, CF_CONNECT_FLAG_NONE, CfConnectSyncRoot,
+        CF_CALLBACK_TYPE_NONE, CF_CALLBACK_TYPE_NOTIFY_DELETE,
+        CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION, CF_CALLBACK_TYPE_NOTIFY_RENAME,
+        CF_CONNECT_FLAG_NONE, CfConnectSyncRoot,
     };
     use windows::core::PCWSTR;
 
@@ -974,6 +1168,18 @@ fn connect_cloud_filter_sync_root(
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_FETCH_DATA,
             Callback: Some(on_fetch_data),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
+            Callback: Some(on_file_close_completion),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_RENAME,
+            Callback: Some(on_rename),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DELETE,
+            Callback: Some(on_delete),
         },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_NONE,
@@ -995,6 +1201,7 @@ fn connect_cloud_filter_sync_root(
     Ok(ConnectedCloudProvider {
         connection_key,
         context,
+        local_change_watcher: None,
     })
 }
 
@@ -1050,6 +1257,74 @@ unsafe extern "system" fn on_fetch_data(
         }
     }) {
         eprintln!("{COMMAND_NAME}: fetch data panicked: {error:?}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn on_file_close_completion(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    callback_parameters: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_PARAMETERS,
+) {
+    let _ = callback_parameters;
+    if let Err(error) = std::panic::catch_unwind(|| {
+        let result = unsafe { handle_file_close_completion(callback_info) };
+        if let Err(error) = result {
+            eprintln!("{COMMAND_NAME}: close completion failed: {error}");
+        }
+    }) {
+        eprintln!("{COMMAND_NAME}: close completion panicked: {error:?}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn on_rename(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    callback_parameters: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_PARAMETERS,
+) {
+    if let Err(error) = std::panic::catch_unwind(|| {
+        let result = unsafe { handle_rename(callback_info, callback_parameters) };
+        let status = if result.is_ok() {
+            status_success()
+        } else {
+            if let Err(error) = result {
+                eprintln!("{COMMAND_NAME}: rename failed: {error}");
+            }
+            status_unsuccessful()
+        };
+        unsafe {
+            let _ = acknowledge_rename_with_status(callback_info, status);
+        }
+    }) {
+        eprintln!("{COMMAND_NAME}: rename panicked: {error:?}");
+        unsafe {
+            let _ = acknowledge_rename_with_status(callback_info, status_unsuccessful());
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn on_delete(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    callback_parameters: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_PARAMETERS,
+) {
+    if let Err(error) = std::panic::catch_unwind(|| {
+        let result = unsafe { handle_delete(callback_info, callback_parameters) };
+        let status = if result.is_ok() {
+            status_success()
+        } else {
+            if let Err(error) = result {
+                eprintln!("{COMMAND_NAME}: delete failed: {error}");
+            }
+            status_unsuccessful()
+        };
+        unsafe {
+            let _ = acknowledge_delete_with_status(callback_info, status);
+        }
+    }) {
+        eprintln!("{COMMAND_NAME}: delete panicked: {error:?}");
+        unsafe {
+            let _ = acknowledge_delete_with_status(callback_info, status_unsuccessful());
+        }
     }
 }
 
@@ -1121,6 +1396,99 @@ unsafe fn handle_fetch_data(
 }
 
 #[cfg(target_os = "windows")]
+unsafe fn handle_file_close_completion(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+) -> Result<(), HelperError> {
+    let info = unsafe { callback_info.as_ref() }.ok_or_else(|| {
+        HelperError::new(
+            "invalid_callback",
+            "file close completion callback info was null",
+        )
+    })?;
+    let context = unsafe { provider_context(info) }?;
+    let identifier = callback_identifier(info)
+        .ok_or_else(|| HelperError::new("invalid_callback", "file close missing file identity"))?;
+    let path = callback_path(context, info)
+        .ok_or_else(|| HelperError::new("invalid_callback", "file close missing path"))?;
+    commit_local_file_contents(context, &identifier, &path)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn handle_rename(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    callback_parameters: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_PARAMETERS,
+) -> Result<(), HelperError> {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE, CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE,
+    };
+
+    let info = unsafe { callback_info.as_ref() }
+        .ok_or_else(|| HelperError::new("invalid_callback", "rename callback info was null"))?;
+    let params = unsafe { callback_parameters.as_ref() }.ok_or_else(|| {
+        HelperError::new("invalid_callback", "rename callback parameters were null")
+    })?;
+    let context = unsafe { provider_context(info) }?;
+    let rename = unsafe { params.Anonymous.Rename };
+    let source_in_scope = rename
+        .Flags
+        .contains(CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE);
+    let target_in_scope = rename
+        .Flags
+        .contains(CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE);
+    if !source_in_scope {
+        return Ok(());
+    }
+
+    let identifier = callback_identifier(info)
+        .ok_or_else(|| HelperError::new("invalid_callback", "rename missing file identity"))?;
+    if !target_in_scope {
+        context.trash(&identifier)?;
+        return Ok(());
+    }
+
+    let target_path = pcwstr_to_path(rename.TargetPath)
+        .ok_or_else(|| HelperError::new("invalid_callback", "rename missing target path"))?;
+    let target_path = absolute_cloud_path(context, &target_path);
+    let new_filename = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| HelperError::new("invalid_callback", "rename target missing filename"))?;
+    let new_parent_path = target_path
+        .parent()
+        .ok_or_else(|| HelperError::new("invalid_callback", "rename target missing parent"))?;
+    let new_parent_identifier = parent_identifier_for_path(context, new_parent_path)?;
+    context.rename(&identifier, &new_parent_identifier, new_filename)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn handle_delete(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    callback_parameters: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_PARAMETERS,
+) -> Result<(), HelperError> {
+    use windows::Win32::Storage::CloudFilters::CF_CALLBACK_DELETE_FLAG_IS_UNDELETE;
+
+    let info = unsafe { callback_info.as_ref() }
+        .ok_or_else(|| HelperError::new("invalid_callback", "delete callback info was null"))?;
+    let params = unsafe { callback_parameters.as_ref() }.ok_or_else(|| {
+        HelperError::new("invalid_callback", "delete callback parameters were null")
+    })?;
+    let delete = unsafe { params.Anonymous.Delete };
+    if delete.Flags.contains(CF_CALLBACK_DELETE_FLAG_IS_UNDELETE) {
+        return Err(HelperError::new(
+            "unsupported_delete",
+            "Windows Cloud Files undelete notifications are not supported yet",
+        ));
+    }
+
+    let context = unsafe { provider_context(info) }?;
+    let identifier = callback_identifier(info)
+        .ok_or_else(|| HelperError::new("invalid_callback", "delete missing file identity"))?;
+    context.trash(&identifier)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 unsafe fn provider_context(
     info: &windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
 ) -> Result<&'static ProviderContext, HelperError> {
@@ -1143,6 +1511,222 @@ fn callback_identifier(
         )
     };
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn callback_path(
+    context: &ProviderContext,
+    info: &windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+) -> Option<PathBuf> {
+    let path = pcwstr_to_path(info.NormalizedPath)?;
+    Some(absolute_cloud_path(context, &path))
+}
+
+#[cfg(target_os = "windows")]
+fn commit_local_file_contents(
+    context: &ProviderContext,
+    identifier: &str,
+    path: &Path,
+) -> Result<(), HelperError> {
+    if !path_is_under_sync_root(context, path) {
+        return Ok(());
+    }
+    let Some(info) = placeholder_info_for_path(path)? else {
+        return Ok(());
+    };
+    if info.in_sync {
+        return Ok(());
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(HelperError::io("inspect closed file", error)),
+    };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let contents =
+        std::fs::read(path).map_err(|error| HelperError::io("read closed file", error))?;
+    commit_local_bytes(context, identifier, path, &contents)
+}
+
+#[cfg(target_os = "windows")]
+fn commit_local_bytes(
+    context: &ProviderContext,
+    identifier: &str,
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), HelperError> {
+    let report = context.commit_write(identifier, contents)?;
+    let in_sync = report.hydration == afs_core::model::HydrationState::Hydrated;
+    let _ = set_placeholder_in_sync_state(path, in_sync);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn parent_identifier_for_path(
+    context: &ProviderContext,
+    parent: &Path,
+) -> Result<String, HelperError> {
+    let parent = absolute_cloud_path(context, parent);
+    if same_cloud_path(&parent, &context.sync_root) {
+        return Ok(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
+    }
+    placeholder_identity_for_path(&parent)?.ok_or_else(|| {
+        HelperError::new(
+            "missing_parent_identity",
+            format!(
+                "could not resolve Cloud Files identity for parent `{}`",
+                parent.display()
+            ),
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn placeholder_identity_for_path(path: &Path) -> Result<Option<String>, HelperError> {
+    Ok(placeholder_info_for_path(path)?.map(|info| info.identity))
+}
+
+#[cfg(target_os = "windows")]
+struct PlaceholderInfo {
+    identity: String,
+    in_sync: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn placeholder_info_for_path(path: &Path) -> Result<Option<PlaceholderInfo>, HelperError> {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_IN_SYNC_STATE_IN_SYNC, CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_INFO_BASIC,
+        CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH, CfGetPlaceholderInfo,
+    };
+
+    let handle = match open_cloud_file(
+        path,
+        windows::Win32::Storage::CloudFilters::CF_OPEN_FILE_FLAG_NONE,
+    ) {
+        Ok(handle) => handle,
+        Err(_) => return Ok(None),
+    };
+    let mut buffer = vec![
+        0_u8;
+        std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>()
+            + CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize
+    ];
+    let mut returned = 0_u32;
+    if unsafe {
+        CfGetPlaceholderInfo(
+            handle.raw(),
+            CF_PLACEHOLDER_INFO_BASIC,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            Some(&mut returned),
+        )
+    }
+    .is_err()
+    {
+        return Ok(None);
+    }
+
+    let info = unsafe { &*(buffer.as_ptr().cast::<CF_PLACEHOLDER_BASIC_INFO>()) };
+    let identity_length = info.FileIdentityLength as usize;
+    if identity_length == 0 {
+        return Ok(None);
+    }
+    let identity_offset = std::mem::offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
+    if identity_offset + identity_length > buffer.len() {
+        return Err(HelperError::new(
+            "invalid_placeholder",
+            format!(
+                "placeholder identity for `{}` exceeded buffer",
+                path.display()
+            ),
+        ));
+    }
+    let identity =
+        String::from_utf8(buffer[identity_offset..identity_offset + identity_length].to_vec())
+            .map_err(|error| HelperError::new("invalid_placeholder", error.to_string()))?;
+    Ok(Some(PlaceholderInfo {
+        identity,
+        in_sync: info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC,
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn convert_to_placeholder(path: &Path, identifier: &str, in_sync: bool) -> Result<(), HelperError> {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_CONVERT_FLAG_MARK_IN_SYNC, CF_CONVERT_FLAG_NONE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+        CfConvertToPlaceholder,
+    };
+
+    let handle = open_cloud_file(path, CF_OPEN_FILE_FLAG_WRITE_ACCESS)?;
+    let identity = identifier.as_bytes();
+    let flags = if in_sync {
+        CF_CONVERT_FLAG_MARK_IN_SYNC
+    } else {
+        CF_CONVERT_FLAG_NONE
+    };
+    unsafe {
+        CfConvertToPlaceholder(
+            handle.raw(),
+            Some(identity.as_ptr().cast()),
+            identity.len() as u32,
+            flags,
+            None,
+            None,
+        )
+    }
+    .map_err(win32_error("convert local item to cloud placeholder"))
+}
+
+#[cfg(target_os = "windows")]
+fn set_placeholder_in_sync_state(path: &Path, in_sync: bool) -> Result<(), HelperError> {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_IN_SYNC_STATE_IN_SYNC, CF_IN_SYNC_STATE_NOT_IN_SYNC, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
+        CF_SET_IN_SYNC_FLAG_NONE, CfSetInSyncState,
+    };
+
+    let handle = open_cloud_file(path, CF_OPEN_FILE_FLAG_WRITE_ACCESS)?;
+    let state = if in_sync {
+        CF_IN_SYNC_STATE_IN_SYNC
+    } else {
+        CF_IN_SYNC_STATE_NOT_IN_SYNC
+    };
+    unsafe { CfSetInSyncState(handle.raw(), state, CF_SET_IN_SYNC_FLAG_NONE, None) }
+        .map_err(win32_error("set cloud placeholder sync state"))
+}
+
+#[cfg(target_os = "windows")]
+struct CloudFileHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl CloudFileHandle {
+    fn raw(&self) -> windows::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for CloudFileHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_cloud_file(
+    path: &Path,
+    flags: windows::Win32::Storage::CloudFilters::CF_OPEN_FILE_FLAGS,
+) -> Result<CloudFileHandle, HelperError> {
+    use windows::Win32::Storage::CloudFilters::CfOpenFileWithOplock;
+    use windows::core::PCWSTR;
+
+    let path_wide = wide_path(path);
+    unsafe { CfOpenFileWithOplock(PCWSTR::from_raw(path_wide.as_ptr()), flags) }
+        .map(CloudFileHandle)
+        .map_err(win32_error("open cloud file"))
 }
 
 #[cfg(target_os = "windows")]
@@ -1326,6 +1910,68 @@ unsafe fn complete_fetch_data_with_status(
 }
 
 #[cfg(target_os = "windows")]
+unsafe fn acknowledge_delete_with_status(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    status: windows::Win32::Foundation::NTSTATUS,
+) -> Result<(), HelperError> {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_OPERATION_ACK_DELETE_FLAG_NONE, CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0,
+        CF_OPERATION_PARAMETERS_0_7, CF_OPERATION_TYPE_ACK_DELETE, CfExecute,
+    };
+
+    let info = unsafe { callback_info.as_ref() }.ok_or_else(|| {
+        HelperError::new(
+            "invalid_callback",
+            "delete acknowledgement callback info was null",
+        )
+    })?;
+    let operation_info = operation_info(info, CF_OPERATION_TYPE_ACK_DELETE);
+    let mut parameters = CF_OPERATION_PARAMETERS {
+        ParamSize: operation_parameter_size::<CF_OPERATION_PARAMETERS_0_7>(),
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            AckDelete: CF_OPERATION_PARAMETERS_0_7 {
+                Flags: CF_OPERATION_ACK_DELETE_FLAG_NONE,
+                CompletionStatus: status,
+            },
+        },
+    };
+
+    unsafe { CfExecute(&operation_info, &mut parameters) }
+        .map_err(win32_error("acknowledge delete"))
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn acknowledge_rename_with_status(
+    callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    status: windows::Win32::Foundation::NTSTATUS,
+) -> Result<(), HelperError> {
+    use windows::Win32::Storage::CloudFilters::{
+        CF_OPERATION_ACK_RENAME_FLAG_NONE, CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0,
+        CF_OPERATION_PARAMETERS_0_6, CF_OPERATION_TYPE_ACK_RENAME, CfExecute,
+    };
+
+    let info = unsafe { callback_info.as_ref() }.ok_or_else(|| {
+        HelperError::new(
+            "invalid_callback",
+            "rename acknowledgement callback info was null",
+        )
+    })?;
+    let operation_info = operation_info(info, CF_OPERATION_TYPE_ACK_RENAME);
+    let mut parameters = CF_OPERATION_PARAMETERS {
+        ParamSize: operation_parameter_size::<CF_OPERATION_PARAMETERS_0_6>(),
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            AckRename: CF_OPERATION_PARAMETERS_0_6 {
+                Flags: CF_OPERATION_ACK_RENAME_FLAG_NONE,
+                CompletionStatus: status,
+            },
+        },
+    };
+
+    unsafe { CfExecute(&operation_info, &mut parameters) }
+        .map_err(win32_error("acknowledge rename"))
+}
+
+#[cfg(target_os = "windows")]
 unsafe fn restart_hydration_with_size(
     callback_info: *const windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
     item: &afsd::file_provider::FileProviderItem,
@@ -1439,6 +2085,80 @@ fn required_range(contents: &[u8], offset: i64, length: i64) -> Result<&[u8], He
     }
     let end = start.saturating_add(length as usize).min(contents.len());
     Ok(&contents[start..end])
+}
+
+#[cfg(target_os = "windows")]
+fn pcwstr_to_path(value: windows::core::PCWSTR) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    if value.is_null() {
+        return None;
+    }
+    let mut len = 0_usize;
+    unsafe {
+        while *value.0.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(value.0, len);
+        Some(PathBuf::from(std::ffi::OsString::from_wide(slice)))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn absolute_cloud_path(context: &ProviderContext, path: &Path) -> PathBuf {
+    let path = platform_display_path(path.to_path_buf());
+    if path_has_drive_or_unc_prefix(&path) {
+        return path;
+    }
+    if path.is_absolute()
+        && let Some(prefixed) = drive_relative_to_sync_root(context, &path)
+    {
+        return prefixed;
+    }
+    if path.is_absolute() {
+        return path;
+    }
+    context.sync_root.join(path)
+}
+
+#[cfg(target_os = "windows")]
+fn path_has_drive_or_unc_prefix(path: &Path) -> bool {
+    use std::path::Component;
+
+    matches!(path.components().next(), Some(Component::Prefix(_)))
+}
+
+#[cfg(target_os = "windows")]
+fn drive_relative_to_sync_root(context: &ProviderContext, path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let Some(Component::Prefix(prefix)) = context.sync_root.components().next() else {
+        return None;
+    };
+    let prefix = prefix.as_os_str().to_string_lossy();
+    let path = path.as_os_str().to_string_lossy();
+    Some(PathBuf::from(format!("{prefix}{path}")))
+}
+
+#[cfg(target_os = "windows")]
+fn path_is_under_sync_root(context: &ProviderContext, path: &Path) -> bool {
+    let path = normalized_cloud_path_string(path);
+    let root = normalized_cloud_path_string(&context.sync_root);
+    path == root || path.starts_with(&(root + r"\"))
+}
+
+#[cfg(target_os = "windows")]
+fn same_cloud_path(left: &Path, right: &Path) -> bool {
+    normalized_cloud_path_string(left) == normalized_cloud_path_string(right)
+}
+
+#[cfg(target_os = "windows")]
+fn normalized_cloud_path_string(path: &Path) -> String {
+    let path = platform_display_path(path.to_path_buf());
+    path.to_string_lossy()
+        .replace('/', r"\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 #[cfg(target_os = "windows")]
@@ -1689,5 +2409,39 @@ mod tests {
             strip_windows_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\AFS")),
             PathBuf::from(r"\\server\share\AFS")
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn root_relative_cloud_paths_use_sync_root_drive() {
+        let context = ProviderContext {
+            mount_id: "notion-main".to_string(),
+            sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
+            state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
+        };
+
+        assert_eq!(
+            absolute_cloud_path(&context, Path::new(r"\Users\Ada\AFS\Notion\Page.md")),
+            PathBuf::from(r"C:\Users\Ada\AFS\Notion\Page.md")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sync_root_membership_is_case_insensitive() {
+        let context = ProviderContext {
+            mount_id: "notion-main".to_string(),
+            sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
+            state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
+        };
+
+        assert!(path_is_under_sync_root(
+            &context,
+            Path::new(r"c:\users\ada\afs\notion\Draft.md")
+        ));
+        assert!(!path_is_under_sync_root(
+            &context,
+            Path::new(r"C:\Users\Ada\AFS\Notion Backup\Draft.md")
+        ));
     }
 }

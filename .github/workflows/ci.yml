@@ -69,6 +69,7 @@ jobs:
           -p afs-notion
           -p afsd
           -p afs-cli
+          -p afs-cloud-files
           --all-targets
           --no-fail-fast
       - name: Check Linux-only FUSE stub
