@@ -74,6 +74,8 @@ provider for existing Cloud Files mounts and restarts supervised provider
 children if they exit.
 On uninstall, the NSIS hook removes the sidecars, the per-user Windows login
 item, and AFS-managed terminal command shims.
+See `docs/windows-distribution.md` for release signing, updater artifacts, and
+the GitHub release workflow.
 
 ## Current Scope
 

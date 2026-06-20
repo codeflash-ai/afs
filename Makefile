@@ -57,6 +57,10 @@ publish-mas: setup ## Build, sign, package, and optionally upload a Mac App Stor
 publish-linux: setup ## Build and validate Linux .deb and .rpm packages.
 	scripts/publish-linux.sh
 
+.PHONY: publish-windows
+publish-windows: setup ## Build, sign, and validate a Windows NSIS package.
+	pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/publish-windows.ps1
+
 .PHONY: build-tauri-windows
 build-tauri-windows: setup ## Build the Windows Tauri installer.
 	$(DESKTOP_NPM) run build:windows

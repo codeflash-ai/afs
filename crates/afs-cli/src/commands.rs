@@ -39,6 +39,7 @@ use crate::connector::{
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff_with_state_root};
+use crate::doctor::{DoctorOptions, doctor_exit_code, print_doctor_report, run_doctor};
 use crate::file_provider as file_provider_helper;
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
@@ -123,6 +124,8 @@ enum AfsCommand {
     Info(PathArg),
     #[command(about = "Show local sync state for mounts or paths")]
     Status(PathArg),
+    #[command(about = "Run read-only diagnostics for daemon, mounts, providers, and auth")]
+    Doctor,
     #[command(about = "Search local mount metadata without contacting remote sources")]
     Search(SearchArgs),
     #[command(about = "List, validate, and create local template pack workspaces")]
@@ -562,6 +565,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         AfsCommand::Mount { .. } => mount(&legacy_args[1..], json),
         AfsCommand::Info(_) => info(&legacy_args[1..], json),
         AfsCommand::Status(_) => status(&legacy_args[1..], json),
+        AfsCommand::Doctor => doctor(json),
         AfsCommand::Search(_) => search(&legacy_args[1..], json),
         AfsCommand::Templates { .. } => templates(&legacy_args[1..], json),
         AfsCommand::Inspect(_) => inspect(&legacy_args[1..], json),
@@ -685,6 +689,7 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
             args.push("status".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
         }
+        AfsCommand::Doctor => args.push("doctor".to_string()),
         AfsCommand::Search(options) => {
             args.push("search".to_string());
             for query_part in &options.query {
@@ -856,6 +861,17 @@ fn daemon(args: &[String], json: bool) -> i32 {
         }
         Err(error) => daemon_command_error(json, error),
     }
+}
+
+fn doctor(json: bool) -> i32 {
+    let report = run_doctor(DoctorOptions::default());
+    let exit_code = doctor_exit_code(&report);
+    if json {
+        print_json(&report);
+    } else {
+        print_doctor_report(&report);
+    }
+    exit_code
 }
 
 fn connect(args: &[String], json: bool) -> i32 {
@@ -4908,6 +4924,10 @@ mod tests {
                 ],
             ),
             (
+                vec!["doctor", "--help"],
+                vec!["Usage: afs doctor", "Run read-only diagnostics", "--json"],
+            ),
+            (
                 vec!["search", "--help"],
                 vec![
                     "Usage: afs search",
@@ -5158,6 +5178,12 @@ mod tests {
         assert_eq!(
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["file-provider", "restart", "notion-main"]
+        );
+
+        let cli = parse_cli(["doctor"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["doctor"]
         );
     }
 

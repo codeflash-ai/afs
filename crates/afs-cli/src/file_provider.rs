@@ -1005,7 +1005,7 @@ pub fn run_macos_file_provider_helper(
     action: &str,
     args: Vec<String>,
 ) -> Result<FileProviderHelperReport, FileProviderHelperError> {
-    let helper = file_provider_helper_path().ok_or(FileProviderHelperError::Missing)?;
+    let helper = macos_file_provider_helper_path().ok_or(FileProviderHelperError::Missing)?;
     let mut command = Command::new(&helper);
     command.arg(action);
     command.args(args);
@@ -1036,7 +1036,7 @@ pub fn run_macos_file_provider_helper(
     })
 }
 
-fn file_provider_helper_path() -> Option<PathBuf> {
+pub fn macos_file_provider_helper_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("AFS_FILE_PROVIDERCTL") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -1201,7 +1201,7 @@ fn home_dir_path() -> Result<PathBuf, LinuxFuseRegistrationError> {
 }
 
 #[cfg(target_os = "linux")]
-fn afs_fuse_helper_path() -> Option<PathBuf> {
+pub fn afs_fuse_helper_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("AFS_FUSE_BIN") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -1224,6 +1224,11 @@ fn afs_fuse_helper_path() -> Option<PathBuf> {
         return Some(path);
     }
     find_on_path("afs-fuse")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn afs_fuse_helper_path() -> Option<PathBuf> {
+    None
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {

@@ -427,6 +427,14 @@ The same contract should run against:
 - Linux FUSE smoke;
 - Windows Cloud Files smoke.
 
+Implemented baseline: `crates/afs-cli/tests/projection_contract.rs` runs the
+shared daemon virtual-filesystem contract for `macos-file-provider`,
+`linux-fuse`, and `windows-cloud-files` projection modes below the kernel
+adapters. It covers metadata-only browse, nested child refresh, hydration,
+provider write/dirty transition, create, rename, and delete semantics. Real
+kernel/provider smoke tests remain platform-specific layers above that shared
+contract.
+
 ### Path Contract Tests
 
 Add explicit path tests for:
@@ -491,13 +499,20 @@ install and recovery paths.
 
 Work:
 
-- Unified diagnostics: extend the provider lifecycle `status` output into
-  top-level `afs doctor`.
-- Unified reset: unregister projection, stop daemon, preserve user documents,
-  clear state/credentials only with confirmation.
-- Shared projection contract test suite.
-- Signed release artifacts for all platforms.
-- Documentation split by platform, with one shared model section.
+- Unified diagnostics: implemented as top-level `afs doctor`, a read-only
+  command that inspects daemon state, SQLite compatibility, connections,
+  credentials, mounts, and platform provider lifecycle without mutating local
+  state.
+- Unified reset: out of scope for this phase of implementation; keep existing
+  explicit reset surfaces until a cross-platform reset contract is designed.
+- Shared projection contract test suite: implemented for the daemon virtual
+  filesystem contract and wired into local e2e CI.
+- Signed release artifacts for all platforms: macOS and Linux release workflows
+  already exist; Windows now has a signed NSIS release workflow and updater
+  manifest path.
+- Documentation split by platform, with one shared model section: see
+  `docs/platforms.md`, `docs/macos-distribution.md`,
+  `docs/linux-distribution.md`, and `docs/windows-distribution.md`.
 
 ## Non-Goals
 

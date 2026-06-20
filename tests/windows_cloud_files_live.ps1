@@ -296,6 +296,11 @@ try {
         $output = Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "afs file-provider status"
         return $output.Contains('"state": "running"')
     }
+    $doctorOutput = Invoke-Native -FilePath $afsBin -Arguments @("doctor", "--json") -Step "afs doctor"
+    $doctor = $doctorOutput | ConvertFrom-Json
+    if (-not $doctor.ok) {
+        throw "afs doctor reported $($doctor.status) during live Cloud Files e2e: $doctorOutput"
+    }
 
     $sourceRoot = Join-Path $syncRoot "notion"
     $pageDir = Join-Path $sourceRoot (ConvertTo-AfsSlug $scratchTitle)

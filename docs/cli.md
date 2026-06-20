@@ -19,6 +19,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
 - `afs daemon start|stop|status|reload|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
+- `afs doctor [--json]`
 - `afs diff [path] [--json]`
 - `afs restore <path> [--force] [--json]`
 - `afs undo [push-id] [--json]`
@@ -77,6 +78,43 @@ Auth error JSON uses stable codes:
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 
 Auth failures exit `1` and include `suggested_command` when there is an obvious recovery command.
+
+## Diagnostics
+
+`afs doctor [--json]` runs read-only local diagnostics. It inspects daemon
+status, SQLite compatibility, configured connections, credential availability,
+mount roots, projection support for the current platform, and native provider
+lifecycle state for macOS File Provider, Linux FUSE, or Windows Cloud Files.
+
+The command does not initialize missing SQLite state, run migrations, write
+credentials, register providers, start daemons, or reset anything. Recovery is
+reported as explicit suggested commands, for example `afs connect notion`,
+`afs daemon start`, or `afs file-provider start <mount>`.
+
+Human output is a compact checklist. JSON output uses stable finding codes and
+never includes credential values:
+
+```json
+{
+  "ok": false,
+  "command": "doctor",
+  "status": "error",
+  "platform": "windows",
+  "findings": [
+    {
+      "severity": "error",
+      "code": "daemon_stopped_for_virtual_mount",
+      "mount_id": "notion-main",
+      "message": "Virtual mount `notion-main` needs afsd running.",
+      "suggested_command": "afs daemon start"
+    }
+  ],
+  "suggested_commands": ["afs daemon start"]
+}
+```
+
+`doctor` exits `0` for `ok` and `warning` reports, and exits `3` when any
+finding has `error` severity.
 
 ## Local Search
 

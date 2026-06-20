@@ -1,0 +1,245 @@
+name: release Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.1.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-preflight:
+    name: Release preflight
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Verify release tag is current main
+        shell: pwsh
+        run: |
+          git fetch --force --no-tags origin `
+            "+refs/heads/main:refs/remotes/origin/main" `
+            "+refs/tags/${env:RELEASE_TAG}:refs/tags/${env:RELEASE_TAG}"
+          $tagCommit = git rev-parse "${env:RELEASE_TAG}^{}"
+          $mainCommit = git rev-parse "origin/main^{}"
+          if ($tagCommit -ne $mainCommit) {
+            Write-Error "Release tag $env:RELEASE_TAG must point at current origin/main ($mainCommit); got $tagCommit."
+            exit 1
+          }
+
+      - name: Verify tag matches app version
+        shell: pwsh
+        run: |
+          $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $expected = "v$($config.version)"
+          if ($env:RELEASE_TAG -ne $expected) {
+            Write-Error "Release tag $env:RELEASE_TAG does not match app version $($config.version); expected $expected."
+            exit 1
+          }
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Select stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Windows Rust tests
+        run: >
+          cargo test
+          -p afs-core
+          -p afs-connector
+          -p afs-store
+          -p afs-platform
+          -p afs-notion
+          -p afsd
+          -p afs-cli
+          -p afs-cloud-files
+          --all-targets
+          --locked
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Build desktop web UI
+        run: npm run build
+        working-directory: apps/desktop
+
+  windows-x64:
+    name: Build and publish Windows x64
+    needs: release-preflight
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      PUBLISH_CHANNEL: release
+      PUBLISH_REQUIRE_SIGNING: "1"
+      AFS_WINDOWS_CODESIGN: "1"
+      PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+      TAURI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest-windows.json
+      TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      WINDOWS_CODESIGN_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_PFX_BASE64 }}
+      WINDOWS_CODESIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
+      WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Verify release tag is current main
+        shell: pwsh
+        run: |
+          git fetch --force --no-tags origin `
+            "+refs/heads/main:refs/remotes/origin/main" `
+            "+refs/tags/${env:RELEASE_TAG}:refs/tags/${env:RELEASE_TAG}"
+          $tagCommit = git rev-parse "${env:RELEASE_TAG}^{}"
+          $mainCommit = git rev-parse "origin/main^{}"
+          if ($tagCommit -ne $mainCommit) {
+            Write-Error "Release tag $env:RELEASE_TAG must point at current origin/main ($mainCommit); got $tagCommit."
+            exit 1
+          }
+          Write-Host "Release tag $env:RELEASE_TAG points at current origin/main ($mainCommit)."
+
+      - name: Verify tag matches app version
+        shell: pwsh
+        run: |
+          $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $expected = "v$($config.version)"
+          if ($env:RELEASE_TAG -ne $expected) {
+            Write-Error "Release tag $env:RELEASE_TAG does not match app version $($config.version); expected $expected."
+            exit 1
+          }
+          "APP_VERSION=$($config.version)" >> $env:GITHUB_ENV
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Select stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Verify release secrets
+        shell: pwsh
+        run: |
+          $missing = @()
+          foreach ($name in @("TAURI_UPDATER_PUBKEY", "TAURI_SIGNING_PRIVATE_KEY", "WINDOWS_CODESIGN_CERT_PFX_BASE64", "WINDOWS_CODESIGN_CERT_PASSWORD")) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing required secret or environment value: $($missing -join ', ')"
+            exit 1
+          }
+
+      - name: Import Windows code signing certificate
+        shell: pwsh
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "afs-windows-codesign.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:WINDOWS_CODESIGN_CERT_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate.Thumbprint) {
+            Write-Error "Could not import Windows code signing certificate."
+            exit 1
+          }
+          "WINDOWS_CODESIGN_CERT_SHA1=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: Build, sign, and validate Windows installer
+        shell: pwsh
+        run: ./scripts/publish-windows.ps1
+
+      - name: Render Windows updater manifest
+        shell: bash
+        env:
+          GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-windows.json
+          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/updater/AFS-release-windows-x86_64.nsis.zip
+          UPDATER_NOTES: AFS ${{ env.APP_VERSION }} Windows update.
+        run: scripts/render-tauri-updater-manifest.sh
+
+      - name: Collect release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target/release/github-assets | Out-Null
+          Copy-Item target/release/bundle/windows/AFS-release-windows-x86_64-setup.exe* target/release/github-assets/
+          Copy-Item target/release/bundle/updater/AFS-release-windows-x86_64.nsis.zip* target/release/github-assets/
+          Copy-Item target/release/bundle/updater/latest-windows.json target/release/github-assets/
+          Get-ChildItem target/release/github-assets -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } | Set-Content -Encoding ascii target/release/github-assets/SHA256SUMS-windows
+          Get-ChildItem target/release/github-assets
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $createArgs = @("release", "create", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--verify-tag", "--title", "AFS $env:APP_VERSION", "--generate-notes")
+          $editArgs = @("release", "edit", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--title", "AFS $env:APP_VERSION")
+          if ($env:PRERELEASE -eq "true") {
+            $createArgs += @("--prerelease", "--latest=false")
+            $editArgs += @("--prerelease=true", "--latest=false")
+          } else {
+            $createArgs += @("--latest=true")
+            $editArgs += @("--prerelease=false", "--latest=true")
+          }
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -eq 0) {
+            gh @editArgs
+          } else {
+            gh @createArgs
+          }
+
+      - name: Upload GitHub Release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:RELEASE_TAG target/release/github-assets/* --repo $env:GITHUB_REPOSITORY --clobber

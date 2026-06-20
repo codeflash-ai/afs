@@ -41,6 +41,8 @@ GitHub Actions runs these from `.github/workflows/notion-live-e2e.yml` on
 `main` when `NOTION_TOKEN` and `AFS_NOTION_LIVE_PARENT_PAGE` are configured in
 the `notion-live-e2e` environment. The Windows job runs on `windows-latest` and
 registers a real Cloud Files sync root against disposable scratch Notion pages.
+During that live Windows run, `afs doctor --json` must pass against the same
+state directory after the daemon and Cloud Files provider are running.
 
 ## Expected Behavior Coverage
 
@@ -75,7 +77,7 @@ Coverage labels:
 | E2E-017 | Database row property validation rejects invalid options before writing. | Covered live | Schema validation tests. | Live coverage is connector-level for invalid option validation, not the desktop UI path. |
 | E2E-018 | Existing database rows can edit body and supported properties: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, phone, external files, people IDs, relation IDs. | Covered live | Notion apply tests. | Covered for the representative property set. |
 | E2E-019 | Creating a new Markdown file under a database directory creates a Notion row and verifies the rendered row. | Covered live | Local virtual create tests. | Covered through live mounted workflow. |
-| E2E-020 | Local creates/renames/deletes in virtual mounts surface as pending virtual mutations. | Covered live for Windows Cloud Files | `tests/linux_fuse_smoke.sh`; virtual filesystem tests. | Linux FUSE and macOS File Provider live create/rename/delete still need provider-backed Notion coverage. |
+| E2E-020 | Local creates/renames/deletes in virtual mounts surface as pending virtual mutations. | Covered live for Windows Cloud Files | `crates/afs-cli/tests/projection_contract.rs`; `tests/linux_fuse_smoke.sh`; virtual filesystem tests. | Linux FUSE and macOS File Provider live create/rename/delete still need provider-backed Notion coverage. |
 | E2E-021 | Push preflight detects remote drift before writing and blocks or requires review instead of overwriting. | Covered live | `crates/afs-cli/tests/push.rs`, `crates/afs-core/tests/push_executor.rs`, Notion concurrency unit tests. | Covered with scratch page local+remote drift; desktop review UI still separate. |
 | E2E-022 | Pull of a dirty local file never overwrites local pending edits and does not insert conflict markers unless remote content diverged. | Local only | `crates/afs-cli/tests/pull.rs`; `crates/afs-cli/tests/live_workspace_mount.rs` manual/destructive. | Needs non-destructive live Notion dirty-pull/drift test. |
 | E2E-023 | Remote observation uses cheap metadata and does not hydrate full block bodies. | Local only | `crates/afs-notion/tests/observe.rs`; freshness tests. | Needs live Notion observation API smoke that asserts metadata-only behavior indirectly. |
@@ -102,6 +104,8 @@ Coverage labels:
 | `crates/afs-cli/tests/e2e_push_workflow.rs::live_cyclic_supported_block_edits_push_and_verify_notion` | Live mounted workflow, plain files | Edit supported rich blocks and typed mentions through Markdown, push, fetch/verify Notion render. Covers E2E-014, E2E-015. |
 | `crates/afs-cli/tests/e2e_push_workflow.rs::live_cyclic_database_rows_mount_edit_create_and_verify_notion` | Live mounted workflow, plain files | Create database, pull schema, hydrate row, no-op preserves row JSON, edit row properties/body, create row from new Markdown file, fetch/verify Notion. Covers E2E-016, E2E-018, E2E-019. |
 | `tests/windows_cloud_files_live.ps1` | Live Windows Cloud Files provider | Registers a real Cloud Files sync root, lazily enumerates a scratch Notion page, hydrates `page.md`, edits and pushes it, creates/renames/deletes a pending draft, creates a child page directory through the mount, pushes it to Notion, then deletes and pushes the child archive. Covers Windows provider paths for E2E-004, E2E-006, E2E-011, E2E-013, and E2E-020. |
+| `crates/afs-cli/tests/projection_contract.rs` | Local shared projection contract | Runs the same daemon virtual-filesystem browse, hydrate, write, create, rename, and delete contract against macOS File Provider, Linux FUSE, and Windows Cloud Files projection modes below the OS adapters. Covers the shared semantics behind E2E-004, E2E-005, E2E-006, E2E-011, and E2E-020. |
+| `crates/afs-cli/tests/doctor.rs` | Local diagnostics contract | Verifies `afs doctor` does not initialize missing state and reports mount, connection, profile, and credential findings with recovery commands. |
 | `crates/afs-cli/tests/live_workspace_mount.rs::live_workspace_pull_edit_pull_push_regression` | Manual/destructive live workspace | Pull workspace/file, edit mounted file, dirty pull skip, push, pull, verify content. Covers parts of E2E-011, E2E-013, E2E-022, but is ignored and uses a pre-existing workspace. |
 | `crates/afs-notion/tests/fetch_render.rs::live_fetch_and_render_page_from_environment` | Manual live fetch/render | Fetch/render one configured page. Legacy smoke; lower coverage than the scratch live tests. |
 

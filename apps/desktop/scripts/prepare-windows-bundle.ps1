@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Resolve-Path (Join-Path $ScriptDir "..\..\..")
 $Out = Join-Path $Root "apps\desktop\src-tauri\windows"
+. (Join-Path $Root "scripts\windows-codesign.ps1")
 $Cargo = $env:CARGO
 if ([string]::IsNullOrWhiteSpace($Cargo)) {
     $CargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
@@ -31,6 +32,18 @@ New-Item -ItemType Directory -Force -Path $Out | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root "target\release\afs.exe") -Destination (Join-Path $Out "afs.exe") -Force
 Copy-Item -LiteralPath (Join-Path $Root "target\release\afsd.exe") -Destination (Join-Path $Out "afsd.exe") -Force
 Copy-Item -LiteralPath (Join-Path $Root "target\release\afs-cloud-files.exe") -Destination (Join-Path $Out "afs-cloud-files.exe") -Force
+
+$Sidecars = @(
+    (Join-Path $Out "afs.exe"),
+    (Join-Path $Out "afsd.exe"),
+    (Join-Path $Out "afs-cloud-files.exe")
+)
+if (Test-AfsWindowsCodeSigningRequested) {
+    foreach ($Sidecar in $Sidecars) {
+        [void] (Invoke-AfsWindowsCodeSign -Path $Sidecar)
+        Assert-AfsWindowsSigned -Path $Sidecar
+    }
+}
 
 Write-Host "Prepared Windows CLI in $(Join-Path $Out 'afs.exe')"
 Write-Host "Prepared Windows daemon in $(Join-Path $Out 'afsd.exe')"
