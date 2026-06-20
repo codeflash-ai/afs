@@ -1149,8 +1149,8 @@ fn file_provider(args: &[String], json: bool) -> i32 {
         "register" => file_provider_register(args, json),
         "open" => file_provider_open(args, json),
         "unregister" => file_provider_unregister(args, json),
-        "list" => run_file_provider_helper(json, "list", Vec::new(), None),
-        "reset" => run_file_provider_helper(json, "reset", Vec::new(), None),
+        "list" => run_platform_file_provider_helper(json, "list", Vec::new(), None),
+        "reset" => run_platform_file_provider_helper(json, "reset", Vec::new(), None),
         _ => command_error(
             json,
             CommandError::new(
@@ -1219,6 +1219,9 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
             )
         }
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_register(json, &mount)
+        }
     }
 }
 
@@ -1269,6 +1272,9 @@ fn file_provider_open(args: &[String], json: bool) -> i32 {
             Some(mount.mount_id.0),
         ),
         VirtualProjectionRegistration::LinuxFuse => open_path_for_linux_fuse(json, &mount),
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_open(json, &mount)
+        }
     }
 }
 
@@ -1291,6 +1297,12 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
         .and_then(|store| resolve_mount_target(&store, target).ok());
     if target_os == "linux" {
         return run_linux_fuse_unregister(json, resolved_mount.as_ref(), target);
+    }
+    if target_os == "windows" {
+        let mount_id = resolved_mount
+            .map(|mount| mount.mount_id.0)
+            .unwrap_or_else(|| target.to_string());
+        return run_windows_cloud_files_unregister(json, &mount_id);
     }
 
     let mount_id = match resolved_mount {
@@ -3041,6 +3053,19 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+fn run_platform_file_provider_helper(
+    json: bool,
+    action: &str,
+    args: Vec<String>,
+    mount_id: Option<String>,
+) -> i32 {
+    if std::env::consts::OS == "windows" {
+        return run_windows_cloud_files_helper(json, action, args, mount_id);
+    }
+
+    run_file_provider_helper(json, action, args, mount_id)
+}
+
 fn run_file_provider_helper(
     json: bool,
     action: &str,
@@ -3058,6 +3083,111 @@ fn run_file_provider_helper(
         }
     };
 
+    let report = FileProviderCommandReport {
+        ok: true,
+        command: "file-provider",
+        action: action.to_string(),
+        mount_id,
+        helper: helper_report.helper.display().to_string(),
+        helper_report: helper_report.helper_report,
+    };
+
+    if json {
+        print_json(&report);
+    } else {
+        print_file_provider_report(&report);
+    }
+    EXIT_SUCCESS
+}
+
+fn run_windows_cloud_files_register(json: bool, mount: &MountConfig) -> i32 {
+    let state_root = default_state_root();
+    let display_name = file_provider_display_name(mount);
+    let helper_report = match file_provider_helper::register_windows_cloud_files_sync_root(
+        &state_root,
+        mount,
+        &display_name,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", error.code(), error.message()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(
+        json,
+        "register",
+        Some(mount.mount_id.0.clone()),
+        helper_report,
+    )
+}
+
+fn run_windows_cloud_files_open(json: bool, mount: &MountConfig) -> i32 {
+    let helper_report = match file_provider_helper::open_windows_cloud_files_sync_root(mount) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", error.code(), error.message()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(json, "open", Some(mount.mount_id.0.clone()), helper_report)
+}
+
+fn run_windows_cloud_files_unregister(json: bool, mount_id: &str) -> i32 {
+    let helper_report =
+        match file_provider_helper::unregister_windows_cloud_files_sync_root(mount_id) {
+            Ok(report) => report,
+            Err(error) => {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", error.code(), error.message()),
+                    EXIT_INTERNAL,
+                );
+            }
+        };
+
+    file_provider_helper_success_report(
+        json,
+        "unregister",
+        Some(mount_id.to_string()),
+        helper_report,
+    )
+}
+
+fn run_windows_cloud_files_helper(
+    json: bool,
+    action: &str,
+    args: Vec<String>,
+    mount_id: Option<String>,
+) -> i32 {
+    let helper_report = match file_provider_helper::run_windows_cloud_files_helper(action, args) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", error.code(), error.message()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(json, action, mount_id, helper_report)
+}
+
+fn file_provider_helper_success_report(
+    json: bool,
+    action: &str,
+    mount_id: Option<String>,
+    helper_report: file_provider_helper::FileProviderHelperReport,
+) -> i32 {
     let report = FileProviderCommandReport {
         ok: true,
         command: "file-provider",
@@ -4141,6 +4271,7 @@ fn projection_usage_options_for_target(target_os: &str) -> String {
 enum VirtualProjectionRegistration {
     MacosFileProvider,
     LinuxFuse,
+    WindowsCloudFiles,
 }
 
 impl VirtualProjectionRegistration {
@@ -4148,6 +4279,7 @@ impl VirtualProjectionRegistration {
         match self {
             Self::MacosFileProvider => ProjectionMode::MacosFileProvider,
             Self::LinuxFuse => ProjectionMode::LinuxFuse,
+            Self::WindowsCloudFiles => ProjectionMode::WindowsCloudFiles,
         }
     }
 
@@ -4193,6 +4325,9 @@ fn virtual_projection_registration_for_target(
             Some(VirtualProjectionRegistration::MacosFileProvider)
         }
         Some(ProjectionMode::LinuxFuse) => Some(VirtualProjectionRegistration::LinuxFuse),
+        Some(ProjectionMode::WindowsCloudFiles) => {
+            Some(VirtualProjectionRegistration::WindowsCloudFiles)
+        }
         _ => None,
     }
 }
@@ -4208,6 +4343,9 @@ fn auto_registration_for_mounted_projection(
 
     match (projection, target_os) {
         (ProjectionMode::LinuxFuse, "linux") => Some(VirtualProjectionRegistration::LinuxFuse),
+        (ProjectionMode::WindowsCloudFiles, "windows") => {
+            Some(VirtualProjectionRegistration::WindowsCloudFiles)
+        }
         _ => None,
     }
 }
@@ -4259,6 +4397,30 @@ fn auto_register_mounted_projection(
                 })
         }
         VirtualProjectionRegistration::MacosFileProvider => Ok(()),
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            let display_name = file_provider_display_name(&mount);
+            file_provider_helper::register_windows_cloud_files_sync_root(
+                state_root,
+                &mount,
+                &display_name,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                CommandError::new(
+                    "mount",
+                    error.code(),
+                    format!(
+                        "mounted `{}` but Windows Cloud Files registration failed: {}",
+                        mount.mount_id.0,
+                        error.message()
+                    ),
+                )
+                .with_suggested_command(format!(
+                    "afs file-provider register {}",
+                    mount.root.display()
+                ))
+            })
+        }
     }
 }
 
@@ -4872,6 +5034,12 @@ mod tests {
         let linux_mount =
             MountConfig::new(MountId::new("notion-linux"), "notion", "/tmp/afs/linux")
                 .projection(ProjectionMode::LinuxFuse);
+        let windows_mount = MountConfig::new(
+            MountId::new("notion-windows"),
+            "notion",
+            r"C:\Users\Ada\AFS",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
 
         assert_eq!(
             validate_virtual_projection_registration(&macos_mount, "macos")
@@ -4882,6 +5050,11 @@ mod tests {
             validate_virtual_projection_registration(&linux_mount, "linux")
                 .expect("linux fuse mount is valid"),
             VirtualProjectionRegistration::LinuxFuse
+        );
+        assert_eq!(
+            validate_virtual_projection_registration(&windows_mount, "windows")
+                .expect("windows cloud files mount is valid"),
+            VirtualProjectionRegistration::WindowsCloudFiles
         );
 
         let wrong_projection = validate_virtual_projection_registration(&linux_mount, "macos")
@@ -4898,14 +5071,13 @@ mod tests {
         assert_eq!(wrong_projection.code, "wrong_projection");
         assert!(wrong_projection.message.contains("--projection linux-fuse"));
 
-        let unsupported_platform =
-            validate_virtual_projection_registration(&macos_mount, "windows")
-                .expect_err("windows has no virtual projection registration yet");
-        assert_eq!(unsupported_platform.code, "unsupported_platform");
+        let wrong_projection = validate_virtual_projection_registration(&macos_mount, "windows")
+            .expect_err("macos file provider mount is not a windows cloud files sync root");
+        assert_eq!(wrong_projection.code, "wrong_projection");
         assert!(
-            unsupported_platform
+            wrong_projection
                 .message
-                .contains("no virtual filesystem registration is implemented")
+                .contains("--projection windows-cloud-files")
         );
     }
 
@@ -4914,6 +5086,14 @@ mod tests {
         assert_eq!(
             auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", false),
             Some(VirtualProjectionRegistration::LinuxFuse)
+        );
+        assert_eq!(
+            auto_registration_for_mounted_projection(
+                ProjectionMode::WindowsCloudFiles,
+                "windows",
+                false
+            ),
+            Some(VirtualProjectionRegistration::WindowsCloudFiles)
         );
         assert_eq!(
             auto_registration_for_mounted_projection(ProjectionMode::PlainFiles, "linux", false),

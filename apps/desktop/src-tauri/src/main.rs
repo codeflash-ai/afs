@@ -17,6 +17,10 @@ use afs_cli::file_provider::{
     open_macos_file_provider_domain, register_macos_file_provider_domain,
     run_macos_file_provider_helper,
 };
+#[cfg(target_os = "windows")]
+use afs_cli::file_provider::{
+    open_windows_cloud_files_sync_root, register_windows_cloud_files_sync_root,
+};
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::{PullReport, run_pull_with_state_root};
@@ -65,7 +69,9 @@ use agent_guidance::{
     AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,
 };
 
+#[cfg(any(not(windows), test))]
 const TERMINAL_CLI_PATH_MANAGED_START: &str = "# >>> AFS_TERMINAL_CLI_PATH >>>";
+#[cfg(any(not(windows), test))]
 const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< AFS_TERMINAL_CLI_PATH <<<";
 #[cfg(windows)]
 const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "AFS_TERMINAL_CLI_SHIM";
@@ -2881,6 +2887,7 @@ fn terminal_cli_shell_config_path() -> Option<PathBuf> {
     })
 }
 
+#[cfg(any(not(windows), test))]
 fn write_terminal_cli_path_section(path: &Path, directory: &Path) -> Result<(), String> {
     let existing = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -2895,6 +2902,7 @@ fn write_terminal_cli_path_section(path: &Path, directory: &Path) -> Result<(), 
     fs::write(path, next).map_err(|error| error.to_string())
 }
 
+#[cfg(any(not(windows), test))]
 fn terminal_cli_path_shell_block(directory: &Path) -> String {
     let directory = shell_single_quote(&directory.display().to_string());
     format!(
@@ -2909,6 +2917,7 @@ unset _afs_cli_dir\n\
     )
 }
 
+#[cfg(any(not(windows), test))]
 fn replace_terminal_cli_path_section(existing: &str, block: &str) -> String {
     let Some(start) = existing.find(TERMINAL_CLI_PATH_MANAGED_START) else {
         let trimmed = existing.trim_end();
@@ -2937,6 +2946,7 @@ fn replace_terminal_cli_path_section(existing: &str, block: &str) -> String {
     next
 }
 
+#[cfg(any(not(windows), test))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -3463,9 +3473,7 @@ fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result
         }
         ProjectionMode::LinuxFuse => register_linux_virtual_projection(state_root, mount),
         ProjectionMode::PlainFiles => Ok(()),
-        ProjectionMode::WindowsCloudFiles => {
-            Err("Windows Cloud Files projection registration is not implemented yet".to_string())
-        }
+        ProjectionMode::WindowsCloudFiles => register_windows_virtual_projection(state_root, mount),
     }
 }
 
@@ -3507,6 +3515,32 @@ fn register_linux_virtual_projection(
     ))
 }
 
+#[cfg(target_os = "windows")]
+fn register_windows_virtual_projection(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    register_windows_cloud_files_sync_root(state_root, mount, &connector_label(&mount.connector))
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not register Windows Cloud Files sync root: {}",
+                error.message()
+            )
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_windows_virtual_projection(
+    _state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    Err(format!(
+        "Windows Cloud Files mounts can only be registered on Windows; mount `{}` cannot be registered here.",
+        mount.mount_id.0
+    ))
+}
+
 fn open_virtual_mount_or_path(path: &Path) -> Result<(), String> {
     if let Some(mount) = virtual_mount_for_path(path)
         && mount.projection.uses_virtual_filesystem()
@@ -3529,9 +3563,7 @@ fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
         ProjectionMode::MacosFileProvider => open_macos_virtual_projection(mount),
         ProjectionMode::LinuxFuse => open_in_file_manager(&mount_access_root(mount)),
         ProjectionMode::PlainFiles => open_in_file_manager(&mount.root),
-        ProjectionMode::WindowsCloudFiles => {
-            Err("Windows Cloud Files projection opening is not implemented yet".to_string())
-        }
+        ProjectionMode::WindowsCloudFiles => open_windows_virtual_projection(mount),
     }
 }
 
@@ -3563,6 +3595,26 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
             })
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_virtual_projection(mount: &MountConfig) -> Result<(), String> {
+    open_windows_cloud_files_sync_root(mount)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not open Windows Cloud Files sync root: {}",
+                error.message()
+            )
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_windows_virtual_projection(mount: &MountConfig) -> Result<(), String> {
+    Err(format!(
+        "Windows Cloud Files mounts can only be opened on Windows; mount `{}` cannot be opened here.",
+        mount.mount_id.0
+    ))
 }
 
 #[cfg(not(target_os = "macos"))]

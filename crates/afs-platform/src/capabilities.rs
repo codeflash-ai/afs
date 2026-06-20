@@ -103,7 +103,7 @@ pub fn mount_cli_capabilities_for_target(target_os: &str) -> PlatformCapabilitie
             target_os: target_os.to_string(),
             default_projection: ProjectionMode::PlainFiles,
             supported_projections: vec![ProjectionMode::PlainFiles],
-            virtual_registration: None,
+            virtual_registration: Some(ProjectionMode::WindowsCloudFiles),
             supports_daemon_service: false,
             supports_secure_os_credentials: true,
         },
@@ -147,6 +147,10 @@ mod tests {
 
         assert_eq!(capabilities.default_projection, ProjectionMode::PlainFiles);
         assert_eq!(capabilities.projection_usage_options(), "plain-files");
+        assert_eq!(
+            capabilities.virtual_registration,
+            Some(ProjectionMode::WindowsCloudFiles)
+        );
         assert_eq!(
             capabilities
                 .projection_from_cli_value(Some("windows-cloud-files"))

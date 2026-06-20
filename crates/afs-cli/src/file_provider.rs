@@ -96,6 +96,33 @@ impl LinuxFuseRegistrationError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowsCloudFilesHelperError {
+    Missing,
+    Failed(String),
+    UnsupportedPlatform(String),
+}
+
+impl WindowsCloudFilesHelperError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Missing => "helper_missing",
+            Self::Failed(_) => "helper_failed",
+            Self::UnsupportedPlatform(_) => "unsupported_platform",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Missing => {
+                "afs-cloud-files was not found; build or install the Windows Cloud Files helper"
+                    .to_string()
+            }
+            Self::Failed(message) | Self::UnsupportedPlatform(message) => message.clone(),
+        }
+    }
+}
+
 pub fn register_macos_file_provider_domain(
     mount_id: &str,
     display_name: &str,
@@ -145,6 +172,163 @@ pub fn register_linux_fuse_mount(
         "linux_fuse registration is only supported on Linux; mount `{}` cannot be registered here",
         mount.mount_id.0
     )))
+}
+
+pub fn register_windows_cloud_files_sync_root(
+    state_root: &Path,
+    mount: &MountConfig,
+    display_name: &str,
+) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    #[cfg(target_os = "windows")]
+    {
+        run_windows_cloud_files_helper(
+            "register",
+            windows_cloud_files_register_args(state_root, mount, display_name),
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = state_root;
+        let _ = display_name;
+        Err(WindowsCloudFilesHelperError::UnsupportedPlatform(format!(
+            "Windows Cloud Files registration is only supported on Windows; mount `{}` cannot be registered here",
+            mount.mount_id.0
+        )))
+    }
+}
+
+pub fn open_windows_cloud_files_sync_root(
+    mount: &MountConfig,
+) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    #[cfg(target_os = "windows")]
+    {
+        run_windows_cloud_files_helper("open", windows_cloud_files_open_args(mount))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(WindowsCloudFilesHelperError::UnsupportedPlatform(format!(
+            "Windows Cloud Files opening is only supported on Windows; mount `{}` cannot be opened here",
+            mount.mount_id.0
+        )))
+    }
+}
+
+pub fn unregister_windows_cloud_files_sync_root(
+    mount_id: &str,
+) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    #[cfg(target_os = "windows")]
+    {
+        run_windows_cloud_files_helper("unregister", windows_cloud_files_unregister_args(mount_id))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(WindowsCloudFilesHelperError::UnsupportedPlatform(format!(
+            "Windows Cloud Files unregister is only supported on Windows for `{mount_id}`"
+        )))
+    }
+}
+
+pub fn run_windows_cloud_files_helper(
+    action: &str,
+    args: Vec<String>,
+) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    #[cfg(target_os = "windows")]
+    {
+        let helper =
+            windows_cloud_files_helper_path().ok_or(WindowsCloudFilesHelperError::Missing)?;
+        let mut command = Command::new(&helper);
+        command.arg(action);
+        command.args(args);
+        command.arg("--json");
+
+        let output = command
+            .output()
+            .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let helper_report = serde_json::from_str::<Value>(&stdout)
+            .unwrap_or_else(|_| Value::String(stdout.clone()));
+
+        if !output.status.success() {
+            let message = helper_report
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|message| !message.is_empty())
+                .or_else(|| (!stderr.is_empty()).then_some(stderr))
+                .unwrap_or_else(|| format!("afs-cloud-files exited with {}", output.status));
+            return Err(WindowsCloudFilesHelperError::Failed(message));
+        }
+
+        Ok(FileProviderHelperReport {
+            helper,
+            helper_report,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = args;
+        Err(WindowsCloudFilesHelperError::UnsupportedPlatform(format!(
+            "Windows Cloud Files {action} is only supported on Windows"
+        )))
+    }
+}
+
+fn windows_cloud_files_register_args(
+    state_root: &Path,
+    mount: &MountConfig,
+    display_name: &str,
+) -> Vec<String> {
+    vec![
+        "--mount-id".to_string(),
+        mount.mount_id.0.clone(),
+        "--display-name".to_string(),
+        display_name.to_string(),
+        "--sync-root".to_string(),
+        mount.root.display().to_string(),
+        "--state-dir".to_string(),
+        state_root.display().to_string(),
+    ]
+}
+
+fn windows_cloud_files_open_args(mount: &MountConfig) -> Vec<String> {
+    vec![
+        "--mount-id".to_string(),
+        mount.mount_id.0.clone(),
+        "--sync-root".to_string(),
+        mount.root.display().to_string(),
+    ]
+}
+
+fn windows_cloud_files_unregister_args(mount_id: &str) -> Vec<String> {
+    vec!["--mount-id".to_string(), mount_id.to_string()]
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_helper_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("AFS_CLOUD_FILES_BIN") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let helper_name = afs_platform::executable_filename("afs-cloud-files");
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        candidates.push(dir.join(&helper_name));
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest_dir.join("../..");
+    candidates.push(workspace.join("target/debug").join(&helper_name));
+    candidates.push(workspace.join("target/release").join(&helper_name));
+
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        return Some(path);
+    }
+    find_on_path(&helper_name)
 }
 
 pub fn open_macos_file_provider_domain(
@@ -443,7 +627,6 @@ fn afs_fuse_helper_path() -> Option<PathBuf> {
     find_on_path("afs-fuse")
 }
 
-#[cfg(target_os = "linux")]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -503,6 +686,9 @@ mod linux_tests {
 
 #[cfg(test)]
 mod tests {
+    use afs_core::model::MountId;
+    use afs_store::{MountConfig, ProjectionMode};
+
     #[test]
     fn macos_file_provider_display_name_strips_agentfs_cloudstorage_prefix() {
         assert_eq!(
@@ -536,6 +722,50 @@ mod tests {
         assert_eq!(
             super::macos_file_provider_display_name(std::path::Path::new("/"), "fallback"),
             "fallback"
+        );
+    }
+
+    #[test]
+    fn windows_cloud_files_register_args_are_stable_helper_contract() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", r"C:\Users\Ada\AFS")
+            .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert_eq!(
+            super::windows_cloud_files_register_args(
+                std::path::Path::new(r"C:\Users\Ada\AppData\Local\AgentFS"),
+                &mount,
+                "Notion"
+            ),
+            vec![
+                "--mount-id",
+                "notion-main",
+                "--display-name",
+                "Notion",
+                "--sync-root",
+                r"C:\Users\Ada\AFS",
+                "--state-dir",
+                r"C:\Users\Ada\AppData\Local\AgentFS",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_cloud_files_open_and_unregister_args_are_stable_helper_contract() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", r"C:\Users\Ada\AFS")
+            .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert_eq!(
+            super::windows_cloud_files_open_args(&mount),
+            vec![
+                "--mount-id",
+                "notion-main",
+                "--sync-root",
+                r"C:\Users\Ada\AFS"
+            ]
+        );
+        assert_eq!(
+            super::windows_cloud_files_unregister_args("notion-main"),
+            vec!["--mount-id", "notion-main"]
         );
     }
 }
