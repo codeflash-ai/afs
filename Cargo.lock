@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "afs-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "afs-connector",
  "afs-core",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "afs-connector"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "afs-core",
  "serde",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "afs-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "afs-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "afs-cli",
  "afs-core",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "afs-fuse"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "afs-core",
  "afsd",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "afs-notion"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "afs-connector",
  "afs-core",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "afs-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "afs-core",
  "rusqlite",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "afsd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "afs-connector",
  "afs-core",
