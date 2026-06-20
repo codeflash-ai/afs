@@ -69,6 +69,9 @@ The build stages `afs.exe`, `afsd.exe`, and `afs-cloud-files.exe` under
 sidecars next to the desktop executable so the app can start the packaged
 daemon, locate the packaged CLI, and call the Windows Cloud Files registration
 and provider runtime helper.
+At runtime, the Windows desktop app starts the `afs-cloud-files.exe run`
+provider for existing Cloud Files mounts and restarts supervised provider
+children if they exit.
 On uninstall, the NSIS hook removes the sidecars, the per-user Windows login
 item, and AFS-managed terminal command shims.
 

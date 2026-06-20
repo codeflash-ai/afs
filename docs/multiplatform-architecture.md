@@ -293,6 +293,7 @@ Responsibilities:
 - On local modification/close, call daemon `commit_write` and mark the local
   item dirty in daemon state.
 - Map local create/rename/delete notifications to daemon virtual mutations.
+- Start and supervise the per-mount provider runtime from the desktop app.
 - Surface sync/provider status in a Windows-native way where possible.
 
 Implementation note: Cloud Files native callbacks cover close, rename, delete,
@@ -301,10 +302,14 @@ sync-root filesystem watcher, converted to placeholders after the daemon records
 the virtual mutation, and then tracked through the same placeholder identity path
 as existing cloud items.
 
+Current implementation direction: Windows uses the Rust `afs-cloud-files.exe`
+helper. The desktop app registers the sync root, starts the per-mount provider
+runtime when a mount is activated/opened or when the app launches with existing
+Cloud Files mounts, and restarts provider children that exit while the desktop
+app is supervising them.
+
 Open design questions:
 
-- Whether the provider is a Rust helper using Win32 bindings directly, a small
-  C++ helper, or a mixed Rust/C++ boundary.
 - Whether the provider talks to `afsd` over named pipe or authenticated TCP.
 - Whether the installed daemon is a per-user Windows Service, scheduled task, or
   desktop-managed background process.
@@ -473,6 +478,7 @@ Work:
 - Implement placeholder enumeration from daemon metadata.
 - Implement hydration callback through daemon `materialize`.
 - Implement write/create/rename/delete callback mapping to virtual mutations.
+- Wire desktop lifecycle supervision for the Windows provider runtime.
 - Add Windows Cloud Files smoke tests on a suitable runner.
 
 ### Phase 4: Cross-Platform Product Hardening

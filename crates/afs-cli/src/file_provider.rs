@@ -334,6 +334,12 @@ fn windows_cloud_files_run_args(state_root: &Path, mount: &MountConfig) -> Vec<S
     ]
 }
 
+pub fn windows_cloud_files_run_command_args(state_root: &Path, mount: &MountConfig) -> Vec<String> {
+    let mut args = vec!["run".to_string()];
+    args.extend(windows_cloud_files_run_args(state_root, mount));
+    args
+}
+
 fn windows_cloud_files_unregister_args(state_root: &Path, mount_id: &str) -> Vec<String> {
     vec![
         "--mount-id".to_string(),
@@ -344,7 +350,7 @@ fn windows_cloud_files_unregister_args(state_root: &Path, mount_id: &str) -> Vec
 }
 
 #[cfg(target_os = "windows")]
-fn windows_cloud_files_helper_path() -> Option<PathBuf> {
+pub fn windows_cloud_files_helper_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("AFS_CLOUD_FILES_BIN") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -368,6 +374,11 @@ fn windows_cloud_files_helper_path() -> Option<PathBuf> {
         return Some(path);
     }
     find_on_path(&helper_name)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn windows_cloud_files_helper_path() -> Option<PathBuf> {
+    None
 }
 
 pub fn open_macos_file_provider_domain(
@@ -808,6 +819,21 @@ mod tests {
                 &mount,
             ),
             vec![
+                "--mount-id",
+                "notion-main",
+                "--sync-root",
+                r"C:\Users\Ada\AFS",
+                "--state-dir",
+                r"C:\Users\Ada\AppData\Local\AgentFS",
+            ]
+        );
+        assert_eq!(
+            super::windows_cloud_files_run_command_args(
+                std::path::Path::new(r"C:\Users\Ada\AppData\Local\AgentFS"),
+                &mount,
+            ),
+            vec![
+                "run",
                 "--mount-id",
                 "notion-main",
                 "--sync-root",

@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::sync::{
     Mutex, OnceLock,
@@ -20,6 +22,7 @@ use afs_cli::file_provider::{
 #[cfg(target_os = "windows")]
 use afs_cli::file_provider::{
     open_windows_cloud_files_sync_root, register_windows_cloud_files_sync_root,
+    windows_cloud_files_helper_path, windows_cloud_files_run_command_args,
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
@@ -40,6 +43,8 @@ use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use afs_platform::bundled_binary_next_to_current_exe;
+#[cfg(target_os = "windows")]
+use afs_platform::{DefaultSessionProcessManager, SessionProcessManager};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
@@ -242,6 +247,10 @@ struct DesktopSettingChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
+    Mutex<WindowsCloudFilesProviderSupervisor>,
+> = OnceLock::new();
 const DESKTOP_INSTALL_MARKER_VERSION: u32 = 2;
 const DESKTOP_ACTIVITY_LIMIT: usize = 20;
 const TRAY_POPOVER_WIDTH: f64 = 360.0;
@@ -421,7 +430,10 @@ async fn choose_mount_folder(
 #[tauri::command]
 fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
     let state_root = default_state_root();
-    match ensure_daemon_running(&state_root).and_then(|_| reload_daemon_mounts(&state_root)) {
+    match ensure_daemon_running(&state_root)
+        .and_then(|_| reload_daemon_mounts(&state_root))
+        .and_then(|_| ensure_virtual_projection_runtimes_for_state(&state_root))
+    {
         Ok(()) => {
             refresh_tray_icon(&app);
             ActionReport {
@@ -748,6 +760,7 @@ fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionRe
 
 #[tauri::command]
 fn quit_completely(app: AppHandle) -> ActionReport {
+    stop_windows_cloud_files_provider_supervisor();
     app.exit(0);
     ActionReport {
         ok: true,
@@ -1712,6 +1725,7 @@ fn reset_platform_projection_state() {
             );
         }
     }
+    stop_windows_cloud_files_provider_supervisor();
 }
 
 fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
@@ -2544,10 +2558,12 @@ fn desktop_projection_mode() -> ProjectionMode {
     {
         ProjectionMode::LinuxFuse
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        // Windows Cloud Files is the target product projection, but plain files
-        // stay as the desktop fallback until the provider helper exists.
+        ProjectionMode::WindowsCloudFiles
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
         ProjectionMode::PlainFiles
     }
 }
@@ -3340,6 +3356,7 @@ fn activate_virtual_projection_mount(
     if wait_for_entities {
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
+    ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
     Ok(())
 }
@@ -3383,6 +3400,219 @@ fn prefetch_virtual_projection_container(
             "Could not ask afsd to load the top-level Notion folder: {}",
             error.message()
         )),
+    }
+}
+
+fn ensure_virtual_projection_runtime(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+    match mount.projection {
+        ProjectionMode::WindowsCloudFiles => {
+            ensure_windows_cloud_files_provider_running(state_root, mount)
+        }
+        ProjectionMode::MacosFileProvider
+        | ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles => Ok(()),
+    }
+}
+
+fn ensure_virtual_projection_runtimes_for_state(state_root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        ensure_windows_cloud_files_providers_for_state(state_root)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = state_root;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct WindowsCloudFilesProviderSupervisor {
+    children: std::collections::HashMap<String, Child>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsCloudFilesProviderSupervisor {
+    fn ensure_running(&mut self, state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+        if mount.projection != ProjectionMode::WindowsCloudFiles {
+            return Ok(());
+        }
+
+        let mount_id = mount.mount_id.0.clone();
+        let mut exited_status = None;
+        if let Some(child) = self.children.get_mut(&mount_id) {
+            match child.try_wait() {
+                Ok(None) => return Ok(()),
+                Ok(Some(status)) => exited_status = Some(status.to_string()),
+                Err(error) => {
+                    return Err(format!(
+                        "Could not inspect Windows Cloud Files provider for `{mount_id}`: {error}"
+                    ));
+                }
+            }
+        }
+        if let Some(status) = exited_status {
+            self.children.remove(&mount_id);
+            eprintln!(
+                "afs desktop restarting Windows Cloud Files provider `{mount_id}` after exit with {status}"
+            );
+        }
+
+        let helper = windows_cloud_files_helper_path().ok_or_else(|| {
+            "afs-cloud-files was not found; build or install the Windows Cloud Files helper"
+                .to_string()
+        })?;
+        let mut command = Command::new(&helper);
+        command
+            .args(windows_cloud_files_run_command_args(state_root, mount))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let child = DefaultSessionProcessManager
+            .spawn_detached(&mut command)
+            .map_err(|error| {
+                format!(
+                    "Could not start Windows Cloud Files provider `{}` with `{}`: {error}",
+                    mount.mount_id.0,
+                    helper.display()
+                )
+            })?;
+        eprintln!(
+            "afs desktop started Windows Cloud Files provider `{}` as pid {}",
+            mount.mount_id.0,
+            child.id()
+        );
+        self.children.insert(mount_id, child);
+        Ok(())
+    }
+
+    fn retain_mount_ids(&mut self, active_mount_ids: &std::collections::HashSet<String>) {
+        let stale_mount_ids = self
+            .children
+            .keys()
+            .filter(|mount_id| !active_mount_ids.contains(*mount_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for mount_id in stale_mount_ids {
+            self.stop_mount(&mount_id);
+        }
+    }
+
+    fn stop_all(&mut self) {
+        let mount_ids = self.children.keys().cloned().collect::<Vec<_>>();
+        for mount_id in mount_ids {
+            self.stop_mount(&mount_id);
+        }
+    }
+
+    fn stop_mount(&mut self, mount_id: &str) {
+        let Some(mut child) = self.children.remove(mount_id) else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            if let Err(error) = child.kill() {
+                eprintln!(
+                    "afs desktop could not stop Windows Cloud Files provider `{mount_id}`: {error}"
+                );
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_provider_supervisor() -> &'static Mutex<WindowsCloudFilesProviderSupervisor>
+{
+    WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR
+        .get_or_init(|| Mutex::new(WindowsCloudFilesProviderSupervisor::default()))
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_cloud_files_provider_running(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    windows_cloud_files_provider_supervisor()
+        .lock()
+        .map_err(|_| "Windows Cloud Files provider supervisor lock was poisoned".to_string())?
+        .ensure_running(state_root, mount)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_windows_cloud_files_provider_running(
+    _state_root: &Path,
+    _mount: &MountConfig,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_cloud_files_providers_for_state(state_root: &Path) -> Result<(), String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let cloud_mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?
+        .into_iter()
+        .filter(|mount| mount.projection == ProjectionMode::WindowsCloudFiles)
+        .collect::<Vec<_>>();
+    let active_mount_ids = cloud_mounts
+        .iter()
+        .map(|mount| mount.mount_id.0.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    if cloud_mounts.is_empty() {
+        windows_cloud_files_provider_supervisor()
+            .lock()
+            .map_err(|_| "Windows Cloud Files provider supervisor lock was poisoned".to_string())?
+            .retain_mount_ids(&active_mount_ids);
+        return Ok(());
+    }
+
+    ensure_daemon_running(state_root)?;
+    reload_daemon_mounts(state_root)?;
+    for mount in &cloud_mounts {
+        register_windows_virtual_projection(state_root, mount)?;
+        ensure_windows_cloud_files_provider_running(state_root, mount)?;
+    }
+    windows_cloud_files_provider_supervisor()
+        .lock()
+        .map_err(|_| "Windows Cloud Files provider supervisor lock was poisoned".to_string())?
+        .retain_mount_ids(&active_mount_ids);
+    Ok(())
+}
+
+fn start_windows_cloud_files_provider_supervisor() {
+    #[cfg(target_os = "windows")]
+    {
+        std::thread::spawn(|| {
+            let state_root = default_state_root();
+            loop {
+                if let Err(error) = ensure_virtual_projection_runtimes_for_state(&state_root) {
+                    eprintln!(
+                        "afs desktop could not supervise Windows Cloud Files provider: {error}"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+    }
+}
+
+fn stop_windows_cloud_files_provider_supervisor() {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(supervisor) = WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR.get() else {
+            return;
+        };
+        match supervisor.lock() {
+            Ok(mut supervisor) => supervisor.stop_all(),
+            Err(_) => {
+                eprintln!("afs desktop could not stop Windows Cloud Files providers: lock poisoned")
+            }
+        }
     }
 }
 
@@ -3595,6 +3825,9 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn open_windows_virtual_projection(mount: &MountConfig) -> Result<(), String> {
+    let state_root = default_state_root();
+    register_windows_virtual_projection(&state_root, mount)?;
+    ensure_windows_cloud_files_provider_running(&state_root, mount)?;
     open_windows_cloud_files_sync_root(mount)
         .map(|_| ())
         .map_err(|error| {
@@ -4281,6 +4514,30 @@ mod tests {
         assert_eq!(
             super::mount_access_root(&mount),
             std::path::PathBuf::from("/tmp/AFS")
+        );
+    }
+
+    #[test]
+    fn windows_cloud_files_mount_access_root_stays_at_sync_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+            .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert_eq!(
+            super::mount_access_root(&mount),
+            std::path::PathBuf::from("/tmp/AFS")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_mount_summary_without_mount_reports_cloud_files_projection() {
+        assert_eq!(
+            super::mount_summary(None, None).projection,
+            "Windows Cloud Files"
+        );
+        assert_eq!(
+            super::desktop_projection_mode(),
+            ProjectionMode::WindowsCloudFiles
         );
     }
 
@@ -5310,6 +5567,7 @@ fn main() {
             build_tray(app)?;
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
+            start_windows_cloud_files_provider_supervisor();
             start_agent_guidance_refresher();
             Ok(())
         })
@@ -5445,7 +5703,10 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             "hide_menubar" => {
                 let _ = set_menu_bar_visible(app, false);
             }
-            "quit_completely" => app.exit(0),
+            "quit_completely" => {
+                stop_windows_cloud_files_provider_supervisor();
+                app.exit(0);
+            }
             _ => {}
         })
         .build(app)?;
