@@ -857,9 +857,9 @@ fn windows_cloud_files_register_args(
         "--display-name".to_string(),
         display_name.to_string(),
         "--sync-root".to_string(),
-        mount.root.display().to_string(),
+        helper_path_arg(&mount.root),
         "--state-dir".to_string(),
-        state_root.display().to_string(),
+        helper_path_arg(state_root),
     ]
 }
 
@@ -868,7 +868,7 @@ fn windows_cloud_files_open_args(mount: &MountConfig) -> Vec<String> {
         "--mount-id".to_string(),
         mount.mount_id.0.clone(),
         "--sync-root".to_string(),
-        mount.root.display().to_string(),
+        helper_path_arg(&mount.root),
     ]
 }
 
@@ -877,9 +877,9 @@ fn windows_cloud_files_run_args(state_root: &Path, mount: &MountConfig) -> Vec<S
         "--mount-id".to_string(),
         mount.mount_id.0.clone(),
         "--sync-root".to_string(),
-        mount.root.display().to_string(),
+        helper_path_arg(&mount.root),
         "--state-dir".to_string(),
-        state_root.display().to_string(),
+        helper_path_arg(state_root),
     ]
 }
 
@@ -894,8 +894,28 @@ fn windows_cloud_files_unregister_args(state_root: &Path, mount_id: &str) -> Vec
         "--mount-id".to_string(),
         mount_id.to_string(),
         "--state-dir".to_string(),
-        state_root.display().to_string(),
+        helper_path_arg(state_root),
     ]
+}
+
+fn helper_path_arg(path: &Path) -> String {
+    absolute_helper_path(path).display().to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn absolute_helper_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn absolute_helper_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 #[cfg(target_os = "windows")]
@@ -1349,6 +1369,33 @@ mod tests {
                 r"C:\Users\Ada\AFS",
                 "--state-dir",
                 r"C:\Users\Ada\AppData\Local\AgentFS",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cloud_files_helper_args_absolutize_relative_state_dir() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", r"C:\Users\Ada\AFS")
+            .projection(ProjectionMode::WindowsCloudFiles);
+        let current_dir = std::env::current_dir().expect("current dir");
+        let expected_state_dir = current_dir.join(".afs").display().to_string();
+
+        assert_eq!(
+            super::windows_cloud_files_register_args(
+                std::path::Path::new(".afs"),
+                &mount,
+                "Notion"
+            ),
+            vec![
+                "--mount-id",
+                "notion-main",
+                "--display-name",
+                "Notion",
+                "--sync-root",
+                r"C:\Users\Ada\AFS",
+                "--state-dir",
+                &expected_state_dir,
             ]
         );
     }

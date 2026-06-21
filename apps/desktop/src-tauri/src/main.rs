@@ -42,7 +42,10 @@ use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
-use afs_platform::bundled_binary_next_to_current_exe;
+use afs_platform::{
+    bundled_binary_next_to_current_exe, default_state_root as platform_default_state_root,
+    user_home as platform_user_home,
+};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
@@ -432,7 +435,7 @@ async fn choose_mount_folder(
         .map(|path| {
             let root = normalize_desktop_mount_root(&path)?;
             validate_desktop_mount_root(&root, &default_state_root(), &desktop_projection_mode())?;
-            Ok(display_path(&root))
+            Ok(absolute_display_path(&root))
         })
         .transpose()
 }
@@ -892,7 +895,7 @@ fn mount_summary(
             workspace_name: connection
                 .and_then(|connection| connection.workspace_name.clone())
                 .unwrap_or_else(|| "No Notion folder".to_string()),
-            local_path: display_path(&default_notion_access_root()),
+            local_path: absolute_display_path(&default_notion_access_root()),
             notion_url: None,
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
@@ -911,7 +914,7 @@ fn mount_summary(
         workspace_name: connection
             .and_then(|connection| connection.workspace_name.clone())
             .unwrap_or_else(|| connector_label(&mount.connector)),
-        local_path: display_path(&mount_access_root(mount)),
+        local_path: absolute_display_path(&mount_access_root(mount)),
         notion_url: mount
             .remote_root_id
             .as_ref()
@@ -2269,15 +2272,7 @@ fn mount_access_root(mount: &MountConfig) -> PathBuf {
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
+    absolute_state_root(platform_default_state_root())
 }
 
 fn expand_tilde(path: &str) -> std::io::Result<PathBuf> {
@@ -2291,9 +2286,18 @@ fn expand_tilde(path: &str) -> std::io::Result<PathBuf> {
 }
 
 fn home_dir() -> std::io::Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))
+    platform_user_home()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "home is not set"))
+}
+
+fn absolute_state_root(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(&path))
+        .unwrap_or(path)
 }
 
 fn display_path(path: &Path) -> String {
@@ -2307,6 +2311,13 @@ fn display_path(path: &Path) -> String {
     }
 
     path.display().to_string()
+}
+
+fn absolute_display_path(path: &Path) -> String {
+    absolute_path(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn default_notion_mount_root() -> PathBuf {
@@ -2429,7 +2440,7 @@ fn validate_desktop_mount_root(
             if !root.starts_with(&afs_root) || root == afs_root {
                 return Err(format!(
                     "Choose a source folder inside the AFS CloudStorage root, for example {}.",
-                    display_path(&default_notion_mount_root())
+                    absolute_display_path(&default_notion_mount_root())
                 ));
             }
         }
@@ -2637,7 +2648,7 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
 
     Ok(format!(
         "Mounted Notion workspace at {} with {}.",
-        display_path(&mount_access_root(&mount)),
+        absolute_display_path(&mount_access_root(&mount)),
         projection_label(&mount.projection)
     ))
 }
@@ -4531,6 +4542,18 @@ mod tests {
     };
 
     #[test]
+    fn desktop_state_root_absolutizes_relative_fallbacks() {
+        assert!(super::absolute_state_root(PathBuf::from(".afs")).is_absolute());
+    }
+
+    #[test]
+    fn mount_summary_default_path_is_absolute() {
+        let summary = super::mount_summary(None, None, None);
+
+        assert!(Path::new(&summary.local_path).is_absolute());
+    }
+
+    #[test]
     fn extracts_id_from_notion_pretty_workspace_url() {
         assert_eq!(
             notion_id_from_url(
@@ -5559,7 +5582,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         mount: MountSummary {
             connector: "notion".to_string(),
             workspace_name: "CodeFlash".to_string(),
-            local_path: display_path(&default_notion_mount_root()),
+            local_path: absolute_display_path(&default_notion_mount_root()),
             notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
             projection: "macOS File Provider".to_string(),
             read_only: false,
