@@ -383,12 +383,30 @@ export default function App() {
     route === "#onboarding-ready" ? 4 : 1,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
+  const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
+  const refreshSnapshotQueued = useRef(false);
   const setupIsComplete = setupComplete(snapshot);
 
   async function refreshSnapshot() {
-    const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
-    setSnapshot(nextSnapshot);
-    setSnapshotLoaded(true);
+    if (refreshSnapshotPromise.current) {
+      refreshSnapshotQueued.current = true;
+      return refreshSnapshotPromise.current;
+    }
+
+    const run = async () => {
+      do {
+        refreshSnapshotQueued.current = false;
+        const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
+        setSnapshot(nextSnapshot);
+        setSnapshotLoaded(true);
+      } while (refreshSnapshotQueued.current);
+    };
+
+    const promise = run().finally(() => {
+      refreshSnapshotPromise.current = null;
+    });
+    refreshSnapshotPromise.current = promise;
+    return promise;
   }
 
   async function checkForAppUpdate(options: { silent?: boolean } = {}) {

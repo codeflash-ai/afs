@@ -421,12 +421,15 @@ fn start_windows_cloud_files_lifecycle(
     }
 
     let helper = windows_cloud_files_helper_path().ok_or(WindowsCloudFilesHelperError::Missing)?;
-    register_windows_cloud_files_sync_root(state_root, mount, display_name)?;
-
     let existing = read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?;
     if let Some(metadata) = existing
         && windows_process_is_running(metadata.pid, &metadata.helper)
     {
+        let registered =
+            windows_cloud_files_registration_marker_exists(state_root, &mount.mount_id.0);
+        if !registered {
+            register_windows_cloud_files_sync_root(state_root, mount, display_name)?;
+        }
         return Ok(windows_cloud_files_lifecycle_report(
             action,
             mount,
@@ -440,6 +443,7 @@ fn start_windows_cloud_files_lifecycle(
         ));
     }
 
+    register_windows_cloud_files_sync_root(state_root, mount, display_name)?;
     std::fs::create_dir_all(windows_cloud_files_lifecycle_dir(state_root))
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     let log_dir = windows_cloud_files_log_dir(state_root);
@@ -677,6 +681,15 @@ fn windows_cloud_files_registration_status(state_root: &Path, mount_id: &str) ->
             .and_then(Value::as_str)
             .is_some_and(|registered_mount_id| registered_mount_id == mount_id)
     }))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_registration_marker_exists(state_root: &Path, mount_id: &str) -> bool {
+    state_root
+        .join("cloud-files")
+        .join(mount_id)
+        .join("registration.json")
+        .exists()
 }
 
 fn windows_cloud_files_lifecycle_dir(state_root: &Path) -> PathBuf {

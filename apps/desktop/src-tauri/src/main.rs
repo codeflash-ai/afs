@@ -11,6 +11,7 @@ use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
@@ -142,6 +143,13 @@ struct ProviderRuntimeSummary {
     stale_pid_file: bool,
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Deserialize)]
+struct DesktopWindowsCloudFilesProcessMetadata {
+    mount_id: String,
+    pid: u32,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSettings {
@@ -264,16 +272,25 @@ struct DesktopSettingChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
+static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 #[cfg(target_os = "windows")]
 static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
     Mutex<WindowsCloudFilesProviderSupervisor>,
 > = OnceLock::new();
 const DESKTOP_INSTALL_MARKER_VERSION: u32 = 2;
 const DESKTOP_ACTIVITY_LIMIT: usize = 20;
+const SURFACE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const TRAY_POPOVER_WIDTH: f64 = 360.0;
 const TRAY_POPOVER_HEIGHT: f64 = 520.0;
 const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
 const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
+
+#[derive(Default)]
+struct SurfaceRefreshState {
+    last_requested: Option<Instant>,
+    scheduled: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TrayVisualState {
@@ -299,8 +316,12 @@ struct ScreenBounds {
 }
 
 #[tauri::command]
-fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
-    let snapshot = load_desktop_snapshot().unwrap_or_else(|_| sample_snapshot());
+async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
+    let snapshot = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(sample_snapshot);
     refresh_tray_icon_for_snapshot(&app, &snapshot);
     snapshot
 }
@@ -397,13 +418,21 @@ fn notion_login_link() -> Option<String> {
 }
 
 #[tauri::command]
-fn install_state_review() -> InstallStateReview {
-    inspect_install_state(&default_state_root())
+async fn install_state_review() -> InstallStateReview {
+    tauri::async_runtime::spawn_blocking(|| inspect_install_state(&default_state_root()))
+        .await
+        .unwrap_or_else(|_| inspect_install_state(&default_state_root()))
 }
 
 #[tauri::command]
-fn acknowledge_install_state() -> ActionReport {
-    match record_current_install_marker(&default_state_root()) {
+async fn acknowledge_install_state() -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(|| {
+        record_current_install_marker(&default_state_root())
+    })
+    .await
+    .map_err(|error| format!("Install marker worker failed: {error}"))
+    .and_then(|result| result)
+    {
         Ok(()) => ActionReport {
             ok: true,
             message: "AFS install state recorded.".to_string(),
@@ -413,10 +442,15 @@ fn acknowledge_install_state() -> ActionReport {
 }
 
 #[tauri::command]
-fn reset_local_afs_state(app: AppHandle) -> ActionReport {
-    let state_root = default_state_root();
-    match reset_local_afs_state_at(&state_root)
-        .and_then(|_| record_current_install_marker(&state_root))
+async fn reset_local_afs_state(app: AppHandle) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(|| {
+        let state_root = default_state_root();
+        reset_local_afs_state_at(&state_root)
+            .and_then(|_| record_current_install_marker(&state_root))
+    })
+    .await
+    .map_err(|error| format!("Reset worker failed: {error}"))
+    .and_then(|result| result)
     {
         Ok(()) => {
             refresh_desktop_surfaces(&app);
@@ -445,14 +479,19 @@ async fn choose_mount_folder(
 }
 
 #[tauri::command]
-fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
-    let state_root = default_state_root();
-    match ensure_daemon_running(&state_root)
-        .and_then(|_| reload_daemon_mounts(&state_root))
-        .and_then(|_| ensure_virtual_projection_runtimes_for_state(&state_root))
+async fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(|| {
+        let state_root = default_state_root();
+        ensure_daemon_running(&state_root)
+            .and_then(|_| reload_daemon_mounts(&state_root))
+            .and_then(|_| ensure_virtual_projection_runtimes_for_state(&state_root))
+    })
+    .await
+    .map_err(|error| format!("Runtime worker failed: {error}"))
+    .and_then(|result| result)
     {
         Ok(()) => {
-            refresh_tray_icon(&app);
+            refresh_desktop_surfaces(&app);
             ActionReport {
                 ok: true,
                 message: "AFS runtime is running.".to_string(),
@@ -463,8 +502,12 @@ fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
-fn ensure_terminal_cli_available() -> ActionReport {
-    match install_terminal_cli_link() {
+async fn ensure_terminal_cli_available() -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(install_terminal_cli_link)
+        .await
+        .map_err(|error| format!("Terminal CLI worker failed: {error}"))
+        .and_then(|result| result)
+    {
         Ok(path) => ActionReport {
             ok: true,
             message: format!("AFS terminal command is ready at {}.", path.display()),
@@ -474,10 +517,14 @@ fn ensure_terminal_cli_available() -> ActionReport {
 }
 
 #[tauri::command]
-fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
-    match create_notion_workspace_mount(&path) {
+async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || create_notion_workspace_mount(&path))
+        .await
+        .map_err(|error| format!("Mount worker failed: {error}"))
+        .and_then(|result| result)
+    {
         Ok(report) => {
-            refresh_tray_icon(&app);
+            refresh_desktop_surfaces(&app);
             ActionReport {
                 ok: true,
                 message: report,
@@ -488,30 +535,51 @@ fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
 }
 
 #[tauri::command]
-fn install_agent_guidance(mount_path: Option<String>) -> AgentGuidanceInstallReport {
-    install_guidance_files(mount_path.as_deref())
+async fn install_agent_guidance(mount_path: Option<String>) -> AgentGuidanceInstallReport {
+    tauri::async_runtime::spawn_blocking(move || install_guidance_files(mount_path.as_deref()))
+        .await
+        .unwrap_or_else(|error| AgentGuidanceInstallReport {
+            ok: false,
+            command: "install_agent_guidance",
+            targets: vec![agent_guidance::AgentGuidanceTarget {
+                agent: "Agent instructions".to_string(),
+                status: "failed".to_string(),
+                path: None,
+                detail: format!("Agent guidance worker failed: {error}"),
+            }],
+            prompt: String::new(),
+        })
 }
 
 #[tauri::command]
-fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
-    let query = url.trim();
-    if query.is_empty() {
-        return Err("Paste a Notion page URL or search your local Notion index.".to_string());
-    }
+async fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let query = url.trim();
+        if query.is_empty() {
+            return Err("Paste a Notion page URL or search your local Notion index.".to_string());
+        }
 
-    locate_notion_query(query)
+        locate_notion_query(query)
+    })
+    .await
+    .map_err(|error| format!("Locate worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn search_notion_pages(query: String) -> Result<Vec<LocatedItem>, String> {
-    search_notion_index(&query, 8)
+async fn search_notion_pages(query: String) -> Result<Vec<LocatedItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || search_notion_index(&query, 8))
+        .await
+        .map_err(|error| format!("Search worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn review_push_plan() -> PushPlan {
-    let files = load_desktop_snapshot()
+async fn review_push_plan() -> PushPlan {
+    let files = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
+        .await
+        .ok()
+        .and_then(Result::ok)
         .map(|snapshot| snapshot.pending_changes)
-        .unwrap_or_else(|_| sample_pending_changes());
+        .unwrap_or_else(sample_pending_changes);
     let pages_updated = files.len();
     PushPlan {
         title: "Review Push".to_string(),
@@ -726,10 +794,16 @@ fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
 }
 
 #[tauri::command]
-fn open_path(path: String) -> ActionReport {
-    let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
-    match open_virtual_mount_or_path(&expanded) {
-        Ok(()) => ActionReport {
+async fn open_path(path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        open_virtual_mount_or_path(&expanded).map(|()| expanded)
+    })
+    .await
+    .map_err(|error| format!("Open worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(expanded) => ActionReport {
             ok: true,
             message: format!("Opened {}", expanded.display()),
         },
@@ -738,10 +812,16 @@ fn open_path(path: String) -> ActionReport {
 }
 
 #[tauri::command]
-fn reveal_path(path: String) -> ActionReport {
-    let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
-    match reveal_in_file_manager(&expanded) {
-        Ok(()) => ActionReport {
+async fn reveal_path(path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        reveal_in_file_manager(&expanded).map(|()| expanded)
+    })
+    .await
+    .map_err(|error| format!("Reveal worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(expanded) => ActionReport {
             ok: true,
             message: format!("Revealed {}", expanded.display()),
         },
@@ -764,9 +844,18 @@ fn hide_menubar(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
-fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionReport {
+async fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionReport {
     match change.key.as_str() {
-        "launch_at_login" => set_launch_at_login(change.enabled).unwrap_or_else(action_error),
+        "launch_at_login" => {
+            match tauri::async_runtime::spawn_blocking(move || set_launch_at_login(change.enabled))
+                .await
+                .map_err(|error| format!("Desktop setting worker failed: {error}"))
+                .and_then(|result| result)
+            {
+                Ok(report) => report,
+                Err(message) => action_error(message),
+            }
+        }
         "show_menu_bar" => set_menu_bar_visible(&app, change.enabled).unwrap_or_else(action_error),
         _ => ActionReport {
             ok: false,
@@ -962,22 +1051,60 @@ fn windows_cloud_files_provider_status(
     state_root: &Path,
     mount: &MountConfig,
 ) -> ProviderRuntimeSummary {
-    match run_windows_cloud_files_lifecycle(
-        state_root,
-        mount,
-        &connector_label(&mount.connector),
-        WindowsCloudFilesLifecycleAction::Status,
-    ) {
-        Ok(report) => provider_runtime_summary_from_value(&report.helper_report),
-        Err(error) => ProviderRuntimeSummary {
-            state: "error".to_string(),
-            message: error.message(),
+    let metadata = desktop_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0);
+    let registered = desktop_windows_cloud_files_registration_marker_exists(state_root, mount);
+    if let Some(metadata) = metadata {
+        return ProviderRuntimeSummary {
+            state: "running".to_string(),
+            message: format!(
+                "Windows Cloud Files provider is running for `{}` (pid {})",
+                mount.mount_id.0, metadata.pid
+            ),
             daemon_running: daemon_is_ready(state_root),
-            registered: None,
-            pid: None,
+            registered: Some(registered),
+            pid: Some(metadata.pid),
             stale_pid_file: false,
-        },
+        };
     }
+
+    ProviderRuntimeSummary {
+        state: "stopped".to_string(),
+        message: format!(
+            "Windows Cloud Files provider is stopped for `{}`",
+            mount.mount_id.0
+        ),
+        daemon_running: daemon_is_ready(state_root),
+        registered: Some(registered),
+        pid: None,
+        stale_pid_file: false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn desktop_windows_cloud_files_lifecycle_metadata(
+    state_root: &Path,
+    mount_id: &str,
+) -> Option<DesktopWindowsCloudFilesProcessMetadata> {
+    let dir = state_root.join("cloud-files-lifecycle");
+    let entries = fs::read_dir(dir).ok()?;
+    entries.flatten().find_map(|entry| {
+        let json = fs::read_to_string(entry.path()).ok()?;
+        let metadata =
+            serde_json::from_str::<DesktopWindowsCloudFilesProcessMetadata>(&json).ok()?;
+        (metadata.mount_id == mount_id).then_some(metadata)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn desktop_windows_cloud_files_registration_marker_exists(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> bool {
+    let marker = state_root
+        .join("cloud-files")
+        .join(&mount.mount_id.0)
+        .join("registration.json");
+    marker.exists()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -995,34 +1122,6 @@ fn windows_cloud_files_provider_status(
         registered: None,
         pid: None,
         stale_pid_file: false,
-    }
-}
-
-fn provider_runtime_summary_from_value(value: &serde_json::Value) -> ProviderRuntimeSummary {
-    ProviderRuntimeSummary {
-        state: value
-            .get("state")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
-        message: value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Provider status is unavailable.")
-            .to_string(),
-        daemon_running: value
-            .get("daemon_running")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        registered: value.get("registered").and_then(serde_json::Value::as_bool),
-        pid: value
-            .get("pid")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|pid| u32::try_from(pid).ok()),
-        stale_pid_file: value
-            .get("stale_pid_file")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
     }
 }
 
@@ -1640,9 +1739,33 @@ fn search_kind_label(kind: &str) -> &str {
 fn desktop_settings() -> DesktopSettings {
     let persisted = load_desktop_settings().unwrap_or_default();
     DesktopSettings {
-        launch_at_login: launch_at_login_enabled(),
+        launch_at_login: cached_launch_at_login_enabled(persisted.launch_at_login),
         show_menu_bar: persisted.show_menu_bar,
     }
+}
+
+fn cached_launch_at_login_enabled(default: bool) -> bool {
+    LAUNCH_AT_LOGIN_STATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|state| *state)
+        .unwrap_or(default)
+}
+
+fn set_launch_at_login_cache(enabled: bool) {
+    if let Ok(mut state) = LAUNCH_AT_LOGIN_STATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *state = Some(enabled);
+    }
+}
+
+fn refresh_launch_at_login_cache_async() {
+    tauri::async_runtime::spawn_blocking(|| {
+        set_launch_at_login_cache(launch_at_login_enabled());
+    });
 }
 
 fn load_desktop_settings() -> Result<DesktopSettings, String> {
@@ -1703,6 +1826,7 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
     let mut settings = load_desktop_settings().unwrap_or_default();
     settings.launch_at_login = enabled;
     save_desktop_settings(&settings)?;
+    set_launch_at_login_cache(enabled);
 
     Ok(ActionReport {
         ok: true,
@@ -1719,6 +1843,7 @@ fn apply_launch_at_login_preference() -> Result<(), String> {
     if settings.launch_at_login && !running_from_read_only_volume()? {
         install_launch_at_login()?;
     }
+    set_launch_at_login_cache(settings.launch_at_login);
     Ok(())
 }
 
@@ -2044,15 +2169,75 @@ fn is_virtual_content_temp_path(path: &Path) -> bool {
 }
 
 fn refresh_desktop_surfaces(app: &AppHandle) {
-    refresh_tray_icon(app);
+    schedule_desktop_surface_refresh(app.clone());
+}
+
+fn schedule_tray_icon_refresh(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let snapshot = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if let Some(snapshot) = snapshot {
+            refresh_tray_icon_for_snapshot(&app, &snapshot);
+        } else {
+            set_tray_icon_and_tooltip(&app, TrayVisualState::Reconnect, "AFS needs attention");
+        }
+    });
+}
+
+fn schedule_desktop_surface_refresh(app: AppHandle) {
+    let delay = {
+        let mut state = SURFACE_REFRESH_STATE
+            .get_or_init(|| Mutex::new(SurfaceRefreshState::default()))
+            .lock()
+            .expect("surface refresh lock poisoned");
+        if state.scheduled {
+            return;
+        }
+        state.scheduled = true;
+
+        let now = Instant::now();
+        state
+            .last_requested
+            .and_then(|last| {
+                SURFACE_REFRESH_MIN_INTERVAL.checked_sub(now.saturating_duration_since(last))
+            })
+            .unwrap_or_default()
+    };
+
+    std::thread::spawn(move || {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+
+        {
+            let mut state = SURFACE_REFRESH_STATE
+                .get_or_init(|| Mutex::new(SurfaceRefreshState::default()))
+                .lock()
+                .expect("surface refresh lock poisoned");
+            state.last_requested = Some(Instant::now());
+            state.scheduled = false;
+        }
+
+        if !dispatch_window_snapshot_refresh(&app) {
+            schedule_tray_icon_refresh(app.clone());
+        }
+    });
+}
+
+fn dispatch_window_snapshot_refresh(app: &AppHandle) -> bool {
+    let mut dispatched = false;
     for label in ["main", "tray"] {
         if let Some(window) = app.get_webview_window(label) {
-            if label == "main" && !window.is_visible().unwrap_or(false) {
+            if !window.is_visible().unwrap_or(false) {
                 continue;
             }
             let _ = window.eval("window.dispatchEvent(new CustomEvent('afs-refresh-snapshot'));");
+            dispatched = true;
         }
     }
+    dispatched
 }
 
 fn running_from_read_only_volume() -> Result<bool, String> {
@@ -3938,17 +4123,35 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn open_windows_virtual_projection(mount: &MountConfig) -> Result<(), String> {
-    let state_root = default_state_root();
-    register_windows_virtual_projection(&state_root, mount)?;
-    ensure_windows_cloud_files_provider_running(&state_root, mount)?;
-    open_windows_cloud_files_sync_root(mount)
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "Could not open Windows Cloud Files sync root: {}",
-                error.message()
-            )
-        })
+    match open_windows_cloud_files_sync_root(mount) {
+        Ok(_) => {
+            let mount = mount.clone();
+            std::thread::spawn(move || {
+                let state_root = default_state_root();
+                if let Err(error) = ensure_windows_cloud_files_provider_running(&state_root, &mount)
+                {
+                    eprintln!(
+                        "afs desktop could not prepare Windows Cloud Files provider while opening `{}`: {error}",
+                        mount.mount_id.0
+                    );
+                }
+            });
+            Ok(())
+        }
+        Err(open_error) => {
+            let first_error = open_error.message();
+            let state_root = default_state_root();
+            ensure_windows_cloud_files_provider_running(&state_root, mount)?;
+            open_windows_cloud_files_sync_root(mount)
+                .map(|_| ())
+                .map_err(|retry_error| {
+                    format!(
+                        "Could not open Windows Cloud Files sync root: {}. Initial open failed with: {first_error}",
+                        retry_error.message()
+                    )
+                })
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -5694,6 +5897,7 @@ fn main() {
             if let Err(error) = apply_launch_at_login_preference() {
                 eprintln!("afs desktop could not apply launch-at-login preference: {error}");
             }
+            refresh_launch_at_login_cache_async();
             build_tray(app)?;
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
