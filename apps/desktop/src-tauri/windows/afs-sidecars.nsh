@@ -4,6 +4,20 @@
 !define AFS_RUN_VALUE "AFS"
 !define AFS_SHIM_MARKER "rem AFS_TERMINAL_CLI_SHIM"
 
+!macro STOP_AFS_PROCESS_IMAGE IMAGE_NAME
+  DetailPrint "Stopping ${IMAGE_NAME} if running..."
+  ClearErrors
+  ExecWait '"$SYSDIR\taskkill.exe" /F /T /IM "${IMAGE_NAME}"' $0
+  ClearErrors
+!macroend
+
+!macro STOP_AFS_SIDECAR_PROCESSES
+  !insertmacro STOP_AFS_PROCESS_IMAGE "afs-cloud-files.exe"
+  !insertmacro STOP_AFS_PROCESS_IMAGE "afsd.exe"
+  !insertmacro STOP_AFS_PROCESS_IMAGE "afs.exe"
+  Sleep 500
+!macroend
+
 !macro DELETE_AFS_TERMINAL_SHIM SHIM_PATH
   ClearErrors
   FileOpen $0 "${SHIM_PATH}" r
@@ -18,11 +32,19 @@
   ${EndIf}
 !macroend
 
+!macro NSIS_HOOK_PREINSTALL
+  !insertmacro STOP_AFS_SIDECAR_PROCESSES
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
   File /oname=afs.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afs.exe"
   File /oname=afsd.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afsd.exe"
   File /oname=afs-cloud-files.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afs-cloud-files.exe"
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro STOP_AFS_SIDECAR_PROCESSES
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
