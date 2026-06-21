@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::io;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -85,6 +87,8 @@ const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "AFS_TERMINAL_CLI_SHIM";
 const WINDOWS_RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const WINDOWS_RUN_VALUE_NAME: &str = "AFS";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2143,7 +2147,9 @@ fn install_windows_login_item() -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
     let value = windows_run_value_for_executable(&executable);
-    let output = Command::new("reg")
+    let mut command = Command::new("reg");
+    configure_hidden_windows_command(&mut command);
+    let output = command
         .args([
             "add",
             WINDOWS_RUN_KEY_PATH,
@@ -2169,7 +2175,9 @@ fn install_windows_login_item() -> Result<(), String> {
 
 #[cfg(windows)]
 fn uninstall_windows_login_item() -> Result<(), String> {
-    let output = Command::new("reg")
+    let mut command = Command::new("reg");
+    configure_hidden_windows_command(&mut command);
+    let output = command
         .args([
             "delete",
             WINDOWS_RUN_KEY_PATH,
@@ -2195,7 +2203,9 @@ fn uninstall_windows_login_item() -> Result<(), String> {
 
 #[cfg(windows)]
 fn windows_run_key_is_registered() -> Result<bool, String> {
-    let output = Command::new("reg")
+    let mut command = Command::new("reg");
+    configure_hidden_windows_command(&mut command);
+    let output = command
         .args(["query", WINDOWS_RUN_KEY_PATH, "/v", WINDOWS_RUN_VALUE_NAME])
         .output()
         .map_err(|error| format!("Could not inspect the Windows login item: {error}"))?;
@@ -2206,6 +2216,11 @@ fn windows_run_key_is_registered() -> Result<bool, String> {
 #[cfg(windows)]
 fn windows_run_value_for_executable(executable: &Path) -> String {
     format!("\"{}\"", executable.display())
+}
+
+#[cfg(windows)]
+fn configure_hidden_windows_command(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(windows)]

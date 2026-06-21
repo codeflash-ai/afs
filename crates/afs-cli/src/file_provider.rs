@@ -5,6 +5,8 @@
 //! than shelling through `afs file-provider`, so the CLI and desktop app share
 //! the same platform boundary.
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "windows")]
@@ -20,6 +22,15 @@ use serde_json::Value;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "windows")]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(target_os = "windows")]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const HIDDEN_WINDOWS_PROCESS_FLAGS: u32 =
+    CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileProviderHelperReport {
@@ -363,6 +374,7 @@ pub fn run_windows_cloud_files_helper(
         command.arg(action);
         command.args(args);
         command.arg("--json");
+        configure_hidden_windows_command(&mut command);
 
         let output = command
             .output()
@@ -404,10 +416,6 @@ fn start_windows_cloud_files_lifecycle(
     display_name: &str,
     action: WindowsCloudFilesLifecycleAction,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
     if !daemon_is_running(state_root) {
         return Err(WindowsCloudFilesHelperError::DaemonNotRunning);
     }
@@ -454,8 +462,8 @@ fn start_windows_cloud_files_lifecycle(
     command
         .args(windows_cloud_files_run_command_args(state_root, mount))
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .creation_flags(CREATE_NO_WINDOW);
+        .stderr(Stdio::from(stderr));
+    configure_hidden_windows_command(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
@@ -776,10 +784,10 @@ fn remove_windows_cloud_files_lifecycle_metadata(
 #[cfg(target_os = "windows")]
 fn windows_process_is_running(pid: u32, helper: &Path) -> bool {
     let filter = format!("PID eq {pid}");
-    let Ok(output) = Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .output()
-    else {
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+    configure_hidden_windows_command(&mut command);
+    let Ok(output) = command.output() else {
         return false;
     };
     if !output.status.success() {
@@ -827,8 +835,10 @@ fn parse_tasklist_csv_line(line: &str) -> Vec<String> {
 
 #[cfg(target_os = "windows")]
 fn stop_windows_process(pid: u32) -> Result<(), WindowsCloudFilesHelperError> {
-    let output = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    configure_hidden_windows_command(&mut command);
+    let output = command
         .output()
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     if output.status.success() {
@@ -844,6 +854,11 @@ fn stop_windows_process(pid: u32) -> Result<(), WindowsCloudFilesHelperError> {
             message
         },
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn configure_hidden_windows_command(command: &mut Command) {
+    command.creation_flags(HIDDEN_WINDOWS_PROCESS_FLAGS);
 }
 
 fn windows_cloud_files_register_args(

@@ -1,4 +1,6 @@
 use std::fs::{self, OpenOptions};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -13,6 +15,8 @@ pub const DAEMON_PID_FILENAME: &str = "afsd.pid";
 pub const DAEMON_METADATA_FILENAME: &str = "afsd.manager.json";
 pub const DAEMON_STDOUT_LOG_FILENAME: &str = "afsd.out.log";
 pub const DAEMON_STDERR_LOG_FILENAME: &str = "afsd.err.log";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -288,13 +292,21 @@ fn stop_session(paths: &DaemonProcessPaths) -> Result<(), DaemonProcessError> {
         .to_string();
     if !pid.is_empty() {
         let stop_command = DefaultSessionProcessManager.stop_command(&pid);
-        let _ = Command::new(stop_command.program())
-            .args(stop_command.args())
-            .output();
+        let mut command = Command::new(stop_command.program());
+        configure_hidden_windows_command(&mut command);
+        let _ = command.args(stop_command.args()).output();
     }
     let _ = fs::remove_file(&paths.pid_file);
     Ok(())
 }
+
+#[cfg(windows)]
+fn configure_hidden_windows_command(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_hidden_windows_command(_command: &mut Command) {}
 
 #[cfg(target_os = "macos")]
 fn start_launchd(
