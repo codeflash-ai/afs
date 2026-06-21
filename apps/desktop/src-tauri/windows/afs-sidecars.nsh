@@ -7,7 +7,8 @@
 !macro STOP_AFS_PROCESS_IMAGE IMAGE_NAME
   DetailPrint "Stopping ${IMAGE_NAME} if running..."
   ClearErrors
-  ExecWait '"$SYSDIR\taskkill.exe" /F /T /IM "${IMAGE_NAME}"' $0
+  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /T /IM "${IMAGE_NAME}"'
+  Pop $0
   ClearErrors
 !macroend
 
