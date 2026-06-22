@@ -1690,6 +1690,7 @@ p {
 }
 
 .status-pill {
+  position: relative;
   display: inline-flex;
   align-items: center;
   min-height: 24px;
@@ -1697,6 +1698,33 @@ p {
   border-radius: 999px;
   font-size: 11px;
   font-weight: 900;
+}
+
+.status-pill.has-tooltip {
+  outline: none;
+}
+
+.status-pill.has-tooltip:hover::after,
+.status-pill.has-tooltip:focus-visible::after {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  width: min(290px, 70vw);
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 14px 28px rgba(20, 30, 43, 0.14);
+  color: var(--ink);
+  content: attr(data-tooltip);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  pointer-events: none;
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
 }
 
 .status-pill.ready {

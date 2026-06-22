@@ -3281,7 +3281,16 @@ function StatusPill({
   tone: "ready" | "warn" | "danger";
   title?: string;
 }) {
-  return <span className={`status-pill ${tone}`} title={title}>{children}</span>;
+  return (
+    <span
+      className={`status-pill ${tone} ${title ? "has-tooltip" : ""}`}
+      aria-label={title}
+      data-tooltip={title}
+      tabIndex={title ? 0 : undefined}
+    >
+      {children}
+    </span>
+  );
 }
 
 function ApertureIcon({ state = "default" }: { state?: "default" | "review" | "reconnect" }) {
@@ -3404,10 +3413,10 @@ function healthDescription(state: string, attentionCount: number) {
     return "Notion needs to be reconnected before AFS can sync this workspace.";
   }
   if (state === "stopped") {
-    return "The AFS daemon is stopped; the app can still run direct actions when needed.";
+    return "The AFS daemon is stopped. Background sync, hydration, and auto-save are paused; direct actions can still run from the app.";
   }
   if (state === "runtime_stopped") {
-    return "The filesystem provider is stopped or unregistered; start AFS to restore online-only file access.";
+    return "The filesystem provider is stopped or unregistered. Use Repair AFS in Settings to restore online-only file access.";
   }
   if (state === "checking_freshness") {
     return "AFS is checking the local mount and Notion freshness state.";
