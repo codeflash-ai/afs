@@ -149,6 +149,22 @@ The final artifact is copied to:
 target/release/bundle/dmg/AFS-beta-YYYYMMDD-<commit>-notarized-<arch>.dmg
 ```
 
+For local packaging tests that should sign the app but skip Apple notarization,
+use:
+
+```sh
+make publish-unnotarized
+```
+
+This sets `PUBLISH_SKIP_NOTARIZATION=1`, skips notary credential lookup,
+`notarytool submit`, stapling, and notarization validation, and writes:
+
+```text
+target/release/bundle/dmg/AFS-beta-YYYYMMDD-<commit>-unnotarized-<arch>.dmg
+```
+
+Use `make publish` for public direct-download and Homebrew artifacts.
+
 Useful overrides:
 
 ```sh

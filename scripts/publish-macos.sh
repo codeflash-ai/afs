@@ -20,6 +20,10 @@ fail() {
   exit 1
 }
 
+skip_notarization() {
+  [[ "${PUBLISH_SKIP_NOTARIZATION:-0}" == "1" ]]
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
@@ -243,29 +247,37 @@ main() {
   require_command git
   require_command npm
   require_command cargo
-  require_command xcrun
   require_command hdiutil
   require_command codesign
-  require_command spctl
   require_command security
   require_command strings
+  if ! skip_notarization; then
+    require_command xcrun
+    require_command spctl
+  fi
 
   assert_clean_tree
 
-  local signing_identity commit_short commit_full config_json dmg arch output_name final_dmg sha
+  local signing_identity commit_short commit_full config_json dmg arch output_name final_dmg sha dmg_status
   signing_identity="$(detect_signing_identity)"
   commit_short="$(git -C "${ROOT}" rev-parse --short=7 HEAD)"
   commit_full="$(git -C "${ROOT}" rev-parse --short=12 HEAD)"
   config_json="$(build_config_json "${signing_identity}")"
 
   local -a submit_args=()
-  while IFS= read -r -d '' arg; do
-    submit_args+=("${arg}")
-  done < <(notary_args)
+  if ! skip_notarization; then
+    while IFS= read -r -d '' arg; do
+      submit_args+=("${arg}")
+    done < <(notary_args)
+  fi
 
   log "commit ${commit_full}"
   log "signing identity: ${signing_identity}"
-  log "notary profile: ${NOTARY_PROFILE}"
+  if skip_notarization; then
+    log "notarization disabled"
+  else
+    log "notary profile: ${NOTARY_PROFILE}"
+  fi
   if updater_enabled; then
     log "updater endpoint: ${UPDATER_ENDPOINT}"
   else
@@ -297,20 +309,31 @@ main() {
   log "verifying Developer ID signatures"
   verify_signed_app_in_dmg "${dmg}" "${commit_full}"
 
-  log "submitting for notarization"
-  xcrun notarytool submit "${dmg}" --wait "${submit_args[@]}"
+  if skip_notarization; then
+    log "skipping notarization and stapling"
+    dmg_status="unnotarized"
+  else
+    log "submitting for notarization"
+    xcrun notarytool submit "${dmg}" --wait "${submit_args[@]}"
 
-  log "stapling notarization ticket"
-  xcrun stapler staple "${dmg}"
+    log "stapling notarization ticket"
+    xcrun stapler staple "${dmg}"
+    dmg_status="notarized"
+  fi
 
   arch="$(basename "${dmg}" .dmg)"
   arch="${arch##*_}"
-  output_name="${PUBLISH_DMG_NAME:-${PRODUCT_NAME}-${CHANNEL}-${DATE_STAMP}-${commit_short}-notarized-${arch}.dmg}"
+  output_name="${PUBLISH_DMG_NAME:-${PRODUCT_NAME}-${CHANNEL}-${DATE_STAMP}-${commit_short}-${dmg_status}-${arch}.dmg}"
   final_dmg="${DMG_DIR}/${output_name}"
   cp "${dmg}" "${final_dmg}"
 
-  log "validating notarized DMG"
-  validate_notarized_dmg "${final_dmg}"
+  if skip_notarization; then
+    log "validating DMG integrity"
+    hdiutil verify "${final_dmg}"
+  else
+    log "validating notarized DMG"
+    validate_notarized_dmg "${final_dmg}"
+  fi
 
   sha="$(shasum -a 256 "${final_dmg}" | awk '{print $1}')"
   printf '\nPublished DMG: %s\n' "${final_dmg}"
