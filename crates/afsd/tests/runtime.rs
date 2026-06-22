@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
@@ -27,7 +27,9 @@ use afsd::runtime::{
     FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullRuntimeReport,
 };
 use afsd::scheduler::PullSchedulerTick;
-use afsd::virtual_fs::{ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport};
+use afsd::virtual_fs::{
+    ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, virtual_fs_content_root,
+};
 use afsd::watcher::{FileEvent, FileEventKind};
 use serde_json::json;
 
@@ -1012,6 +1014,43 @@ fn runtime_queues_remote_fast_forward_from_freshness_report() {
     runtime.shutdown();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn runtime_refreshes_macos_visible_replica_after_remote_fast_forward() {
+    let config = relay_config("remote-fast-forward-refresh-visible");
+    let mount_root = temp_root("remote-fast-forward-refresh-visible-mount").join("notion");
+    let visible_path =
+        seed_clean_remote_changed_macos_file_provider_page(&config.state_root, &mount_root);
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        MacosProjectionFastForwardRunner {
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .file_event(FileEvent {
+            path: visible_path.clone(),
+            kind: FileEventKind::Write,
+        })
+        .expect("submit freshness event");
+
+    let request = hydrated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("auto fast-forward hydration drained");
+    assert_eq!(request.mount_id, MountId::new("notion-main"));
+    assert_eq!(request.remote_id, RemoteId::new("page-1"));
+    assert_eq!(request.reason, HydrationReason::RemoteFastForward);
+
+    wait_for_file_contains(&visible_path, "Remote body.");
+    let visible = std::fs::read_to_string(&visible_path).expect("read visible");
+    assert!(!visible.contains("Original body."));
+    runtime.shutdown();
+}
+
 #[test]
 fn runtime_delays_remote_fast_forward_for_recently_opened_file() {
     let config = relay_config("remote-fast-forward-active");
@@ -1103,6 +1142,21 @@ fn assert_hydration_jobs_drained(state_root: PathBuf) {
         assert!(
             std::time::Instant::now() < deadline,
             "hydration jobs did not drain"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_file_contains(path: &Path, needle: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(path).is_ok_and(|contents| contents.contains(needle)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`{}` did not contain `{needle}`",
+            path.display()
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -1902,6 +1956,11 @@ struct AutoFastForwardRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
 }
 
+#[cfg(target_os = "macos")]
+struct MacosProjectionFastForwardRunner {
+    hydrated: mpsc::Sender<HydrationRequest>,
+}
+
 struct PushRequestRunner {
     push_tx: mpsc::Sender<PushJob>,
 }
@@ -2380,6 +2439,102 @@ impl RuntimeJobRunner for AutoFastForwardRunner {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl RuntimeJobRunner for MacosProjectionFastForwardRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        state_root: PathBuf,
+        request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        let body = markdown_body("Remote body.");
+        let shadow = ShadowDocument::from_synced_body(
+            request.remote_id.clone(),
+            body.clone(),
+            8,
+            [RemoteId::new("heading-1"), RemoteId::new("paragraph-2")],
+        )
+        .expect("shadow")
+        .with_frontmatter(frontmatter());
+        let document = CanonicalDocument::new(frontmatter(), body);
+        let content_path =
+            virtual_fs_content_root(&state_root, &request.mount_id).join("Roadmap.md");
+        std::fs::create_dir_all(content_path.parent().expect("content parent"))
+            .map_err(AfsError::from)?;
+        std::fs::write(&content_path, render_canonical_markdown(&document))
+            .map_err(AfsError::from)?;
+
+        let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
+        store
+            .save_shadow(&request.mount_id, shadow.clone())
+            .map_err(AfsError::from)?;
+        let mut entity = store
+            .get_entity(&request.mount_id, &request.remote_id)
+            .map_err(AfsError::from)?
+            .expect("entity");
+        entity.hydration = HydrationState::Hydrated;
+        entity.content_hash = Some(shadow.body_hash);
+        entity.remote_edited_at = Some("remote-v2".to_string());
+        store.save_entity(entity).map_err(AfsError::from)?;
+
+        self.hydrated.send(request).expect("notify hydrated");
+        Ok(HydrationOutcome::Hydrated)
+    }
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        _event: FileEvent,
+    ) -> afs_core::AfsResult<FileEventRuntimeReport> {
+        Ok(FileEventRuntimeReport {
+            freshness_jobs: vec![SyncJob::new(
+                MountId::new("notion-main"),
+                Some(RemoteId::new("page-1")),
+                SyncJobKind::ObserveEntity,
+                ChangeHintKind::RemoteMaybeChanged,
+            )],
+            ..Default::default()
+        })
+    }
+
+    fn run_freshness_job(
+        &self,
+        _state_root: PathBuf,
+        job: SyncJob,
+    ) -> afs_core::AfsResult<FreshnessRuntimeReport> {
+        Ok(FreshnessRuntimeReport {
+            job,
+            remote_hint_pending: true,
+            queued_hydrations: vec![HydrationRequest::new(
+                MountId::new("notion-main"),
+                RemoteId::new("page-1"),
+                PathBuf::from("Roadmap.md"),
+                HydrationState::Hydrated,
+                HydrationReason::RemoteFastForward,
+            )],
+            follow_up_jobs: Vec::new(),
+        })
+    }
+}
+
 impl RuntimeJobRunner for SchedulingRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
@@ -2550,6 +2705,64 @@ fn seed_clean_remote_changed_page(state_root: &PathBuf, mount_root: &PathBuf) {
         render_canonical_markdown(&document),
     )
     .expect("write clean page");
+}
+
+#[cfg(target_os = "macos")]
+fn seed_clean_remote_changed_macos_file_provider_page(
+    state_root: &PathBuf,
+    mount_root: &PathBuf,
+) -> PathBuf {
+    let mount_id = MountId::new("notion-main");
+    let remote_id = RemoteId::new("page-1");
+    let body = markdown_body("Original body.");
+    let shadow = ShadowDocument::from_synced_body(
+        remote_id.clone(),
+        body.clone(),
+        7,
+        [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
+    .with_frontmatter(frontmatter());
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(mount_id.clone(), "notion", mount_root.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save mount");
+    store
+        .save_shadow(&mount_id, shadow.clone())
+        .expect("save shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_content_hash(shadow.body_hash)
+            .with_remote_edited_at("remote-v1"),
+        )
+        .expect("save entity");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(mount_id.clone(), remote_id.clone(), FreshnessTier::Hot)
+                .remote_hint_pending(true),
+        )
+        .expect("save freshness");
+
+    let rendered = render_canonical_markdown(&CanonicalDocument::new(frontmatter(), body));
+    std::fs::create_dir_all(mount_root).expect("create mount root");
+    let visible_path = mount_root.join("Roadmap.md");
+    std::fs::write(&visible_path, &rendered).expect("write visible page");
+    let content_path = virtual_fs_content_root(state_root, &mount_id).join("Roadmap.md");
+    std::fs::create_dir_all(content_path.parent().expect("content parent"))
+        .expect("create content root");
+    std::fs::write(content_path, rendered).expect("write content cache");
+    visible_path
 }
 
 fn mark_page_recently_opened(state_root: &PathBuf) {

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DMG_DIR="${ROOT}/target/release/bundle/dmg"
+DMG_DIR="${HOMEBREW_DMG_DIR:-${ROOT}/target/release/bundle/dmg}"
 OUTPUT="${HOMEBREW_CASK_OUTPUT:-${ROOT}/target/release/homebrew/Casks/afs.rb}"
 VERSION="${HOMEBREW_VERSION:-}"
 RELEASE_TAG="${HOMEBREW_RELEASE_TAG:-}"
@@ -21,9 +21,9 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
-latest_dmg_for_arch() {
+latest_notarized_dmg_for_arch() {
   local arch="$1"
-  find "${DMG_DIR}" -maxdepth 1 -type f -name "*${arch}.dmg" | sort | tail -n 1
+  find "${DMG_DIR}" -maxdepth 1 -type f -name "*-notarized-*${arch}.dmg" | sort | tail -n 1
 }
 
 sha256_file() {
@@ -91,11 +91,11 @@ main() {
   fi
 
   local dmg
-  dmg="${HOMEBREW_DMG:-${HOMEBREW_ARM_DMG:-$(latest_dmg_for_arch aarch64)}}"
+  dmg="${HOMEBREW_DMG:-${HOMEBREW_ARM_DMG:-$(latest_notarized_dmg_for_arch aarch64)}}"
   if [[ -z "${dmg}" ]]; then
-    dmg="${HOMEBREW_DMG:-${HOMEBREW_ARM_DMG:-$(latest_dmg_for_arch arm64)}}"
+    dmg="${HOMEBREW_DMG:-${HOMEBREW_ARM_DMG:-$(latest_notarized_dmg_for_arch arm64)}}"
   fi
-  [[ -n "${dmg}" && -f "${dmg}" ]] || fail "need an Apple Silicon DMG; set HOMEBREW_DMG or HOMEBREW_ARM_DMG"
+  [[ -n "${dmg}" && -f "${dmg}" ]] || fail "need a notarized Apple Silicon DMG; set HOMEBREW_DMG or HOMEBREW_ARM_DMG"
 
   mkdir -p "$(dirname "${OUTPUT}")"
   write_cask "${dmg}"

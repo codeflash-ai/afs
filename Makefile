@@ -49,6 +49,10 @@ build-mas: setup ## Build a local Mac App Store-channel .app bundle.
 publish: setup ## Build, sign, notarize, staple, and validate a macOS DMG.
 	scripts/publish-macos.sh
 
+.PHONY: publish-unnotarized
+publish-unnotarized: setup ## Build, sign, and validate a macOS DMG without notarization.
+	PUBLISH_SKIP_NOTARIZATION=1 scripts/publish-macos.sh
+
 .PHONY: publish-mas
 publish-mas: setup ## Build, sign, package, and optionally upload a Mac App Store build.
 	scripts/publish-mas.sh
@@ -124,6 +128,10 @@ test-linux-fuse: ## Run the optional Linux FUSE smoke test when enabled by env v
 test-linux-publish-config: ## Validate Linux package publish configuration.
 	tests/linux_publish_config.sh
 	tests/linux_publish_validation.sh
+
+.PHONY: test-macos-publish-config
+test-macos-publish-config: ## Validate macOS package publish configuration.
+	tests/macos_publish_config.sh
 
 .PHONY: fmt
 fmt: ## Format Rust code.

@@ -4316,7 +4316,10 @@ fn pull_command_error(json: bool, error: PullError) -> i32 {
         PullError::MountNotFound(_)
         | PullError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
         PullError::ReadFile { .. } | PullError::WriteFile { .. } => EXIT_INTERNAL,
-        PullError::Store(_) | PullError::Connector(_) | PullError::CurrentDir(_) => EXIT_INTERNAL,
+        PullError::Store(_)
+        | PullError::Connector(_)
+        | PullError::CurrentDir(_)
+        | PullError::Projection(_) => EXIT_INTERNAL,
     };
     command_error(
         json,

@@ -20,7 +20,7 @@ use afs_store::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::file_provider;
+use crate::file_provider::{self, ProjectionRefreshBase};
 use crate::hydration::{HydratedAsset, HydratedEntity};
 use crate::media::{
     document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
@@ -58,7 +58,11 @@ pub fn run_pull<S, Source>(
     target_path: impl AsRef<Path>,
 ) -> Result<PullReport, PullError>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + afs_store::VirtualMutationRepository
+        + afs_store::FreshnessStateRepository,
     Source: SourceAdapter + Clone,
 {
     run_pull_with_state_root(store, source, target_path, None)
@@ -71,7 +75,11 @@ pub fn run_pull_with_state_root<S, Source>(
     state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + afs_store::VirtualMutationRepository
+        + afs_store::FreshnessStateRepository,
     Source: SourceAdapter + Clone,
 {
     let target_path = absolute_path(target_path.as_ref())?;
@@ -81,9 +89,11 @@ where
     let mount = mount.clone();
     let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
+    let refresh_bases =
+        prepare_macos_file_provider_projection_pull(store, state_root, &mount, &target_path)?;
 
-    if should_pull_mount_root(&mount, &relative_path, &target_path) {
-        pull_mount_root(store, &source, &mount, target_path, state_root)
+    let report = if should_pull_mount_root(&mount, &relative_path, &target_path) {
+        pull_mount_root(store, &source, &mount, target_path.clone(), state_root)
     } else if let Some(report) = pull_virtual_directory_path(
         store,
         &source,
@@ -99,10 +109,80 @@ where
             &source,
             &mount,
             &relative_path,
-            target_path,
+            target_path.clone(),
             state_root,
         )
+    }?;
+
+    refresh_macos_file_provider_projection_after_pull(
+        store,
+        state_root,
+        &target_path,
+        &report,
+        &refresh_bases,
+    )?;
+    Ok(report)
+}
+
+fn prepare_macos_file_provider_projection_pull<S>(
+    store: &mut S,
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    target_path: &Path,
+) -> Result<Vec<ProjectionRefreshBase>, PullError>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + afs_store::VirtualMutationRepository
+        + afs_store::FreshnessStateRepository,
+{
+    let Some(state_root) = state_root else {
+        return Ok(Vec::new());
+    };
+    if mount.projection != afs_store::ProjectionMode::MacosFileProvider {
+        return Ok(Vec::new());
     }
+
+    let refresh_bases =
+        file_provider::macos_file_provider_projection_refresh_bases(store, Some(target_path))
+            .map_err(PullError::Projection)?;
+    if !refresh_bases.is_empty() {
+        file_provider::reconcile_newer_macos_file_provider_projection(
+            store,
+            state_root,
+            Some(target_path),
+        )
+        .map_err(PullError::Projection)?;
+    }
+    Ok(refresh_bases)
+}
+
+fn refresh_macos_file_provider_projection_after_pull<S>(
+    store: &S,
+    state_root: Option<&Path>,
+    target_path: &Path,
+    report: &PullReport,
+    refresh_bases: &[ProjectionRefreshBase],
+) -> Result<(), PullError>
+where
+    S: MountRepository + EntityRepository,
+{
+    if report.hydrated == 0 && report.conflicts.is_empty() {
+        return Ok(());
+    }
+    let Some(state_root) = state_root else {
+        return Ok(());
+    };
+
+    file_provider::refresh_macos_file_provider_projection(
+        store,
+        state_root,
+        Some(target_path),
+        refresh_bases,
+    )
+    .map(|_| ())
+    .map_err(PullError::Projection)
 }
 
 fn pull_mount_root<S, Source>(
@@ -979,6 +1059,7 @@ pub enum PullError {
     Connector(afs_core::AfsError),
     CurrentDir(String),
     MountNotFound(PathBuf),
+    Projection(afs_core::AfsError),
     ReadFile { path: PathBuf, message: String },
     Store(StoreError),
     WriteFile { path: PathBuf, message: String },
@@ -991,6 +1072,7 @@ impl PullError {
             Self::Connector(_) => "connector_error",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountNotFound(_) => "mount_not_found",
+            Self::Projection(_) => "projection_refresh_failed",
             Self::ReadFile { .. } => "read_file_failed",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
             Self::Store(_) => "store_error",
@@ -1004,6 +1086,9 @@ impl PullError {
             Self::CurrentDir(message) => format!("failed to resolve current directory: {message}"),
             Self::MountNotFound(path) => {
                 format!("no AgentFS mount contains `{}`", path.display())
+            }
+            Self::Projection(error) => {
+                format!("macOS File Provider projection refresh failed: {error}")
             }
             Self::ReadFile { path, message } => {
                 format!("failed to read `{}`: {message}", path.display())

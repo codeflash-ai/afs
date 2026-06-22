@@ -19,6 +19,7 @@ use afs_core::freshness::{ChangeHintKind, RemoteObservation, SyncJob, SyncJobKin
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
+use afs_core::shadow::ShadowDocument;
 use afs_store::{
     AutoSaveRepository, AutoSaveState, EntityRecord, EntityRepository, FreshnessStateRecord,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
@@ -32,7 +33,7 @@ use serde_json::{Value, json};
 use crate::DaemonConfig;
 use crate::autosave::{auto_save_target_for_write, pause_auto_save_for_remote_change};
 use crate::execution::{DaemonEventReport, PushJob};
-use crate::file_provider::FileProviderReadReport;
+use crate::file_provider::{self, FileProviderReadReport};
 use crate::freshness::{
     FreshnessQueue, freshness_timestamp, record_file_opened, record_local_change,
 };
@@ -1472,8 +1473,20 @@ impl RuntimeState {
                 }
                 Err(error) => eprintln!("afsd scheduled pull failed: {error}"),
             },
-            JobCompletion::Hydration { request, result } => match result {
-                Ok(_) => self.delete_hydration_job(&request),
+            JobCompletion::Hydration {
+                request,
+                result,
+                previous_shadow,
+            } => match result {
+                Ok(outcome) => {
+                    self.delete_hydration_job(&request);
+                    if outcome == HydrationOutcome::Hydrated {
+                        self.refresh_visible_projection_after_remote_fast_forward(
+                            &request,
+                            previous_shadow.as_ref(),
+                        );
+                    }
+                }
                 Err(error) => {
                     eprintln!(
                         "afsd hydration failed for `{}`: {error}",
@@ -1846,6 +1859,41 @@ impl RuntimeState {
         }
     }
 
+    fn refresh_visible_projection_after_remote_fast_forward(
+        &self,
+        request: &HydrationRequest,
+        previous_shadow: Option<&ShadowDocument>,
+    ) {
+        if std::env::consts::OS != "macos" || request.reason != HydrationReason::RemoteFastForward {
+            return;
+        }
+        let Some(previous_shadow) = previous_shadow else {
+            return;
+        };
+
+        let store = match SqliteStateStore::open(self.config.state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "afsd failed to open state for macOS File Provider refresh after remote fast-forward: {error}"
+                );
+                return;
+            }
+        };
+        if let Err(error) = file_provider::refresh_macos_file_provider_entity_projection_if_clean(
+            &store,
+            &self.config.state_root,
+            &request.mount_id,
+            &request.remote_id,
+            previous_shadow,
+        ) {
+            eprintln!(
+                "afsd failed to refresh macOS File Provider replica after remote fast-forward for `{}`: {error}",
+                request.path.display()
+            );
+        }
+    }
+
     fn status(&self) -> DaemonRuntimeStatus {
         let freshness_metrics = self.freshness.metrics(Some(&freshness_timestamp()));
         let active_child_refresh = self
@@ -1906,6 +1954,20 @@ fn load_persisted_hydrations(state_root: &Path) -> HydrationQueue {
     }
 
     queue
+}
+
+fn remote_fast_forward_previous_shadow(
+    state_root: &Path,
+    request: &HydrationRequest,
+) -> Option<ShadowDocument> {
+    if std::env::consts::OS != "macos" || request.reason != HydrationReason::RemoteFastForward {
+        return None;
+    }
+
+    SqliteStateStore::open(state_root.to_path_buf())
+        .ok()?
+        .load_shadow(&request.mount_id, &request.remote_id)
+        .ok()
 }
 
 fn hydration_request_for_projection<S>(
@@ -2213,8 +2275,13 @@ fn run_job(
             JobCompletion::ScheduledPull(runner.run_scheduled_pull(state_root, tick, policy))
         }
         MutatingJob::Hydration { request } => {
+            let previous_shadow = remote_fast_forward_previous_shadow(&state_root, &request);
             let result = runner.run_hydration(state_root, request.clone());
-            JobCompletion::Hydration { request, result }
+            JobCompletion::Hydration {
+                request,
+                result,
+                previous_shadow,
+            }
         }
         MutatingJob::Freshness { job } => {
             JobCompletion::Freshness(runner.run_freshness_job(state_root, job))
@@ -2561,6 +2628,7 @@ enum JobCompletion {
     Hydration {
         request: HydrationRequest,
         result: afs_core::AfsResult<HydrationOutcome>,
+        previous_shadow: Option<ShadowDocument>,
     },
     FileEvent(afs_core::AfsResult<FileEventRuntimeReport>),
     Freshness(afs_core::AfsResult<FreshnessRuntimeReport>),
