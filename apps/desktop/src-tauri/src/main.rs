@@ -1655,8 +1655,7 @@ fn set_tray_icon_and_tooltip(app: &AppHandle, state: TrayVisualState, tooltip: &
             return;
         }
 
-        let is_template = matches!(state, TrayVisualState::Ready);
-        let _ = tray.set_icon_with_as_template(Some(tray_icon_image(state)), is_template);
+        let _ = tray.set_icon_with_as_template(Some(tray_icon_image(state)), false);
         let _ = tray.set_tooltip(Some(tooltip.to_string()));
     }
 }
@@ -1705,12 +1704,9 @@ fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
         ((15.1, 18.0), (20.9, 18.0)),
     ];
 
-    if matches!(state, TrayVisualState::Review | TrayVisualState::Reconnect) {
-        for (start, end) in paths {
-            draw_line(&mut rgba, size, start, end, 5.2, [255, 255, 255, 255]);
-        }
+    for (start, end) in paths {
+        draw_line(&mut rgba, size, start, end, 5.2, [255, 255, 255, 255]);
     }
-
     for (start, end) in paths {
         draw_line(&mut rgba, size, start, end, 3.4, [17, 24, 39, 255]);
     }
@@ -5352,6 +5348,17 @@ mod tests {
         assert_eq!(ready.height(), 36);
         assert_eq!(review.width(), 36);
         assert_eq!(reconnect.height(), 36);
+        assert!(
+            ready.rgba().chunks_exact(4).any(|pixel| {
+                pixel[0] > 240 && pixel[1] > 240 && pixel[2] > 240 && pixel[3] > 200
+            })
+        );
+        assert!(
+            ready
+                .rgba()
+                .chunks_exact(4)
+                .any(|pixel| { pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200 })
+        );
         assert!(review.rgba().chunks_exact(4).any(|pixel| {
             pixel[0] > 200 && pixel[1] > 100 && pixel[1] < 180 && pixel[2] < 80 && pixel[3] > 200
         }));
@@ -6525,7 +6532,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
-        .icon_as_template(true)
+        .icon_as_template(false)
         .tooltip("AFS")
         .menu(&menu)
         .show_menu_on_left_click(false)
