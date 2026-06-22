@@ -3416,11 +3416,23 @@ fn windows_cloud_files_state_args_for_platform() -> Vec<String> {
     if std::env::consts::OS == "windows" {
         vec![
             "--state-dir".to_string(),
-            default_state_root().display().to_string(),
+            absolute_command_path(&default_state_root())
+                .display()
+                .to_string(),
         ]
     } else {
         Vec::new()
     }
+}
+
+fn absolute_command_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn run_windows_cloud_files_helper(
@@ -4794,6 +4806,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::path::Path;
 
     use clap::Parser;
     use clap::error::ErrorKind;
@@ -4808,8 +4821,8 @@ mod tests {
 
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
-        auto_registration_for_mounted_projection, diff_report_exit_code, legacy_args_for_command,
-        notion_oauth_broker_config, projection_mode_for_target,
+        absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
+        legacy_args_for_command, notion_oauth_broker_config, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, should_prompt_for_push_confirmation,
         should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
@@ -5472,6 +5485,14 @@ mod tests {
             auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", true),
             None
         );
+    }
+
+    #[test]
+    fn command_paths_absolutize_relative_state_roots() {
+        let path = absolute_command_path(Path::new(".afs"));
+
+        assert!(path.is_absolute());
+        assert!(path.ends_with(".afs"));
     }
 
     #[test]

@@ -669,7 +669,7 @@ fn windows_cloud_files_lifecycle_message(
 fn windows_cloud_files_registration_status(state_root: &Path, mount_id: &str) -> Option<bool> {
     let report = run_windows_cloud_files_helper(
         "list",
-        vec!["--state-dir".to_string(), state_root.display().to_string()],
+        vec!["--state-dir".to_string(), helper_path_arg(state_root)],
     )
     .ok()?;
     let roots = report
