@@ -638,8 +638,8 @@ mod tests {
     };
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use serde_json::Value;
-    use std::io::Write;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -686,6 +686,7 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         accepted += 1;
+                        read_http_request_headers(&mut stream);
                         if accepted == 1 {
                             thread::sleep(Duration::from_millis(250));
                             continue;
@@ -731,6 +732,28 @@ mod tests {
             result.expect("retry timeout request").get("ok"),
             Some(&Value::Bool(true))
         );
+    }
+
+    fn read_http_request_headers(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set request read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).expect("read request headers");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            assert!(
+                request.len() <= 8192,
+                "request headers exceeded test server limit"
+            );
+        }
     }
 }
 
