@@ -627,12 +627,12 @@ fn refresh_projection_candidate_if_clean(
         return Ok(ProjectionRefreshOutcome::Unchanged);
     }
 
-    if projection_is_not_newer_than_cache(&projection_path, &content_path) == Some(true) {
-        write_binary_atomic(&projection_path, &cache_contents).map_err(AfsError::from)?;
-        return Ok(ProjectionRefreshOutcome::Refreshed);
-    }
+    let can_refresh_stale_replica = previous_shadow.is_none()
+        && projection_is_not_newer_than_cache(&projection_path, &content_path) == Some(true);
 
-    if !projection_contents_are_replaceable(&projection_contents, previous_shadow) {
+    if !can_refresh_stale_replica
+        && !projection_contents_are_replaceable(&projection_contents, previous_shadow)
+    {
         return Ok(ProjectionRefreshOutcome::SkippedLocalChanges);
     }
 
@@ -1276,6 +1276,33 @@ mod tests {
         fixture.write_cache("Pulled remote body.\n");
         std::thread::sleep(Duration::from_millis(5));
         fixture.write_projection_without_identity("Local visible edit.\n");
+
+        let store = fixture.store();
+        let report = refresh_macos_file_provider_entity_projection_if_clean(
+            &store,
+            &fixture.state_root,
+            &fixture.mount_id,
+            &fixture.remote_id,
+            &previous_shadow,
+        )
+        .expect("refresh projection");
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refreshed, 0);
+        assert_eq!(report.skipped_local_changes, 1);
+        let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
+        assert!(visible.contains("Local visible edit."));
+        assert!(!visible.contains("Pulled remote body."));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refresh_macos_entity_projection_if_clean_skips_older_visible_local_changes() {
+        let fixture = ProjectionFixture::new("refresh-entity-older-local-change");
+        let previous_shadow = fixture.previous_shadow();
+        fixture.write_projection_without_identity("Local visible edit.\n");
+        std::thread::sleep(Duration::from_millis(5));
+        fixture.write_cache("Pulled remote body.\n");
 
         let store = fixture.store();
         let report = refresh_macos_file_provider_entity_projection_if_clean(

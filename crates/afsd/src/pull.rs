@@ -21,7 +21,6 @@ use afs_store::{
 use serde::{Deserialize, Serialize};
 
 use crate::file_provider;
-use crate::file_provider::ProjectionRefreshBase;
 use crate::hydration::{HydratedAsset, HydratedEntity};
 use crate::media::update_hydrated_media_manifest;
 use crate::shadow_match::{parsed_matches_shadow, shadows_match};
@@ -87,8 +86,7 @@ where
     let mount = mount.clone();
     let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
-    let refresh_bases =
-        prepare_macos_file_provider_projection_pull(store, state_root, &mount, &target_path)?;
+    prepare_macos_file_provider_projection_pull(store, state_root, &mount, &target_path)?;
 
     let report = if should_pull_mount_root(&mount, &relative_path, &target_path) {
         pull_mount_root(store, &source, &mount, target_path.clone(), state_root)
@@ -112,13 +110,7 @@ where
         )
     }?;
 
-    refresh_macos_file_provider_projection_after_pull(
-        store,
-        state_root,
-        &target_path,
-        &report,
-        &refresh_bases,
-    )?;
+    refresh_macos_file_provider_projection_after_pull(store, state_root, &target_path, &report)?;
     Ok(report)
 }
 
@@ -127,7 +119,7 @@ fn prepare_macos_file_provider_projection_pull<S>(
     state_root: Option<&Path>,
     mount: &MountConfig,
     target_path: &Path,
-) -> Result<Vec<ProjectionRefreshBase>, PullError>
+) -> Result<(), PullError>
 where
     S: MountRepository
         + EntityRepository
@@ -136,10 +128,10 @@ where
         + afs_store::FreshnessStateRepository,
 {
     let Some(state_root) = state_root else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     if mount.projection != afs_store::ProjectionMode::MacosFileProvider {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let refresh_bases =
@@ -153,7 +145,7 @@ where
         )
         .map_err(PullError::Projection)?;
     }
-    Ok(refresh_bases)
+    Ok(())
 }
 
 fn refresh_macos_file_provider_projection_after_pull<S>(
@@ -161,7 +153,6 @@ fn refresh_macos_file_provider_projection_after_pull<S>(
     state_root: Option<&Path>,
     target_path: &Path,
     report: &PullReport,
-    refresh_bases: &[ProjectionRefreshBase],
 ) -> Result<(), PullError>
 where
     S: MountRepository + EntityRepository,
@@ -173,14 +164,9 @@ where
         return Ok(());
     };
 
-    file_provider::refresh_macos_file_provider_projection(
-        store,
-        state_root,
-        Some(target_path),
-        refresh_bases,
-    )
-    .map(|_| ())
-    .map_err(PullError::Projection)
+    file_provider::refresh_macos_file_provider_projection(store, state_root, Some(target_path), &[])
+        .map(|_| ())
+        .map_err(PullError::Projection)
 }
 
 fn pull_mount_root<S, Source>(
