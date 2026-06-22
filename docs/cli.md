@@ -239,10 +239,11 @@ misses: normal writes should still arrive through `modifyItem`, but targeted
 review and push commands should not ignore a newer visible `page.md` replica.
 After a targeted `afs pull <page.md>` updates the daemon content cache, the CLI
 also repairs an already-materialized visible CloudStorage replica for that file
-so the path the user pulled reads back the accepted remote render. Background
-remote-fast-forward hydration applies the same repair for already-materialized
-macOS replicas when the visible file still matches the previous synced shadow;
-if the visible file has diverged, AFS leaves it untouched for review.
+when the visible file still matches the synced shadow captured before the pull.
+If the visible file has diverged, AFS leaves it untouched for review instead of
+overwriting a possible File Provider callback miss. Background
+remote-fast-forward hydration applies the same clean-shadow guard for
+already-materialized macOS replicas.
 
 `afs file-provider register <mount-id-or-path>` validates the mount against the
 current platform's virtual projection: `macos_file_provider` on macOS,

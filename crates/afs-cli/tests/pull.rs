@@ -238,7 +238,7 @@ fn pull_macos_file_provider_reconciles_missed_visible_edit_before_refresh() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn pull_macos_file_provider_repairs_stale_visible_replica_without_dirtying_cache() {
+fn pull_macos_file_provider_preserves_older_visible_replica_after_cache_fast_forward() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("afs-cli-pull-macos-stale-visible-state");
     let mount_root = fixture.root.join("notion");
@@ -286,10 +286,78 @@ fn pull_macos_file_provider_repairs_stale_visible_replica_without_dirtying_cache
     assert_eq!(report.hydrated, 1);
     assert_eq!(report.skipped_dirty, 0);
     let visible = fs::read_to_string(&visible_path).expect("read visible replica");
-    assert!(visible.contains("Remote body."));
-    assert!(!visible.contains("Root body."));
+    assert!(visible.contains("Root body."));
+    assert!(!visible.contains("Remote body."));
     let cached = fs::read_to_string(&content_path).expect("read daemon cache");
     assert!(cached.contains("Remote body."));
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get root entity")
+        .expect("root entity");
+    assert_eq!(entity.hydration, HydrationState::Hydrated);
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pull_macos_file_provider_preserves_older_visible_edit_after_cache_fast_forward() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-macos-older-visible-edit-state");
+    let mount_root = fixture.root.join("notion");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_root)
+                .with_remote_root_id(fixture.root_page_id.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save macos file provider mount");
+    run_pull_with_state_root(
+        &mut store,
+        &fixture.connector("Roadmap"),
+        &mount_root,
+        Some(&state_root),
+    )
+    .expect("initial pull");
+
+    let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
+        .join("roadmap")
+        .join("page.md");
+    let visible_path = mount_root.join("roadmap").join("page.md");
+    fs::create_dir_all(visible_path.parent().expect("visible parent"))
+        .expect("create visible parent");
+    fs::write(
+        &visible_path,
+        "---\nafs:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal visible edit.\n",
+    )
+    .expect("missed visible edit");
+    std::thread::sleep(Duration::from_millis(20));
+    seed_remote_fast_forward_cache(
+        &mut store,
+        &content_path,
+        &fixture.mount_id,
+        &fixture.canonical_root_page_id,
+        "Remote body.",
+    );
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z"),
+        &visible_path,
+        Some(&state_root),
+    )
+    .expect("pull visible file");
+
+    assert!(report.ok);
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.skipped_dirty, 0);
+    let visible = fs::read_to_string(&visible_path).expect("read visible replica");
+    assert!(visible.contains("Local visible edit."));
+    assert!(!visible.contains("Remote body."));
+    let cached = fs::read_to_string(&content_path).expect("read daemon cache");
+    assert!(cached.contains("Remote body."));
+    assert!(!cached.contains("Local visible edit."));
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
         .expect("get root entity")
