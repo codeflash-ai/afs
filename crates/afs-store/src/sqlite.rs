@@ -2603,7 +2603,7 @@ fn entity_search_match_query(query: &str) -> Option<String> {
         .collect::<String>();
     let tokens = normalized
         .split_whitespace()
-        .filter(|token| token.len() >= 2)
+        .filter(|token| search_token_allowed(token))
         .take(16)
         .map(|token| format!("{token}*"))
         .collect::<Vec<_>>();
@@ -2613,6 +2613,10 @@ fn entity_search_match_query(query: &str) -> Option<String> {
     }
 
     Some(tokens.join(" AND "))
+}
+
+fn search_token_allowed(token: &str) -> bool {
+    token.len() >= 2 || token.chars().any(|character| character.is_ascii_digit())
 }
 
 fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {

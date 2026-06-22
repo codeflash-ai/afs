@@ -473,6 +473,22 @@ fn entity_search_candidates_use_sqlite_index() {
     assert!(title_matches[0].observation.is_none());
 
     store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-2"),
+            EntityKind::Page,
+            "1:1 Notes",
+            "Meetings/1-1 Notes/page.md",
+        ))
+        .expect("save numbered entity");
+    let numeric_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "1", None)
+        .expect("search numeric title")
+        .expect("sqlite search");
+    assert_eq!(numeric_matches.len(), 1);
+    assert_eq!(numeric_matches[0].entity.remote_id, RemoteId::new("page-2"));
+
+    store
         .save_remote_observation(RemoteObservationRecord::new(
             fixture.mount_id.clone(),
             RemoteId::new("page-1"),
