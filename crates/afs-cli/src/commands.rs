@@ -1689,17 +1689,11 @@ fn pull(args: &[String], json: bool) -> i32 {
     });
     let fallback_reason = match daemon_report {
         DaemonReport::Report(report) if json => {
-            if let Err(error) = refresh_visible_projection_after_pull(&state_root, &report) {
-                return command_error(json, error, EXIT_INTERNAL);
-            }
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
             return exit_code;
         }
         DaemonReport::Report(report) => {
-            if let Err(error) = refresh_visible_projection_after_pull(&state_root, &report) {
-                return command_error(json, error, EXIT_INTERNAL);
-            }
             let exit_code = pull_report_exit_code(&report);
             print_pull_report(&report);
             return exit_code;
@@ -1748,59 +1742,17 @@ fn pull(args: &[String], json: bool) -> i32 {
         )
     }) {
         Ok(report) if json => {
-            if let Err(error) = refresh_visible_projection_after_pull(&state_root, &report) {
-                return command_error(json, error, EXIT_INTERNAL);
-            }
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
             exit_code
         }
         Ok(report) => {
-            if let Err(error) = refresh_visible_projection_after_pull(&state_root, &report) {
-                return command_error(json, error, EXIT_INTERNAL);
-            }
             let exit_code = pull_report_exit_code(&report);
             print_pull_report(&report);
             exit_code
         }
         Err(error) => pull_command_error(json, error),
     }
-}
-
-fn refresh_visible_projection_after_pull(
-    state_root: &Path,
-    report: &PullReport,
-) -> Result<(), CommandError> {
-    if std::env::consts::OS != "macos" || report.hydrated == 0 {
-        return Ok(());
-    }
-
-    let store = SqliteStateStore::open(state_root.to_path_buf()).map_err(|error| {
-        CommandError::new(
-            "pull",
-            "projection_refresh_failed",
-            format!(
-                "pull updated daemon content but could not open state to refresh the visible File Provider replica: {error}"
-            ),
-        )
-    })?;
-    let target = PathBuf::from(&report.target);
-    daemon_file_provider::refresh_macos_file_provider_projection(
-        &store,
-        state_root,
-        Some(&target),
-    )
-    .map(|_| ())
-    .map_err(|error| {
-        CommandError::new(
-            "pull",
-            "projection_refresh_failed",
-            format!(
-                "pull updated daemon content but could not refresh the visible File Provider replica for `{}`: {error}",
-                target.display()
-            ),
-        )
-    })
 }
 
 fn status(args: &[String], json: bool) -> i32 {
@@ -4362,7 +4314,10 @@ fn pull_command_error(json: bool, error: PullError) -> i32 {
         PullError::MountNotFound(_)
         | PullError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
         PullError::ReadFile { .. } | PullError::WriteFile { .. } => EXIT_INTERNAL,
-        PullError::Store(_) | PullError::Connector(_) | PullError::CurrentDir(_) => EXIT_INTERNAL,
+        PullError::Store(_)
+        | PullError::Connector(_)
+        | PullError::CurrentDir(_)
+        | PullError::Projection(_) => EXIT_INTERNAL,
     };
     command_error(
         json,

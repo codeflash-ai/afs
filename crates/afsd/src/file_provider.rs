@@ -10,10 +10,11 @@ use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository, VirtualMutationRepository,
+    ProjectionMode, ShadowRepository, StoreError, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::hydration::HydrationSource;
@@ -147,6 +148,13 @@ pub struct ProjectionRefreshReport {
     pub skipped_local_changes: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionRefreshBase {
+    pub mount_id: MountId,
+    pub remote_id: RemoteId,
+    pub previous_shadow: ShadowDocument,
+}
+
 /// Imports macOS File Provider replica edits that did not arrive through
 /// `modifyItem`.
 ///
@@ -218,6 +226,7 @@ pub fn refresh_macos_file_provider_projection<S>(
     store: &S,
     state_root: &Path,
     target: Option<&Path>,
+    refresh_bases: &[ProjectionRefreshBase],
 ) -> AfsResult<ProjectionRefreshReport>
 where
     S: MountRepository + EntityRepository,
@@ -247,7 +256,12 @@ where
                 continue;
             };
 
-            match refresh_projection_candidate(&entity, &content_root, candidate)? {
+            match refresh_projection_candidate_if_clean(
+                &entity,
+                &content_root,
+                candidate,
+                refresh_base_for_entity(refresh_bases, &mount.mount_id, &entity.remote_id),
+            )? {
                 ProjectionRefreshOutcome::MissingCache => {
                     report.checked += 1;
                     report.skipped_missing_cache += 1;
@@ -273,6 +287,50 @@ where
     }
 
     Ok(report)
+}
+
+pub fn macos_file_provider_projection_refresh_bases<S>(
+    store: &S,
+    target: Option<&Path>,
+) -> AfsResult<Vec<ProjectionRefreshBase>>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    let Some(target) = target.map(absolute_reconcile_path).transpose()? else {
+        return Ok(Vec::new());
+    };
+    let mounts = store.load_mounts().map_err(AfsError::from)?;
+    let mut bases = Vec::new();
+
+    for mount in mounts {
+        if mount.projection != ProjectionMode::MacosFileProvider {
+            continue;
+        }
+
+        let Some(target_match) = match_mount_path(&mount, &target) else {
+            continue;
+        };
+
+        let entities = scoped_page_entities(store, &mount, Some(&target_match))?;
+        for entity in entities {
+            if refresh_candidate_path(&mount, &entity, Some(&target), Some(&target_match)).is_none()
+            {
+                continue;
+            }
+
+            match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+                Ok(previous_shadow) => bases.push(ProjectionRefreshBase {
+                    mount_id: mount.mount_id.clone(),
+                    remote_id: entity.remote_id,
+                    previous_shadow,
+                }),
+                Err(StoreError::ShadowMissing { .. }) => {}
+                Err(error) => return Err(AfsError::from(error)),
+            }
+        }
+    }
+
+    Ok(bases)
 }
 
 /// Repairs already-materialized macOS File Provider replicas after a background
@@ -322,7 +380,7 @@ where
             &entity,
             &content_root,
             candidate,
-            previous_shadow,
+            Some(previous_shadow),
         )? {
             ProjectionRefreshOutcome::MissingCache => {
                 report.checked += 1;
@@ -511,29 +569,11 @@ enum ProjectionRefreshOutcome {
     Refreshed,
 }
 
-fn refresh_projection_candidate(
-    entity: &EntityRecord,
-    content_root: &Path,
-    projection_path: PathBuf,
-) -> AfsResult<ProjectionRefreshOutcome> {
-    let content_path = content_cache_path(content_root, &entity.path)?;
-    let Ok(cache_contents) = std::fs::read(&content_path) else {
-        return Ok(ProjectionRefreshOutcome::MissingCache);
-    };
-
-    if std::fs::read(&projection_path).is_ok_and(|existing| existing == cache_contents) {
-        return Ok(ProjectionRefreshOutcome::Unchanged);
-    }
-
-    write_binary_atomic(&projection_path, &cache_contents).map_err(AfsError::from)?;
-    Ok(ProjectionRefreshOutcome::Refreshed)
-}
-
 fn refresh_projection_candidate_if_clean(
     entity: &EntityRecord,
     content_root: &Path,
     projection_path: PathBuf,
-    previous_shadow: &ShadowDocument,
+    previous_shadow: Option<&ShadowDocument>,
 ) -> AfsResult<ProjectionRefreshOutcome> {
     let content_path = content_cache_path(content_root, &entity.path)?;
     let Ok(cache_contents) = std::fs::read(&content_path) else {
@@ -547,12 +587,35 @@ fn refresh_projection_candidate_if_clean(
         return Ok(ProjectionRefreshOutcome::Unchanged);
     }
 
-    if !projection_contents_match_shadow(&projection_contents, previous_shadow) {
+    if !projection_contents_are_replaceable(&projection_contents, previous_shadow) {
         return Ok(ProjectionRefreshOutcome::SkippedLocalChanges);
     }
 
     write_binary_atomic(&projection_path, &cache_contents).map_err(AfsError::from)?;
     Ok(ProjectionRefreshOutcome::Refreshed)
+}
+
+fn refresh_base_for_entity<'a>(
+    refresh_bases: &'a [ProjectionRefreshBase],
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> Option<&'a ShadowDocument> {
+    refresh_bases
+        .iter()
+        .find(|base| &base.mount_id == mount_id && &base.remote_id == remote_id)
+        .map(|base| &base.previous_shadow)
+}
+
+fn projection_contents_are_replaceable(
+    contents: &[u8],
+    previous_shadow: Option<&ShadowDocument>,
+) -> bool {
+    if let Some(previous_shadow) = previous_shadow {
+        return projection_contents_match_shadow(contents, previous_shadow);
+    }
+
+    std::str::from_utf8(contents)
+        .is_ok_and(|contents| contents.contains(CanonicalDocument::STUB_MARKER))
 }
 
 fn projection_contents_match_shadow(contents: &[u8], shadow: &ShadowDocument) -> bool {
@@ -712,10 +775,21 @@ fn write_binary_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("afs-file-provider-refresh");
-    let temp_path = path.with_file_name(format!(".{file_name}.afs-tmp"));
+    let temp_path = file_provider_atomic_temp_path(path, file_name);
     std::fs::write(&temp_path, contents)?;
-    std::fs::rename(temp_path, path)?;
+    std::fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp_path);
+    })?;
     Ok(())
+}
+
+fn file_provider_atomic_temp_path(path: &Path, file_name: &str) -> PathBuf {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        "{file_name}.tmp.afs-refresh-{}-{suffix}",
+        std::process::id()
+    ))
 }
 
 fn absolute_reconcile_path(path: &Path) -> AfsResult<PathBuf> {
@@ -894,6 +968,18 @@ mod tests {
     }
 
     #[test]
+    fn refresh_atomic_temp_name_is_supported_by_file_provider_writes() {
+        let temp_path = file_provider_atomic_temp_path(Path::new("/tmp/page.md"), "page.md");
+        let file_name = temp_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp filename");
+
+        assert!(file_name.starts_with("page.md.tmp."));
+        assert!(!file_name.starts_with('.'));
+    }
+
+    #[test]
     fn plain_mount_keeps_source_named_directory_in_relative_path() {
         let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS");
 
@@ -1036,14 +1122,16 @@ mod tests {
     #[test]
     fn refresh_macos_projection_copies_cache_to_visible_replica() {
         let fixture = ProjectionFixture::new("refresh-visible");
+        let refresh_bases = fixture.refresh_bases();
+        fixture.write_projection_from_shadow(&refresh_bases[0].previous_shadow);
         fixture.write_cache("Pulled remote body.\n");
-        fixture.write_projection_without_identity("Stale visible body.\n");
 
         let store = fixture.store();
         let report = refresh_macos_file_provider_projection(
             &store,
             &fixture.state_root,
             Some(&fixture.projection_path()),
+            &refresh_bases,
         )
         .expect("refresh projection");
 
@@ -1052,7 +1140,7 @@ mod tests {
         assert_eq!(report.skipped_unchanged, 0);
         let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
         assert!(visible.contains("Pulled remote body."));
-        assert!(!visible.contains("Stale visible body."));
+        assert!(!visible.contains("Original body."));
         assert!(visible.contains("afs:"));
     }
 
@@ -1068,12 +1156,38 @@ mod tests {
             &store,
             &fixture.state_root,
             Some(&fixture.projection_path()),
+            &fixture.refresh_bases(),
         )
         .expect("refresh projection");
 
         assert_eq!(report.checked, 1);
         assert_eq!(report.refreshed, 0);
         assert_eq!(report.skipped_unchanged, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refresh_macos_projection_skips_visible_local_changes() {
+        let fixture = ProjectionFixture::new("refresh-visible-local-change");
+        let refresh_bases = fixture.refresh_bases();
+        fixture.write_projection_without_identity("Local visible edit.\n");
+        fixture.write_cache("Pulled remote body.\n");
+
+        let store = fixture.store();
+        let report = refresh_macos_file_provider_projection(
+            &store,
+            &fixture.state_root,
+            Some(&fixture.projection_path()),
+            &refresh_bases,
+        )
+        .expect("refresh projection");
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refreshed, 0);
+        assert_eq!(report.skipped_local_changes, 1);
+        let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
+        assert!(visible.contains("Local visible edit."));
+        assert!(!visible.contains("Pulled remote body."));
     }
 
     #[cfg(target_os = "macos")]
@@ -1242,6 +1356,14 @@ mod tests {
             self.store()
                 .load_shadow(&self.mount_id, &self.remote_id)
                 .expect("load shadow")
+        }
+
+        fn refresh_bases(&self) -> Vec<ProjectionRefreshBase> {
+            vec![ProjectionRefreshBase {
+                mount_id: self.mount_id.clone(),
+                remote_id: self.remote_id.clone(),
+                previous_shadow: self.previous_shadow(),
+            }]
         }
     }
 
