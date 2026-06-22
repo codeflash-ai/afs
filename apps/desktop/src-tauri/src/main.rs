@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::env;
 use std::fs;
 use std::io;
 #[cfg(windows)]
@@ -870,6 +871,24 @@ async fn open_path(path: String) -> ActionReport {
         Ok(expanded) => ActionReport {
             ok: true,
             message: format!("Opened {}", expanded.display()),
+        },
+        Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+async fn open_in_vs_code(path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        open_path_in_vs_code(&expanded).map(|()| expanded)
+    })
+    .await
+    .map_err(|error| format!("VS Code worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(expanded) => ActionReport {
+            ok: true,
+            message: format!("Opened {} in VS Code", expanded.display()),
         },
         Err(message) => ActionReport { ok: false, message },
     }
@@ -3010,6 +3029,89 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
 
     command.spawn().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn open_path_in_vs_code(path: &Path) -> Result<(), String> {
+    let command = resolve_vs_code_command().ok_or_else(|| {
+        "Could not find VS Code. Install Visual Studio Code and enable the `code` command from the Command Palette: Shell Command: Install 'code' command in PATH.".to_string()
+    })?;
+    Command::new(&command)
+        .arg("--new-window")
+        .arg(path)
+        .spawn()
+        .map_err(|error| format!("Could not open VS Code: {error}"))?;
+    Ok(())
+}
+
+fn resolve_vs_code_command() -> Option<PathBuf> {
+    if let Some(command) = find_command_on_path("code") {
+        return Some(command);
+    }
+
+    vs_code_command_candidates()
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+fn vs_code_command_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from(
+            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+        ));
+        if let Some(home) = platform_user_home() {
+            candidates.push(
+                home.join("Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
+            );
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/code"));
+        candidates.push(PathBuf::from("/usr/local/bin/code"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            candidates.push(
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("Microsoft VS Code")
+                    .join("Code.exe"),
+            );
+        }
+    }
+
+    candidates
+}
+
+fn find_command_on_path(name: &str) -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    env::split_paths(&paths).find_map(|directory| {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let pathext = env::var_os("PATHEXT")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+            for extension in pathext.split(';') {
+                let extension = extension.trim();
+                if extension.is_empty() {
+                    continue;
+                }
+                let candidate = directory.join(format!("{name}{extension}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
+    })
 }
 
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
@@ -6527,6 +6629,7 @@ fn main() {
             save_notion_file,
             set_auto_save_for_file,
             open_path,
+            open_in_vs_code,
             reveal_path,
             show_main_window,
             set_desktop_setting,

@@ -6,10 +6,11 @@ import {
   AlertTriangle,
   Bot,
   Check,
-  ChevronUp,
   ChevronRight,
+  ChevronUp,
   Clipboard,
   Clock3,
+  Code2,
   Copy,
   Download,
   EyeOff,
@@ -1550,6 +1551,18 @@ function MountDetailView({
     }
   }
 
+  async function openVsCode() {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "open_in_vs_code",
+      { path: snapshot.mount.localPath },
+      { ok: true, message: "Opened demo folder in VS Code." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+    }
+  }
+
   async function changeNotionAccess() {
     if (accessState === "changing") {
       return;
@@ -1602,6 +1615,9 @@ function MountDetailView({
           </PrimaryButton>
           <SecondaryButton compact icon={<Copy />} onClick={() => copyText(snapshot.mount.localPath)}>
             Copy Path
+          </SecondaryButton>
+          <SecondaryButton compact icon={<Code2 />} onClick={() => void openVsCode()}>
+            Open in VS Code
           </SecondaryButton>
           <SecondaryButton
             compact
