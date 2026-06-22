@@ -79,16 +79,7 @@ pub fn render_page_bundle_with_options(
     let mut rendered_blocks = Vec::new();
     render_block_trees(&bundle.blocks, options, &mut rendered_blocks);
 
-    let body = rendered_blocks
-        .iter()
-        .map(|block| block.markdown.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let body = if body.is_empty() {
-        String::new()
-    } else {
-        format!("{body}\n")
-    };
+    let body = render_block_markdown_body(&rendered_blocks);
     let shadow_ids = rendered_blocks
         .iter()
         .filter_map(|block| block.shadow_id.clone())
@@ -113,6 +104,35 @@ pub fn render_page_bundle_with_options(
             .filter_map(|block| block.media_asset)
             .collect(),
     })
+}
+
+fn render_block_markdown_body(rendered_blocks: &[RenderedBlock]) -> String {
+    let mut body = String::new();
+    let mut pending_empty_blocks = 0;
+
+    for block in rendered_blocks {
+        if block.markdown.is_empty() {
+            pending_empty_blocks += 1;
+            continue;
+        }
+
+        if !body.is_empty() {
+            let separator_newlines = if pending_empty_blocks == 0 {
+                2
+            } else {
+                pending_empty_blocks + 1
+            };
+            body.push_str(&"\n".repeat(separator_newlines));
+        }
+        body.push_str(&block.markdown);
+        pending_empty_blocks = 0;
+    }
+
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("{body}\n")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

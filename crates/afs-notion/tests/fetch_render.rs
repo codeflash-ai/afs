@@ -87,7 +87,7 @@ fn render_empty_paragraph_as_blank_line_without_shadow_marker() {
 
     assert_eq!(
         rendered.document.body,
-        "First paragraph.\n\n\n\nSecond paragraph.\n"
+        "First paragraph.\n\nSecond paragraph.\n"
     );
     assert!(!rendered.document.body.contains("empty_paragraph"));
     assert_eq!(
@@ -98,6 +98,47 @@ fn render_empty_paragraph_as_blank_line_without_shadow_marker() {
             .map(|block| block.remote_id.as_str())
             .collect::<Vec<_>>(),
         vec!["paragraph-1", "paragraph-2"]
+    );
+}
+
+#[test]
+fn render_consecutive_empty_paragraphs_as_one_blank_line_each() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![
+            BlockTreeDto {
+                block: paragraph_block("paragraph-1", vec![rich_text("Before.")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("empty-paragraph-1", Vec::new()),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("empty-paragraph-2", Vec::new()),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: code_block("code-1", "python", "def hello():\n    print(\"hi\")"),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "Before.\n\n\n```python\ndef hello():\n    print(\"hi\")\n```\n"
+    );
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["paragraph-1", "code-1"]
     );
 }
 
