@@ -165,7 +165,7 @@ fn refresh_macos_file_provider_projection_after_pull<S>(
 where
     S: MountRepository + EntityRepository,
 {
-    if report.hydrated == 0 {
+    if report.hydrated == 0 && report.conflicts.is_empty() {
         return Ok(());
     }
     let Some(state_root) = state_root else {
