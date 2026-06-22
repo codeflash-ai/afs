@@ -1,5 +1,9 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::fs;
 use std::io;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -7,10 +11,16 @@ use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
 use afs_cli::diff::{DiffReport, run_diff};
+#[cfg(target_os = "windows")]
+use afs_cli::file_provider::{
+    WindowsCloudFilesLifecycleAction, open_windows_cloud_files_sync_root,
+    register_windows_cloud_files_sync_root, run_windows_cloud_files_lifecycle,
+};
 #[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
     macos_file_provider_display_name, macos_file_provider_domain_url,
@@ -34,6 +44,10 @@ use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
+};
+use afs_platform::{
+    bundled_binary_next_to_current_exe, default_state_root as platform_default_state_root,
+    user_home as platform_user_home,
 };
 use afs_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -68,8 +82,22 @@ use agent_guidance::{
     AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,
 };
 
+#[cfg(any(not(windows), test))]
 const TERMINAL_CLI_PATH_MANAGED_START: &str = "# >>> AFS_TERMINAL_CLI_PATH >>>";
+#[cfg(any(not(windows), test))]
 const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< AFS_TERMINAL_CLI_PATH <<<";
+#[cfg(windows)]
+const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "AFS_TERMINAL_CLI_SHIM";
+#[cfg(windows)]
+const WINDOWS_RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const WINDOWS_RUN_VALUE_NAME: &str = "AFS";
+#[cfg(windows)]
+const WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX: &str = r"Local\CodeFlash.AFS.Desktop.SingleInstance";
+#[cfg(windows)]
+const WINDOWS_DESKTOP_ACTIVATION_EVENT: &str = r"Local\CodeFlash.AFS.Desktop.Activate";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +137,18 @@ struct MountSummary {
     projection: String,
     read_only: bool,
     status: String,
+    provider: Option<ProviderRuntimeSummary>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderRuntimeSummary {
+    state: String,
+    message: String,
+    daemon_running: bool,
+    registered: Option<bool>,
+    pid: Option<u32>,
+    stale_pid_file: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -250,12 +290,25 @@ struct AutoSaveFileChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
+static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
+    Mutex<WindowsCloudFilesProviderSupervisor>,
+> = OnceLock::new();
 const DESKTOP_INSTALL_MARKER_VERSION: u32 = 2;
 const DESKTOP_ACTIVITY_LIMIT: usize = 20;
+const SURFACE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const TRAY_POPOVER_WIDTH: f64 = 360.0;
 const TRAY_POPOVER_HEIGHT: f64 = 520.0;
 const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
 const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
+
+#[derive(Default)]
+struct SurfaceRefreshState {
+    last_requested: Option<Instant>,
+    scheduled: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TrayVisualState {
@@ -272,6 +325,47 @@ struct TrayRenderState {
 
 static LAST_TRAY_RENDER: OnceLock<Mutex<Option<TrayRenderState>>> = OnceLock::new();
 
+struct DesktopSingleInstanceGuard {
+    #[cfg(windows)]
+    mutex_handle: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(windows)]
+    activation_event_handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl DesktopSingleInstanceGuard {
+    fn activation_event_handle(&self) -> Option<usize> {
+        #[cfg(windows)]
+        {
+            if self.activation_event_handle.is_null() {
+                None
+            } else {
+                Some(self.activation_event_handle as usize)
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DesktopSingleInstanceGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        unsafe {
+            if !self.activation_event_handle.is_null() {
+                let _ = CloseHandle(self.activation_event_handle);
+            }
+            if !self.mutex_handle.is_null() {
+                let _ = CloseHandle(self.mutex_handle);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScreenBounds {
     left: f64,
@@ -281,8 +375,12 @@ struct ScreenBounds {
 }
 
 #[tauri::command]
-fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
-    let snapshot = load_desktop_snapshot().unwrap_or_else(|_| sample_snapshot());
+async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
+    let snapshot = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(sample_snapshot);
     refresh_tray_icon_for_snapshot(&app, &snapshot);
     snapshot
 }
@@ -379,13 +477,21 @@ fn notion_login_link() -> Option<String> {
 }
 
 #[tauri::command]
-fn install_state_review() -> InstallStateReview {
-    inspect_install_state(&default_state_root())
+async fn install_state_review() -> InstallStateReview {
+    tauri::async_runtime::spawn_blocking(|| inspect_install_state(&default_state_root()))
+        .await
+        .unwrap_or_else(|_| inspect_install_state(&default_state_root()))
 }
 
 #[tauri::command]
-fn acknowledge_install_state() -> ActionReport {
-    match record_current_install_marker(&default_state_root()) {
+async fn acknowledge_install_state() -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(|| {
+        record_current_install_marker(&default_state_root())
+    })
+    .await
+    .map_err(|error| format!("Install marker worker failed: {error}"))
+    .and_then(|result| result)
+    {
         Ok(()) => ActionReport {
             ok: true,
             message: "AFS install state recorded.".to_string(),
@@ -395,10 +501,15 @@ fn acknowledge_install_state() -> ActionReport {
 }
 
 #[tauri::command]
-fn reset_local_afs_state(app: AppHandle) -> ActionReport {
-    let state_root = default_state_root();
-    match reset_local_afs_state_at(&state_root)
-        .and_then(|_| record_current_install_marker(&state_root))
+async fn reset_local_afs_state(app: AppHandle) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(|| {
+        let state_root = default_state_root();
+        reset_local_afs_state_at(&state_root)
+            .and_then(|_| record_current_install_marker(&state_root))
+    })
+    .await
+    .map_err(|error| format!("Reset worker failed: {error}"))
+    .and_then(|result| result)
     {
         Ok(()) => {
             refresh_desktop_surfaces(&app);
@@ -421,20 +532,28 @@ async fn choose_mount_folder(
         .map(|path| {
             let root = normalize_desktop_mount_root(&path)?;
             validate_desktop_mount_root(&root, &default_state_root(), &desktop_projection_mode())?;
-            Ok(display_path(&root))
+            Ok(absolute_display_path(&root))
         })
         .transpose()
 }
 
 #[tauri::command]
-fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
-    let state_root = default_state_root();
-    match ensure_daemon_running(&state_root).and_then(|_| reload_daemon_mounts(&state_root)) {
+async fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(|| {
+        let state_root = default_state_root();
+        ensure_daemon_running(&state_root)
+            .and_then(|_| reload_daemon_mounts(&state_root))
+            .and_then(|_| ensure_virtual_projection_runtimes_for_state(&state_root))
+    })
+    .await
+    .map_err(|error| format!("Runtime worker failed: {error}"))
+    .and_then(|result| result)
+    {
         Ok(()) => {
-            refresh_tray_icon(&app);
+            refresh_desktop_surfaces(&app);
             ActionReport {
                 ok: true,
-                message: "AFS daemon is running.".to_string(),
+                message: "AFS runtime is running.".to_string(),
             }
         }
         Err(message) => ActionReport { ok: false, message },
@@ -442,8 +561,12 @@ fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
-fn ensure_terminal_cli_available() -> ActionReport {
-    match install_terminal_cli_link() {
+async fn ensure_terminal_cli_available() -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(install_terminal_cli_link)
+        .await
+        .map_err(|error| format!("Terminal CLI worker failed: {error}"))
+        .and_then(|result| result)
+    {
         Ok(path) => ActionReport {
             ok: true,
             message: format!("AFS terminal command is ready at {}.", path.display()),
@@ -453,10 +576,14 @@ fn ensure_terminal_cli_available() -> ActionReport {
 }
 
 #[tauri::command]
-fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
-    match create_notion_workspace_mount(&path) {
+async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || create_notion_workspace_mount(&path))
+        .await
+        .map_err(|error| format!("Mount worker failed: {error}"))
+        .and_then(|result| result)
+    {
         Ok(report) => {
-            refresh_tray_icon(&app);
+            refresh_desktop_surfaces(&app);
             ActionReport {
                 ok: true,
                 message: report,
@@ -467,30 +594,51 @@ fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
 }
 
 #[tauri::command]
-fn install_agent_guidance(mount_path: Option<String>) -> AgentGuidanceInstallReport {
-    install_guidance_files(mount_path.as_deref())
+async fn install_agent_guidance(mount_path: Option<String>) -> AgentGuidanceInstallReport {
+    tauri::async_runtime::spawn_blocking(move || install_guidance_files(mount_path.as_deref()))
+        .await
+        .unwrap_or_else(|error| AgentGuidanceInstallReport {
+            ok: false,
+            command: "install_agent_guidance",
+            targets: vec![agent_guidance::AgentGuidanceTarget {
+                agent: "Agent instructions".to_string(),
+                status: "failed".to_string(),
+                path: None,
+                detail: format!("Agent guidance worker failed: {error}"),
+            }],
+            prompt: String::new(),
+        })
 }
 
 #[tauri::command]
-fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
-    let query = url.trim();
-    if query.is_empty() {
-        return Err("Paste a Notion page URL or search your local Notion index.".to_string());
-    }
+async fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let query = url.trim();
+        if query.is_empty() {
+            return Err("Paste a Notion page URL or search your local Notion index.".to_string());
+        }
 
-    locate_notion_query(query)
+        locate_notion_query(query)
+    })
+    .await
+    .map_err(|error| format!("Locate worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn search_notion_pages(query: String) -> Result<Vec<LocatedItem>, String> {
-    search_notion_index(&query, 8)
+async fn search_notion_pages(query: String) -> Result<Vec<LocatedItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || search_notion_index(&query, 8))
+        .await
+        .map_err(|error| format!("Search worker failed: {error}"))?
 }
 
 #[tauri::command]
-fn review_push_plan() -> PushPlan {
-    let files = load_desktop_snapshot()
+async fn review_push_plan() -> PushPlan {
+    let files = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
+        .await
+        .ok()
+        .and_then(Result::ok)
         .map(|snapshot| snapshot.pending_changes)
-        .unwrap_or_else(|_| sample_pending_changes());
+        .unwrap_or_else(sample_pending_changes);
     let pages_updated = files.len();
     PushPlan {
         title: "Review Push".to_string(),
@@ -705,10 +853,16 @@ fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
 }
 
 #[tauri::command]
-fn open_path(path: String) -> ActionReport {
-    let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
-    match open_virtual_mount_or_path(&expanded) {
-        Ok(()) => ActionReport {
+async fn open_path(path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        open_virtual_mount_or_path(&expanded).map(|()| expanded)
+    })
+    .await
+    .map_err(|error| format!("Open worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(expanded) => ActionReport {
             ok: true,
             message: format!("Opened {}", expanded.display()),
         },
@@ -717,10 +871,16 @@ fn open_path(path: String) -> ActionReport {
 }
 
 #[tauri::command]
-fn reveal_path(path: String) -> ActionReport {
-    let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
-    match reveal_in_file_manager(&expanded) {
-        Ok(()) => ActionReport {
+async fn reveal_path(path: String) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        reveal_in_file_manager(&expanded).map(|()| expanded)
+    })
+    .await
+    .map_err(|error| format!("Reveal worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(expanded) => ActionReport {
             ok: true,
             message: format!("Revealed {}", expanded.display()),
         },
@@ -743,9 +903,18 @@ fn hide_menubar(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
-fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionReport {
+async fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionReport {
     match change.key.as_str() {
-        "launch_at_login" => set_launch_at_login(change.enabled).unwrap_or_else(action_error),
+        "launch_at_login" => {
+            match tauri::async_runtime::spawn_blocking(move || set_launch_at_login(change.enabled))
+                .await
+                .map_err(|error| format!("Desktop setting worker failed: {error}"))
+                .and_then(|result| result)
+            {
+                Ok(report) => report,
+                Err(message) => action_error(message),
+            }
+        }
         "show_menu_bar" => set_menu_bar_visible(&app, change.enabled).unwrap_or_else(action_error),
         _ => ActionReport {
             ok: false,
@@ -761,6 +930,7 @@ fn set_auto_save_for_file(change: AutoSaveFileChange) -> ActionReport {
 
 #[tauri::command]
 fn quit_completely(app: AppHandle) -> ActionReport {
+    stop_windows_cloud_files_provider_supervisor();
     app.exit(0);
     ActionReport {
         ok: true,
@@ -787,6 +957,9 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
 
     let mount = choose_mount(&mounts);
     let connection = choose_connection(&connections, mount.as_ref());
+    let provider = mount
+        .as_ref()
+        .and_then(|mount| provider_runtime_summary(&state_root, mount));
     let pending_changes = status
         .as_ref()
         .map(|status| pending_changes_from_status(&store, status))
@@ -798,6 +971,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
         &pending_changes,
         connection.as_ref(),
         daemon_ready,
+        provider.as_ref(),
         status.as_ref(),
     );
 
@@ -807,7 +981,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
-        mount: mount_summary(mount.as_ref(), connection.as_ref()),
+        mount: mount_summary(mount.as_ref(), connection.as_ref(), provider),
         settings: desktop_settings(),
         pending_changes,
         activity: activity_from_journals(&journals, &store, &state_root),
@@ -870,6 +1044,7 @@ fn connection_summary(connection: Option<&ConnectionRecord>) -> ConnectionSummar
 fn mount_summary(
     mount: Option<&MountConfig>,
     connection: Option<&ConnectionRecord>,
+    provider: Option<ProviderRuntimeSummary>,
 ) -> MountSummary {
     let Some(mount) = mount else {
         return MountSummary {
@@ -877,27 +1052,129 @@ fn mount_summary(
             workspace_name: connection
                 .and_then(|connection| connection.workspace_name.clone())
                 .unwrap_or_else(|| "No Notion folder".to_string()),
-            local_path: display_path(&default_notion_access_root()),
+            local_path: absolute_display_path(&default_notion_access_root()),
             notion_url: None,
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
             status: "not_mounted".to_string(),
+            provider: None,
         };
     };
+
+    let mount_status = provider
+        .as_ref()
+        .and_then(mount_status_from_provider)
+        .unwrap_or("ready");
 
     MountSummary {
         connector: mount.connector.clone(),
         workspace_name: connection
             .and_then(|connection| connection.workspace_name.clone())
             .unwrap_or_else(|| connector_label(&mount.connector)),
-        local_path: display_path(&mount_access_root(mount)),
+        local_path: absolute_display_path(&mount_access_root(mount)),
         notion_url: mount
             .remote_root_id
             .as_ref()
             .map(|remote_id| notion_object_url(&remote_id.0)),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
-        status: "ready".to_string(),
+        status: mount_status.to_string(),
+        provider,
+    }
+}
+
+fn mount_status_from_provider(provider: &ProviderRuntimeSummary) -> Option<&'static str> {
+    match provider.state.as_str() {
+        "running" if provider.registered == Some(false) => Some("provider_unregistered"),
+        "running" => Some("ready"),
+        "stopped" => Some("provider_stopped"),
+        "error" => Some("provider_error"),
+        _ => None,
+    }
+}
+
+fn provider_runtime_summary(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Option<ProviderRuntimeSummary> {
+    if !mount.projection.uses_virtual_filesystem() {
+        return None;
+    }
+    match mount.projection {
+        ProjectionMode::WindowsCloudFiles => {
+            Some(windows_cloud_files_provider_status(state_root, mount))
+        }
+        ProjectionMode::MacosFileProvider
+        | ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_provider_status(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> ProviderRuntimeSummary {
+    match run_windows_cloud_files_lifecycle(
+        state_root,
+        mount,
+        &connector_label(&mount.connector),
+        WindowsCloudFilesLifecycleAction::Status,
+    ) {
+        Ok(report) => {
+            let value = report.helper_report;
+            ProviderRuntimeSummary {
+                state: value
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+                message: value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Windows Cloud Files provider status is unavailable")
+                    .to_string(),
+                daemon_running: value
+                    .get("daemon_running")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| daemon_is_ready(state_root)),
+                registered: value.get("registered").and_then(serde_json::Value::as_bool),
+                pid: value
+                    .get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok()),
+                stale_pid_file: value
+                    .get("stale_pid_file")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }
+        }
+        Err(error) => ProviderRuntimeSummary {
+            state: "error".to_string(),
+            message: error.message(),
+            daemon_running: daemon_is_ready(state_root),
+            registered: None,
+            pid: None,
+            stale_pid_file: false,
+        },
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_cloud_files_provider_status(
+    _state_root: &Path,
+    mount: &MountConfig,
+) -> ProviderRuntimeSummary {
+    ProviderRuntimeSummary {
+        state: "error".to_string(),
+        message: format!(
+            "Windows Cloud Files mounts can only be inspected on Windows; mount `{}` cannot be inspected here.",
+            mount.mount_id.0
+        ),
+        daemon_running: false,
+        registered: None,
+        pid: None,
+        stale_pid_file: false,
     }
 }
 
@@ -1218,12 +1495,15 @@ fn health_state(
     pending_changes: &[PendingChange],
     connection: Option<&ConnectionRecord>,
     daemon_ready: bool,
+    provider: Option<&ProviderRuntimeSummary>,
     status: Option<&afs_cli::status::StatusReport>,
 ) -> &'static str {
     if connection.is_some_and(|connection| connection.status != "active") {
         "reconnect_needed"
     } else if !daemon_ready {
         "stopped"
+    } else if provider.is_some_and(provider_needs_repair) {
+        "runtime_stopped"
     } else if !pending_changes.is_empty() {
         "needs_review"
     } else if status.is_some_and(|status| status.summary.checking_freshness > 0) {
@@ -1279,6 +1559,10 @@ fn set_tray_icon_and_tooltip(app: &AppHandle, state: TrayVisualState, tooltip: &
     }
 }
 
+fn provider_needs_repair(provider: &ProviderRuntimeSummary) -> bool {
+    provider.state != "running" || provider.registered == Some(false)
+}
+
 fn sync_tray_visibility(app: &AppHandle, settings: &DesktopSettings) {
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_visible(settings.show_menu_bar);
@@ -1286,7 +1570,7 @@ fn sync_tray_visibility(app: &AppHandle, settings: &DesktopSettings) {
 }
 
 fn tray_state_for_health(state: &str) -> TrayVisualState {
-    if state == "reconnect_needed" || state == "stopped" {
+    if state == "reconnect_needed" || state == "stopped" || state == "runtime_stopped" {
         TrayVisualState::Reconnect
     } else if state == "needs_review" {
         TrayVisualState::Review
@@ -1301,6 +1585,7 @@ fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
         "checking_freshness" => "AFS: checking freshness".to_string(),
         "reconnect_needed" => "AFS: reconnect Notion".to_string(),
         "stopped" => "AFS: daemon stopped".to_string(),
+        "runtime_stopped" => "AFS: provider needs repair".to_string(),
         _ => "AFS: ready".to_string(),
     }
 }
@@ -1563,9 +1848,33 @@ fn search_kind_label(kind: &str) -> &str {
 fn desktop_settings() -> DesktopSettings {
     let persisted = load_desktop_settings().unwrap_or_default();
     DesktopSettings {
-        launch_at_login: launch_agent_path().is_some_and(|path| path.exists()),
+        launch_at_login: cached_launch_at_login_enabled(persisted.launch_at_login),
         show_menu_bar: persisted.show_menu_bar,
     }
+}
+
+fn cached_launch_at_login_enabled(default: bool) -> bool {
+    LAUNCH_AT_LOGIN_STATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|state| *state)
+        .unwrap_or(default)
+}
+
+fn set_launch_at_login_cache(enabled: bool) {
+    if let Ok(mut state) = LAUNCH_AT_LOGIN_STATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *state = Some(enabled);
+    }
+}
+
+fn refresh_launch_at_login_cache_async() {
+    tauri::async_runtime::spawn_blocking(|| {
+        set_launch_at_login_cache(launch_at_login_enabled());
+    });
 }
 
 fn load_desktop_settings() -> Result<DesktopSettings, String> {
@@ -1618,21 +1927,15 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
         if running_from_read_only_volume()? {
             return Err("Move AFS to Applications before enabling launch at login.".to_string());
         }
-        install_launch_agent()?;
-    } else if let Some(path) = launch_agent_path()
-        && path.exists()
-    {
-        fs::remove_file(&path).map_err(|error| {
-            format!(
-                "Could not remove launch agent `{}`: {error}",
-                path.display()
-            )
-        })?;
+        install_launch_at_login()?;
+    } else {
+        uninstall_launch_at_login()?;
     }
 
     let mut settings = load_desktop_settings().unwrap_or_default();
     settings.launch_at_login = enabled;
     save_desktop_settings(&settings)?;
+    set_launch_at_login_cache(enabled);
 
     Ok(ActionReport {
         ok: true,
@@ -1647,8 +1950,9 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
 fn apply_launch_at_login_preference() -> Result<(), String> {
     let settings = load_desktop_settings().unwrap_or_default();
     if settings.launch_at_login && !running_from_read_only_volume()? {
-        install_launch_agent()?;
+        install_launch_at_login()?;
     }
+    set_launch_at_login_cache(settings.launch_at_login);
     Ok(())
 }
 
@@ -1788,6 +2092,7 @@ fn reset_platform_projection_state() {
             );
         }
     }
+    stop_windows_cloud_files_provider_supervisor();
 }
 
 fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
@@ -1973,15 +2278,75 @@ fn is_virtual_content_temp_path(path: &Path) -> bool {
 }
 
 fn refresh_desktop_surfaces(app: &AppHandle) {
-    refresh_tray_icon(app);
+    schedule_desktop_surface_refresh(app.clone());
+}
+
+fn schedule_tray_icon_refresh(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let snapshot = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if let Some(snapshot) = snapshot {
+            refresh_tray_icon_for_snapshot(&app, &snapshot);
+        } else {
+            set_tray_icon_and_tooltip(&app, TrayVisualState::Reconnect, "AFS needs attention");
+        }
+    });
+}
+
+fn schedule_desktop_surface_refresh(app: AppHandle) {
+    let delay = {
+        let mut state = SURFACE_REFRESH_STATE
+            .get_or_init(|| Mutex::new(SurfaceRefreshState::default()))
+            .lock()
+            .expect("surface refresh lock poisoned");
+        if state.scheduled {
+            return;
+        }
+        state.scheduled = true;
+
+        let now = Instant::now();
+        state
+            .last_requested
+            .and_then(|last| {
+                SURFACE_REFRESH_MIN_INTERVAL.checked_sub(now.saturating_duration_since(last))
+            })
+            .unwrap_or_default()
+    };
+
+    std::thread::spawn(move || {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+
+        {
+            let mut state = SURFACE_REFRESH_STATE
+                .get_or_init(|| Mutex::new(SurfaceRefreshState::default()))
+                .lock()
+                .expect("surface refresh lock poisoned");
+            state.last_requested = Some(Instant::now());
+            state.scheduled = false;
+        }
+
+        if !dispatch_window_snapshot_refresh(&app) {
+            schedule_tray_icon_refresh(app.clone());
+        }
+    });
+}
+
+fn dispatch_window_snapshot_refresh(app: &AppHandle) -> bool {
+    let mut dispatched = false;
     for label in ["main", "tray"] {
         if let Some(window) = app.get_webview_window(label) {
-            if label == "main" && !window.is_visible().unwrap_or(false) {
+            if !window.is_visible().unwrap_or(false) {
                 continue;
             }
             let _ = window.eval("window.dispatchEvent(new CustomEvent('afs-refresh-snapshot'));");
+            dispatched = true;
         }
     }
+    dispatched
 }
 
 fn running_from_read_only_volume() -> Result<bool, String> {
@@ -1990,6 +2355,50 @@ fn running_from_read_only_volume() -> Result<bool, String> {
     Ok(executable.starts_with("/Volumes"))
 }
 
+fn launch_at_login_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        windows_run_key_is_registered().unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        launch_agent_path().is_some_and(|path| path.exists())
+    }
+}
+
+fn install_launch_at_login() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        install_windows_login_item()
+    }
+    #[cfg(not(windows))]
+    {
+        install_launch_agent()
+    }
+}
+
+fn uninstall_launch_at_login() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        uninstall_windows_login_item()
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(path) = launch_agent_path()
+            && path.exists()
+        {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Could not remove launch agent `{}`: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
 fn install_launch_agent() -> Result<(), String> {
     let Some(path) = launch_agent_path() else {
         return Err("HOME is not set, so AFS cannot install a login item.".to_string());
@@ -2005,6 +2414,7 @@ fn install_launch_agent() -> Result<(), String> {
         .map_err(|error| format!("Could not write launch agent `{}`: {error}", path.display()))
 }
 
+#[cfg(not(windows))]
 fn launch_agent_plist(executable: &Path) -> String {
     let executable = escape_xml(&executable.display().to_string());
     format!(
@@ -2026,6 +2436,101 @@ fn launch_agent_plist(executable: &Path) -> String {
     )
 }
 
+#[cfg(windows)]
+fn install_windows_login_item() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
+    let value = windows_run_value_for_executable(&executable);
+    let mut command = Command::new("reg");
+    configure_hidden_windows_command(&mut command);
+    let output = command
+        .args([
+            "add",
+            WINDOWS_RUN_KEY_PATH,
+            "/v",
+            WINDOWS_RUN_VALUE_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+        ])
+        .arg(value)
+        .arg("/f")
+        .output()
+        .map_err(|error| format!("Could not update the Windows login item: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not update the Windows login item: {}",
+            process_output_message(&output)
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn uninstall_windows_login_item() -> Result<(), String> {
+    let mut command = Command::new("reg");
+    configure_hidden_windows_command(&mut command);
+    let output = command
+        .args([
+            "delete",
+            WINDOWS_RUN_KEY_PATH,
+            "/v",
+            WINDOWS_RUN_VALUE_NAME,
+            "/f",
+        ])
+        .output()
+        .map_err(|error| format!("Could not remove the Windows login item: {error}"))?;
+    if output.status.success()
+        || process_output_message(&output)
+            .to_ascii_lowercase()
+            .contains("unable to find")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not remove the Windows login item: {}",
+            process_output_message(&output)
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_run_key_is_registered() -> Result<bool, String> {
+    let mut command = Command::new("reg");
+    configure_hidden_windows_command(&mut command);
+    let output = command
+        .args(["query", WINDOWS_RUN_KEY_PATH, "/v", WINDOWS_RUN_VALUE_NAME])
+        .output()
+        .map_err(|error| format!("Could not inspect the Windows login item: {error}"))?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains(WINDOWS_RUN_VALUE_NAME))
+}
+
+#[cfg(windows)]
+fn windows_run_value_for_executable(executable: &Path) -> String {
+    format!("\"{}\"", executable.display())
+}
+
+#[cfg(windows)]
+fn configure_hidden_windows_command(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(windows)]
+fn process_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("process exited with {}", output.status)
+}
+
+#[cfg(not(windows))]
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2043,6 +2548,7 @@ fn desktop_activity_path(state_root: &Path) -> PathBuf {
     state_root.join("desktop-activity.json")
 }
 
+#[cfg(not(windows))]
 fn launch_agent_path() -> Option<PathBuf> {
     home_dir().ok().map(|home| {
         home.join("Library")
@@ -2075,15 +2581,7 @@ fn mount_access_root(mount: &MountConfig) -> PathBuf {
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
+    absolute_state_root(platform_default_state_root())
 }
 
 fn expand_tilde(path: &str) -> std::io::Result<PathBuf> {
@@ -2097,9 +2595,18 @@ fn expand_tilde(path: &str) -> std::io::Result<PathBuf> {
 }
 
 fn home_dir() -> std::io::Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))
+    platform_user_home()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "home is not set"))
+}
+
+fn absolute_state_root(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(&path))
+        .unwrap_or(path)
 }
 
 fn display_path(path: &Path) -> String {
@@ -2113,6 +2620,13 @@ fn display_path(path: &Path) -> String {
     }
 
     path.display().to_string()
+}
+
+fn absolute_display_path(path: &Path) -> String {
+    absolute_path(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn default_notion_mount_root() -> PathBuf {
@@ -2235,7 +2749,7 @@ fn validate_desktop_mount_root(
             if !root.starts_with(&afs_root) || root == afs_root {
                 return Err(format!(
                     "Choose a source folder inside the AFS CloudStorage root, for example {}.",
-                    display_path(&default_notion_mount_root())
+                    absolute_display_path(&default_notion_mount_root())
                 ));
             }
         }
@@ -2300,6 +2814,7 @@ fn projection_label(projection: &ProjectionMode) -> &'static str {
         ProjectionMode::PlainFiles => "Plain files",
         ProjectionMode::MacosFileProvider => "macOS File Provider",
         ProjectionMode::LinuxFuse => "Linux FUSE",
+        ProjectionMode::WindowsCloudFiles => "Windows Cloud Files",
     }
 }
 
@@ -2442,7 +2957,7 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
 
     Ok(format!(
         "Mounted Notion workspace at {} with {}.",
-        display_path(&mount_access_root(&mount)),
+        absolute_display_path(&mount_access_root(&mount)),
         projection_label(&mount.projection)
     ))
 }
@@ -2489,7 +3004,11 @@ fn desktop_projection_mode() -> ProjectionMode {
     {
         ProjectionMode::LinuxFuse
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        ProjectionMode::WindowsCloudFiles
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         ProjectionMode::PlainFiles
     }
@@ -2576,15 +3095,11 @@ fn daemon_control_args_any_manager(action: &str, state_root: &Path) -> Vec<Strin
 }
 
 fn bundled_afsd_binary() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let candidate = executable.parent()?.join("afsd");
-    candidate.is_file().then_some(candidate)
+    bundled_binary_next_to_current_exe("afsd")
 }
 
 fn bundled_afs_cli_binary() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let candidate = executable.parent()?.join("afs");
-    candidate.is_file().then_some(candidate)
+    bundled_binary_next_to_current_exe("afs")
 }
 
 fn app_store_distribution() -> bool {
@@ -2628,6 +3143,17 @@ fn install_terminal_cli_link() -> Result<PathBuf, String> {
 enum TerminalCliLinkState {
     Current,
     NeedsInstall,
+}
+
+fn terminal_cli_command_filename() -> &'static str {
+    #[cfg(windows)]
+    {
+        "afs.cmd"
+    }
+    #[cfg(not(windows))]
+    {
+        "afs"
+    }
 }
 
 fn install_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<PathBuf, String> {
@@ -2699,7 +3225,7 @@ fn install_terminal_cli_link_in_sorted_path_dirs(
         if is_protected_terminal_cli_path(&directory) {
             continue;
         }
-        let link_path = directory.join("afs");
+        let link_path = directory.join(terminal_cli_command_filename());
         match install_terminal_cli_link_at(cli_path, &link_path) {
             Ok(path) => return Ok(path),
             Err(error) => errors.push(error),
@@ -2721,8 +3247,31 @@ fn install_terminal_cli_link_in_sorted_path_dirs(
     ))
 }
 
+#[cfg(not(windows))]
 fn default_user_terminal_cli_dir() -> Option<PathBuf> {
     home_dir().ok().map(|home| home.join(".local/bin"))
+}
+
+#[cfg(windows)]
+fn default_user_terminal_cli_dir() -> Option<PathBuf> {
+    env_first(&["LOCALAPPDATA"])
+        .map(PathBuf::from)
+        .map(|local_app_data| {
+            let windows_apps = local_app_data.join("Microsoft").join("WindowsApps");
+            if terminal_cli_dir_is_on_path(&windows_apps) {
+                windows_apps
+            } else {
+                local_app_data.join("AgentFS").join("bin")
+            }
+        })
+        .or_else(|| {
+            home_dir().ok().map(|home| {
+                home.join("AppData")
+                    .join("Local")
+                    .join("AgentFS")
+                    .join("bin")
+            })
+        })
 }
 
 fn insert_user_terminal_cli_fallback_dir(dirs: &mut Vec<PathBuf>, directory: &Path) {
@@ -2746,19 +3295,32 @@ fn ensure_terminal_cli_dir_registered(installed: &Path) -> Result<(), String> {
     if terminal_cli_dir_is_on_path(directory) {
         return Ok(());
     }
-    let Some(config_path) = terminal_cli_shell_config_path() else {
+
+    #[cfg(windows)]
+    {
         return Err(format!(
-            "Installed the AFS terminal command at {}, but could not find your home directory to add it to PATH.",
-            installed.display()
+            "Installed the AFS terminal command at {}, but {} is not on PATH. Add that directory to your user PATH, then open a new terminal.",
+            installed.display(),
+            directory.display()
         ));
-    };
-    write_terminal_cli_path_section(&config_path, directory).map_err(|error| {
+    }
+
+    #[cfg(not(windows))]
+    {
+        let Some(config_path) = terminal_cli_shell_config_path() else {
+            return Err(format!(
+                "Installed the AFS terminal command at {}, but could not find your home directory to add it to PATH.",
+                installed.display()
+            ));
+        };
+        write_terminal_cli_path_section(&config_path, directory).map_err(|error| {
         format!(
             "Installed the AFS terminal command at {}, but could not update {} to add it to PATH: {error}",
             installed.display(),
             config_path.display()
         )
     })
+    }
 }
 
 fn terminal_cli_dir_is_on_path(directory: &Path) -> bool {
@@ -2770,6 +3332,7 @@ fn path_list_contains_dir(path: std::ffi::OsString, directory: &Path) -> bool {
     std::env::split_paths(&path).any(|candidate| paths_equal(&candidate, directory))
 }
 
+#[cfg(not(windows))]
 fn terminal_cli_shell_config_path() -> Option<PathBuf> {
     let home = home_dir().ok()?;
     let shell_name = std::env::var_os("SHELL")
@@ -2782,6 +3345,7 @@ fn terminal_cli_shell_config_path() -> Option<PathBuf> {
     })
 }
 
+#[cfg(any(not(windows), test))]
 fn write_terminal_cli_path_section(path: &Path, directory: &Path) -> Result<(), String> {
     let existing = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -2796,6 +3360,7 @@ fn write_terminal_cli_path_section(path: &Path, directory: &Path) -> Result<(), 
     fs::write(path, next).map_err(|error| error.to_string())
 }
 
+#[cfg(any(not(windows), test))]
 fn terminal_cli_path_shell_block(directory: &Path) -> String {
     let directory = shell_single_quote(&directory.display().to_string());
     format!(
@@ -2810,6 +3375,7 @@ unset _afs_cli_dir\n\
     )
 }
 
+#[cfg(any(not(windows), test))]
 fn replace_terminal_cli_path_section(existing: &str, block: &str) -> String {
     let Some(start) = existing.find(TERMINAL_CLI_PATH_MANAGED_START) else {
         let trimmed = existing.trim_end();
@@ -2838,6 +3404,7 @@ fn replace_terminal_cli_path_section(existing: &str, block: &str) -> String {
     next
 }
 
+#[cfg(any(not(windows), test))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -2869,6 +3436,13 @@ fn sort_terminal_cli_path_dirs(dirs: &mut Vec<PathBuf>) {
 }
 
 fn terminal_cli_path_dir_rank(directory: &Path, home: Option<&Path>) -> u8 {
+    #[cfg(windows)]
+    {
+        if is_windows_user_terminal_cli_path(directory) {
+            return 0;
+        }
+    }
+
     if directory.ends_with(Path::new(".local/bin"))
         || home.is_some_and(|home| {
             directory == home.join("bin") || directory == home.join(".local/bin")
@@ -2901,9 +3475,38 @@ fn is_system_path(path: &Path) -> bool {
 }
 
 fn is_protected_terminal_cli_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        if is_windows_system_path(path) {
+            return true;
+        }
+    }
+
     is_system_path(path)
         || path.starts_with("/System")
         || path.starts_with("/var/run/com.apple.security.cryptexd")
+}
+
+#[cfg(windows)]
+fn is_windows_user_terminal_cli_path(path: &Path) -> bool {
+    let value = path
+        .display()
+        .to_string()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    value.ends_with(r"\microsoft\windowsapps") || value.ends_with(r"\agentfs\bin")
+}
+
+#[cfg(windows)]
+fn is_windows_system_path(path: &Path) -> bool {
+    let value = path
+        .display()
+        .to_string()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    value.starts_with(r"c:\windows")
+        || value.starts_with(r"c:\program files")
+        || value.starts_with(r"c:\program files (x86)")
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -2939,6 +3542,11 @@ fn terminal_cli_link_state(
             ));
         }
     };
+
+    #[cfg(windows)]
+    if let Some(state) = windows_terminal_cli_shim_state(link_path, &cli_path, &metadata)? {
+        return Ok(state);
+    }
 
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(link_path).map_err(|error| {
@@ -2982,6 +3590,58 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     left == right
 }
 
+#[cfg(windows)]
+fn windows_terminal_cli_shim_state(
+    link_path: &Path,
+    cli_path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<TerminalCliLinkState>, String> {
+    if !metadata.is_file() || !path_extension_eq(link_path, "cmd") {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(link_path).map_err(|error| {
+        format!(
+            "Could not read terminal command shim {}: {error}",
+            link_path.display()
+        )
+    })?;
+    if !contents.contains(WINDOWS_TERMINAL_CLI_SHIM_MARKER) {
+        return Err(format!(
+            "A file already exists at {}. Move it aside so AFS can install the bundled CLI there.",
+            link_path.display()
+        ));
+    }
+
+    Ok(Some(
+        if contents == windows_terminal_cli_shim_contents(cli_path) {
+            TerminalCliLinkState::Current
+        } else {
+            TerminalCliLinkState::NeedsInstall
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn windows_terminal_cli_shim_contents(cli_path: &Path) -> String {
+    let cli_path = batch_file_literal(&cli_path.display().to_string());
+    format!(
+        "@echo off\r\nrem {WINDOWS_TERMINAL_CLI_SHIM_MARKER}\r\nset \"_afs_cli={cli_path}\"\r\n\"%_afs_cli%\" %*\r\n"
+    )
+}
+
+#[cfg(windows)]
+fn batch_file_literal(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
+#[cfg(windows)]
+fn path_extension_eq(path: &Path, extension: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+
 #[cfg(unix)]
 fn install_terminal_cli_link_direct(cli_path: &Path, link_path: &Path) -> io::Result<()> {
     if let Some(parent) = link_path.parent() {
@@ -2996,11 +3656,24 @@ fn install_terminal_cli_link_direct(cli_path: &Path, link_path: &Path) -> io::Re
     std::os::unix::fs::symlink(cli_path, link_path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn install_terminal_cli_link_direct(cli_path: &Path, link_path: &Path) -> io::Result<()> {
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::symlink_metadata(link_path) {
+        Ok(_) => fs::remove_file(link_path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::write(link_path, windows_terminal_cli_shim_contents(cli_path))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn install_terminal_cli_link_direct(_cli_path: &Path, _link_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "terminal command links are only supported on Unix",
+        "terminal command links are only supported on Unix and Windows",
     ))
 }
 
@@ -3028,17 +3701,40 @@ fn login_shell_path() -> Option<std::ffi::OsString> {
 }
 
 fn find_command_in_path(command: &str) -> Option<PathBuf> {
-    if command.contains('/') {
+    if command.contains('/') || command.contains('\\') {
         return None;
     }
     let path = std::env::var_os("PATH")?;
+    let candidates = command_path_candidates(command);
     for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(command);
-        if candidate.is_file() {
-            return Some(candidate);
+        for candidate in &candidates {
+            let path = directory.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
         }
     }
     None
+}
+
+fn command_path_candidates(command: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        if Path::new(command).extension().is_some() {
+            return vec![command.to_string()];
+        }
+        return vec![
+            format!("{command}.exe"),
+            format!("{command}.cmd"),
+            format!("{command}.bat"),
+            command.to_string(),
+        ];
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![command.to_string()]
+    }
 }
 
 fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
@@ -3106,6 +3802,7 @@ fn activate_virtual_projection_mount(
     if wait_for_entities {
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
+    ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
     Ok(())
 }
@@ -3149,6 +3846,180 @@ fn prefetch_virtual_projection_container(
             "Could not ask afsd to load the top-level Notion folder: {}",
             error.message()
         )),
+    }
+}
+
+fn ensure_virtual_projection_runtime(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+    match mount.projection {
+        ProjectionMode::WindowsCloudFiles => {
+            ensure_windows_cloud_files_provider_running(state_root, mount)
+        }
+        ProjectionMode::MacosFileProvider
+        | ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles => Ok(()),
+    }
+}
+
+fn ensure_virtual_projection_runtimes_for_state(state_root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        ensure_windows_cloud_files_providers_for_state(state_root)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = state_root;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct WindowsCloudFilesProviderSupervisor;
+
+#[cfg(target_os = "windows")]
+impl WindowsCloudFilesProviderSupervisor {
+    fn ensure_running(&mut self, state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+        if mount.projection != ProjectionMode::WindowsCloudFiles {
+            return Ok(());
+        }
+
+        let report = run_windows_cloud_files_lifecycle(
+            state_root,
+            mount,
+            &connector_label(&mount.connector),
+            WindowsCloudFilesLifecycleAction::Start,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not start Windows Cloud Files provider `{}`: {}",
+                mount.mount_id.0,
+                error.message()
+            )
+        })?;
+        if let Some(message) = report
+            .helper_report
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+        {
+            eprintln!("{message}");
+        }
+        Ok(())
+    }
+
+    fn stop_all(&mut self, state_root: &Path) {
+        for mount in windows_cloud_files_mounts(state_root) {
+            if let Err(error) = self.stop_mount(state_root, &mount) {
+                eprintln!(
+                    "afs desktop could not stop Windows Cloud Files provider `{}`: {error}",
+                    mount.mount_id.0
+                );
+            }
+        }
+    }
+
+    fn stop_mount(&mut self, state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+        run_windows_cloud_files_lifecycle(
+            state_root,
+            mount,
+            &connector_label(&mount.connector),
+            WindowsCloudFilesLifecycleAction::Stop,
+        )
+        .map(|_| ())
+        .map_err(|error| error.message())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_provider_supervisor() -> &'static Mutex<WindowsCloudFilesProviderSupervisor>
+{
+    WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR
+        .get_or_init(|| Mutex::new(WindowsCloudFilesProviderSupervisor::default()))
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_cloud_files_provider_running(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    windows_cloud_files_provider_supervisor()
+        .lock()
+        .map_err(|_| "Windows Cloud Files provider supervisor lock was poisoned".to_string())?
+        .ensure_running(state_root, mount)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_windows_cloud_files_provider_running(
+    _state_root: &Path,
+    _mount: &MountConfig,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_cloud_files_providers_for_state(state_root: &Path) -> Result<(), String> {
+    let cloud_mounts = load_windows_cloud_files_mounts(state_root)?;
+
+    if cloud_mounts.is_empty() {
+        return Ok(());
+    }
+
+    ensure_daemon_running(state_root)?;
+    reload_daemon_mounts(state_root)?;
+    for mount in &cloud_mounts {
+        ensure_windows_cloud_files_provider_running(state_root, mount)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn load_windows_cloud_files_mounts(state_root: &Path) -> Result<Vec<MountConfig>, String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    Ok(store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?
+        .into_iter()
+        .filter(|mount| mount.projection == ProjectionMode::WindowsCloudFiles)
+        .collect::<Vec<_>>())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_mounts(state_root: &Path) -> Vec<MountConfig> {
+    load_windows_cloud_files_mounts(state_root).unwrap_or_else(|error| {
+        eprintln!("afs desktop could not load Windows Cloud Files mounts: {error}");
+        Vec::new()
+    })
+}
+
+fn start_windows_cloud_files_provider_supervisor() {
+    #[cfg(target_os = "windows")]
+    {
+        std::thread::spawn(|| {
+            let state_root = default_state_root();
+            loop {
+                if let Err(error) = ensure_virtual_projection_runtimes_for_state(&state_root) {
+                    eprintln!(
+                        "afs desktop could not supervise Windows Cloud Files provider: {error}"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+    }
+}
+
+fn stop_windows_cloud_files_provider_supervisor() {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(supervisor) = WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR.get() else {
+            return;
+        };
+        match supervisor.lock() {
+            Ok(mut supervisor) => supervisor.stop_all(&default_state_root()),
+            Err(_) => {
+                eprintln!("afs desktop could not stop Windows Cloud Files providers: lock poisoned")
+            }
+        }
     }
 }
 
@@ -3196,7 +4067,9 @@ fn signal_virtual_projection_container(
         ProjectionMode::MacosFileProvider => {
             signal_macos_virtual_projection(&mount.mount_id.0, container_identifier)
         }
-        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => Ok(()),
+        ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles
+        | ProjectionMode::WindowsCloudFiles => Ok(()),
     }
 }
 
@@ -3233,6 +4106,7 @@ fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result
         }
         ProjectionMode::LinuxFuse => register_linux_virtual_projection(state_root, mount),
         ProjectionMode::PlainFiles => Ok(()),
+        ProjectionMode::WindowsCloudFiles => register_windows_virtual_projection(state_root, mount),
     }
 }
 
@@ -3274,6 +4148,32 @@ fn register_linux_virtual_projection(
     ))
 }
 
+#[cfg(target_os = "windows")]
+fn register_windows_virtual_projection(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    register_windows_cloud_files_sync_root(state_root, mount, &connector_label(&mount.connector))
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not register Windows Cloud Files sync root: {}",
+                error.message()
+            )
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_windows_virtual_projection(
+    _state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    Err(format!(
+        "Windows Cloud Files mounts can only be registered on Windows; mount `{}` cannot be registered here.",
+        mount.mount_id.0
+    ))
+}
+
 fn open_virtual_mount_or_path(path: &Path) -> Result<(), String> {
     if let Some(mount) = virtual_mount_for_path(path)
         && mount.projection.uses_virtual_filesystem()
@@ -3296,6 +4196,7 @@ fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
         ProjectionMode::MacosFileProvider => open_macos_virtual_projection(mount),
         ProjectionMode::LinuxFuse => open_in_file_manager(&mount_access_root(mount)),
         ProjectionMode::PlainFiles => open_in_file_manager(&mount.root),
+        ProjectionMode::WindowsCloudFiles => open_windows_virtual_projection(mount),
     }
 }
 
@@ -3329,6 +4230,47 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn open_windows_virtual_projection(mount: &MountConfig) -> Result<(), String> {
+    match open_windows_cloud_files_sync_root(mount) {
+        Ok(_) => {
+            let mount = mount.clone();
+            std::thread::spawn(move || {
+                let state_root = default_state_root();
+                if let Err(error) = ensure_windows_cloud_files_provider_running(&state_root, &mount)
+                {
+                    eprintln!(
+                        "afs desktop could not prepare Windows Cloud Files provider while opening `{}`: {error}",
+                        mount.mount_id.0
+                    );
+                }
+            });
+            Ok(())
+        }
+        Err(open_error) => {
+            let first_error = open_error.message();
+            let state_root = default_state_root();
+            ensure_windows_cloud_files_provider_running(&state_root, mount)?;
+            open_windows_cloud_files_sync_root(mount)
+                .map(|_| ())
+                .map_err(|retry_error| {
+                    format!(
+                        "Could not open Windows Cloud Files sync root: {}. Initial open failed with: {first_error}",
+                        retry_error.message()
+                    )
+                })
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_windows_virtual_projection(mount: &MountConfig) -> Result<(), String> {
+    Err(format!(
+        "Windows Cloud Files mounts can only be opened on Windows; mount `{}` cannot be opened here.",
+        mount.mount_id.0
+    ))
+}
+
 #[cfg(not(target_os = "macos"))]
 fn open_macos_virtual_projection(_mount: &MountConfig) -> Result<(), String> {
     Err("macOS File Provider mounts can only be opened on macOS.".to_string())
@@ -3348,10 +4290,11 @@ fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
             redirect_uri: redirect_uri.clone(),
         })
         .map_err(|error| format!("Could not start Notion OAuth broker flow: {error}"))?;
-    set_notion_login_link(start.authorization_url.clone());
+    let authorization_url = start.normalized_authorization_url();
+    set_notion_login_link(authorization_url.clone());
     let authorization = run_local_oauth_authorization(
         "Notion",
-        &start.authorization_url,
+        &authorization_url,
         &start.redirect_uri,
         &start.state,
         false,
@@ -4026,9 +4969,8 @@ mod tests {
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
         TrayVisualState, clear_state_root_contents, conflict_preview, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        failed_push_summary, hydration_after_editor_write, insert_user_terminal_cli_fallback_dir,
-        inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, install_terminal_cli_link_in_sorted_path_dirs,
+        failed_push_summary, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
         pending_changes_from_status, pull_report_message, push_action_message,
         record_current_install_marker, record_desktop_activity, shell_single_quote,
@@ -4037,6 +4979,18 @@ mod tests {
         tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
         write_terminal_cli_path_section,
     };
+
+    #[test]
+    fn desktop_state_root_absolutizes_relative_fallbacks() {
+        assert!(super::absolute_state_root(PathBuf::from(".afs")).is_absolute());
+    }
+
+    #[test]
+    fn mount_summary_default_path_is_absolute() {
+        let summary = super::mount_summary(None, None, None);
+
+        assert!(Path::new(&summary.local_path).is_absolute());
+    }
 
     #[test]
     fn extracts_id_from_notion_pretty_workspace_url() {
@@ -4113,6 +5067,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_cloud_files_mount_access_root_stays_at_sync_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+            .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert_eq!(
+            super::mount_access_root(&mount),
+            std::path::PathBuf::from("/tmp/AFS")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_mount_summary_without_mount_reports_cloud_files_projection() {
+        assert_eq!(
+            super::mount_summary(None, None, None).projection,
+            "Windows Cloud Files"
+        );
+        assert_eq!(
+            super::desktop_projection_mode(),
+            ProjectionMode::WindowsCloudFiles
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_default_notion_mount_root_is_shared_afs_root() {
@@ -4138,7 +5116,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_mount_summary_without_mount_reports_linux_fuse_projection() {
-        assert_eq!(super::mount_summary(None, None).projection, "Linux FUSE");
+        assert_eq!(
+            super::mount_summary(None, None, None).projection,
+            "Linux FUSE"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4263,6 +5244,17 @@ mod tests {
                 pixel[0] > 180 && pixel[1] < 90 && pixel[2] < 90 && pixel[3] > 200
             })
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_single_instance_objects_are_session_scoped_and_null_terminated() {
+        assert!(super::WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX.starts_with(r"Local\"));
+        assert!(super::WINDOWS_DESKTOP_ACTIVATION_EVENT.starts_with(r"Local\"));
+
+        let wide = super::windows_wide_null("AFS");
+        assert_eq!(wide.last().copied(), Some(0));
+        assert_eq!(&wide[..3], &['A' as u16, 'F' as u16, 'S' as u16]);
     }
 
     #[test]
@@ -4693,6 +5685,86 @@ mod tests {
         assert_eq!(fs::read_link(&link).expect("read cli link"), cli);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn terminal_cli_installer_creates_windows_cmd_shim() {
+        let temp = TestTempDir::new("terminal-cli-windows-shim");
+        let cli = temp.path().join("app/afs.exe");
+        let link = temp.path().join("bin/afs.cmd");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::write(&cli, b"afs cli").expect("write cli");
+
+        let installed = install_terminal_cli_link_at(&cli, &link).expect("install cli shim");
+
+        assert_eq!(installed, link);
+        assert_eq!(
+            terminal_cli_link_state(&link, &cli).expect("shim state"),
+            TerminalCliLinkState::Current
+        );
+        let contents = fs::read_to_string(&link).expect("read shim");
+        assert!(contents.contains(super::WINDOWS_TERMINAL_CLI_SHIM_MARKER));
+        assert!(contents.contains(&cli.display().to_string()));
+        assert!(contents.contains("%*"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_cli_installer_updates_stale_windows_cmd_shim() {
+        let temp = TestTempDir::new("terminal-cli-windows-shim-refresh");
+        let old_cli = temp.path().join("old/afs.exe");
+        let new_cli = temp.path().join("new/afs.exe");
+        let link = temp.path().join("bin/afs.cmd");
+        fs::create_dir_all(old_cli.parent().expect("old cli parent")).expect("create old parent");
+        fs::create_dir_all(new_cli.parent().expect("new cli parent")).expect("create new parent");
+        fs::create_dir_all(link.parent().expect("link parent")).expect("create link parent");
+        fs::write(&old_cli, b"old afs cli").expect("write old cli");
+        fs::write(&new_cli, b"new afs cli").expect("write new cli");
+        fs::write(&link, super::windows_terminal_cli_shim_contents(&old_cli))
+            .expect("write stale shim");
+
+        install_terminal_cli_link_at(&new_cli, &link).expect("refresh cli shim");
+
+        let contents = fs::read_to_string(&link).expect("read shim");
+        assert!(contents.contains(&new_cli.display().to_string()));
+        assert!(!contents.contains(&old_cli.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_cli_installer_uses_cmd_file_on_windows() {
+        let temp = TestTempDir::new("terminal-cli-windows-path-dir");
+        let cli = temp.path().join("app/afs.exe");
+        let writable = temp.path().join("writable-bin");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::create_dir_all(&writable).expect("create writable dir");
+        fs::write(&cli, b"afs cli").expect("write cli");
+
+        let installed = install_terminal_cli_link_in_path_dirs(&cli, vec![writable.clone()])
+            .expect("install cli shim in path");
+
+        assert_eq!(installed, writable.join("afs.cmd"));
+        assert!(installed.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_lookup_checks_exe_and_cmd_extensions() {
+        assert_eq!(
+            super::command_path_candidates("afs"),
+            vec!["afs.exe", "afs.cmd", "afs.bat", "afs"]
+        );
+        assert_eq!(super::terminal_cli_command_filename(), "afs.cmd");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_login_run_value_quotes_executable() {
+        assert_eq!(
+            super::windows_run_value_for_executable(Path::new(r"C:\Program Files\AFS\AFS.exe")),
+            r#""C:\Program Files\AFS\AFS.exe""#
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminal_cli_installer_updates_stale_symlink() {
@@ -4788,10 +5860,10 @@ mod tests {
         fs::write(&cli, b"afs cli").expect("write cli");
 
         let mut dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/sbin")];
-        insert_user_terminal_cli_fallback_dir(&mut dirs, &user_bin);
+        super::insert_user_terminal_cli_fallback_dir(&mut dirs, &user_bin);
 
-        let installed =
-            install_terminal_cli_link_in_sorted_path_dirs(&cli, dirs).expect("install fallback");
+        let installed = super::install_terminal_cli_link_in_sorted_path_dirs(&cli, dirs)
+            .expect("install fallback");
 
         assert_eq!(installed, user_bin.join("afs"));
         assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
@@ -4995,11 +6067,12 @@ fn sample_snapshot() -> DesktopSnapshot {
         mount: MountSummary {
             connector: "notion".to_string(),
             workspace_name: "CodeFlash".to_string(),
-            local_path: display_path(&default_notion_mount_root()),
+            local_path: absolute_display_path(&default_notion_mount_root()),
             notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
             projection: "macOS File Provider".to_string(),
             read_only: false,
             status: "ready".to_string(),
+            provider: None,
         },
         settings: DesktopSettings {
             launch_at_login: true,
@@ -5077,7 +6150,103 @@ fn sample_auto_save_status(enabled: bool) -> AutoSaveFileStatus {
     }
 }
 
+#[cfg(windows)]
+fn acquire_desktop_single_instance() -> Option<DesktopSingleInstanceGuard> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW};
+
+    let mutex_name = windows_wide_null(WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX);
+    let mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) };
+    if mutex_handle.is_null() {
+        eprintln!("afs desktop could not create single-instance mutex");
+        return Some(DesktopSingleInstanceGuard {
+            mutex_handle,
+            activation_event_handle: std::ptr::null_mut(),
+        });
+    }
+
+    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already_running {
+        signal_existing_desktop_instance();
+        unsafe {
+            let _ = CloseHandle(mutex_handle);
+        }
+        return None;
+    }
+
+    let event_name = windows_wide_null(WINDOWS_DESKTOP_ACTIVATION_EVENT);
+    let activation_event_handle =
+        unsafe { CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr()) };
+    if activation_event_handle.is_null() {
+        eprintln!("afs desktop could not create single-instance activation event");
+    }
+
+    Some(DesktopSingleInstanceGuard {
+        mutex_handle,
+        activation_event_handle,
+    })
+}
+
+#[cfg(not(windows))]
+fn acquire_desktop_single_instance() -> Option<DesktopSingleInstanceGuard> {
+    Some(DesktopSingleInstanceGuard {})
+}
+
+#[cfg(windows)]
+fn signal_existing_desktop_instance() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+    let event_name = windows_wide_null(WINDOWS_DESKTOP_ACTIVATION_EVENT);
+    let event_handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr()) };
+    if event_handle.is_null() {
+        return;
+    }
+
+    unsafe {
+        let _ = SetEvent(event_handle);
+        let _ = CloseHandle(event_handle);
+    }
+}
+
+fn start_desktop_activation_listener(app: AppHandle, activation_event_handle: Option<usize>) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+        let Some(activation_event_handle) = activation_event_handle else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let activation_event_handle = activation_event_handle as HANDLE;
+            loop {
+                let result = unsafe { WaitForSingleObject(activation_event_handle, INFINITE) };
+                if result != WAIT_OBJECT_0 {
+                    break;
+                }
+                show_main_window_with_view(&app, None);
+            }
+        });
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        let _ = activation_event_handle;
+    }
+}
+
+#[cfg(windows)]
+fn windows_wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 fn main() {
+    let Some(single_instance_guard) = acquire_desktop_single_instance() else {
+        return;
+    };
+    let activation_event_handle = single_instance_guard.activation_event_handle();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init());
@@ -5100,7 +6269,7 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             if desktop_smoke_test_requested() {
                 app.app_handle().exit(0);
                 return Ok(());
@@ -5108,9 +6277,13 @@ fn main() {
             if let Err(error) = apply_launch_at_login_preference() {
                 eprintln!("afs desktop could not apply launch-at-login preference: {error}");
             }
+            refresh_launch_at_login_cache_async();
+            configure_main_window_chrome(app);
             build_tray(app)?;
+            start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
+            start_windows_cloud_files_provider_supervisor();
             start_agent_guidance_refresher();
             Ok(())
         })
@@ -5161,6 +6334,22 @@ fn start_agent_guidance_refresher() {
             std::thread::sleep(std::time::Duration::from_secs(10 * 60));
         }
     });
+}
+
+fn configure_main_window_chrome(app: &mut tauri::App) {
+    #[cfg(windows)]
+    {
+        if let Some(window) = app.get_webview_window("main") {
+            if let Err(error) = window.set_decorations(false) {
+                eprintln!("afs desktop could not configure Windows window chrome: {error}");
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+    }
 }
 
 fn refresh_agent_guidance_best_effort() {
@@ -5247,7 +6436,10 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             "hide_menubar" => {
                 let _ = set_menu_bar_visible(app, false);
             }
-            "quit_completely" => app.exit(0),
+            "quit_completely" => {
+                stop_windows_cloud_files_provider_supervisor();
+                app.exit(0);
+            }
             _ => {}
         })
         .build(app)?;

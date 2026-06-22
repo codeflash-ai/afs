@@ -5,11 +5,12 @@
 //! generic API instead of growing platform-specific daemon semantics.
 
 use afs_core::AfsResult;
-use afs_core::model::MountId;
+use afs_core::model::{HydrationState, MountId};
 use afs_store::{
     EntityRepository, FreshnessStateRepository, MountConfig, MountRepository, ProjectionMode,
     ShadowRepository, VirtualMutationRepository,
 };
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::hydration::HydrationSource;
@@ -23,6 +24,18 @@ pub use crate::virtual_fs::{
     VirtualFsMaterializeOutcome as FileProviderMaterializeOutcome,
     VirtualFsMaterializeReport as FileProviderMaterializeReport,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileProviderReadReport {
+    pub mount_id: String,
+    pub identifier: String,
+    pub remote_id: String,
+    pub path: String,
+    pub outcome: FileProviderMaterializeOutcome,
+    pub hydration: HydrationState,
+    pub item: FileProviderItem,
+    pub contents_base64: String,
+}
 
 pub fn file_provider_item<S>(
     store: &S,
@@ -72,7 +85,10 @@ pub struct MountPathMatch {
 pub fn mount_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     let mut roots = vec![mount.root.clone()];
 
-    if mount.projection == ProjectionMode::LinuxFuse {
+    if matches!(
+        mount.projection,
+        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
+    ) {
         roots.push(
             mount
                 .root
@@ -247,6 +263,18 @@ mod tests {
     fn linux_fuse_source_directory_is_an_access_root() {
         let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
             .projection(ProjectionMode::LinuxFuse);
+
+        let matched = match_mount_path(&mount, Path::new("/tmp/AFS/notion/roadmap/page.md"))
+            .expect("path matches source directory");
+
+        assert_eq!(matched.access_root, PathBuf::from("/tmp/AFS/notion"));
+        assert_eq!(matched.relative_path, PathBuf::from("roadmap/page.md"));
+    }
+
+    #[test]
+    fn windows_cloud_files_source_directory_is_an_access_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+            .projection(ProjectionMode::WindowsCloudFiles);
 
         let matched = match_mount_path(&mount, Path::new("/tmp/AFS/notion/roadmap/page.md"))
             .expect("path matches source directory");

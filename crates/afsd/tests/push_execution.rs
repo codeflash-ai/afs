@@ -414,6 +414,79 @@ fn daemon_push_job_plans_pending_virtual_create() {
 }
 
 #[test]
+fn daemon_push_job_reads_explicit_pending_virtual_create_from_projected_path() {
+    let fixture = PushFixture::new();
+    let cache_path = fixture.root.join(".content/Roadmap/Draft/page.md");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, "").expect("stale cache file");
+    let projected_path = fixture.root.join("Roadmap/Draft/page.md");
+    fs::create_dir_all(projected_path.parent().expect("projected parent"))
+        .expect("projected parent");
+    fs::write(
+        &projected_path,
+        "---\ntitle: Fresh Draft\n---\n# Fresh Draft\n\nProjected body.\n",
+    )
+    .expect("projected file");
+
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            fixture.remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap.md",
+        ))
+        .expect("save parent page");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(fixture.remote_id.clone()),
+            "Roadmap/Draft/page.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: projected_path,
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &FakePushSource::default(),
+        None,
+    )
+    .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert!(report.pipeline.validation.issues.is_empty());
+    let plan = report.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            title,
+            body,
+            source_path,
+            ..
+        } => {
+            assert_eq!(title, "Fresh Draft");
+            assert_eq!(body, "# Fresh Draft\n\nProjected body.\n");
+            assert_eq!(source_path, &PathBuf::from("Roadmap/Draft/page.md"));
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
 fn auto_save_push_applies_pending_virtual_create_and_tracks_created_remote() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");

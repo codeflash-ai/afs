@@ -825,20 +825,7 @@ where
             remote_id: parent_id.clone(),
         })
         .map_err(PushPrepareError::Store)?;
-    let read_path = pending
-        .content_path
-        .clone()
-        .or_else(|| {
-            state_root.map(|root| {
-                virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
-            })
-        })
-        .ok_or_else(|| {
-            PushPrepareError::Core(AfsError::InvalidState(format!(
-                "pending create `{}` has no cached content path",
-                pending.local_id
-            )))
-        })?;
+    let read_path = pending_create_read_path(&mount, &pending, state_root, &absolute_path)?;
     let contents = read_to_string(&read_path)?;
     if let Some(line) = unresolved_conflict_marker_line(&contents) {
         return Ok(PreparedPush {
@@ -890,6 +877,32 @@ where
         shadows: Vec::new(),
         pipeline,
     })
+}
+
+fn pending_create_read_path(
+    mount: &MountConfig,
+    pending: &VirtualMutationRecord,
+    state_root: Option<&Path>,
+    absolute_path: &Path,
+) -> Result<PathBuf, PushPrepareError> {
+    if mount.projection.uses_virtual_filesystem() && absolute_path.is_file() {
+        return Ok(absolute_path.to_path_buf());
+    }
+
+    pending
+        .content_path
+        .clone()
+        .or_else(|| {
+            state_root.map(|root| {
+                virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
+            })
+        })
+        .ok_or_else(|| {
+            PushPrepareError::Core(AfsError::InvalidState(format!(
+                "pending create `{}` has no cached content path",
+                pending.local_id
+            )))
+        })
 }
 
 fn prepare_pending_scope<S, Validator>(

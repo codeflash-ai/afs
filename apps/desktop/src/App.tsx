@@ -18,6 +18,7 @@ import {
   Home,
   ListChecks,
   Loader2,
+  Minus,
   Power,
   RefreshCw,
   RotateCcw,
@@ -25,6 +26,8 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Square,
+  X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -54,6 +57,7 @@ type DesktopSnapshot = {
     projection: string;
     readOnly: boolean;
     status: string;
+    provider?: ProviderRuntimeSummary | null;
   };
   settings: {
     launchAtLogin: boolean;
@@ -89,6 +93,15 @@ type ConnectorSuggestion = {
   connector: string;
   description: string;
   state: string;
+};
+
+type ProviderRuntimeSummary = {
+  state: string;
+  message: string;
+  daemonRunning: boolean;
+  registered?: boolean | null;
+  pid?: number | null;
+  stalePidFile: boolean;
 };
 
 type LocatedItem = {
@@ -172,6 +185,7 @@ const sampleSnapshot: DesktopSnapshot = {
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
+    provider: null,
   },
   settings: {
     launchAtLogin: true,
@@ -375,18 +389,35 @@ export default function App() {
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
-  const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
+  const [showOnboarding, setShowOnboarding] = useState(() => route === "#onboarding-ready");
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
     route === "#onboarding-ready" ? 4 : 1,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
-  const setupIsComplete = setupComplete(snapshot);
+  const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
+  const refreshSnapshotQueued = useRef(false);
 
   async function refreshSnapshot() {
-    const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
-    setSnapshot(nextSnapshot);
-    setSnapshotLoaded(true);
+    if (refreshSnapshotPromise.current) {
+      refreshSnapshotQueued.current = true;
+      return refreshSnapshotPromise.current;
+    }
+
+    const run = async () => {
+      do {
+        refreshSnapshotQueued.current = false;
+        const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
+        setSnapshot(nextSnapshot);
+        setSnapshotLoaded(true);
+      } while (refreshSnapshotQueued.current);
+    };
+
+    const promise = run().finally(() => {
+      refreshSnapshotPromise.current = null;
+    });
+    refreshSnapshotPromise.current = promise;
+    return promise;
   }
 
   async function checkForAppUpdate(options: { silent?: boolean } = {}) {
@@ -511,13 +542,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!snapshotLoaded || route === "#app" || route === "#tray" || route === "#onboarding-ready") {
+    if (!snapshotLoaded || route === "#tray") {
       return;
     }
-    if (setupIsComplete) {
-      setShowOnboarding(false);
+
+    if (route === "#onboarding-ready") {
+      setShowOnboarding(true);
+      return;
     }
-  }, [route, setupIsComplete, snapshotLoaded]);
+
+    setShowOnboarding(false);
+  }, [route, snapshotLoaded]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -1897,6 +1932,8 @@ function SettingsView({
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
+  const runtimeStopped = snapshot.health.state === "runtime_stopped";
+  const runtimeNeedsRepair = daemonStopped || runtimeStopped;
   const checkingForUpdate = updateStatus.state === "checking";
   const installingUpdate = updateStatus.state === "installing";
   const updateAvailable = updateStatus.state === "available" || updateStatus.state === "installing";
@@ -1910,14 +1947,14 @@ function SettingsView({
   }, [snapshot.settings.launchAtLogin, snapshot.settings.showMenuBar]);
 
   async function repairRuntime() {
-    if (!daemonStopped) {
+    if (!runtimeNeedsRepair) {
       return;
     }
     setDiagnosticMessage("");
     const report = await callCommand<ActionReport>(
       "ensure_runtime_ready",
       undefined,
-      { ok: true, message: "AFS daemon is running." },
+      { ok: true, message: "AFS runtime is running." },
     );
     setDiagnosticMessage(report.message);
     await onRefresh().catch(() => undefined);
@@ -1926,12 +1963,13 @@ function SettingsView({
   function copyDiagnostics() {
     const summary = [
       `AFS process: ${daemonStopped ? "Stopped" : "Running"}`,
+      snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
       "State folder: ~/.afs",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
       `Pending changes: ${snapshot.pendingChanges.length}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
     copyText(summary);
     setDiagnosticMessage("Copied diagnostics summary.");
   }
@@ -2094,14 +2132,17 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Diagnostics" />
           <SettingRow title="AFS process" value={daemonStopped ? "Stopped" : "Running"} />
+          {snapshot.mount.provider && (
+            <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
+          )}
           <SettingRow title="State folder" value="~/.afs" />
           <SettingRow title="Projection" value={snapshot.mount.projection} />
           <div className="button-row">
             <SecondaryButton compact onClick={copyDiagnostics}>
               Copy Summary
             </SecondaryButton>
-            <SecondaryButton compact disabled={!daemonStopped} onClick={() => void repairRuntime()}>
-              {daemonStopped ? "Start AFS" : "Repair AFS"}
+            <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
+              {runtimeNeedsRepair ? "Start AFS" : "Repair AFS"}
             </SecondaryButton>
           </div>
           {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
@@ -2978,11 +3019,19 @@ function WindowChrome({
   metaTitle?: string;
   onMetaClick?: () => void;
 }) {
+  const showWindowControls = isWindowsRuntime();
+
   return (
-    <div className="window-chrome" onMouseDown={handleChromeMouseDown}>
+    <div
+      className={`window-chrome ${showWindowControls ? "windows-chrome" : ""}`}
+      onMouseDown={handleChromeMouseDown}
+    >
       <div className="native-traffic-space" aria-hidden="true" />
       <div data-tauri-drag-region>{title}</div>
-      <div data-tauri-drag-region={!onMetaClick || undefined}>
+      <div
+        className="window-chrome-actions"
+        data-tauri-drag-region={(!onMetaClick && !showWindowControls) || undefined}
+      >
         {onMetaClick ? (
           <button className="window-meta-button" title={metaTitle} onClick={onMetaClick}>
             {meta}
@@ -2990,7 +3039,42 @@ function WindowChrome({
         ) : (
           <span title={metaTitle}>{meta}</span>
         )}
+        {showWindowControls && <WindowsWindowControls />}
       </div>
+    </div>
+  );
+}
+
+function WindowsWindowControls() {
+  return (
+    <div className="window-controls" aria-label="Window controls">
+      <button
+        className="window-control-button"
+        type="button"
+        aria-label="Minimize"
+        title="Minimize"
+        onClick={() => void getCurrentWindow().minimize()}
+      >
+        <Minus />
+      </button>
+      <button
+        className="window-control-button"
+        type="button"
+        aria-label="Maximize or restore"
+        title="Maximize or restore"
+        onClick={() => void getCurrentWindow().toggleMaximize()}
+      >
+        <Square />
+      </button>
+      <button
+        className="window-control-button close"
+        type="button"
+        aria-label="Close"
+        title="Close"
+        onClick={() => void getCurrentWindow().close()}
+      >
+        <X />
+      </button>
     </div>
   );
 }
@@ -3007,6 +3091,10 @@ function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
 
   event.preventDefault();
   void getCurrentWindow().startDragging();
+}
+
+function isWindowsRuntime() {
+  return typeof navigator !== "undefined" && /^Win/i.test(navigator.platform);
 }
 
 function SetupContent({
@@ -3235,10 +3323,6 @@ function mountMissing(snapshot: DesktopSnapshot) {
   return snapshot.mount.status === "not_mounted";
 }
 
-function setupComplete(snapshot: DesktopSnapshot) {
-  return !connectionMissing(snapshot) && !mountMissing(snapshot);
-}
-
 function isAppView(value: string): value is AppView {
   return value === "home" || value === "mount" || value === "pending" || value === "review" || value === "activity" || value === "settings";
 }
@@ -3252,6 +3336,9 @@ function healthLabel(state: string) {
   }
   if (state === "stopped") {
     return "Stopped";
+  }
+  if (state === "runtime_stopped") {
+    return "Runtime Needs Repair";
   }
   if (state === "checking_freshness") {
     return "Checking";
@@ -3269,6 +3356,9 @@ function healthDescription(state: string, attentionCount: number) {
   if (state === "stopped") {
     return "The AFS daemon is stopped; the app can still run direct actions when needed.";
   }
+  if (state === "runtime_stopped") {
+    return "The filesystem provider is stopped or unregistered; start AFS to restore online-only file access.";
+  }
   if (state === "checking_freshness") {
     return "AFS is checking the local mount and Notion freshness state.";
   }
@@ -3276,7 +3366,7 @@ function healthDescription(state: string, attentionCount: number) {
 }
 
 function healthTone(state: string): "ready" | "warn" | "danger" {
-  if (state === "reconnect_needed" || state === "stopped") {
+  if (state === "reconnect_needed" || state === "stopped" || state === "runtime_stopped") {
     return "danger";
   }
   if (state === "needs_review") {
@@ -3286,7 +3376,7 @@ function healthTone(state: string): "ready" | "warn" | "danger" {
 }
 
 function healthIconState(state: string): "default" | "review" | "reconnect" {
-  if (state === "reconnect_needed" || state === "stopped") {
+  if (state === "reconnect_needed" || state === "stopped" || state === "runtime_stopped") {
     return "reconnect";
   }
   if (state === "needs_review") {
@@ -3315,6 +3405,21 @@ function locatedStateLabel(state: LocatedItem["state"]) {
     return "Not Found";
   }
   return "Ready";
+}
+
+function providerStatusLabel(provider: ProviderRuntimeSummary) {
+  const state = provider.state === "running" ? "Running" : provider.state === "stopped" ? "Stopped" : "Error";
+  const parts = [state];
+  if (provider.pid) {
+    parts.push(`pid ${provider.pid}`);
+  }
+  if (provider.registered === false) {
+    parts.push("not registered");
+  }
+  if (provider.stalePidFile) {
+    parts.push("stale pid");
+  }
+  return parts.join(" - ");
 }
 
 function joinMountPath(mountPath: string, relativePath: string) {

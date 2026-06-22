@@ -617,6 +617,10 @@ fn protect_private_file(path: &Path) -> Result<(), String> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("Could not protect `{}`: {error}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -662,19 +666,21 @@ fn normalized_mount_path(mount_path: Option<&str>) -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+    afs_platform::user_home()
 }
 
 fn default_state_root() -> PathBuf {
     if let Ok(value) = env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return path;
+        }
+        if let Ok(current_dir) = env::current_dir() {
+            return current_dir.join(path);
+        }
     }
 
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
+    afs_platform::default_state_root()
 }
 
 fn mcp_endpoint() -> String {

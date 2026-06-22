@@ -27,12 +27,12 @@ use afs_store::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::DaemonConfig;
 use crate::autosave::{auto_save_target_for_write, pause_auto_save_for_remote_change};
 use crate::execution::{DaemonEventReport, PushJob};
+use crate::file_provider::FileProviderReadReport;
 use crate::freshness::{
     FreshnessQueue, freshness_timestamp, record_file_opened, record_local_change,
 };
@@ -49,8 +49,8 @@ use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
-    ROOT_CONTAINER_IDENTIFIER, VirtualFsItem, VirtualFsItemKind, VirtualFsMaterializeOutcome,
-    commit_virtual_fs_write, create_virtual_fs_directory, create_virtual_fs_file,
+    ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
+    create_virtual_fs_directory, create_virtual_fs_file,
     materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
     rename_virtual_fs_item, source_root_identifier, trash_virtual_fs_item,
     virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
@@ -388,18 +388,6 @@ pub struct FreshnessRuntimeReport {
     pub follow_up_jobs: Vec<SyncJob>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct FileProviderReadPayload {
-    mount_id: String,
-    identifier: String,
-    remote_id: String,
-    path: String,
-    outcome: VirtualFsMaterializeOutcome,
-    hydration: HydrationState,
-    item: VirtualFsItem,
-    contents_base64: String,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct DefaultRuntimeJobRunner;
 
@@ -729,7 +717,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error(afs_error_code(&error), error.to_string()),
         };
 
-        DaemonResponse::ok(FileProviderReadPayload {
+        DaemonResponse::ok(FileProviderReadReport {
             mount_id: materialized.mount_id,
             identifier: materialized.identifier,
             remote_id: materialized.remote_id,
@@ -2336,6 +2324,7 @@ fn observable_remote_identifier(identifier: &str) -> bool {
         && !identifier.starts_with("local:")
         && !identifier.starts_with("schema:")
         && !identifier.starts_with("children:")
+        && !identifier.starts_with("guidance:")
         && !identifier.starts_with("path:")
         && !identifier.starts_with("source:")
         && identifier != ROOT_CONTAINER_IDENTIFIER
@@ -2960,7 +2949,7 @@ mod tests {
 
     use super::{
         ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest,
-        execute_file_event, execute_observe_entity_job,
+        execute_file_event, execute_observe_entity_job, observable_remote_identifier,
     };
 
     #[test]
@@ -3037,6 +3026,16 @@ mod tests {
         active.clear();
         let deeper = queue.pop_ready(&active).expect("deeper refresh");
         assert_eq!(deeper.container_identifier, "children:page-a1");
+    }
+
+    #[test]
+    fn observable_remote_identifiers_exclude_virtual_only_items() {
+        assert!(observable_remote_identifier(
+            "3833ac0e-bb88-814b-b0e3-ea6963b6708a"
+        ));
+        assert!(!observable_remote_identifier("guidance:AGENTS.md"));
+        assert!(!observable_remote_identifier("children:page-1"));
+        assert!(!observable_remote_identifier("source:notion"));
     }
 
     #[test]
