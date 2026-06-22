@@ -79,16 +79,7 @@ pub fn render_page_bundle_with_options(
     let mut rendered_blocks = Vec::new();
     render_block_trees(&bundle.blocks, options, &mut rendered_blocks);
 
-    let body = rendered_blocks
-        .iter()
-        .map(|block| block.markdown.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let body = if body.is_empty() {
-        String::new()
-    } else {
-        format!("{body}\n")
-    };
+    let body = render_markdown_body(&rendered_blocks);
     let shadow_ids = rendered_blocks
         .iter()
         .filter_map(|block| block.shadow_id.clone())
@@ -120,7 +111,15 @@ struct RenderedBlock {
     markdown: String,
     shadow_id: Option<RemoteId>,
     metadata: RenderedBlockMetadata,
+    spacing: RenderedBlockSpacing,
     media_asset: Option<MediaAsset>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RenderedBlockSpacing {
+    #[default]
+    Normal,
+    ListItem,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -132,6 +131,43 @@ enum RenderedBlockMetadata {
         has_column_header: bool,
         has_row_header: bool,
     },
+}
+
+fn render_markdown_body(blocks: &[RenderedBlock]) -> String {
+    let mut body = String::new();
+    let mut previous_non_empty: Option<&RenderedBlock> = None;
+    let mut pending_empty_blocks = 0;
+
+    for block in blocks {
+        if block.markdown.is_empty() {
+            pending_empty_blocks += 1;
+            continue;
+        }
+
+        if let Some(previous) = previous_non_empty {
+            if pending_empty_blocks == 0 && should_tight_join(previous, block) {
+                body.push('\n');
+            } else if pending_empty_blocks == 0 {
+                body.push_str("\n\n");
+            } else {
+                body.push_str(&"\n".repeat(pending_empty_blocks + 1));
+            }
+        }
+        body.push_str(&block.markdown);
+        previous_non_empty = Some(block);
+        pending_empty_blocks = 0;
+    }
+
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("{body}\n")
+    }
+}
+
+fn should_tight_join(previous: &RenderedBlock, next: &RenderedBlock) -> bool {
+    previous.spacing == RenderedBlockSpacing::ListItem
+        && next.spacing == RenderedBlockSpacing::ListItem
 }
 
 fn render_block_trees(
@@ -197,13 +233,13 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
             |text| format!("#### {text}"),
             "heading_4",
         ),
-        "bulleted_list_item" => rich_text_block(
+        "bulleted_list_item" => list_item_block(
             block,
             block.bulleted_list_item.as_ref(),
             |text| format!("- {text}"),
             "bulleted_list_item",
         ),
-        "numbered_list_item" => rich_text_block(
+        "numbered_list_item" => list_item_block(
             block,
             block.numbered_list_item.as_ref(),
             |text| format!("1. {text}"),
@@ -216,7 +252,7 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
                 if text.trim().is_empty() {
                     directive_block(block, "empty_to_do", None)
                 } else {
-                    rendered_block(format!("- [{marker}] {text}"), shadow_id)
+                    list_item_rendered_block(format!("- [{marker}] {text}"), shadow_id)
                 }
             }
             None => directive_block(block, "malformed_to_do", None),
@@ -330,6 +366,19 @@ fn rich_text_block(
     }
 }
 
+fn list_item_block(
+    block: &BlockDto,
+    content: Option<&RichTextBlockDto>,
+    render: impl FnOnce(&str) -> String,
+    empty_directive_type: &str,
+) -> RenderedBlock {
+    let mut block = rich_text_block(block, content, render, empty_directive_type);
+    if block.shadow_id.is_some() {
+        block.spacing = RenderedBlockSpacing::ListItem;
+    }
+    block
+}
+
 fn equation_block(block: &BlockDto, equation: Option<&EquationBlockDto>) -> RenderedBlock {
     let Some(expression) = equation
         .map(|equation| equation.expression.trim())
@@ -385,7 +434,7 @@ fn file_media_block(
                 && let Some(page_path) = options.page_path.as_deref()
             {
                 let local_path = media_local_path(page_path, &block.id, media_type, &url);
-                if media_type == "image" && options.use_local_media_for(&block.id) {
+                if options.use_local_media_for(&block.id) {
                     markdown_url = local_media_href(page_path, &local_path);
                 }
                 media_asset = Some(MediaAsset {
@@ -400,7 +449,7 @@ fn file_media_block(
             let markdown = if media_type == "image" {
                 format!("![{}]({markdown_url})", escape_markdown_link_label(&label))
             } else {
-                format!("[{}]({url})", escape_markdown_link_label(&label))
+                format!("[{}]({markdown_url})", escape_markdown_link_label(&label))
             };
             let mut rendered = rendered_block(markdown, Some(RemoteId::new(block.id.clone())));
             rendered.media_asset = media_asset;
@@ -507,6 +556,7 @@ fn directive_block_with_attrs(
         markdown,
         shadow_id: None,
         metadata: RenderedBlockMetadata::None,
+        spacing: RenderedBlockSpacing::Normal,
         media_asset: None,
     }
 }
@@ -516,8 +566,15 @@ fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBloc
         markdown,
         shadow_id,
         metadata: RenderedBlockMetadata::None,
+        spacing: RenderedBlockSpacing::Normal,
         media_asset: None,
     }
+}
+
+fn list_item_rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBlock {
+    let mut block = rendered_block(markdown, shadow_id);
+    block.spacing = RenderedBlockSpacing::ListItem;
+    block
 }
 
 fn code_fence_markdown(language: &str, code: &str) -> String {
@@ -599,6 +656,7 @@ fn render_table_tree(tree: &BlockTreeDto) -> Option<RenderedBlock> {
             has_column_header: table.has_column_header,
             has_row_header: table.has_row_header,
         },
+        spacing: RenderedBlockSpacing::Normal,
         media_asset: None,
     })
 }

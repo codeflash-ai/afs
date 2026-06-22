@@ -19,7 +19,7 @@ use afs_store::{
     RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
-use afsd::virtual_fs::virtual_fs_content_path;
+use afsd::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
 #[test]
 fn status_reports_clean_and_dirty_hydrated_files() {
@@ -57,6 +57,68 @@ fn status_reports_clean_and_dirty_hydrated_files() {
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
     assert_eq!(entry_state(&report, "Notes.md"), StatusState::Dirty);
     assert_eq!(entry_issue(&report, "Notes.md"), "local_body_changed");
+}
+
+#[test]
+fn status_treats_content_cache_absolute_media_href_as_clean() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap/page.md",
+        "# Roadmap\n\n![Image](../.afs/media/Roadmap/image-1.png)",
+    );
+    let absolute_media = virtual_fs_content_root(&fixture.state_root, &fixture.mount_id)
+        .join(".afs/media/Roadmap/image-1.png");
+    fixture.write_page(
+        "Roadmap/page.md",
+        "page-1",
+        &format!("# Roadmap\n\n![Image]({})", absolute_media.display()),
+    );
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.join("Roadmap/page.md")),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(entry_state(&report, "Roadmap/page.md"), StatusState::Clean);
+    assert!(report.clean);
+}
+
+#[test]
+fn status_reports_clean_when_dirty_hint_has_equivalent_body() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(entity_record(
+            &fixture.mount_id,
+            "page-1",
+            "Roadmap.md",
+            HydrationState::Dirty,
+        ))
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "- One\n\n- Two"))
+        .expect("save shadow");
+    fixture.write_page("Roadmap.md", "page-1", "- One\n- Two");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean, "{report:#?}");
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
+    assert!(status_entry(&report, "Roadmap.md").issues.is_empty());
 }
 
 #[test]

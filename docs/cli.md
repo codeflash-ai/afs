@@ -434,6 +434,11 @@ The production command path uses the SQLite store. A real diff requires persiste
 
 The push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `afs diff`. It refuses `unresolved_conflict_markers`; edit the file to the intended final content and remove every marker line before pushing. When the plan is approved, it enters the journaled connector-apply executor. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
 
+Markdown edits that change a block's remote type are reported as
+`replace_block` operations. For Notion, that means AFS creates the replacement
+block at the old block's position and archives the old block after the new ID is
+journaled.
+
 The JSON report has the same validation, plan, degradation, guardrail, and stage fields as `afs diff`. Its `action` is one of:
 
 - `fix_validation`;
@@ -446,7 +451,7 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_not_implemented`;
 - `apply_failed`.
 
-Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, local image media updates, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal. Once a journaled push starts, the daemon performs connector metadata checks and verifies the current Remote Tree render still matches the Synced Tree shadow before applying Local Tree edits.
+Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, local file-like media updates, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal. Once a journaled push starts, the daemon performs connector metadata checks and verifies the current Remote Tree render still matches the Synced Tree shadow before applying Local Tree edits.
 
 Unsupported-operation JSON shape:
 

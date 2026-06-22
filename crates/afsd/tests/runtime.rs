@@ -315,6 +315,32 @@ fn runtime_reports_status_snapshot() {
 }
 
 #[test]
+fn runtime_shutdown_request_stops_runtime() {
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("shutdown-request"),
+        EventRunner {
+            event_tx: mpsc::channel().0,
+        },
+    )
+    .expect("spawn runtime");
+    let handle = runtime.handle();
+
+    let response = handle.request(DaemonRequest::Shutdown);
+    assert_eq!(
+        response,
+        DaemonResponse::ok(json!({ "status": "shutting_down" }))
+    );
+
+    let ping = handle.request(DaemonRequest::Ping);
+    assert!(!ping.ok);
+    assert_eq!(
+        ping.error.expect("runtime stopped error").code,
+        "runtime_stopped"
+    );
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_routes_push_request_through_runner() {
     let (push_tx, push_rx) = mpsc::channel();
     let runtime = DaemonRuntime::spawn_with_runner(

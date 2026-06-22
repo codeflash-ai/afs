@@ -11,10 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, Connector};
 
-use afs_core::canonical::{
-    CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown,
-    render_canonical_markdown,
-};
+use afs_core::canonical::{CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown};
 use afs_core::conflict::unresolved_conflict_marker_line;
 use afs_core::diff::property_value_from_frontmatter;
 use afs_core::freshness::RemoteVersion;
@@ -37,7 +34,7 @@ use afs_core::shadow::segment_markdown_body;
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::media::{
-    load_media_manifest, media_manifest_entry, resolve_media_href, sha256_hex,
+    load_media_manifest, media_manifest_entry, resolve_media_href_with_content_root, sha256_hex,
 };
 use afs_store::{
     AutoSaveRepository, EntityRecord, EntityRepository, FreshnessStateRepository,
@@ -54,7 +51,7 @@ use crate::autosave::{
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
-use crate::media::update_hydrated_media_manifest;
+use crate::media::{render_document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use crate::shadow_match::shadows_match;
 use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
@@ -410,25 +407,42 @@ fn augment_notion_media_plan(
     let mut media_updates = BTreeMap::<RemoteId, PushOperation>::new();
 
     for (index, shadow_block) in shadow.blocks.iter().enumerate() {
-        let Some((_, shadow_href)) = parse_image_markdown(&shadow_block.text) else {
+        let Some((shadow_shape, shadow_caption, shadow_href)) =
+            parse_file_like_media_markdown(&shadow_block.text)
+        else {
             continue;
         };
-        let Some(shadow_path) = resolve_media_href(relative_path, shadow_href) else {
-            continue;
-        };
-        let Some(edited_block) = edited_blocks.get(index) else {
-            continue;
-        };
-        let Some((caption, edited_href)) = parse_image_markdown(&edited_block.text) else {
-            continue;
-        };
-        let Some(local_path) = resolve_media_href(relative_path, edited_href) else {
+        let Some(shadow_path) =
+            resolve_media_href_with_content_root(relative_path, shadow_href, &root)
+        else {
             continue;
         };
         let Some(entry) = media_manifest_entry(&manifest, &shadow_path) else {
             continue;
         };
-        let markdown_changed = shadow_block.text != edited_block.text;
+        if entry.block_id != shadow_block.remote_id.as_str()
+            || !is_file_like_media_kind(&entry.kind)
+            || !media_markdown_shape_matches_kind(shadow_shape, &entry.kind)
+        {
+            continue;
+        }
+        let Some(edited_block) = edited_blocks.get(index) else {
+            continue;
+        };
+        let Some((edited_shape, caption, edited_href)) =
+            parse_file_like_media_markdown(&edited_block.text)
+        else {
+            continue;
+        };
+        if !media_markdown_shape_matches_kind(edited_shape, &entry.kind) {
+            continue;
+        }
+        let Some(local_path) =
+            resolve_media_href_with_content_root(relative_path, edited_href, &root)
+        else {
+            continue;
+        };
+        let markdown_changed = shadow_caption != caption || shadow_path != local_path;
         let bytes_changed = std::fs::read(root.join(&local_path))
             .map(|bytes| sha256_hex(&bytes) != entry.sha256)
             .unwrap_or(false);
@@ -479,20 +493,48 @@ fn augment_notion_media_plan(
     }
 }
 
-fn parse_image_markdown(input: &str) -> Option<(&str, &str)> {
-    let link = input.trim().strip_prefix('!')?;
-    if !link.starts_with('[') {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaMarkdownShape {
+    Image,
+    Link,
+}
+
+fn parse_file_like_media_markdown(input: &str) -> Option<(MediaMarkdownShape, &str, &str)> {
+    let trimmed = input.trim();
+    if let Some(link) = trimmed.strip_prefix('!') {
+        let (label, href) = parse_markdown_link_exact(link)?;
+        return Some((MediaMarkdownShape::Image, label, href));
+    }
+
+    let (label, href) = parse_markdown_link_exact(trimmed)?;
+    Some((MediaMarkdownShape::Link, label, href))
+}
+
+fn parse_markdown_link_exact(input: &str) -> Option<(&str, &str)> {
+    if !input.starts_with('[') {
         return None;
     }
-    let label_end = link.find("](")?;
+    let label_end = input.find("](")?;
     let href_start = label_end + 2;
-    let href_end = link[href_start..]
+    let href_end = input[href_start..]
         .find(')')
         .map(|offset| href_start + offset)?;
-    if href_end + 1 != link.len() {
+    if href_end + 1 != input.len() {
         return None;
     }
-    Some((&link[1..label_end], &link[href_start..href_end]))
+    Some((&input[1..label_end], &input[href_start..href_end]))
+}
+
+fn media_markdown_shape_matches_kind(shape: MediaMarkdownShape, kind: &str) -> bool {
+    matches!(
+        (shape, kind),
+        (MediaMarkdownShape::Image, "image")
+            | (MediaMarkdownShape::Link, "video" | "file" | "pdf" | "audio")
+    )
+}
+
+fn is_file_like_media_kind(kind: &str) -> bool {
+    matches!(kind, "image" | "video" | "file" | "pdf" | "audio")
 }
 
 fn remote_preconditions_for_plan<S>(
@@ -1458,7 +1500,10 @@ where
         write_binary_atomic(&path, &asset.bytes)?;
     }
     update_hydrated_media_manifest(output_root, &rendered.assets)?;
-    write_atomic(path, render_canonical_markdown(&rendered.document))?;
+    write_atomic(
+        path,
+        render_document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root),
+    )?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(AfsError::from)?;

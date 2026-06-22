@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_provider::{self, ProjectionRefreshBase};
 use crate::hydration::{HydratedAsset, HydratedEntity};
-use crate::media::update_hydrated_media_manifest;
+use crate::media::{
+    document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
+    update_hydrated_media_manifest,
+};
 use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 use crate::source::SourceAdapter;
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
@@ -612,7 +615,7 @@ where
     write_assets(&media_root, &rendered.assets)?;
 
     if can_replace {
-        accept_remote_projection(store, mount, entity, &path, rendered)?;
+        accept_remote_projection(store, mount, entity, &path, &media_root, rendered)?;
         return Ok(HydrationOutcome::Hydrated);
     }
 
@@ -624,7 +627,7 @@ where
         return Ok(HydrationOutcome::Conflicted(conflict));
     } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
         let conflict = pull_conflict(mount, &entity);
-        materialize_conflict(store, mount, entity, &path, rendered)?;
+        materialize_conflict(store, mount, entity, &path, &media_root, rendered)?;
         return Ok(HydrationOutcome::Conflicted(conflict));
     } else {
         store
@@ -692,12 +695,14 @@ fn accept_remote_projection<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     path: &Path,
+    output_root: &Path,
     rendered: HydratedEntity,
 ) -> Result<(), PullError>
 where
     S: EntityRepository + ShadowRepository,
 {
-    let markdown = render_canonical_markdown(&rendered.document);
+    let markdown =
+        render_document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
     write_atomic(path, markdown)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
@@ -718,6 +723,7 @@ fn materialize_conflict<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     path: &Path,
+    output_root: &Path,
     rendered: HydratedEntity,
 ) -> Result<(), PullError>
 where
@@ -732,12 +738,14 @@ where
         Err(StoreError::ShadowMissing { .. }) => None,
         Err(error) => return Err(PullError::Store(error)),
     };
+    let remote_document =
+        document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
     let conflict_markdown = render_inline_conflict_markdown_with_base(
         &local_contents,
         base_shadow
             .as_ref()
             .map(|shadow| shadow.rendered_body.as_str()),
-        &rendered.document,
+        &remote_document,
     );
     write_atomic(path, conflict_markdown)?;
     store
@@ -1100,7 +1108,7 @@ mod tests {
 
     use afs_core::canonical::render_canonical_markdown;
     use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
-    use afs_core::shadow::{ShadowDocument, stable_hash};
+    use afs_core::shadow::{ShadowDocument, segment_markdown_body};
     use afs_store::{EntityRecord, EntityRepository, InMemoryStateStore, ShadowRepository};
 
     use super::{can_replace_file, write_atomic};
@@ -1113,6 +1121,30 @@ mod tests {
             HydrationState::Dirty,
             fixture.document("Roadmap", "# Roadmap\n\nOriginal body.\n"),
         );
+
+        assert!(
+            can_replace_file(
+                &store,
+                &fixture.mount,
+                &fixture.entity(HydrationState::Dirty),
+                &fixture.page_path,
+            )
+            .expect("check replace")
+        );
+    }
+
+    #[test]
+    fn can_replace_stale_dirty_file_when_block_diff_is_noop() {
+        let fixture = PullFixture::new();
+        let store = fixture.store_with_shadow(
+            HydrationState::Dirty,
+            fixture.document("Roadmap", "- One\n\n- Two\n"),
+        );
+        write_atomic(
+            &fixture.page_path,
+            render_canonical_markdown(&fixture.document("Roadmap", "- One\n- Two\n")),
+        )
+        .expect("write compacted projection");
 
         assert!(
             can_replace_file(
@@ -1254,13 +1286,21 @@ mod tests {
             document: CanonicalDocument,
         ) -> InMemoryStateStore {
             let mut store = InMemoryStateStore::new();
-            let shadow = ShadowDocument {
-                entity_id: self.remote_id.clone(),
-                frontmatter: document.frontmatter.clone(),
-                body_hash: stable_hash(&document.body),
-                rendered_body: document.body.clone(),
-                blocks: Vec::new(),
-            };
+            let body_start_line = document.frontmatter.lines().count() + 3;
+            let native_block_count = segment_markdown_body(&document.body, body_start_line)
+                .into_iter()
+                .filter(|block| !block.is_directive())
+                .count();
+            let block_ids =
+                (0..native_block_count).map(|index| RemoteId::new(format!("block-{index}")));
+            let shadow = ShadowDocument::from_synced_body(
+                self.remote_id.clone(),
+                document.body.clone(),
+                body_start_line,
+                block_ids,
+            )
+            .expect("shadow")
+            .with_frontmatter(document.frontmatter.clone());
 
             store
                 .save_shadow(&self.mount_id, shadow)

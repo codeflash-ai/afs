@@ -17,6 +17,7 @@ pub enum DaemonRequest {
     Ping,
     Status,
     ReloadMounts,
+    Shutdown,
     Pull {
         path: PathBuf,
     },
@@ -570,6 +571,14 @@ mod tests {
                 identifier: "page-1".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn shutdown_command_decodes() {
+        let request: DaemonRequest =
+            serde_json::from_str(r#"{"command":"shutdown"}"#).expect("decode shutdown request");
+
+        assert_eq!(request, DaemonRequest::Shutdown);
     }
 
     #[test]

@@ -6,10 +6,11 @@ import {
   AlertTriangle,
   Bot,
   Check,
-  ChevronUp,
   ChevronRight,
+  ChevronUp,
   Clipboard,
   Clock3,
+  Code2,
   Copy,
   Download,
   EyeOff,
@@ -54,6 +55,7 @@ type DesktopSnapshot = {
     workspaceName: string;
     localPath: string;
     notionUrl?: string | null;
+    accessScope: string;
     projection: string;
     readOnly: boolean;
     status: string;
@@ -183,6 +185,7 @@ const sampleSnapshot: DesktopSnapshot = {
     workspaceName: "CodeFlash",
     localPath: "~/Library/CloudStorage/AFS/notion",
     notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
+    accessScope: "Initial Idea",
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
@@ -1533,6 +1536,8 @@ function MountDetailView({
   const [actionError, setActionError] = useState("");
   const [accessMessage, setAccessMessage] = useState("");
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
+  const accountLabel = snapshot.connection.accountLabel.trim();
+  const showAccount = accountLabel.length > 0 && accountLabel !== snapshot.connection.workspaceName;
 
   async function openFolder() {
     setActionError("");
@@ -1540,6 +1545,18 @@ function MountDetailView({
       "open_path",
       { path: snapshot.mount.localPath },
       { ok: true, message: "Opened demo folder." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+    }
+  }
+
+  async function openVsCode() {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "open_in_vs_code",
+      { path: snapshot.mount.localPath },
+      { ok: true, message: "Opened demo folder in VS Code." },
     );
     if (!report.ok) {
       setActionError(report.message);
@@ -1599,6 +1616,9 @@ function MountDetailView({
           <SecondaryButton compact icon={<Copy />} onClick={() => copyText(snapshot.mount.localPath)}>
             Copy Path
           </SecondaryButton>
+          <SecondaryButton compact icon={<Code2 />} onClick={() => void openVsCode()}>
+            Open in VS Code
+          </SecondaryButton>
           <SecondaryButton
             compact
             disabled={connectionMissing(snapshot) || accessState === "changing"}
@@ -1618,22 +1638,20 @@ function MountDetailView({
 
       <section className="detail-grid">
         <div className="panel">
-          <PanelTitle title="Workspace" />
-          <SettingRow title="Source" value="Notion" />
+          <PanelTitle title="Notion Access" />
           <SettingRow title="Workspace" value={snapshot.connection.workspaceName} />
-          <SettingRow title="Account" value={snapshot.connection.accountLabel || "Connected"} />
-          <SettingRow
-            title="Mounted root"
-            value={snapshot.mount.notionUrl ? "Open in Notion" : "Not available"}
-            href={snapshot.mount.notionUrl ?? undefined}
-          />
-          <SettingRow title="Notion access" value="Selected pages and databases" />
-          <SettingRow title="Access" value={snapshot.mount.readOnly ? "Read Only" : "Edit enabled"} />
+          {showAccount && <SettingRow title="Account" value={accountLabel} />}
+          <SettingRow title="Selected access" value={snapshot.mount.accessScope} />
+          {snapshot.mount.notionUrl && (
+            <SettingRow title="Mounted root" value="Open in Notion" href={snapshot.mount.notionUrl} />
+          )}
+          <SettingRow title="Permission" value={snapshot.mount.readOnly ? "Read only" : "Edit enabled"} />
         </div>
 
         <div className="panel">
           <PanelTitle title="Local Files" />
           <SettingRow title="Location" value={snapshot.mount.localPath} />
+          <SettingRow title="Projection" value={snapshot.mount.projection} />
           <SettingRow title="Mounted content" value="Workspace hierarchy" />
           <SettingRow title="Agent guidance" value="AGENTS.md and CLAUDE.md" />
         </div>
@@ -2279,9 +2297,34 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [quitOptionsOpen, setQuitOptionsOpen] = useState(false);
+  const quitOptionsRef = useRef<HTMLDivElement | null>(null);
   const { results: searchResults, searching } = useNotionSearchResults(url);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
   const visibleSearchResults = locateState === "ready" ? [] : searchResults.slice(0, 3);
+
+  useEffect(() => {
+    if (!quitOptionsOpen) {
+      return undefined;
+    }
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!quitOptionsRef.current?.contains(event.target as Node)) {
+        setQuitOptionsOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setQuitOptionsOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", closeOnOutsideClick, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [quitOptionsOpen]);
 
   async function locatePage() {
     if (!url.trim()) {
@@ -2421,16 +2464,15 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
 
       <section className="tray-section tray-suggestion">
         <p className="label">Suggestion</p>
-        <div className="tray-suggestion-copy">
+        <div className="tray-suggestion-row">
           <strong>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</strong>
-          <span>{snapshot.suggestions[0]?.description ?? "Mount more workspaces as local files."}</span>
+          <button disabled>Coming Soon</button>
         </div>
-        <button disabled>Coming Soon</button>
       </section>
 
       <footer className="tray-footer">
         <button onClick={() => openMain("settings")}>Settings</button>
-        <div className="tray-quit-options">
+        <div className="tray-quit-options" ref={quitOptionsRef}>
           <button onClick={() => setQuitOptionsOpen((open) => !open)}>Quit Options</button>
           {quitOptionsOpen && (
             <div className="tray-quit-menu">
