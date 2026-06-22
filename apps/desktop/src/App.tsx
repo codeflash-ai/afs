@@ -584,6 +584,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauriRuntime()) {
+      return undefined;
+    }
+
+    const refreshVisibleSnapshot = () => {
+      if (document.visibilityState !== "hidden") {
+        void refreshSnapshot().catch(() => undefined);
+      }
+    };
+
+    const interval = window.setInterval(refreshVisibleSnapshot, 10000);
+    window.addEventListener("focus", refreshVisibleSnapshot);
+    document.addEventListener("visibilitychange", refreshVisibleSnapshot);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshVisibleSnapshot);
+      document.removeEventListener("visibilitychange", refreshVisibleSnapshot);
+    };
+  }, []);
+
+  useEffect(() => {
     document.body.dataset.surface = route === "#tray" ? "tray" : "app";
   }, [route]);
 
@@ -1135,8 +1157,9 @@ function MainShell({
   appStoreDistribution: boolean;
   onResetComplete: () => void;
 }) {
-  const meta = snapshot.health.attentionCount > 0 ? "Pending Changes" : "Ready";
+  const meta = chromeStatusLabel(snapshot);
   const statusTitle = healthDescription(snapshot.health.state, snapshot.health.attentionCount);
+  const statusTarget = chromeStatusTarget(snapshot);
 
   return (
     <main className="app-frame">
@@ -1144,7 +1167,7 @@ function MainShell({
         title="AFS"
         meta={meta}
         metaTitle={statusTitle}
-        onMetaClick={snapshot.health.attentionCount > 0 ? () => onViewChange("pending") : undefined}
+        onMetaClick={statusTarget ? () => onViewChange(statusTarget) : undefined}
       />
       <div className="app-shell">
         <aside className="sidebar">
@@ -1185,10 +1208,10 @@ function MainShell({
             <button
               className="status-button"
               title={statusTitle}
-              onClick={() => onViewChange(snapshot.health.attentionCount > 0 ? "pending" : "mount")}
+              onClick={() => onViewChange(statusTarget ?? "mount")}
             >
-              <StatusPill tone={snapshot.health.attentionCount > 0 ? "warn" : "ready"} title={statusTitle}>
-                {snapshot.health.attentionCount > 0 ? "Pending Changes" : "Notion Ready"}
+              <StatusPill tone={healthTone(snapshot.health.state)} title={statusTitle}>
+                {sidebarStatusLabel(snapshot)}
               </StatusPill>
             </button>
           </div>
@@ -1548,7 +1571,7 @@ function MountDetailView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mount" }]} />
-      <ViewHeader eyebrow="Mount" title={snapshot.mount.workspaceName}>
+      <ViewHeader title={snapshot.mount.workspaceName}>
         <StatusPill
           tone={healthTone(snapshot.health.state)}
           title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
@@ -1701,7 +1724,7 @@ function PendingView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending" }]} />
-      <ViewHeader eyebrow="Pending" title="Pending Changes">
+      <ViewHeader title="Pending Changes">
         <div className="button-row">
           <SecondaryButton
             disabled={!hasPendingChanges || isPushing}
@@ -1825,7 +1848,7 @@ function ReviewView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending", onClick: onPending }, { label: "Review" }]} />
-      <ViewHeader eyebrow="Review Push" title={plan.title}>
+      <ViewHeader title={plan.title}>
         <StatusPill
           tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}
           title={isPushing ? "AFS is writing the approved local changes to Notion." : "This push is ready for review."}
@@ -1885,7 +1908,7 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Activity" }]} />
-      <ViewHeader eyebrow="Activity" title="Recent activity" />
+      <ViewHeader title="Recent activity" />
       {Object.entries(grouped).map(([when, items]) => (
         <section className="activity-group" key={when}>
           <p className="label">{when}</p>
@@ -2125,7 +2148,7 @@ function SettingsView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Settings" }]} />
-      <ViewHeader eyebrow="Settings" title="AFS controls" />
+      <ViewHeader title="AFS controls" />
 
       <section className="settings-grid">
         <div className="panel">
@@ -3112,14 +3135,14 @@ function ViewHeader({
   title,
   children,
 }: {
-  eyebrow: string;
+  eyebrow?: string;
   title: string;
   children?: React.ReactNode;
 }) {
   return (
     <header className="view-header">
       <div>
-        <p className="eyebrow">{eyebrow}</p>
+        {eyebrow && <p className="eyebrow">{eyebrow}</p>}
         <h1>{title}</h1>
       </div>
       {children}
@@ -3453,6 +3476,40 @@ function mountMissing(snapshot: DesktopSnapshot) {
 
 function isAppView(value: string): value is AppView {
   return value === "home" || value === "mount" || value === "pending" || value === "review" || value === "activity" || value === "settings";
+}
+
+function chromeStatusLabel(snapshot: DesktopSnapshot) {
+  if (snapshot.health.state === "ready") {
+    return "Ready";
+  }
+  if (snapshot.health.state === "needs_review") {
+    return "Pending Changes";
+  }
+  return healthLabel(snapshot.health.state);
+}
+
+function sidebarStatusLabel(snapshot: DesktopSnapshot) {
+  if (snapshot.health.state === "ready") {
+    return "Notion Ready";
+  }
+  if (snapshot.health.state === "needs_review") {
+    return "Pending Changes";
+  }
+  return healthLabel(snapshot.health.state);
+}
+
+function chromeStatusTarget(snapshot: DesktopSnapshot): AppView | null {
+  if (snapshot.health.state === "needs_review") {
+    return "pending";
+  }
+  if (
+    snapshot.health.state === "stopped" ||
+    snapshot.health.state === "runtime_stopped" ||
+    snapshot.health.state === "reconnect_needed"
+  ) {
+    return "settings";
+  }
+  return null;
 }
 
 function healthLabel(state: string) {
