@@ -11,7 +11,7 @@ use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
@@ -194,6 +194,8 @@ struct ActivityItem {
     title: String,
     detail: String,
     when: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    occurred_at: Option<String>,
     kind: String,
     undo_available: bool,
 }
@@ -1503,6 +1505,7 @@ fn activity_from_journals(
                 title,
                 detail,
                 when: "Recent".to_string(),
+                occurred_at: journal_activity_timestamp(journal),
                 kind: "push".to_string(),
                 undo_available,
             }
@@ -1516,6 +1519,7 @@ fn activity_from_journals(
             title: "AFS desktop opened".to_string(),
             detail: "Ready to connect and review workspace changes".to_string(),
             when: "Today".to_string(),
+            occurred_at: Some(activity_timestamp()),
             kind: "open".to_string(),
             undo_available: false,
         });
@@ -1537,6 +1541,7 @@ fn record_desktop_activity(
             title: title.to_string(),
             detail: detail.to_string(),
             when: "Recent".to_string(),
+            occurred_at: Some(activity_timestamp()),
             kind: kind.to_string(),
             undo_available: false,
         },
@@ -1551,6 +1556,19 @@ fn record_desktop_activity(
     let contents = serde_json::to_string_pretty(&items)
         .map_err(|error| format!("Could not serialize desktop activity: {error}"))?;
     fs::write(&path, contents).map_err(|error| format!("Could not write desktop activity: {error}"))
+}
+
+fn journal_activity_timestamp(journal: &JournalEntry) -> Option<String> {
+    let timestamp = journal.push_id.0.strip_prefix("push-")?.split('-').next()?;
+    let nanos = timestamp.parse::<u128>().ok()?;
+    Some(format!("unix_ms:{}", nanos / 1_000_000))
+}
+
+fn activity_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix_ms:{}", duration.as_millis()),
+        Err(_) => "unix_ms:0".to_string(),
+    }
 }
 
 fn load_desktop_activity(state_root: &Path) -> Result<Vec<ActivityItem>, String> {
@@ -6103,6 +6121,12 @@ mod tests {
             Some("Changed Notion access 2")
         );
         assert!(items.iter().all(|item| item.when == "Recent"));
+        assert!(items.iter().all(|item| item.occurred_at.is_some()));
+        assert!(items.iter().all(|item| {
+            item.occurred_at
+                .as_deref()
+                .is_some_and(|value| value.starts_with("unix_ms:"))
+        }));
         assert!(items.iter().all(|item| !item.undo_available));
     }
 
@@ -6207,6 +6231,7 @@ fn sample_snapshot() -> DesktopSnapshot {
                 title: "Pushed Roadmap 2026 to Notion".to_string(),
                 detail: "2 block edits".to_string(),
                 when: "Today".to_string(),
+                occurred_at: Some("unix_ms:1782033300000".to_string()),
                 kind: "push".to_string(),
                 undo_available: true,
             },
@@ -6214,6 +6239,7 @@ fn sample_snapshot() -> DesktopSnapshot {
                 title: "Located Launch Plan".to_string(),
                 detail: "Prepared local path for an agent".to_string(),
                 when: "Today".to_string(),
+                occurred_at: Some("unix_ms:1782028800000".to_string()),
                 kind: "locate".to_string(),
                 undo_available: false,
             },
@@ -6221,6 +6247,7 @@ fn sample_snapshot() -> DesktopSnapshot {
                 title: "Connected Notion workspace CodeFlash".to_string(),
                 detail: "Credentials stored in the OS credential store".to_string(),
                 when: "Earlier".to_string(),
+                occurred_at: Some("unix_ms:1781942400000".to_string()),
                 kind: "connect".to_string(),
                 undo_available: false,
             },

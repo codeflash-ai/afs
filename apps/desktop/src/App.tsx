@@ -85,6 +85,7 @@ type ActivityItem = {
   title: string;
   detail: string;
   when: string;
+  occurredAt?: string | null;
   kind: string;
   undoAvailable: boolean;
 };
@@ -219,6 +220,7 @@ const sampleSnapshot: DesktopSnapshot = {
       title: "Pushed Roadmap 2026 to Notion",
       detail: "2 block edits",
       when: "Today",
+      occurredAt: "unix_ms:1782033300000",
       kind: "push",
       undoAvailable: true,
     },
@@ -226,6 +228,7 @@ const sampleSnapshot: DesktopSnapshot = {
       title: "Located Launch Plan",
       detail: "Prepared local path for an agent",
       when: "Today",
+      occurredAt: "unix_ms:1782028800000",
       kind: "locate",
       undoAvailable: false,
     },
@@ -233,6 +236,7 @@ const sampleSnapshot: DesktopSnapshot = {
       title: "Connected Notion workspace CodeFlash",
       detail: "Credentials stored in the OS credential store",
       when: "Earlier",
+      occurredAt: "unix_ms:1781942400000",
       kind: "connect",
       undoAvailable: false,
     },
@@ -1872,7 +1876,8 @@ function ReviewView({
 function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: () => void }) {
   const grouped = useMemo(() => {
     return snapshot.activity.reduce<Record<string, ActivityItem[]>>((acc, item) => {
-      acc[item.when] = [...(acc[item.when] ?? []), item];
+      const label = activityGroupLabel(item);
+      acc[label] = [...(acc[label] ?? []), item];
       return acc;
     }, {});
   }, [snapshot.activity]);
@@ -1885,8 +1890,11 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
         <section className="activity-group" key={when}>
           <p className="label">{when}</p>
           {items.map((item) => (
-            <article className="activity-item" key={`${when}-${item.title}`}>
-              <Clock3 />
+            <article className="activity-item" key={`${when}-${item.kind}-${item.title}-${item.occurredAt ?? item.when}`}>
+              <span className="activity-time" title={activityFullTimeLabel(item)}>
+                <Clock3 />
+                <span>{activityTimeLabel(item)}</span>
+              </span>
               <div>
                 <h3>{item.title}</h3>
                 <p>{item.detail}</p>
@@ -1901,6 +1909,67 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
         </section>
       ))}
     </div>
+  );
+}
+
+function activityGroupLabel(item: ActivityItem) {
+  const date = parseActivityDate(item.occurredAt);
+  if (!date) {
+    return item.when;
+  }
+  if (sameCalendarDay(date, new Date())) {
+    return "Today";
+  }
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (sameCalendarDay(date, yesterday)) {
+    return "Yesterday";
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
+  }).format(date);
+}
+
+function activityTimeLabel(item: ActivityItem) {
+  const date = parseActivityDate(item.occurredAt);
+  if (!date) {
+    return item.when;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function activityFullTimeLabel(item: ActivityItem) {
+  const date = parseActivityDate(item.occurredAt);
+  if (!date) {
+    return item.when;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function parseActivityDate(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  const millis = value.startsWith("unix_ms:") ? Number(value.slice("unix_ms:".length)) : Number(value);
+  const date = Number.isFinite(millis)
+    ? new Date(value.length <= 10 ? millis * 1000 : millis)
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function sameCalendarDay(left: Date, right: Date) {
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
   );
 }
 

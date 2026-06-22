@@ -1564,6 +1564,21 @@ p {
   background: rgba(255, 255, 255, 0.58);
 }
 
+.activity-time {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 82px;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.activity-time svg {
+  width: 15px;
+  height: 15px;
+}
+
 .activity-item h3 {
   font-size: 14px;
 }
