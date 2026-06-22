@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -104,14 +105,18 @@ jobs:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       PUBLISH_CHANNEL: release
       PUBLISH_REQUIRE_SIGNING: "1"
-      AFS_WINDOWS_CODESIGN: "1"
+      AFS_WINDOWS_EXTERNAL_CODESIGN: "1"
       PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
       TAURI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest-windows.json
       TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      WINDOWS_CODESIGN_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_PFX_BASE64 }}
-      WINDOWS_CODESIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+      AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+      AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
       WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
     steps:
       - name: Checkout release tag
@@ -166,7 +171,16 @@ jobs:
         shell: pwsh
         run: |
           $missing = @()
-          foreach ($name in @("TAURI_UPDATER_PUBKEY", "TAURI_SIGNING_PRIVATE_KEY", "WINDOWS_CODESIGN_CERT_PFX_BASE64", "WINDOWS_CODESIGN_CERT_PASSWORD")) {
+          foreach ($name in @(
+            "TAURI_UPDATER_PUBKEY",
+            "TAURI_SIGNING_PRIVATE_KEY",
+            "AZURE_CLIENT_ID",
+            "AZURE_TENANT_ID",
+            "AZURE_SUBSCRIPTION_ID",
+            "AZURE_ARTIFACT_SIGNING_ENDPOINT",
+            "AZURE_ARTIFACT_SIGNING_ACCOUNT",
+            "AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE"
+          )) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
               $missing += $name
             }
@@ -176,22 +190,65 @@ jobs:
             exit 1
           }
 
-      - name: Import Windows code signing certificate
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare unsigned Windows sidecars
+        shell: pwsh
+        env:
+          AFS_WINDOWS_EXTERNAL_CODESIGN: ""
+        run: ./apps/desktop/scripts/prepare-windows-bundle.ps1
+
+      - name: Sign Windows sidecars
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ env.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\apps\desktop\src-tauri\windows
+          files-folder-filter: exe
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Validate signed Windows sidecars
         shell: pwsh
         run: |
-          $certificatePath = Join-Path $env:RUNNER_TEMP "afs-windows-codesign.pfx"
-          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_PFX_BASE64))
-          $password = ConvertTo-SecureString $env:WINDOWS_CODESIGN_CERT_PASSWORD -AsPlainText -Force
-          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password
-          if (-not $certificate.Thumbprint) {
-            Write-Error "Could not import Windows code signing certificate."
-            exit 1
+          . ./scripts/windows-codesign.ps1
+          foreach ($name in @("afs.exe", "afsd.exe", "afs-cloud-files.exe")) {
+            Assert-AfsWindowsSigned -Path (Join-Path "apps/desktop/src-tauri/windows" $name)
           }
-          "WINDOWS_CODESIGN_CERT_SHA1=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
 
       - name: Build, sign, and validate Windows installer
         shell: pwsh
+        env:
+          AFS_WINDOWS_BUNDLE_PREPARED: "1"
+          PUBLISH_ALLOW_DIRTY: "1"
         run: ./scripts/publish-windows.ps1
+
+      - name: Sign Windows installers
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ env.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\target\release\bundle\windows
+          files-folder-filter: exe
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Validate signed Windows installers
+        shell: pwsh
+        run: |
+          . ./scripts/windows-codesign.ps1
+          Get-ChildItem target/release/bundle/windows -Filter *.exe -File | ForEach-Object {
+            Assert-AfsWindowsSigned -Path $_.FullName
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Set-Content -Encoding ascii -LiteralPath "$($_.FullName).sha256"
+          }
 
       - name: Render Windows updater manifest
         shell: bash

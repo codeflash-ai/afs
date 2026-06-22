@@ -155,8 +155,8 @@ Require-Command npm
 Require-Command cargo
 Assert-CleanTree
 
-if ($env:PUBLISH_REQUIRE_SIGNING -eq "1" -and -not (Test-AfsWindowsCodeSigningRequested)) {
-    Fail "PUBLISH_REQUIRE_SIGNING=1 requires AFS_WINDOWS_CODESIGN=1 and a signing certificate selector"
+if ($env:PUBLISH_REQUIRE_SIGNING -eq "1" -and -not (Test-AfsWindowsCodeSigningRequested) -and -not (Test-AfsWindowsExternalCodeSigningRequested)) {
+    Fail "PUBLISH_REQUIRE_SIGNING=1 requires either AFS_WINDOWS_CODESIGN=1 with a signing certificate selector or AFS_WINDOWS_EXTERNAL_CODESIGN=1"
 }
 
 $commitShort = (& git -C $Root rev-parse --short=7 HEAD).Trim()
@@ -170,6 +170,8 @@ Write-Log "commit $commitShort"
 Write-Log "architecture $arch"
 if (Test-AfsWindowsCodeSigningRequested) {
     Write-Log "Windows Authenticode signing enabled"
+} elseif (Test-AfsWindowsExternalCodeSigningRequested) {
+    Write-Log "Windows Authenticode signing delegated to external workflow steps"
 } else {
     Write-Log "Windows Authenticode signing disabled"
 }
@@ -196,7 +198,7 @@ try {
     Pop-Location
 }
 
-if (Test-AfsWindowsCodeSigningRequested) {
+if (Test-AfsWindowsCodeSigningRequested -or Test-AfsWindowsExternalCodeSigningRequested) {
     Assert-SidecarsSigned
 }
 
@@ -210,6 +212,8 @@ if (-not $installer) {
 if (Test-AfsWindowsCodeSigningRequested) {
     [void] (Invoke-AfsWindowsCodeSign -Path $installer.FullName)
     Assert-AfsWindowsSigned -Path $installer.FullName
+} elseif (Test-AfsWindowsExternalCodeSigningRequested) {
+    Write-Log "Windows installer signing deferred to external workflow step"
 } elseif ($env:PUBLISH_REQUIRE_SIGNING -eq "1") {
     Fail "Windows installer is unsigned"
 }

@@ -61,8 +61,28 @@ user-visible mount folders.
 
 ## Code Signing
 
-Release builds should Authenticode-sign the sidecars before NSIS packaging and
-sign the final installer after packaging. Set:
+Release builds Authenticode-sign the sidecars before NSIS packaging and sign the
+final installer after packaging. The GitHub release workflow uses Azure Artifact
+Signing with OpenID Connect so the Windows signing key stays in Azure instead of
+being exported as a PFX into GitHub.
+
+Required repository secrets:
+
+- `AZURE_CLIENT_ID`: client/application ID for the Entra app registration used
+  by GitHub Actions OIDC.
+- `AZURE_TENANT_ID`: Azure tenant/directory ID.
+- `AZURE_SUBSCRIPTION_ID`: Azure subscription ID containing the Artifact
+  Signing account.
+- `AZURE_ARTIFACT_SIGNING_ENDPOINT`: region endpoint for the Artifact Signing
+  account, for example `https://eus.codesigning.azure.net/`.
+- `AZURE_ARTIFACT_SIGNING_ACCOUNT`: Artifact Signing account name.
+- `AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE`: certificate profile name.
+
+The Entra app/service principal must have a federated credential for this
+repository and the `Artifact Signing Certificate Profile Signer` role on the
+Artifact Signing account, resource group, or subscription.
+
+For local release-like signing with an exportable Authenticode certificate, set:
 
 ```powershell
 $env:AFS_WINDOWS_CODESIGN = "1"
@@ -78,10 +98,10 @@ $env:WINDOWS_CODESIGN_TIMESTAMP_URL = "http://timestamp.digicert.com"
 
 `WINDOWS_CODESIGN_CERT_SUBJECT` or `WINDOWS_CODESIGN_SUBJECT` can be used
 instead of `WINDOWS_CODESIGN_CERT_SHA1` for local signing when the certificate
-subject is unique. In CI, prefer the SHA-1 thumbprint from an imported `.pfx`.
+subject is unique.
 
 Set `PUBLISH_REQUIRE_SIGNING=1` to fail the release build if no signing
-certificate selector is available.
+provider is available.
 
 ## Updater Artifacts
 
@@ -107,8 +127,8 @@ bash scripts/render-tauri-updater-manifest.sh
 The GitHub workflow in `.github/workflows/release-windows.yml` publishes the
 Windows channel from a `v*` tag or manual workflow dispatch. It runs on
 `windows-latest`, verifies the tag points at current `main`, verifies the tag
-matches the Tauri app version, imports the Windows code-signing certificate,
-builds the signed NSIS package, renders `latest-windows.json`, creates or
+matches the Tauri app version, signs sidecars and installers through Azure
+Artifact Signing, builds the NSIS package, renders `latest-windows.json`, creates or
 updates the GitHub Release, and uploads:
 
 ```text
@@ -122,9 +142,15 @@ SHA256SUMS-windows
 
 Required repository secrets:
 
-- `WINDOWS_CODESIGN_CERT_PFX_BASE64`: base64-encoded Authenticode certificate
-  exported as `.pfx`.
-- `WINDOWS_CODESIGN_CERT_PASSWORD`: password for that `.pfx`.
+- `AZURE_CLIENT_ID`: client/application ID for the Entra app registration used
+  by GitHub Actions OIDC.
+- `AZURE_TENANT_ID`: Azure tenant/directory ID.
+- `AZURE_SUBSCRIPTION_ID`: Azure subscription ID containing the Artifact
+  Signing account.
+- `AZURE_ARTIFACT_SIGNING_ENDPOINT`: region endpoint for the Artifact Signing
+  account, for example `https://eus.codesigning.azure.net/`.
+- `AZURE_ARTIFACT_SIGNING_ACCOUNT`: Artifact Signing account name.
+- `AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE`: certificate profile name.
 - `TAURI_UPDATER_PUBKEY`: public updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.

@@ -9,6 +9,10 @@ function Test-AfsWindowsCodeSigningRequested {
     )
 }
 
+function Test-AfsWindowsExternalCodeSigningRequested {
+    return $env:AFS_WINDOWS_EXTERNAL_CODESIGN -eq "1"
+}
+
 function Get-AfsSignTool {
     if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNTOOL)) {
         if (Test-Path -LiteralPath $env:WINDOWS_SIGNTOOL) {
