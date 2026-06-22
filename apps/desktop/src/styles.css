@@ -535,6 +535,8 @@ p {
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .ready-folder {
@@ -968,6 +970,15 @@ p {
   font-size: 20px;
 }
 
+.workspace-card > div:first-child,
+.mount-hero > div:nth-child(2) {
+  min-width: 0;
+}
+
+.workspace-card .button-row {
+  flex: 0 0 auto;
+}
+
 .workspace-card .path-line {
   margin-top: 4px;
 }
@@ -1173,6 +1184,8 @@ p {
   margin-top: 4px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 17px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .mount-actions {
@@ -1588,11 +1601,14 @@ p {
 }
 
 .setting-row strong {
+  min-width: 0;
   max-width: 58%;
   color: var(--ink);
   font-size: 12px;
   font-weight: 800;
+  overflow-wrap: anywhere;
   text-align: right;
+  word-break: break-word;
 }
 
 .setting-link {
