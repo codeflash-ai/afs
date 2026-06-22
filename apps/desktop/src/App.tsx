@@ -6,10 +6,11 @@ import {
   AlertTriangle,
   Bot,
   Check,
-  ChevronUp,
   ChevronRight,
+  ChevronUp,
   Clipboard,
   Clock3,
+  Code2,
   Copy,
   Download,
   EyeOff,
@@ -1535,6 +1536,8 @@ function MountDetailView({
   const [actionError, setActionError] = useState("");
   const [accessMessage, setAccessMessage] = useState("");
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
+  const accountLabel = snapshot.connection.accountLabel.trim();
+  const showAccount = accountLabel.length > 0 && accountLabel !== snapshot.connection.workspaceName;
 
   async function openFolder() {
     setActionError("");
@@ -1542,6 +1545,18 @@ function MountDetailView({
       "open_path",
       { path: snapshot.mount.localPath },
       { ok: true, message: "Opened demo folder." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+    }
+  }
+
+  async function openVsCode() {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "open_in_vs_code",
+      { path: snapshot.mount.localPath },
+      { ok: true, message: "Opened demo folder in VS Code." },
     );
     if (!report.ok) {
       setActionError(report.message);
@@ -1601,6 +1616,9 @@ function MountDetailView({
           <SecondaryButton compact icon={<Copy />} onClick={() => copyText(snapshot.mount.localPath)}>
             Copy Path
           </SecondaryButton>
+          <SecondaryButton compact icon={<Code2 />} onClick={() => void openVsCode()}>
+            Open in VS Code
+          </SecondaryButton>
           <SecondaryButton
             compact
             disabled={connectionMissing(snapshot) || accessState === "changing"}
@@ -1620,23 +1638,20 @@ function MountDetailView({
 
       <section className="detail-grid">
         <div className="panel">
-          <PanelTitle title="Workspace" />
-          <SettingRow title="Source" value="Notion" />
+          <PanelTitle title="Notion Access" />
           <SettingRow title="Workspace" value={snapshot.connection.workspaceName} />
-          <SettingRow title="Account" value={snapshot.connection.accountLabel || "Connected"} />
-          <SettingRow title="Access scope" value={snapshot.mount.accessScope} />
-          <SettingRow
-            title="Mounted root"
-            value={snapshot.mount.notionUrl ? "Open in Notion" : "Not available"}
-            href={snapshot.mount.notionUrl ?? undefined}
-          />
-          <SettingRow title="Notion access" value="Selected pages and databases" />
-          <SettingRow title="Access" value={snapshot.mount.readOnly ? "Read Only" : "Edit enabled"} />
+          {showAccount && <SettingRow title="Account" value={accountLabel} />}
+          <SettingRow title="Selected access" value={snapshot.mount.accessScope} />
+          {snapshot.mount.notionUrl && (
+            <SettingRow title="Mounted root" value="Open in Notion" href={snapshot.mount.notionUrl} />
+          )}
+          <SettingRow title="Permission" value={snapshot.mount.readOnly ? "Read only" : "Edit enabled"} />
         </div>
 
         <div className="panel">
           <PanelTitle title="Local Files" />
           <SettingRow title="Location" value={snapshot.mount.localPath} />
+          <SettingRow title="Projection" value={snapshot.mount.projection} />
           <SettingRow title="Mounted content" value="Workspace hierarchy" />
           <SettingRow title="Agent guidance" value="AGENTS.md and CLAUDE.md" />
         </div>
