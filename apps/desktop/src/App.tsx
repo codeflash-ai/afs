@@ -584,6 +584,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauriRuntime()) {
+      return undefined;
+    }
+
+    const refreshVisibleSnapshot = () => {
+      if (document.visibilityState !== "hidden") {
+        void refreshSnapshot().catch(() => undefined);
+      }
+    };
+
+    const interval = window.setInterval(refreshVisibleSnapshot, 10000);
+    window.addEventListener("focus", refreshVisibleSnapshot);
+    document.addEventListener("visibilitychange", refreshVisibleSnapshot);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshVisibleSnapshot);
+      document.removeEventListener("visibilitychange", refreshVisibleSnapshot);
+    };
+  }, []);
+
+  useEffect(() => {
     document.body.dataset.surface = route === "#tray" ? "tray" : "app";
   }, [route]);
 
@@ -1135,8 +1157,9 @@ function MainShell({
   appStoreDistribution: boolean;
   onResetComplete: () => void;
 }) {
-  const meta = snapshot.health.attentionCount > 0 ? "Pending Changes" : "Ready";
+  const meta = chromeStatusLabel(snapshot);
   const statusTitle = healthDescription(snapshot.health.state, snapshot.health.attentionCount);
+  const statusTarget = chromeStatusTarget(snapshot);
 
   return (
     <main className="app-frame">
@@ -1144,7 +1167,7 @@ function MainShell({
         title="AFS"
         meta={meta}
         metaTitle={statusTitle}
-        onMetaClick={snapshot.health.attentionCount > 0 ? () => onViewChange("pending") : undefined}
+        onMetaClick={statusTarget ? () => onViewChange(statusTarget) : undefined}
       />
       <div className="app-shell">
         <aside className="sidebar">
@@ -1185,10 +1208,10 @@ function MainShell({
             <button
               className="status-button"
               title={statusTitle}
-              onClick={() => onViewChange(snapshot.health.attentionCount > 0 ? "pending" : "mount")}
+              onClick={() => onViewChange(statusTarget ?? "mount")}
             >
-              <StatusPill tone={snapshot.health.attentionCount > 0 ? "warn" : "ready"} title={statusTitle}>
-                {snapshot.health.attentionCount > 0 ? "Pending Changes" : "Notion Ready"}
+              <StatusPill tone={healthTone(snapshot.health.state)} title={statusTitle}>
+                {sidebarStatusLabel(snapshot)}
               </StatusPill>
             </button>
           </div>
@@ -3453,6 +3476,40 @@ function mountMissing(snapshot: DesktopSnapshot) {
 
 function isAppView(value: string): value is AppView {
   return value === "home" || value === "mount" || value === "pending" || value === "review" || value === "activity" || value === "settings";
+}
+
+function chromeStatusLabel(snapshot: DesktopSnapshot) {
+  if (snapshot.health.state === "ready") {
+    return "Ready";
+  }
+  if (snapshot.health.state === "needs_review") {
+    return "Pending Changes";
+  }
+  return healthLabel(snapshot.health.state);
+}
+
+function sidebarStatusLabel(snapshot: DesktopSnapshot) {
+  if (snapshot.health.state === "ready") {
+    return "Notion Ready";
+  }
+  if (snapshot.health.state === "needs_review") {
+    return "Pending Changes";
+  }
+  return healthLabel(snapshot.health.state);
+}
+
+function chromeStatusTarget(snapshot: DesktopSnapshot): AppView | null {
+  if (snapshot.health.state === "needs_review") {
+    return "pending";
+  }
+  if (
+    snapshot.health.state === "stopped" ||
+    snapshot.health.state === "runtime_stopped" ||
+    snapshot.health.state === "reconnect_needed"
+  ) {
+    return "settings";
+  }
+  return null;
 }
 
 function healthLabel(state: string) {
