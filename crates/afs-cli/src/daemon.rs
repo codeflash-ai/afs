@@ -258,10 +258,18 @@ fn stop_daemon(
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
     let was_running = is_running(options, paths);
-    let mut stopped_managed_process = DefaultDaemonProcessManager
-        .stop(options.mode, paths)
-        .map_err(daemon_process_error)?
-        .stopped_managed_process;
+    let mut stopped_by_shutdown = false;
+    if was_running && request_graceful_shutdown(options, paths) {
+        stopped_by_shutdown = wait_for_state(options, paths, DaemonRunState::Stopped, STOP_TIMEOUT);
+    }
+
+    let mut stopped_managed_process = false;
+    if !stopped_by_shutdown {
+        stopped_managed_process = DefaultDaemonProcessManager
+            .stop(options.mode, paths)
+            .map_err(daemon_process_error)?
+            .stopped_managed_process;
+    }
 
     if was_running
         && !stopped_managed_process
@@ -281,9 +289,10 @@ fn stop_daemon(
             "daemon is still responding; if it was started manually, stop the afsd process directly",
         ));
     }
+    let _ = fs::remove_file(&paths.pid_file);
     let _ = fs::remove_file(&paths.metadata_file);
 
-    let message = if was_running || stopped_managed_process {
+    let message = if was_running || stopped_managed_process || stopped_by_shutdown {
         "daemon stopped"
     } else {
         "daemon was not running"
@@ -298,6 +307,16 @@ fn stop_daemon(
         None,
         message,
     ))
+}
+
+fn request_graceful_shutdown(options: &DaemonOptions, paths: &DaemonPaths) -> bool {
+    send_daemon_request(
+        options,
+        paths,
+        &DaemonRequest::Shutdown,
+        DAEMON_CONTROL_REQUEST_TIMEOUT,
+    )
+    .is_ok_and(|response| response.ok)
 }
 
 fn status_report(

@@ -1167,6 +1167,12 @@ impl RuntimeState {
                     "mount reload is handled by the daemon server",
                 ));
             }
+            DaemonRequest::Shutdown => {
+                let _ = respond_to.send(DaemonResponse::ok(json!({
+                    "status": "shutting_down"
+                })));
+                let _ = self.sender.send(RuntimeMessage::Shutdown);
+            }
             DaemonRequest::Pull { path } => {
                 self.pending_requests
                     .push_back(MutatingRequest::Pull { path, respond_to });

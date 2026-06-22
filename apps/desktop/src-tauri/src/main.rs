@@ -3286,7 +3286,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
         Some(build) if build == current_build => return Ok(()),
         Some(build) => {
             eprintln!(
-                "afs desktop detected afsd build {} but app expects {}; restarting afsd",
+                "afs desktop detected running afsd build {} but bundled afsd is {}; restarting afsd",
                 build.build_id, current_build.build_id
             );
             return restart_daemon_for_current_binary(state_root);

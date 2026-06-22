@@ -1,14 +1,17 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use afs_core::{AfsError, AfsResult};
 use afs_store::{MountConfig, MountRepository, SqliteStateStore};
+use serde_json::json;
 
 use crate::DaemonConfig;
 use crate::ipc::{
@@ -36,11 +39,15 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
     let server = DaemonServerHandle {
         runtime: runtime_handle.clone(),
         watch_manager: Arc::clone(&watch_manager),
+        shutdown: Arc::new(AtomicBool::new(false)),
     };
 
     if let Some(addr) = config.tcp_addr {
         let listener = TcpListener::bind(addr).map_err(|error| {
             AfsError::Io(format!("failed to bind daemon TCP listener: {error}"))
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            AfsError::Io(format!("failed to configure daemon TCP listener: {error}"))
         })?;
         let server = server.clone();
         #[cfg(unix)]
@@ -67,6 +74,9 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
         remove_stale_socket(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
             .map_err(|error| AfsError::Io(format!("failed to bind daemon socket: {error}")))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| AfsError::Io(format!("failed to configure daemon socket: {error}")))?;
         let mounts = load_mounts(config)?;
         print_startup_banner(
             Some(&socket_path),
@@ -76,15 +86,19 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
         );
 
         println!("afsd is running (socket: {})", socket_path.display());
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
+        while !server.shutdown_requested() {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
                     let server = server.clone();
                     thread::spawn(move || handle_connection(stream, server));
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
                 }
                 Err(error) => eprintln!("afsd accept failed: {error}"),
             }
         }
+        let _ = std::fs::remove_file(&socket_path);
 
         Ok(())
     }
@@ -165,14 +179,24 @@ fn auth_summary(mounts: &[MountConfig]) -> String {
 struct DaemonServerHandle {
     runtime: DaemonRuntimeHandle,
     watch_manager: Arc<Mutex<DaemonWatchManager>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl DaemonServerHandle {
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
 }
 
 fn accept_tcp_connections(listener: TcpListener, server: DaemonServerHandle) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    while !server.shutdown_requested() {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
                 let server = server.clone();
                 thread::spawn(move || handle_connection(stream, server));
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
             }
             Err(error) => eprintln!("afsd TCP accept failed: {error}"),
         }
@@ -206,6 +230,11 @@ fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> Daemon
                 }
                 Err(error) => DaemonResponse::error("reload_mounts_failed", error.to_string()),
             }
+        }
+        DaemonRequest::Shutdown => {
+            server.shutdown.store(true, Ordering::SeqCst);
+            let _ = server.runtime.request(DaemonRequest::Shutdown);
+            DaemonResponse::ok(json!({ "status": "shutting_down" }))
         }
         request => server.runtime.request(request),
     }
@@ -453,6 +482,7 @@ mod tests {
         let server = DaemonServerHandle {
             runtime: runtime.handle(),
             watch_manager,
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
 
         let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
