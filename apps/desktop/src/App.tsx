@@ -54,6 +54,7 @@ type DesktopSnapshot = {
     workspaceName: string;
     localPath: string;
     notionUrl?: string | null;
+    accessScope: string;
     projection: string;
     readOnly: boolean;
     status: string;
@@ -183,6 +184,7 @@ const sampleSnapshot: DesktopSnapshot = {
     workspaceName: "CodeFlash",
     localPath: "~/Library/CloudStorage/AFS/notion",
     notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
+    accessScope: "Initial Idea",
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
@@ -1622,6 +1624,7 @@ function MountDetailView({
           <SettingRow title="Source" value="Notion" />
           <SettingRow title="Workspace" value={snapshot.connection.workspaceName} />
           <SettingRow title="Account" value={snapshot.connection.accountLabel || "Connected"} />
+          <SettingRow title="Access scope" value={snapshot.mount.accessScope} />
           <SettingRow
             title="Mounted root"
             value={snapshot.mount.notionUrl ? "Open in Notion" : "Not available"}
