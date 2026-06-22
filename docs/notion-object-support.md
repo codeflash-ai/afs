@@ -20,7 +20,7 @@ Sources used for the baseline:
 | Data source | Read/query rows, render `_schema.yaml`, validate row property writes, create rows when database has exactly one data source | fixture, live, mounted live | Multi-data-source row writes are intentionally blocked until path/schema selection exists. |
 | User | Read when embedded in mentions/properties; writable by explicit ID in people properties | fixture, live property write | User objects are not mounted as standalone files in v1. |
 | Comment | Unsupported | none | Comments are not in the v1 filesystem model from `plan.md`; adding them needs a thread representation and write policy. |
-| File upload | Supported for existing image block uploads from local `.afs/media/`; external/download URLs are read and external file properties are writable | fixture, live image download/upload, live property write | Direct local uploads are currently limited to image blocks and small single-part uploads. Non-image uploads still need retention, size, dedupe, and local path ownership policy. |
+| File upload | Supported for existing image block uploads and appended image blocks from local `.afs/media/`; external/download URLs are read and external file properties are writable | fixture, live image download/upload, live property write | Direct local uploads are currently limited to image blocks and small single-part uploads. Non-image uploads still need retention, size, dedupe, and local path ownership policy. |
 | View | Unsupported | none | Views are database presentation state, not row/page content. |
 | Custom emoji | Unsupported | none | Emoji metadata is presentation state; emoji text still appears through rich text/plain text. |
 | Webhook event | Unsupported locally | none | Webhooks belong to the optional relay path, not the local direct connector. |
@@ -50,7 +50,7 @@ Sources used for the baseline:
 | `embed` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing embed block. |
 | `bookmark` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing bookmark block. |
 | `link_preview` | Markdown link | Read only | fixture | Renders as a normal link when the API returns a URL; the current create-page API rejected it as a child block in live testing, so writes stay blocked. |
-| `image` | Markdown image with local `.afs/media/` href plus local image download | Yes for existing URL blocks and local image uploads | fixture, live read/write/download/upload | Uses `external.url` or Notion-hosted `file.url` as the source of the downloaded local file. Remote URL Markdown edits write external URLs; local `.afs/media/` href edits upload the local image file back to the existing block. URL-less payloads fall back to directives. |
+| `image` | Markdown image with local `.afs/media/` href plus local image download | Yes for existing URL blocks, local image uploads, and appended local image blocks | fixture, live read/write/download/upload | Uses `external.url` or Notion-hosted `file.url` as the source of the downloaded local file. Remote URL Markdown edits write external URLs; local `.afs/media/` href edits upload the local image file back to the existing block. New Markdown images whose href resolves under the projection output root's `.afs/media/` tree upload the local file and create image blocks. URL-less payloads fall back to directives. |
 | `video` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
 | `file` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
 | `pdf` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
@@ -136,5 +136,5 @@ Sources used for the baseline:
    mode changes need a safer representation than whole-table replacement.
 3. Keep layout, generated, synced, and unknown future blocks directive-backed
    until their Notion semantics can be represented without content loss.
-4. Broaden media writes beyond existing image blocks only after size limits,
+4. Broaden media writes beyond image block uploads only after size limits,
    retention rules, dedupe, and local file ownership decisions are settled.

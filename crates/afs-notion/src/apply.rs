@@ -24,6 +24,7 @@ use crate::dto::{
     RichTextAnnotationsDto, RichTextDto, TableBlockDto,
 };
 use crate::fetch::fetch_page_bundle;
+use crate::media::resolve_media_href_with_content_root;
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
     let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
@@ -118,17 +119,7 @@ pub fn apply_plan(
                         "local media upload requires an apply local root".to_string(),
                     )
                 })?;
-                let bytes = read_local_media(local_root, local_path)?;
-                if bytes.len() > 20 * 1024 * 1024 {
-                    return Err(AfsError::Unsupported(
-                        "local image uploads larger than 20MB need multipart upload support",
-                    ));
-                }
-                let filename = local_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("image");
-                let upload_id = api.upload_file(filename, media_content_type(local_path), bytes)?;
+                let upload_id = upload_local_image(api, local_root, local_path)?;
                 let patch = NotionBlockPatch::new(
                     "image",
                     json!({
@@ -150,7 +141,7 @@ pub fn apply_plan(
                 after,
                 content,
             } => {
-                let patch = parse_supported_block(content, None, None)?;
+                let patch = parse_append_block(api, content, request.local_root)?;
                 let after = block_parents.normalize_after(parent_id, after.as_ref());
                 let chain_key = (parent_id.clone(), after.clone());
                 let effective_after = append_chains.get(&chain_key).cloned().or(after);
@@ -1406,6 +1397,40 @@ fn parse_supported_block(
     ))
 }
 
+fn parse_append_block(
+    api: &dyn NotionApi,
+    markdown: &str,
+    local_root: Option<&Path>,
+) -> AfsResult<NotionBlockPatch> {
+    let trimmed = markdown.trim_end_matches('\n');
+    if let Some((caption, href)) = parse_media_markdown("image", trimmed)
+        && !href.starts_with("http://")
+        && !href.starts_with("https://")
+    {
+        let local_root = local_root.ok_or_else(|| {
+            AfsError::InvalidState("local media upload requires an apply local root".to_string())
+        })?;
+        let local_path = resolve_media_href_with_content_root(Path::new("page.md"), href, local_root)
+            .ok_or_else(|| {
+                AfsError::Unsupported(
+                    "appended local image blocks must reference .afs/media under the projection output root",
+                )
+            })?;
+        let upload_id = upload_local_image(api, local_root, &local_path)?;
+        return Ok(NotionBlockPatch::new(
+            "image",
+            json!({
+                "file_upload": {
+                    "id": upload_id,
+                },
+                "caption": rich_text_payload(caption, None)?,
+            }),
+        ));
+    }
+
+    parse_supported_block(markdown, None, None)
+}
+
 fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
     match after {
         Some(after) => json!({
@@ -2122,6 +2147,24 @@ fn validate_mount_relative_path(path: &Path) -> AfsResult<()> {
         )));
     }
     Ok(())
+}
+
+fn upload_local_image(
+    api: &dyn NotionApi,
+    local_root: &Path,
+    local_path: &Path,
+) -> AfsResult<String> {
+    let bytes = read_local_media(local_root, local_path)?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return Err(AfsError::Unsupported(
+            "local image uploads larger than 20MB need multipart upload support",
+        ));
+    }
+    let filename = local_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+    api.upload_file(filename, media_content_type(local_path), bytes)
 }
 
 fn media_content_type(path: &Path) -> &'static str {

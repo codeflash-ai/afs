@@ -27,7 +27,7 @@ The current implementation is a live-capable read, pull, and narrow write projec
   image writes use absolute local hrefs under the projection output root and keep mount-relative
   download metadata for pull, hydration, and post-push reconcile.
 - `afs push -y` can update, append, and archive simple Notion blocks, upload changed local image
-  media for existing image blocks, update supported page
+  media for existing image blocks, append new local image blocks, update supported page
   properties, create new rows in single-data-source databases, and reconcile by reading the changed
   or created page back into the local shadow.
 - database row property edits and row creation are validated against the local `_schema.yaml`
@@ -118,7 +118,7 @@ Nested children are fetched recursively and rendered after their parent, except 
 The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, block archive, local image media update, supported page property update, and database row creation;
-- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing stable-width/header-mode tables including row add/delete, existing bookmark/embed URL blocks, existing URL-backed media blocks, and existing local image media blocks;
+- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing stable-width/header-mode tables including row add/delete, existing bookmark/embed URL blocks, existing URL-backed media blocks, existing local image media blocks, and new local image block appends;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, database links whose target ID matches a rendered database mention, explicit `@page(...)` page mentions, explicit `@database(...)` database mentions, explicit `@date(...)` date mentions, explicit `@user(...)` user mentions, legacy `afs://` page links, and unchanged preimage mentions such as dates/users;
 - supported page property writes: title, rich text with the same inline Markdown parser used by page bodies, number, select, status, multi-select, checkbox, date, URL, email, phone, external file URLs, explicit people user IDs, and explicit relation page IDs;
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug/page.md` path, using `slug shortid/page.md` only when a sibling name collision requires it;
@@ -150,7 +150,7 @@ When AFS writes a Notion page into a local projection, media blocks with `extern
       image-0123456789ab.png
 ```
 
-The media tree mirrors the Notion page directory under the reserved `.afs/` namespace in the projection output root. This keeps binary files out of content directories while giving agents a stable local file they can open, and avoids collision with a projected Notion page or database named `media`. AFS records downloaded image metadata and checksums in `.afs/media/manifest.json` using mount-relative paths. `afs status`, `afs inspect`, `afs diff`, and `afs push` treat equivalent relative and projection-output-root absolute media hrefs as the same asset. If the resolved local media path, image bytes, or caption changes, `afs diff` plans an `update_media` operation and `afs push` uploads the local image to the existing Notion image block. The first downloader fetches image blocks only; other file-like blocks render their remote URL directly until size and retention policy is designed.
+The media tree mirrors the Notion page directory under the reserved `.afs/` namespace in the projection output root. This keeps binary files out of content directories while giving agents a stable local file they can open, and avoids collision with a projected Notion page or database named `media`. AFS records downloaded image metadata and checksums in `.afs/media/manifest.json` using mount-relative paths. `afs status`, `afs inspect`, `afs diff`, and `afs push` treat equivalent relative and projection-output-root absolute media hrefs as the same asset. If the resolved local media path, image bytes, or caption changes, `afs diff` plans an `update_media` operation and `afs push` uploads the local image to the existing Notion image block. Appending a new Markdown image whose href resolves under the projection output root's `.afs/media/` tree uploads that file and creates a Notion image block. The first downloader fetches image blocks only; other file-like blocks render their remote URL directly until size and retention policy is designed.
 
 ## Path Projection
 

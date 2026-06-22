@@ -1318,6 +1318,80 @@ fn apply_uploads_local_image_media_before_block_update() {
 }
 
 #[test]
+fn apply_uploads_local_image_media_before_block_append() {
+    let temp = tempdir().expect("tempdir");
+    let media_path = temp.path().join(".afs/media/Roadmap/night-sky.jpg");
+    fs::create_dir_all(media_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&media_path, b"new image bytes").expect("write image");
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: format!("![night sky]({})", media_path.display()),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: Some(temp.path()),
+        })
+        .expect("apply local media append");
+
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::CreatedBlock {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new("page-1"),
+            block_id: RemoteId::new("created-1"),
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::UploadFile {
+                filename: "night-sky.jpg".to_string(),
+                content_type: "image/jpeg".to_string(),
+                bytes: b"new image bytes".to_vec(),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "image",
+                        "image": {
+                            "file_upload": {
+                                "id": "upload-1",
+                            },
+                            "caption": rich_text_json("night sky"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "paragraph-1",
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_updates_simple_table_rows_from_markdown_table() {
     let api = Arc::new(RecordingNotionApi::with_table(
         "2026-06-10T00:00:00.000Z",
