@@ -1308,11 +1308,24 @@ fn handle_local_create_like_path(
     if metadata.is_file() {
         let created = context.create_file(&parent_identifier, filename)?;
         context.remember_path_identity(&path, &created.identifier);
-        let contents = read_created_file_when_ready(&path)?;
+        let contents = match read_created_file_when_ready(&path) {
+            Ok(contents) => contents,
+            Err(error) if local_path_disappeared(&error) => {
+                discard_stale_local_create(context, &path, &created.identifier);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if !contents.is_empty() {
             commit_local_bytes(context, &created.identifier, &path, &contents)?;
         }
-        convert_to_placeholder_when_ready(&path, &created.identifier, false)?;
+        if let Err(error) = convert_to_placeholder_when_ready(&path, &created.identifier, false) {
+            if local_path_disappeared(&error) {
+                discard_stale_local_create(context, &path, &created.identifier);
+                return Ok(());
+            }
+            return Err(error);
+        }
         let _ = set_placeholder_in_sync_state(&path, false);
         context.remember_local_file(&path, &created.identifier);
         if let Some(parent_identifier) = context.cached_path_identity(parent)
@@ -1411,8 +1424,34 @@ fn handle_local_remove_like_path(
             context.forget_path_identities(&path);
             Ok(())
         }
+        Err(error) if stale_pending_file_delete(&identifier, &error) => {
+            context.forget_path_identities(&path);
+            Ok(())
+        }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn discard_stale_local_create(context: &ProviderContext, path: &Path, identifier: &str) {
+    trace_cloud_files(format!(
+        "local create discarded path=`{}` identity=`{identifier}` reason=path_disappeared",
+        path.display()
+    ));
+    let _ = context.trash(identifier);
+    context.forget_path_identities(path);
+}
+
+#[cfg(target_os = "windows")]
+fn local_path_disappeared(error: &HelperError) -> bool {
+    error.message.contains("0x80070002")
+        || error.message.contains("not found")
+        || error.message.contains("cannot find the file")
+}
+
+#[cfg(target_os = "windows")]
+fn stale_pending_file_delete(identifier: &str, error: &HelperError) -> bool {
+    identifier.starts_with("local:") && error.message.contains("was not found in mount")
 }
 
 #[cfg(target_os = "windows")]
