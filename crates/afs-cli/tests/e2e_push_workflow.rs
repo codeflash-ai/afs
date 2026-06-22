@@ -613,9 +613,6 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
         "database mention [AFS cyclic linked database",
         "[Cyclic bookmark](https://example.com/cyclic-bookmark)",
         "[Cyclic embed](https://example.com/cyclic-embed)",
-        "[Cyclic video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
-        "[Cyclic file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
-        "[Cyclic PDF](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
     ] {
         assert!(
             markdown.contains(expected),
@@ -623,6 +620,10 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
         );
     }
     assert_local_image_markdown(&markdown, "Cyclic image");
+    assert_local_media_link_markdown(&markdown, "Cyclic video");
+    assert_local_media_link_markdown(&markdown, "Cyclic file");
+    assert_local_media_link_markdown(&markdown, "Cyclic PDF");
+    assert_local_media_link_markdown(&markdown, "Cyclic audio");
     assert!(
         !markdown.contains("type=link_to_page"),
         "link_to_page should render as a Markdown link, not a directive:\n{markdown}"
@@ -685,6 +686,10 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     let editable_image_line = markdown_image_line(&original, "Editable image");
     let editable_image_href = markdown_link_href(editable_image_line);
     let edited_image_line = format!("![Editable image changed]({editable_image_href})");
+    let editable_video_line = markdown_link_line(&original, "Editable video");
+    let editable_file_line = markdown_link_line(&original, "Editable file");
+    let editable_pdf_line = markdown_link_line(&original, "Editable PDF");
+    let editable_audio_line = markdown_link_line(&original, "Editable audio");
     let edited = original
         .replace(
             "Editable paragraph original.",
@@ -723,19 +728,19 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         )
         .replace(editable_image_line, &edited_image_line)
         .replace(
-            "[Editable video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
+            editable_video_line,
             "[Editable video changed](https://www.youtube.com/watch?v=oHg5SJYRHA0)",
         )
         .replace(
-            "[Editable file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+            editable_file_line,
             "[Editable file changed](https://www.orimi.com/pdf-test.pdf)",
         )
         .replace(
-            "[Editable PDF](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+            editable_pdf_line,
             "[Editable PDF changed](https://www.orimi.com/pdf-test.pdf)",
         )
         .replace(
-            "[Editable audio](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)",
+            editable_audio_line,
             "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3)",
         )
         .replace("fn editable() {}", "fn editable_changed() {}")
@@ -811,10 +816,6 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "| Editable table added | Editable table added state |",
         "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
         "[Editable embed changed](https://example.com/editable-embed-changed)",
-        "[Editable video changed](https://www.youtube.com/watch?v=oHg5SJYRHA0)",
-        "[Editable file changed](https://www.orimi.com/pdf-test.pdf)",
-        "[Editable PDF changed](https://www.orimi.com/pdf-test.pdf)",
-        "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3)",
         "fn editable_changed() {}",
         "x-y=z",
     ] {
@@ -824,6 +825,10 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         );
     }
     assert_local_image_markdown(&verified, "Editable image changed");
+    assert_local_media_link_markdown(&verified, "Editable video changed");
+    assert_local_media_link_markdown(&verified, "Editable file changed");
+    assert_local_media_link_markdown(&verified, "Editable PDF changed");
+    assert_local_media_link_markdown(&verified, "Editable audio changed");
 }
 
 #[test]
@@ -2345,6 +2350,14 @@ fn markdown_image_line<'a>(markdown: &'a str, caption: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing image line for {caption:?} in:\n{markdown}"))
 }
 
+fn markdown_link_line<'a>(markdown: &'a str, caption: &str) -> &'a str {
+    let prefix = format!("[{caption}](");
+    markdown
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("missing link line for {caption:?} in:\n{markdown}"))
+}
+
 fn markdown_link_href(line: &str) -> &str {
     let href_start = line.find("](").expect("markdown link start") + 2;
     let href_end = line.rfind(')').expect("markdown link end");
@@ -2353,12 +2366,21 @@ fn markdown_link_href(line: &str) -> &str {
 
 fn assert_local_image_markdown(markdown: &str, caption: &str) {
     let line = markdown_image_line(markdown, caption);
+    assert_local_media_href(line, caption);
+}
+
+fn assert_local_media_link_markdown(markdown: &str, caption: &str) {
+    let line = markdown_link_line(markdown, caption);
+    assert_local_media_href(line, caption);
+}
+
+fn assert_local_media_href(line: &str, caption: &str) {
     let href = markdown_link_href(line);
     assert!(
         !href.starts_with("http://")
             && !href.starts_with("https://")
             && href.contains(".afs/media/"),
-        "expected local media image href for {caption:?}, got {line:?}"
+        "expected local media href for {caption:?}, got {line:?}"
     );
 }
 

@@ -281,9 +281,19 @@ impl HttpNotionApi {
     {
         for attempt in 0..=notion_rate_limit_retries() {
             acquire_notion_request_token();
-            let response = build_request()
-                .send()
-                .map_err(|error| AfsError::Io(format!("notion request failed: {error}")))?;
+            let response = match build_request().send() {
+                Ok(response) => response,
+                Err(error)
+                    if is_retryable_notion_transport_error(&error)
+                        && attempt < notion_rate_limit_retries() =>
+                {
+                    record_notion_transient_request_failure(attempt);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(AfsError::Io(format!("notion request failed: {error}")));
+                }
+            };
             let status = response.status();
 
             if status.is_success() {
@@ -432,6 +442,17 @@ fn record_notion_rate_limit(attempt: usize, retry_after: Option<Duration>) {
         .lock()
         .expect("notion request rate limiter lock poisoned")
         .record_rate_limit(delay);
+}
+
+fn record_notion_transient_request_failure(attempt: usize) {
+    notion_rate_limiter()
+        .lock()
+        .expect("notion request rate limiter lock poisoned")
+        .record_rate_limit(rate_limit_backoff(attempt));
+}
+
+fn is_retryable_notion_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
 }
 
 fn retry_after_header(headers: &HeaderMap) -> Option<Duration> {
@@ -611,8 +632,19 @@ fn data_source_search_body(start_cursor: Option<&str>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{data_source_search_body, rate_limit_backoff, retry_after_header};
+    use super::{
+        HttpNotionApi, data_source_search_body, notion_http_client_builder, rate_limit_backoff,
+        retry_after_header,
+    };
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use serde_json::Value;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread;
     use std::time::Duration;
 
     #[test]
@@ -637,6 +669,68 @@ mod tests {
         assert_eq!(rate_limit_backoff(0), Duration::from_secs(1));
         assert_eq!(rate_limit_backoff(3), Duration::from_secs(8));
         assert_eq!(rate_limit_backoff(99), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn send_request_retries_transient_timeout_before_returning_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let url = format!("http://{}/transient", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let mut accepted = 0;
+            while !server_stop.load(Ordering::Relaxed) || accepted == 0 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted += 1;
+                        if accepted == 1 {
+                            thread::sleep(Duration::from_millis(250));
+                            continue;
+                        }
+
+                        let body = br#"{"ok":true}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .expect("write response headers");
+                        stream.write_all(body).expect("write response body");
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept local request: {error}"),
+                }
+            }
+            accepted
+        });
+
+        let api = HttpNotionApi {
+            config: crate::NotionConfig::default(),
+            client: notion_http_client_builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .expect("build timeout client"),
+        };
+        let mut attempts = 0;
+        let result = api.send_request_with_retry::<Value>(|| {
+            attempts += 1;
+            api.client.get(&url)
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        let accepted = server.join().expect("join local server");
+        assert_eq!(accepted, 2);
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            result.expect("retry timeout request").get("ok"),
+            Some(&Value::Bool(true))
+        );
     }
 }
 
