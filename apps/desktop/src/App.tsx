@@ -2279,9 +2279,34 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [quitOptionsOpen, setQuitOptionsOpen] = useState(false);
+  const quitOptionsRef = useRef<HTMLDivElement | null>(null);
   const { results: searchResults, searching } = useNotionSearchResults(url);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
   const visibleSearchResults = locateState === "ready" ? [] : searchResults.slice(0, 3);
+
+  useEffect(() => {
+    if (!quitOptionsOpen) {
+      return undefined;
+    }
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!quitOptionsRef.current?.contains(event.target as Node)) {
+        setQuitOptionsOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setQuitOptionsOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", closeOnOutsideClick, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [quitOptionsOpen]);
 
   async function locatePage() {
     if (!url.trim()) {
@@ -2421,16 +2446,15 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
 
       <section className="tray-section tray-suggestion">
         <p className="label">Suggestion</p>
-        <div className="tray-suggestion-copy">
+        <div className="tray-suggestion-row">
           <strong>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</strong>
-          <span>{snapshot.suggestions[0]?.description ?? "Mount more workspaces as local files."}</span>
+          <button disabled>Coming Soon</button>
         </div>
-        <button disabled>Coming Soon</button>
       </section>
 
       <footer className="tray-footer">
         <button onClick={() => openMain("settings")}>Settings</button>
-        <div className="tray-quit-options">
+        <div className="tray-quit-options" ref={quitOptionsRef}>
           <button onClick={() => setQuitOptionsOpen((open) => !open)}>Quit Options</button>
           {quitOptionsOpen && (
             <div className="tray-quit-menu">
