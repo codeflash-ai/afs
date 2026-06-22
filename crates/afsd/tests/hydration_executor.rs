@@ -229,10 +229,11 @@ fn executor_writes_absolute_media_hrefs_under_output_root() {
         .expect("hydrate request");
 
     let contents = fs::read_to_string(fixture.page_path()).expect("hydrated file");
-    assert!(contents.contains(&format!(
-        "![Image]({})",
-        output_root.join(".afs/media/Roadmap/image-1.png").display()
-    )));
+    let expected_href = output_root
+        .join(".afs/media/Roadmap/image-1.png")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(contents.contains(&format!("![Image]({expected_href})")));
     assert_eq!(
         store
             .load_shadow(&fixture.mount_id, &fixture.remote_id)
