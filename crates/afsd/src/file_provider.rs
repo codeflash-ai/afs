@@ -140,9 +140,8 @@ pub struct ProjectionReconcileReport {
 /// `modifyItem`.
 ///
 /// This is intentionally a narrow command-boundary fallback, not a background
-/// scanner: it reads an explicit target, or a materialized projection file whose
-/// mtime is newer than the daemon cache. The daemon cache remains the durable
-/// source used by diff and push after this reconciliation step.
+/// scanner: it reads only an explicit target. The daemon cache remains the
+/// durable source used by diff and push after this reconciliation step.
 pub fn reconcile_macos_file_provider_projection<S>(
     store: &mut S,
     state_root: &Path,
@@ -155,7 +154,9 @@ where
         + VirtualMutationRepository
         + FreshnessStateRepository,
 {
-    let target = target.map(absolute_reconcile_path).transpose()?;
+    let Some(target) = target.map(absolute_reconcile_path).transpose()? else {
+        return Ok(ProjectionReconcileReport::default());
+    };
     let mounts = store.load_mounts().map_err(AfsError::from)?;
     let mut report = ProjectionReconcileReport::default();
 
@@ -164,18 +165,15 @@ where
             continue;
         }
 
-        let target_match = target
-            .as_deref()
-            .and_then(|target| match_mount_path(&mount, target));
-        if target.is_some() && target_match.is_none() {
+        let Some(target_match) = match_mount_path(&mount, &target) else {
             continue;
-        }
+        };
 
         let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
-        let entities = scoped_page_entities(store, &mount, target_match.as_ref())?;
+        let entities = scoped_page_entities(store, &mount, Some(&target_match))?;
         for entity in entities {
             let Some(candidate) =
-                reconcile_candidate_path(&mount, &entity, target.as_deref(), target_match.as_ref())
+                reconcile_candidate_path(&mount, &entity, Some(&target), Some(&target_match))
             else {
                 continue;
             };
@@ -706,8 +704,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn reconcile_macos_projection_imports_newer_visible_file_with_missing_identity() {
-        let fixture = ProjectionFixture::new("newer-visible");
+    fn reconcile_macos_projection_without_target_is_noop() {
+        let fixture = ProjectionFixture::new("no-target");
         fixture.write_cache("Original body.\n");
         std::thread::sleep(Duration::from_millis(5));
         fixture.write_projection_without_identity("Original body.\n\nLocal edit.\n");
@@ -716,6 +714,27 @@ mod tests {
         let report =
             reconcile_macos_file_provider_projection(&mut store, &fixture.state_root, None)
                 .expect("reconcile projection");
+
+        assert_eq!(report, ProjectionReconcileReport::default());
+        let cached = fs::read_to_string(fixture.content_path()).expect("read cache");
+        assert!(!cached.contains("Local edit."));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconcile_macos_projection_imports_explicit_visible_file_with_missing_identity() {
+        let fixture = ProjectionFixture::new("newer-visible");
+        fixture.write_cache("Original body.\n");
+        std::thread::sleep(Duration::from_millis(5));
+        fixture.write_projection_without_identity("Original body.\n\nLocal edit.\n");
+
+        let mut store = fixture.store();
+        let report = reconcile_macos_file_provider_projection(
+            &mut store,
+            &fixture.state_root,
+            Some(&fixture.projection_path()),
+        )
+        .expect("reconcile projection");
 
         assert_eq!(report.reconciled, 1);
         let cached = fs::read_to_string(fixture.content_path()).expect("read cache");

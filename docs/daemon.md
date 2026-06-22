@@ -95,11 +95,11 @@ the same time.
 
 For macOS File Provider mounts, the Swift extension normally sends writes to the
 daemon through `modifyItem`. AFS also has a narrow reconciliation fallback at
-review and push boundaries: status, diff, push, auto-save, and the desktop
-pending-changes snapshot can import a newer visible CloudStorage file into the
+review and push boundaries: explicit-path status, diff, push, auto-save, and
+desktop file actions can import a newer visible CloudStorage file into the
 daemon content cache before planning. This fallback is intentionally scoped to
-explicit targets or materialized files with newer mtimes; it is not a broad
-background scanner.
+explicit targets; startup, tray refreshes, and bare status do not scan the whole
+projection.
 
 ## Operator Guide
 

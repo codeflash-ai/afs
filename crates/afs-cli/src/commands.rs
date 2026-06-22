@@ -1771,12 +1771,9 @@ fn status(args: &[String], json: bool) -> i32 {
         path: first_positional(args).map(PathBuf::from),
         state_root: Some(state_root.clone()),
     };
-    reconcile_projection_changes_best_effort(
-        "status",
-        &mut store,
-        &state_root,
-        options.path.as_deref(),
-    );
+    if let Some(target) = options.path.as_deref() {
+        reconcile_projection_changes_best_effort("status", &mut store, &state_root, Some(target));
+    }
 
     match run_status(&store, options) {
         Ok(report) if json => {
