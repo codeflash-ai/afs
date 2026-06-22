@@ -329,6 +329,14 @@ leave the request in the queue so a later daemon tick can retry.
 Notion connector's fetch path and path-aware render method so daemon hydration
 persists the same shadow snapshot and media projection that CLI pull uses.
 
+For macOS File Provider mounts, the runtime captures the previous Synced Tree
+shadow before a background `remote_fast_forward` hydration. After the hydration
+succeeds, it best-effort refreshes any already-materialized visible CloudStorage
+replica from the daemon content cache, but only when that visible file still
+matches the previous shadow. Diverged visible files are left alone so background
+remote refresh cannot erase a local edit that missed the normal File Provider
+write callback.
+
 ## Scheduled Pull Reconciliation
 
 `reconcile_scheduled_pull` is the daemon-side counterpart to `afs pull` for

@@ -5,7 +5,7 @@
 //! generic API instead of growing platform-specific daemon semantics.
 
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId};
+use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::hydration::HydrationSource;
+use crate::shadow_match::parsed_matches_shadow;
 use crate::virtual_fs;
 use crate::virtual_fs::source_root_directory_name;
 
@@ -136,6 +137,16 @@ pub struct ProjectionReconcileReport {
     pub skipped_unchanged: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectionRefreshReport {
+    pub checked: usize,
+    pub refreshed: usize,
+    pub skipped_missing_cache: usize,
+    pub skipped_missing_projection: usize,
+    pub skipped_unchanged: usize,
+    pub skipped_local_changes: usize,
+}
+
 /// Imports macOS File Provider replica edits that did not arrive through
 /// `modifyItem`.
 ///
@@ -189,6 +200,149 @@ where
                     report.checked += 1;
                     report.reconciled += 1;
                 }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Copies daemon-materialized content back into the visible macOS File Provider
+/// replica after an explicit remote refresh.
+///
+/// File Provider may keep an already-materialized CloudStorage file stale even
+/// after the daemon content cache has accepted newer remote content. This repair
+/// is deliberately target-scoped and only writes visible files that already
+/// exist.
+pub fn refresh_macos_file_provider_projection<S>(
+    store: &S,
+    state_root: &Path,
+    target: Option<&Path>,
+) -> AfsResult<ProjectionRefreshReport>
+where
+    S: MountRepository + EntityRepository,
+{
+    let Some(target) = target.map(absolute_reconcile_path).transpose()? else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    let mounts = store.load_mounts().map_err(AfsError::from)?;
+    let mut report = ProjectionRefreshReport::default();
+
+    for mount in mounts {
+        if mount.projection != ProjectionMode::MacosFileProvider {
+            continue;
+        }
+
+        let Some(target_match) = match_mount_path(&mount, &target) else {
+            continue;
+        };
+
+        let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
+        let entities = scoped_page_entities(store, &mount, Some(&target_match))?;
+        for entity in entities {
+            let Some(candidate) =
+                refresh_candidate_path(&mount, &entity, Some(&target), Some(&target_match))
+            else {
+                report.skipped_missing_projection += 1;
+                continue;
+            };
+
+            match refresh_projection_candidate(&entity, &content_root, candidate)? {
+                ProjectionRefreshOutcome::MissingCache => {
+                    report.checked += 1;
+                    report.skipped_missing_cache += 1;
+                }
+                ProjectionRefreshOutcome::MissingProjection => {
+                    report.checked += 1;
+                    report.skipped_missing_projection += 1;
+                }
+                ProjectionRefreshOutcome::Unchanged => {
+                    report.checked += 1;
+                    report.skipped_unchanged += 1;
+                }
+                ProjectionRefreshOutcome::SkippedLocalChanges => {
+                    report.checked += 1;
+                    report.skipped_local_changes += 1;
+                }
+                ProjectionRefreshOutcome::Refreshed => {
+                    report.checked += 1;
+                    report.refreshed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Repairs already-materialized macOS File Provider replicas after a background
+/// remote fast-forward.
+///
+/// Unlike explicit `afs pull <path>`, this path runs without direct user intent,
+/// so it only replaces visible replica contents that are still equal to the
+/// previous synced shadow. If the visible file diverged, the repair is skipped
+/// so a missed File Provider write is not silently overwritten.
+pub fn refresh_macos_file_provider_entity_projection_if_clean<S>(
+    store: &S,
+    state_root: &Path,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+    previous_shadow: &ShadowDocument,
+) -> AfsResult<ProjectionRefreshReport>
+where
+    S: MountRepository + EntityRepository,
+{
+    let Some(mount) = store.get_mount(mount_id).map_err(AfsError::from)? else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    if mount.projection != ProjectionMode::MacosFileProvider {
+        return Ok(ProjectionRefreshReport::default());
+    }
+
+    let Some(entity) = store
+        .get_entity(mount_id, remote_id)
+        .map_err(AfsError::from)?
+    else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    if entity.kind != EntityKind::Page {
+        return Ok(ProjectionRefreshReport::default());
+    }
+
+    let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
+    let mut report = ProjectionRefreshReport::default();
+    let candidates = existing_projection_paths(&mount, &entity.path);
+    if candidates.is_empty() {
+        report.skipped_missing_projection += 1;
+        return Ok(report);
+    }
+
+    for candidate in candidates {
+        match refresh_projection_candidate_if_clean(
+            &entity,
+            &content_root,
+            candidate,
+            previous_shadow,
+        )? {
+            ProjectionRefreshOutcome::MissingCache => {
+                report.checked += 1;
+                report.skipped_missing_cache += 1;
+            }
+            ProjectionRefreshOutcome::MissingProjection => {
+                report.checked += 1;
+                report.skipped_missing_projection += 1;
+            }
+            ProjectionRefreshOutcome::Unchanged => {
+                report.checked += 1;
+                report.skipped_unchanged += 1;
+            }
+            ProjectionRefreshOutcome::SkippedLocalChanges => {
+                report.checked += 1;
+                report.skipped_local_changes += 1;
+            }
+            ProjectionRefreshOutcome::Refreshed => {
+                report.checked += 1;
+                report.refreshed += 1;
             }
         }
     }
@@ -253,7 +407,40 @@ fn reconcile_candidate_path(
     })
 }
 
+fn refresh_candidate_path(
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    target: Option<&Path>,
+    target_match: Option<&MountPathMatch>,
+) -> Option<PathBuf> {
+    if let (Some(target), Some(target_match)) = (target, target_match)
+        && target_match.relative_path == entity.path
+        && target.is_file()
+    {
+        return Some(target.to_path_buf());
+    }
+
+    newest_existing_projection_path(mount, &entity.path)
+}
+
 fn newest_existing_projection_path(mount: &MountConfig, relative_path: &Path) -> Option<PathBuf> {
+    existing_projection_path_entries(mount, relative_path)
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(path, _)| path)
+}
+
+fn existing_projection_paths(mount: &MountConfig, relative_path: &Path) -> Vec<PathBuf> {
+    existing_projection_path_entries(mount, relative_path)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
+}
+
+fn existing_projection_path_entries(
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Vec<(PathBuf, SystemTime)> {
     source_projection_roots(mount)
         .into_iter()
         .filter_map(|root| {
@@ -263,8 +450,7 @@ fn newest_existing_projection_path(mount: &MountConfig, relative_path: &Path) ->
                 .is_file()
                 .then_some((path, metadata_modified(&metadata)))
         })
-        .max_by_key(|(_, modified)| *modified)
-        .map(|(path, _)| path)
+        .collect()
 }
 
 fn source_projection_roots(mount: &MountConfig) -> Vec<PathBuf> {
@@ -314,6 +500,66 @@ where
         &commit_contents,
     )?;
     Ok(ProjectionCandidateOutcome::Reconciled)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionRefreshOutcome {
+    MissingCache,
+    MissingProjection,
+    Unchanged,
+    SkippedLocalChanges,
+    Refreshed,
+}
+
+fn refresh_projection_candidate(
+    entity: &EntityRecord,
+    content_root: &Path,
+    projection_path: PathBuf,
+) -> AfsResult<ProjectionRefreshOutcome> {
+    let content_path = content_cache_path(content_root, &entity.path)?;
+    let Ok(cache_contents) = std::fs::read(&content_path) else {
+        return Ok(ProjectionRefreshOutcome::MissingCache);
+    };
+
+    if std::fs::read(&projection_path).is_ok_and(|existing| existing == cache_contents) {
+        return Ok(ProjectionRefreshOutcome::Unchanged);
+    }
+
+    write_binary_atomic(&projection_path, &cache_contents).map_err(AfsError::from)?;
+    Ok(ProjectionRefreshOutcome::Refreshed)
+}
+
+fn refresh_projection_candidate_if_clean(
+    entity: &EntityRecord,
+    content_root: &Path,
+    projection_path: PathBuf,
+    previous_shadow: &ShadowDocument,
+) -> AfsResult<ProjectionRefreshOutcome> {
+    let content_path = content_cache_path(content_root, &entity.path)?;
+    let Ok(cache_contents) = std::fs::read(&content_path) else {
+        return Ok(ProjectionRefreshOutcome::MissingCache);
+    };
+    let Ok(projection_contents) = std::fs::read(&projection_path) else {
+        return Ok(ProjectionRefreshOutcome::MissingProjection);
+    };
+
+    if projection_contents == cache_contents {
+        return Ok(ProjectionRefreshOutcome::Unchanged);
+    }
+
+    if !projection_contents_match_shadow(&projection_contents, previous_shadow) {
+        return Ok(ProjectionRefreshOutcome::SkippedLocalChanges);
+    }
+
+    write_binary_atomic(&projection_path, &cache_contents).map_err(AfsError::from)?;
+    Ok(ProjectionRefreshOutcome::Refreshed)
+}
+
+fn projection_contents_match_shadow(contents: &[u8], shadow: &ShadowDocument) -> bool {
+    std::str::from_utf8(contents)
+        .ok()
+        .and_then(|contents| parse_canonical_markdown(contents).ok())
+        .is_some_and(|parsed| parsed_matches_shadow(&parsed, shadow))
 }
 
 fn projection_needs_read(projection_path: &Path, content_path: &Path, force_read: bool) -> bool {
@@ -455,6 +701,21 @@ fn content_cache_path(content_root: &Path, relative_path: &Path) -> AfsResult<Pa
         }
     }
     Ok(path)
+}
+
+fn write_binary_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("afs-file-provider-refresh");
+    let temp_path = path.with_file_name(format!(".{file_name}.afs-tmp"));
+    std::fs::write(&temp_path, contents)?;
+    std::fs::rename(temp_path, path)?;
+    Ok(())
 }
 
 fn absolute_reconcile_path(path: &Path) -> AfsResult<PathBuf> {
@@ -772,6 +1033,102 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn refresh_macos_projection_copies_cache_to_visible_replica() {
+        let fixture = ProjectionFixture::new("refresh-visible");
+        fixture.write_cache("Pulled remote body.\n");
+        fixture.write_projection_without_identity("Stale visible body.\n");
+
+        let store = fixture.store();
+        let report = refresh_macos_file_provider_projection(
+            &store,
+            &fixture.state_root,
+            Some(&fixture.projection_path()),
+        )
+        .expect("refresh projection");
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refreshed, 1);
+        assert_eq!(report.skipped_unchanged, 0);
+        let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
+        assert!(visible.contains("Pulled remote body."));
+        assert!(!visible.contains("Stale visible body."));
+        assert!(visible.contains("afs:"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refresh_macos_projection_leaves_matching_visible_replica_unchanged() {
+        let fixture = ProjectionFixture::new("refresh-unchanged");
+        fixture.write_cache("Pulled remote body.\n");
+        fs::copy(fixture.content_path(), fixture.projection_path()).expect("seed visible");
+
+        let store = fixture.store();
+        let report = refresh_macos_file_provider_projection(
+            &store,
+            &fixture.state_root,
+            Some(&fixture.projection_path()),
+        )
+        .expect("refresh projection");
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refreshed, 0);
+        assert_eq!(report.skipped_unchanged, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refresh_macos_entity_projection_if_clean_copies_cache_to_visible_replica() {
+        let fixture = ProjectionFixture::new("refresh-entity-clean");
+        let previous_shadow = fixture.previous_shadow();
+        fixture.write_projection_from_shadow(&previous_shadow);
+        fixture.write_cache("Pulled remote body.\n");
+
+        let store = fixture.store();
+        let report = refresh_macos_file_provider_entity_projection_if_clean(
+            &store,
+            &fixture.state_root,
+            &fixture.mount_id,
+            &fixture.remote_id,
+            &previous_shadow,
+        )
+        .expect("refresh projection");
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refreshed, 1);
+        assert_eq!(report.skipped_local_changes, 0);
+        let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
+        assert!(visible.contains("Pulled remote body."));
+        assert!(!visible.contains("Original body."));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refresh_macos_entity_projection_if_clean_skips_visible_local_changes() {
+        let fixture = ProjectionFixture::new("refresh-entity-local-change");
+        let previous_shadow = fixture.previous_shadow();
+        fixture.write_projection_without_identity("Local visible edit.\n");
+        fixture.write_cache("Pulled remote body.\n");
+
+        let store = fixture.store();
+        let report = refresh_macos_file_provider_entity_projection_if_clean(
+            &store,
+            &fixture.state_root,
+            &fixture.mount_id,
+            &fixture.remote_id,
+            &previous_shadow,
+        )
+        .expect("refresh projection");
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refreshed, 0);
+        assert_eq!(report.skipped_local_changes, 1);
+        let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
+        assert!(visible.contains("Local visible edit."));
+        assert!(!visible.contains("Pulled remote body."));
+    }
+
+    #[cfg(target_os = "macos")]
     struct ProjectionFixture {
         root: PathBuf,
         state_root: PathBuf,
@@ -859,6 +1216,17 @@ mod tests {
             .expect("write projection");
         }
 
+        fn write_projection_from_shadow(&self, shadow: &ShadowDocument) {
+            fs::write(
+                self.projection_path(),
+                render_canonical_markdown(&CanonicalDocument::new(
+                    shadow.frontmatter.clone(),
+                    shadow.rendered_body.clone(),
+                )),
+            )
+            .expect("write projection");
+        }
+
         fn write_cache(&self, body: &str) {
             fs::write(
                 self.content_path(),
@@ -868,6 +1236,12 @@ mod tests {
                 )),
             )
             .expect("write cache");
+        }
+
+        fn previous_shadow(&self) -> ShadowDocument {
+            self.store()
+                .load_shadow(&self.mount_id, &self.remote_id)
+                .expect("load shadow")
         }
     }
 
