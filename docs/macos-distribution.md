@@ -163,6 +163,10 @@ This sets `PUBLISH_SKIP_NOTARIZATION=1`, skips notary credential lookup,
 target/release/bundle/dmg/AFS-beta-YYYYMMDD-<commit>-unnotarized-<arch>.dmg
 ```
 
+If `APPLE_SIGNING_IDENTITY` is set, or exactly one Developer ID Application
+identity is installed, `make publish-unnotarized` signs with that identity.
+Otherwise it uses ad-hoc signing for local-only validation.
+
 Use `make publish` for public direct-download and Homebrew artifacts.
 
 Useful overrides:

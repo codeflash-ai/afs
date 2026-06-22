@@ -22,6 +22,14 @@ grep -q '^test-macos-publish-config:' "${MAKEFILE}" \
 
 grep -q 'skip_notarization()' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must define skip_notarization"
+grep -q 'optional_signing_identity()' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must allow unnotarized builds without Developer ID signing"
+grep -F -q 'signing_identity="$(optional_signing_identity)"' "${PUBLISH_SCRIPT}" \
+  || fail "unnotarized publish must use optional signing identity detection"
+grep -q 'require_developer_id="0"' "${PUBLISH_SCRIPT}" \
+  || fail "unnotarized publish must not require Developer ID signatures"
+grep -q 'require_developer_id="1"' "${PUBLISH_SCRIPT}" \
+  || fail "notarized publish must still require Developer ID signatures"
 grep -q 'PUBLISH_SKIP_NOTARIZATION' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must read PUBLISH_SKIP_NOTARIZATION"
 grep -q 'notary_args' "${PUBLISH_SCRIPT}" \
