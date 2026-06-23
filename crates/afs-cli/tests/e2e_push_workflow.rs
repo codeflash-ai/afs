@@ -2265,6 +2265,161 @@ fn live_virtual_page_directory_delete_archives_remote_child_page() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_virtual_database_row_directory_delete_archives_remote_row() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live virtual row delete parent {}", unique_suffix()),
+        Vec::new(),
+    );
+    let database = cleanup.create_database(
+        &parent.id,
+        &format!("AFS live virtual row delete database {}", unique_suffix()),
+    );
+    let row = cleanup.create_database_row(
+        &database,
+        &format!("AFS live virtual row delete row {}", unique_suffix()),
+        serde_json::Map::new(),
+        vec![paragraph_child("Row body before virtual delete.")],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &parent.id);
+    let content_root = fixture.content_root();
+    let source_root = source_root_identifier("notion");
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
+        .expect("refresh source root");
+    let source_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &source_root,
+    )
+    .expect("list source root");
+    let parent_folder = find_virtual_folder(&source_children.children, &parent.id);
+    refresh_virtual_fs_children(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("refresh parent children");
+    let parent_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("list parent children");
+    let database_folder = find_virtual_folder(&parent_children.children, &database.id);
+    refresh_virtual_fs_children(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &database_folder.identifier,
+    )
+    .expect("refresh database row children");
+    let database_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &database_folder.identifier,
+    )
+    .expect("list database row children");
+    let row_folder = find_virtual_folder(&database_children.children, &row.id);
+    materialize_virtual_fs_item_with_content_root(
+        &mut store,
+        &connector,
+        &content_root,
+        &fixture.mount_id,
+        &row.id,
+    )
+    .expect("hydrate database row before delete");
+
+    let deleted = trash_virtual_fs_item(
+        &mut store,
+        &content_root,
+        &fixture.mount_id,
+        &row_folder.identifier,
+    )
+    .expect("record virtual database row delete");
+    assert_eq!(deleted.identifier, row_folder.identifier);
+    let pending_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("pending database row delete status");
+    let delete_entry = pending_status
+        .mounts
+        .iter()
+        .flat_map(|mount| mount.entries.iter())
+        .find(|entry| entry.entity_id == row.id)
+        .expect("pending database row delete status entry");
+    assert_eq!(delete_entry.state.as_str(), "dirty");
+    assert_eq!(delete_entry.sync_state.as_str(), "pending_local_changes");
+    assert_eq!(delete_entry.issues[0].code, "pending_virtual_delete");
+
+    let diff = run_diff(&store, &fixture.root).expect("diff virtual database row delete");
+    let plan = diff
+        .plan
+        .as_ref()
+        .expect("virtual database row delete plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.entities_archived, 1, "{plan:#?}");
+    assert_eq!(plan.affected_entities, vec![row.id.clone()]);
+
+    let push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &fixture.root,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push virtual database row delete");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("reconciled"));
+    assert_eq!(push.changed_remote_ids, vec![row.id.clone()]);
+    assert_eq!(push.reconciled_remote_ids, vec![row.id.clone()]);
+    assert_eq!(push.apply_effect_count, 1);
+
+    let archived = cleanup
+        .api
+        .retrieve_page(&row.id)
+        .expect("retrieve archived database row");
+    assert!(
+        archived.archived || archived.in_trash,
+        "database row should be archived after virtual delete: {archived:#?}"
+    );
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new(row.id.clone()))
+            .expect("get deleted database row entity")
+            .is_none(),
+        "reconcile should remove archived database row entity from local state"
+    );
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list mutations after database row delete push")
+            .is_empty(),
+        "reconcile should clear the pending database row delete mutation"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
