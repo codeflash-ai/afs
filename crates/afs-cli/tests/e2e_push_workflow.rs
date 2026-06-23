@@ -13,6 +13,10 @@ use afs_cli::search::{SearchOptions, run_search};
 use afs_cli::status::{StatusOptions, run_status};
 use afs_connector::{Connector, FetchRequest};
 use afs_core::canonical::render_canonical_markdown;
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+    has_unresolved_conflict_markers,
+};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::{HttpNotionApi, NotionApi};
@@ -375,6 +379,95 @@ fn live_drift_preflight_blocks_push_before_overwriting_remote() {
         !verified.contains(&local_marker),
         "remote content should not be overwritten by a blocked push:\n{verified}"
     );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let base = "Conflict base body before local and remote edits.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live conflict resolve {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let local_marker = format!("Local conflict edit {}", unique_suffix());
+    let remote_marker = format!("Remote conflict edit {}", unique_suffix());
+    let resolved_marker = format!("Resolved conflict edit {}", unique_suffix());
+
+    fs::write(&page_path, original.replace(base, &local_marker))
+        .expect("write local conflict edit");
+
+    std::thread::sleep(Duration::from_millis(1200));
+    let paragraph_id = first_live_child_block_id(&cleanup.api, &scratch.id);
+    update_remote_paragraph(&cleanup.api, &paragraph_id, &remote_marker);
+
+    let pull = run_pull(&mut store, &connector, &page_path).expect("pull conflicted live page");
+    assert!(!pull.ok, "{pull:#?}");
+    assert_eq!(pull.hydrated, 0, "{pull:#?}");
+    assert_eq!(pull.skipped_dirty, 1, "{pull:#?}");
+    assert_eq!(pull.conflicts.len(), 1, "{pull:#?}");
+
+    let conflicted = fs::read_to_string(&page_path).expect("read conflicted live page");
+    assert!(conflicted.contains(&local_marker), "{conflicted}");
+    assert!(conflicted.contains(&remote_marker), "{conflicted}");
+    assert!(conflicted.contains(CONFLICT_LOCAL_MARKER), "{conflicted}");
+    assert!(
+        conflicted.contains(CONFLICT_SEPARATOR_MARKER),
+        "{conflicted}"
+    );
+    assert!(conflicted.contains(CONFLICT_REMOTE_MARKER), "{conflicted}");
+    assert!(has_unresolved_conflict_markers(&conflicted));
+    let conflicted_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("conflicted status");
+    assert_eq!(
+        conflicted_status.summary.conflicted, 1,
+        "{conflicted_status:#?}"
+    );
+
+    fs::write(&page_path, original.replace(base, &resolved_marker))
+        .expect("write resolved conflict");
+    let diff = run_diff(&store, &page_path).expect("diff resolved conflict");
+    assert!(diff.validation.is_empty(), "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("resolved conflict plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push resolved conflict");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let verified = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(verified.contains(&resolved_marker), "{verified}");
+    assert!(!verified.contains(&local_marker), "{verified}");
+    assert!(!verified.contains(&remote_marker), "{verified}");
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean status after conflict resolution push");
+    assert!(clean_status.clean, "{clean_status:#?}");
 }
 
 #[test]
@@ -1601,6 +1694,28 @@ fn append_remote_paragraph(api: &HttpNotionApi, page_id: &str, text: &str) {
         }),
     )
     .expect("append live remote paragraph");
+}
+
+fn first_live_child_block_id(api: &HttpNotionApi, page_id: &str) -> String {
+    api.retrieve_block_children(page_id, None)
+        .expect("retrieve live child blocks")
+        .results
+        .first()
+        .expect("live page child block")
+        .id
+        .clone()
+}
+
+fn update_remote_paragraph(api: &HttpNotionApi, block_id: &str, text: &str) {
+    api.update_block(
+        block_id,
+        json!({
+            "paragraph": {
+                "rich_text": rich_text_json(text)
+            }
+        }),
+    )
+    .expect("update live remote paragraph");
 }
 
 fn diverse_page_children(target_page_id: &str, database_id: &str) -> Vec<Value> {
