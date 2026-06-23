@@ -574,6 +574,88 @@ fn prepare_push_blocks_notion_table_header_mode_change_before_apply() {
 }
 
 #[test]
+fn prepare_push_blocks_notion_table_middle_row_delete_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let body =
+        "| Name | Status |\n| --- | --- |\n| Alpha | Todo |\n| Beta | Doing |\n| Gamma | Done |";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        body,
+        8,
+        [RemoteId::new("table-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: vec![
+            RemoteId::new("header-row"),
+            RemoteId::new("alpha-row"),
+            RemoteId::new("beta-row"),
+            RemoteId::new("gamma-row"),
+        ],
+        has_column_header: true,
+        has_row_header: false,
+    };
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "| Name | Status |\n| --- | --- |\n| Alpha | Todo |\n| Gamma | Done |",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_table_middle_row_delete_unsupported"
+    );
+}
+
+#[test]
+fn prepare_push_allows_notion_table_trailing_row_delete_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let body =
+        "| Name | Status |\n| --- | --- |\n| Alpha | Todo |\n| Beta | Doing |\n| Gamma | Done |";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        body,
+        8,
+        [RemoteId::new("table-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: vec![
+            RemoteId::new("header-row"),
+            RemoteId::new("alpha-row"),
+            RemoteId::new("beta-row"),
+            RemoteId::new("gamma-row"),
+        ],
+        has_column_header: true,
+        has_row_header: false,
+    };
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "| Name | Status |\n| --- | --- |\n| Alpha | Todo |\n| Beta | Doing |",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert!(prepared.pipeline.validation.is_clean());
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+}
+
+#[test]
 fn prepare_push_uses_shared_validator_for_direct_and_virtual_creates() {
     let fixture = PrepareFixture::new();
     let validator = RecordingValidator::default();

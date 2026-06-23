@@ -4,6 +4,7 @@ use afs_core::{AfsError, AfsResult};
 pub struct MarkdownTableShape {
     pub header: Vec<String>,
     pub width: usize,
+    pub data_rows: Vec<Vec<String>>,
     pub row_widths: Vec<usize>,
 }
 
@@ -18,13 +19,15 @@ pub fn parse_markdown_table_shape(markdown: &str) -> AfsResult<MarkdownTableShap
 
     let header = parse_markdown_table_row(lines[0])?;
     validate_markdown_table_separator(lines[1], header.len())?;
-    let row_widths = lines[2..]
+    let data_rows = lines[2..]
         .iter()
-        .map(|line| parse_markdown_table_row(line).map(|row| row.len()))
+        .map(|line| parse_markdown_table_row(line))
         .collect::<AfsResult<Vec<_>>>()?;
+    let row_widths = data_rows.iter().map(Vec::len).collect::<Vec<_>>();
     Ok(MarkdownTableShape {
         width: header.len(),
         header,
+        data_rows,
         row_widths,
     })
 }
@@ -89,6 +92,7 @@ mod tests {
 
         assert_eq!(shape.width, 2);
         assert_eq!(shape.header, vec!["Name", "Status"]);
+        assert_eq!(shape.data_rows, vec![vec!["Old", "Todo"]]);
         assert_eq!(shape.row_widths, vec![2]);
     }
 

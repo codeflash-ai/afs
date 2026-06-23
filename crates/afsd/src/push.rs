@@ -772,7 +772,63 @@ fn notion_table_shape_change_validation(
         ));
     }
 
+    if table_non_trailing_row_delete_detected(*has_column_header, &original, &edited) {
+        return Some(ValidationIssue::new(
+            "notion_table_middle_row_delete_unsupported",
+            relative_path,
+            Some(shadow_block.source_span.start_line),
+            "deleting non-trailing Notion table rows is not supported from Markdown",
+            Some(
+                "restore the shifted row and only remove rows from the end of the table"
+                    .to_string(),
+            ),
+        ));
+    }
+
     None
+}
+
+fn table_non_trailing_row_delete_detected(
+    has_column_header: bool,
+    original: &afs_notion::markdown_table::MarkdownTableShape,
+    edited: &afs_notion::markdown_table::MarkdownTableShape,
+) -> bool {
+    let original_rows = table_identity_rows(has_column_header, original);
+    let edited_rows = table_identity_rows(has_column_header, edited);
+    if edited_rows.len() >= original_rows.len() {
+        return false;
+    }
+
+    edited_rows.iter().enumerate().any(|(edited_index, row)| {
+        if original_rows.get(edited_index) == Some(row) {
+            return false;
+        }
+        let matching_original_indexes = original_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(original_index, original_row)| {
+                (original_row == row).then_some(original_index)
+            })
+            .collect::<Vec<_>>();
+        matches!(
+            matching_original_indexes.as_slice(),
+            [original_index] if *original_index > edited_index
+        )
+    })
+}
+
+fn table_identity_rows(
+    has_column_header: bool,
+    shape: &afs_notion::markdown_table::MarkdownTableShape,
+) -> Vec<Vec<String>> {
+    if has_column_header {
+        let mut rows = Vec::with_capacity(shape.data_rows.len() + 1);
+        rows.push(shape.header.clone());
+        rows.extend(shape.data_rows.clone());
+        rows
+    } else {
+        shape.data_rows.clone()
+    }
 }
 
 fn moved_rendered_child_page_link_block<'a>(
