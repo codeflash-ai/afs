@@ -1658,6 +1658,80 @@ fn live_table_middle_row_delete_blocks_before_journaled_apply() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_table_trailing_row_delete_pushes_and_reconciles() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live table trailing row delete {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "table",
+            "table": {
+                "table_width": 2,
+                "has_column_header": true,
+                "has_row_header": false,
+                "children": [
+                    table_row_child("Name", "Status"),
+                    table_row_child("Keep task", "Todo"),
+                    table_row_child("Drop task", "Later")
+                ]
+            }
+        })],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    assert!(original.contains("| Drop task | Later |"), "{original}");
+    let trailing_newline = if original.ends_with('\n') { "\n" } else { "" };
+    let edited = original
+        .lines()
+        .filter(|line| *line != "| Drop task | Later |")
+        .collect::<Vec<_>>()
+        .join("\n")
+        + trailing_newline;
+    assert_ne!(edited, original, "{original}");
+    fs::write(&page_path, edited).expect("delete live table trailing row");
+
+    let diff = run_diff(&store, &page_path).expect("diff live table trailing row delete");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("table trailing row delete plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live table trailing row delete");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.apply_effect_count, 1);
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean table trailing row delete status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    assert!(verified.contains("| Keep task | Todo |"), "{verified}");
+    assert!(
+        !verified.contains("| Drop task | Later |"),
+        "trailing table row should be archived remotely and removed locally:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_child_page_link_move_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
