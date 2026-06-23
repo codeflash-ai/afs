@@ -35,6 +35,55 @@ fn restore_rewrites_file_from_shadow_and_marks_entity_hydrated() {
 }
 
 #[test]
+fn restore_page_directory_targets_page_document() {
+    let fixture = RestoreFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_content_hash("dirty")
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save page-directory entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow())
+        .expect("save shadow");
+    let page_dir = fixture.root.join("Roadmap");
+    fs::create_dir_all(&page_dir).expect("page dir");
+    let page_path = page_dir.join("page.md");
+    fs::write(&page_path, canonical_markdown("# Roadmap\n\nLocal edit.")).expect("write page");
+
+    let report =
+        run_restore(&mut store, &page_dir, RestoreOptions::default()).expect("restore report");
+
+    assert!(report.ok);
+    assert!(
+        fs::read_to_string(&page_path)
+            .expect("restored page")
+            .contains("# Roadmap\n\nSynced body.")
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Hydrated);
+}
+
+#[test]
 fn restore_requires_force_for_conflicted_entity() {
     let fixture = RestoreFixture::new();
     let mut store = fixture.store(HydrationState::Conflicted);

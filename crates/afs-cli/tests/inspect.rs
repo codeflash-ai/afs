@@ -58,6 +58,54 @@ fn inspect_reports_remote_changed_only_as_safe_to_fast_forward() {
 }
 
 #[test]
+fn inspect_page_directory_targets_page_document() {
+    let fixture = InspectFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow("page-1", "# Roadmap\n\nBase body."),
+        )
+        .expect("save shadow");
+    let page_path = fixture.write_page("Roadmap/page.md", "# Roadmap\n\nBase body.");
+    let source = FakeInspectSource::new(rendered_entity("page-1", "# Roadmap\n\nBase body."));
+
+    let report = run_inspect(
+        &store,
+        &source,
+        InspectOptions {
+            path: fixture.root.join("Roadmap"),
+            state_root: None,
+        },
+    )
+    .expect("inspect report");
+
+    assert!(report.ok);
+    assert_eq!(report.entity_id, "page-1");
+    assert_eq!(report.local_read_path, page_path.display().to_string());
+    assert_eq!(report.explanation.state, RemoteChangeState::AllSynced);
+}
+
+#[test]
 fn inspect_reports_both_changed_when_local_and_remote_diverged() {
     let fixture = InspectFixture::new();
     let mut store = fixture.store(ProjectionMode::PlainFiles);

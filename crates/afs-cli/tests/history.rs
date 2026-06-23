@@ -71,6 +71,32 @@ fn log_filters_journal_entries_by_projected_path() {
 }
 
 #[test]
+fn log_page_directory_targets_page_document() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    fs::create_dir_all(fixture.root.join("Roadmap")).expect("create page dir");
+    fs::write(fixture.root.join("Roadmap/page.md"), "").expect("write page document");
+    store
+        .save_entity(entity_record(&fixture, "page-2", "Roadmap/page.md"))
+        .expect("save page-directory entity");
+    store
+        .append_journal(journal_entry("push-1", "page-2", JournalStatus::Prepared))
+        .expect("append page-directory journal");
+
+    let report = run_log(
+        &store,
+        LogOptions {
+            path: Some(fixture.root.join("Roadmap")),
+        },
+    )
+    .expect("page-directory log");
+
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].push_id, "push-1");
+    assert_eq!(report.entries[0].remote_ids, vec!["page-2"]);
+}
+
+#[test]
 fn log_filters_created_entity_journal_by_created_path() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();

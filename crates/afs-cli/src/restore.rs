@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use afs_core::canonical::render_canonical_markdown;
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState};
+use afs_core::path_projection::page_document_path;
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
@@ -40,21 +41,32 @@ pub fn run_restore<S>(
 where
     S: MountRepository + EntityRepository + ShadowRepository,
 {
-    let absolute_path = absolute_path(target_path.as_ref())?;
+    let mut absolute_path = absolute_path(target_path.as_ref())?;
     let mounts = store.load_mounts().map_err(RestoreError::Store)?;
     let mount = find_mount_for_path(&mounts, &absolute_path)
         .cloned()
         .ok_or_else(|| RestoreError::MountNotFound(absolute_path.clone()))?;
-    let relative_path = relative_entity_path(&mount, &absolute_path)?;
+    let mut relative_path = relative_entity_path(&mount, &absolute_path)?;
     let mut entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
-        .map_err(RestoreError::Store)?
-        .ok_or_else(|| {
-            RestoreError::Store(StoreError::EntityPathMissing {
-                mount_id: mount.mount_id.clone(),
-                path: relative_path.clone(),
-            })
-        })?;
+        .map_err(RestoreError::Store)?;
+    if entity.is_none() && absolute_path.is_dir() {
+        let page_relative_path = page_document_path(&relative_path);
+        if let Some(page_entity) = store
+            .find_entity_by_path(&mount.mount_id, &page_relative_path)
+            .map_err(RestoreError::Store)?
+        {
+            absolute_path = page_document_path(&absolute_path);
+            relative_path = page_relative_path;
+            entity = Some(page_entity);
+        }
+    }
+    let mut entity = entity.ok_or_else(|| {
+        RestoreError::Store(StoreError::EntityPathMissing {
+            mount_id: mount.mount_id.clone(),
+            path: relative_path.clone(),
+        })
+    })?;
 
     if entity.kind != EntityKind::Page {
         return Err(RestoreError::UnsupportedEntity(entity.kind));

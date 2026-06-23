@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use afs_core::AfsError;
 use afs_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, PushId};
 use afs_core::model::{MountId, RemoteId};
+use afs_core::path_projection::page_document_path;
 use afs_core::undo::{
     UndoApplier, UndoApplyRequest, UndoOperation, UndoPlan, UndoPlanStatus,
     UnsupportedUndoOperation, plan_journal_undo,
@@ -444,16 +445,26 @@ where
     let mounts = store.load_mounts().map_err(HistoryError::Store)?;
     let mount = find_mount_for_path(&mounts, &absolute_path)
         .ok_or_else(|| HistoryError::MountNotFound(absolute_path.clone()))?;
-    let relative_path = relative_entity_path(mount, &absolute_path)?;
-    let entity = store
+    let mut relative_path = relative_entity_path(mount, &absolute_path)?;
+    let mut entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
-        .map_err(HistoryError::Store)?
-        .ok_or_else(|| {
-            HistoryError::Store(StoreError::EntityPathMissing {
-                mount_id: mount.mount_id.clone(),
-                path: relative_path,
-            })
-        })?;
+        .map_err(HistoryError::Store)?;
+    if entity.is_none() && absolute_path.is_dir() {
+        let page_relative_path = page_document_path(&relative_path);
+        if let Some(page_entity) = store
+            .find_entity_by_path(&mount.mount_id, &page_relative_path)
+            .map_err(HistoryError::Store)?
+        {
+            relative_path = page_relative_path;
+            entity = Some(page_entity);
+        }
+    }
+    let entity = entity.ok_or_else(|| {
+        HistoryError::Store(StoreError::EntityPathMissing {
+            mount_id: mount.mount_id.clone(),
+            path: relative_path,
+        })
+    })?;
 
     Ok(PathFilter {
         mount_id: mount.mount_id.clone(),

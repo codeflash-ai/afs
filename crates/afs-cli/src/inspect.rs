@@ -13,6 +13,7 @@ use afs_core::explain::{
 };
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState};
+use afs_core::path_projection::page_document_path;
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
@@ -50,21 +51,32 @@ where
     S: MountRepository + EntityRepository + ShadowRepository,
     Source: HydrationSource + ?Sized,
 {
-    let target = absolute_path(&options.path)?;
+    let mut target = absolute_path(&options.path)?;
     let mounts = store.load_mounts().map_err(InspectError::Store)?;
     let mount = find_mount_for_path(&mounts, &target)
         .cloned()
         .ok_or_else(|| InspectError::MountNotFound(target.clone()))?;
-    let relative_path = relative_entity_path(&mount, &target)?;
-    let entity = store
+    let mut relative_path = relative_entity_path(&mount, &target)?;
+    let mut entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
-        .map_err(InspectError::Store)?
-        .ok_or_else(|| {
-            InspectError::Store(StoreError::EntityPathMissing {
-                mount_id: mount.mount_id.clone(),
-                path: relative_path.clone(),
-            })
-        })?;
+        .map_err(InspectError::Store)?;
+    if entity.is_none() && target.is_dir() {
+        let page_relative_path = page_document_path(&relative_path);
+        if let Some(page_entity) = store
+            .find_entity_by_path(&mount.mount_id, &page_relative_path)
+            .map_err(InspectError::Store)?
+        {
+            target = page_document_path(&target);
+            relative_path = page_relative_path;
+            entity = Some(page_entity);
+        }
+    }
+    let entity = entity.ok_or_else(|| {
+        InspectError::Store(StoreError::EntityPathMissing {
+            mount_id: mount.mount_id.clone(),
+            path: relative_path.clone(),
+        })
+    })?;
     if entity.kind != EntityKind::Page {
         return Err(InspectError::UnsupportedEntity {
             path: target,
