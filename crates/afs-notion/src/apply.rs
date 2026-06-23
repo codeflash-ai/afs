@@ -2763,9 +2763,9 @@ fn unescape_markdown_text(value: &str) -> String {
     let mut rest = value;
 
     while !rest.is_empty() {
-        if let Some(tag) = escaped_literal_inline_tag_prefix(rest) {
-            unescaped.push_str(tag);
-            rest = &rest[tag.len() + 1..];
+        if let Some(marker) = escaped_literal_inline_marker_prefix(rest) {
+            unescaped.push_str(marker);
+            rest = &rest[marker.len() + 1..];
             continue;
         }
         if let Some(tag) = break_tag_prefix(rest) {
@@ -3162,22 +3162,22 @@ fn escape_markdown_text(text: &str) -> String {
     escape_markdown_text_with_options(text, true)
 }
 
-fn escape_markdown_text_with_options(text: &str, escape_equation_markers: bool) -> String {
+fn escape_markdown_text_with_options(text: &str, escape_inline_markers: bool) -> String {
     let mut escaped = String::with_capacity(text.len());
     let mut rest = text;
 
     while !rest.is_empty() {
-        if let Some(tag) = literal_inline_tag_prefix(rest) {
+        if escape_inline_markers && let Some(marker) = literal_inline_marker_prefix(rest) {
             escaped.push('\\');
-            escaped.push_str(tag);
-            rest = &rest[tag.len()..];
+            escaped.push_str(marker);
+            rest = &rest[marker.len()..];
             continue;
         }
 
         let ch = rest.chars().next().expect("non-empty rest");
         match ch {
             '\\' => escaped.push_str("\\\\"),
-            '$' if escape_equation_markers => escaped.push_str("\\$"),
+            '$' if escape_inline_markers => escaped.push_str("\\$"),
             '\n' => escaped.push_str("<br>"),
             _ => escaped.push(ch),
         }
@@ -3193,14 +3193,32 @@ fn escape_markdown_link_label(text: &str) -> String {
         .replace(']', "\\]")
 }
 
-fn escaped_literal_inline_tag_prefix(value: &str) -> Option<&'static str> {
-    ["<br />", "<br/>", "<br>", "</u>", "<u>"]
-        .into_iter()
-        .find(|tag| {
-            value
-                .strip_prefix('\\')
-                .is_some_and(|rest| rest.starts_with(tag))
-        })
+fn escaped_literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
+    [
+        "<br />",
+        "<br/>",
+        "<br>",
+        "</u>",
+        "<u>",
+        "@date(",
+        "@page(",
+        "@database(",
+        "@user(",
+    ]
+    .into_iter()
+    .find(|marker| {
+        value
+            .strip_prefix('\\')
+            .is_some_and(|rest| rest.starts_with(marker))
+    })
+}
+
+fn literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
+    literal_inline_tag_prefix(value).or_else(|| {
+        ["@date(", "@page(", "@database(", "@user("]
+            .into_iter()
+            .find(|marker| value.starts_with(marker))
+    })
 }
 
 fn literal_inline_tag_prefix(value: &str) -> Option<&'static str> {

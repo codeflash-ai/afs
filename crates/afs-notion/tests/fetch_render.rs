@@ -285,6 +285,30 @@ fn render_rich_text_escapes_literal_equation_markers() {
 }
 
 #[test]
+fn render_rich_text_escapes_literal_explicit_mention_markers() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block(
+                "paragraph-1",
+                vec![rich_text(
+                    "Literal @date(2026-06-14), @page(22222222-2222-2222-2222-222222222222), @database(33333333-3333-3333-3333-333333333333), and @user(44444444-4444-4444-4444-444444444444)",
+                )],
+            ),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "Literal \\@date(2026-06-14), \\@page(22222222-2222-2222-2222-222222222222), \\@database(33333333-3333-3333-3333-333333333333), and \\@user(44444444-4444-4444-4444-444444444444)\n"
+    );
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+}
+
+#[test]
 fn fetch_does_not_inline_child_page_or_database_content_into_parent_body() {
     let api = FixtureNotionApi::parent_with_child_boundaries();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));

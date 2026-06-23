@@ -407,6 +407,51 @@ fn apply_decodes_escaped_literal_equation_markers() {
 }
 
 #[test]
+fn apply_decodes_escaped_literal_explicit_mention_markers() {
+    let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
+        "2026-06-10T00:00:00.000Z",
+        rich_text("Original"),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let literal = "Literal @date(2026-06-14), @page(22222222-2222-2222-2222-222222222222), @database(33333333-3333-3333-3333-333333333333), and @user(44444444-4444-4444-4444-444444444444) changed";
+    let escaped = "Literal \\@date(2026-06-14), \\@page(22222222-2222-2222-2222-222222222222), \\@database(33333333-3333-3333-3333-333333333333), and \\@user(44444444-4444-4444-4444-444444444444) changed";
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: escaped.to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "paragraph-1".to_string(),
+            body: json!({
+                "paragraph": {
+                    "rich_text": rich_text_json(literal),
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
