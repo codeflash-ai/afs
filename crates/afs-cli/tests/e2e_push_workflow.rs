@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::diff::run_diff;
+use afs_cli::inspect::{InspectOptions, run_inspect};
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::run_pull;
 use afs_cli::push::{PushOptions, run_push_with_daemon};
@@ -17,6 +18,7 @@ use afs_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
     has_unresolved_conflict_markers,
 };
+use afs_core::explain::{RemoteChangeAction, RemoteChangeState};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::{HttpNotionApi, NotionApi};
@@ -468,6 +470,93 @@ fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
     )
     .expect("clean status after conflict resolution push");
     assert!(clean_status.clean, "{clean_status:#?}");
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_inspect_explains_remote_and_local_drift_without_mutating() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let base = "Inspect base body before drift.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live inspect {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, store, page_path, original) = pull_live_page(&connector, &scratch.id);
+
+    let initial = run_inspect(
+        &store,
+        &connector,
+        InspectOptions {
+            path: page_path.clone(),
+            state_root: None,
+        },
+    )
+    .expect("initial live inspect");
+    assert!(initial.ok, "{initial:#?}");
+    assert_eq!(initial.explanation.state, RemoteChangeState::AllSynced);
+    assert_eq!(initial.explanation.action, RemoteChangeAction::None);
+
+    let remote_marker = format!("Inspect remote drift {}", unique_suffix());
+    append_remote_paragraph(&cleanup.api, &scratch.id, &remote_marker);
+    let remote_only = run_inspect(
+        &store,
+        &connector,
+        InspectOptions {
+            path: page_path.clone(),
+            state_root: None,
+        },
+    )
+    .expect("remote drift live inspect");
+    assert!(remote_only.ok, "{remote_only:#?}");
+    assert_eq!(
+        remote_only.explanation.state,
+        RemoteChangeState::RemoteChangedOnly
+    );
+    assert_eq!(
+        remote_only.explanation.action,
+        RemoteChangeAction::SafeToFastForward
+    );
+    assert!(!remote_only.explanation.local.changed);
+    assert!(remote_only.explanation.remote.changed);
+    assert_eq!(
+        fs::read_to_string(&page_path).expect("read after remote-only inspect"),
+        original,
+        "inspect must not fast-forward or otherwise mutate local content"
+    );
+
+    let local_marker = format!("Inspect local drift {}", unique_suffix());
+    fs::write(&page_path, original.replace(base, &local_marker))
+        .expect("write inspect local drift");
+    let both_changed = run_inspect(
+        &store,
+        &connector,
+        InspectOptions {
+            path: page_path.clone(),
+            state_root: None,
+        },
+    )
+    .expect("both changed live inspect");
+    assert!(both_changed.ok, "{both_changed:#?}");
+    assert_eq!(
+        both_changed.explanation.state,
+        RemoteChangeState::BothChanged
+    );
+    assert_eq!(
+        both_changed.explanation.action,
+        RemoteChangeAction::ReviewBeforePush
+    );
+    assert!(both_changed.explanation.local.changed);
+    assert!(both_changed.explanation.remote.changed);
+    let after_both = fs::read_to_string(&page_path).expect("read after both-changed inspect");
+    assert!(after_both.contains(&local_marker), "{after_both}");
+    assert!(
+        !after_both.contains(&remote_marker),
+        "inspect must not write remote drift into the local file:\n{after_both}"
+    );
 }
 
 #[test]
