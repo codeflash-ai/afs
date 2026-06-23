@@ -1,17 +1,22 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{Connector, ObserveRequest};
 use afs_core::freshness::RemoteVersion;
 use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::{AfsError, AfsResult};
-use afs_notion::client::NotionApi;
+use afs_notion::client::{HttpNotionApi, NotionApi};
 use afs_notion::dto::{
     BlockDto, BlockListDto, DatabaseDto, DatabaseListDto, PageDto, PageListDto, PagePropertyDto,
     PaginatedListDto, ParentDto, RichTextDto, TextRichTextDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
+use serde_json::{Value, json};
+
+const LIVE_PARENT_ENV: &str = "AFS_NOTION_LIVE_PARENT_PAGE";
+const TOKEN_ENV: &str = "NOTION_TOKEN";
 
 #[test]
 fn notion_observe_page_reads_metadata_without_hydrating_blocks() {
@@ -73,11 +78,182 @@ fn notion_observe_database_falls_back_to_database_metadata() {
     );
 }
 
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_notion_observe_page_reads_metadata_without_hydrating_blocks() {
+    std::env::var(TOKEN_ENV).expect("set NOTION_TOKEN");
+    let parent_page_id =
+        normalize_notion_id(&std::env::var(LIVE_PARENT_ENV).unwrap_or_else(|_| {
+            panic!("set {LIVE_PARENT_ENV} to a writable Notion page ID or URL")
+        }));
+    let api = Arc::new(LiveObserveApi::new());
+    let mut cleanup = LiveObserveCleanup::new(api.clone());
+    let title = format!("AFS live observe {}", unique_suffix());
+    let page = cleanup.create_page(&parent_page_id, &title);
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    let observed = connector
+        .observe(ObserveRequest {
+            mount_id: MountId::new("live-notion"),
+            remote_id: RemoteId::new(page.id.clone()),
+        })
+        .expect("observe live page");
+
+    assert_eq!(observed.mount_id, MountId::new("live-notion"));
+    assert_eq!(observed.remote_id, RemoteId::new(page.id.clone()));
+    assert_eq!(observed.kind, EntityKind::Page);
+    assert_eq!(observed.title, title);
+    assert_eq!(
+        observed.parent_remote_id,
+        Some(RemoteId::new(parent_page_id.clone()))
+    );
+    assert!(observed.remote_version.is_some(), "{observed:#?}");
+    assert!(!observed.deleted);
+    assert_eq!(api.block_children_calls.load(Ordering::SeqCst), 0);
+
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let updated_title = format!("{title} updated");
+    api.update_page(
+        &page.id,
+        json!({
+            "properties": {
+                "title": {
+                    "title": rich_text_json(&updated_title)
+                }
+            }
+        }),
+    )
+    .expect("update live page metadata");
+    let updated = connector
+        .observe(ObserveRequest {
+            mount_id: MountId::new("live-notion"),
+            remote_id: RemoteId::new(page.id.clone()),
+        })
+        .expect("observe updated live page");
+
+    assert_eq!(updated.title, updated_title);
+    assert!(updated.remote_version.is_some(), "{updated:#?}");
+    assert_ne!(updated.raw_metadata_json, observed.raw_metadata_json);
+    assert_eq!(api.block_children_calls.load(Ordering::SeqCst), 0);
+}
+
 #[derive(Debug, Default)]
 struct ObserveFixtureApi {
     pages: BTreeMap<String, PageDto>,
     databases: BTreeMap<String, DatabaseDto>,
     block_children_calls: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct LiveObserveApi {
+    inner: HttpNotionApi,
+    block_children_calls: AtomicUsize,
+}
+
+impl LiveObserveApi {
+    fn new() -> Self {
+        Self {
+            inner: HttpNotionApi::new(NotionConfig::default()),
+            block_children_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl NotionApi for LiveObserveApi {
+    fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto> {
+        self.inner.retrieve_page(page_id)
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> AfsResult<DatabaseDto> {
+        self.inner.retrieve_database(database_id)
+    }
+
+    fn create_page(&self, body: Value) -> AfsResult<PageDto> {
+        self.inner.create_page(body)
+    }
+
+    fn update_page(&self, page_id: &str, body: Value) -> AfsResult<PageDto> {
+        self.inner.update_page(page_id, body)
+    }
+
+    fn retrieve_block_children(
+        &self,
+        block_id: &str,
+        start_cursor: Option<&str>,
+    ) -> AfsResult<BlockListDto> {
+        self.block_children_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.retrieve_block_children(block_id, start_cursor)
+    }
+
+    fn search_pages(&self, start_cursor: Option<&str>) -> AfsResult<PageListDto> {
+        self.inner.search_pages(start_cursor)
+    }
+
+    fn search_databases(&self, start_cursor: Option<&str>) -> AfsResult<DatabaseListDto> {
+        self.inner.search_databases(start_cursor)
+    }
+
+    fn update_block(&self, block_id: &str, body: Value) -> AfsResult<BlockDto> {
+        self.inner.update_block(block_id, body)
+    }
+
+    fn append_block_children(&self, block_id: &str, body: Value) -> AfsResult<BlockListDto> {
+        self.inner.append_block_children(block_id, body)
+    }
+
+    fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto> {
+        self.inner.delete_block(block_id)
+    }
+}
+
+struct LiveObserveCleanup {
+    api: Arc<LiveObserveApi>,
+    block_ids: Vec<String>,
+}
+
+impl LiveObserveCleanup {
+    fn new(api: Arc<LiveObserveApi>) -> Self {
+        Self {
+            api,
+            block_ids: Vec::new(),
+        }
+    }
+
+    fn create_page(&mut self, parent_page_id: &str, title: &str) -> PageDto {
+        let page = self
+            .api
+            .create_page(json!({
+                "parent": {
+                    "type": "page_id",
+                    "page_id": parent_page_id
+                },
+                "properties": {
+                    "title": {
+                        "title": rich_text_json(title)
+                    }
+                },
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": rich_text_json("Observation child block must not be hydrated.")
+                        }
+                    }
+                ]
+            }))
+            .expect("create live observe page");
+        self.block_ids.push(page.id.clone());
+        page
+    }
+}
+
+impl Drop for LiveObserveCleanup {
+    fn drop(&mut self) {
+        for block_id in self.block_ids.iter().rev() {
+            let _ = self.api.delete_block(block_id);
+        }
+    }
 }
 
 impl ObserveFixtureApi {
@@ -182,4 +358,44 @@ fn rich_text(text: &str) -> RichTextDto {
         plain_text: text.to_string(),
         ..Default::default()
     }
+}
+
+fn rich_text_json(text: &str) -> Vec<Value> {
+    vec![json!({
+        "type": "text",
+        "text": {
+            "content": text
+        }
+    })]
+}
+
+fn normalize_notion_id(value: &str) -> String {
+    let tail = value
+        .trim()
+        .trim_end_matches('/')
+        .rsplit(['/', '-'])
+        .next()
+        .unwrap_or(value)
+        .trim();
+    let compact = tail.replace('-', "");
+    if compact.len() == 32 {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &compact[0..8],
+            &compact[8..12],
+            &compact[12..16],
+            &compact[16..20],
+            &compact[20..32]
+        )
+    } else {
+        value.to_string()
+    }
+}
+
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
 }
