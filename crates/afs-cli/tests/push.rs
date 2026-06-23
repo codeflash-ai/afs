@@ -411,6 +411,57 @@ fn push_daemon_suggests_pull_when_remote_changed_since_last_sync() {
 }
 
 #[test]
+fn push_daemon_suggests_parent_pull_when_new_page_parent_changed_since_last_sync() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-parent"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save page directory parent");
+    let path = fixture.write_raw(
+        "Roadmap/Draft/page.md",
+        "---\ntitle: Draft\n---\n# Draft\n\nCreated locally.\n",
+    );
+    let parent_path = fixture.write_raw(
+        "Roadmap/page.md",
+        &canonical_markdown("page-parent", "# Roadmap\n\nParent body.\n"),
+    );
+    let source = FakePushSource::with_remote(rendered_entity("Changed paragraph."))
+        .with_concurrency_failure(AfsError::Guardrail(
+            "remote entity `page-parent` changed since last sync (expected remote_edited_at `old`, found `new`)"
+                .to_string(),
+        ));
+
+    let report = run_push_with_daemon(
+        &mut store,
+        &source,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "apply_failed");
+    let expected = format!(
+        "run `afs pull {}` to update the parent from remote, then rerun `afs push {} -y`",
+        parent_path.display(),
+        path.display()
+    );
+    assert_eq!(report.suggested_fix.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
 fn push_dangerous_plan_requires_confirm() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();

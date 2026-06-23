@@ -21,8 +21,8 @@ use afsd::push::{PushJobAction, execute_push_job, execute_push_job_with_content_
 use serde::Serialize;
 
 use crate::diff::{
-    DiffError, GuardrailOutput, PreviewOptions, PushPlanOutput, ValidationIssueOutput, action_name,
-    run_preview, unsupported_action_fields,
+    DiffError, GuardrailOutput, PreviewOptions, PushOperationOutput, PushPlanOutput,
+    ValidationIssueOutput, action_name, run_preview, unsupported_action_fields,
 };
 use crate::status::{StatusError, StatusOptions, StatusState, run_status};
 
@@ -251,7 +251,8 @@ impl PushReport {
             cli_report.ok = false;
             cli_report.push_id = push_id.map(|push_id| push_id.0);
             if cli_report.suggested_fix.is_none() {
-                cli_report.suggested_fix = push_error_suggested_fix(&error, &cli_report.path);
+                cli_report.suggested_fix =
+                    push_error_suggested_fix(&error, &cli_report.path, cli_report.plan.as_ref());
             }
             if cli_report.message.is_none() {
                 cli_report.message = Some(error.message);
@@ -413,14 +414,51 @@ fn daemon_action_name<'a>(
     }
 }
 
-fn push_error_suggested_fix(error: &PushJobError, path: &str) -> Option<String> {
+fn push_error_suggested_fix(
+    error: &PushJobError,
+    path: &str,
+    plan: Option<&PushPlanOutput>,
+) -> Option<String> {
     if error.code == "guardrail" && error.message.contains("changed since last sync") {
+        if let Some(parent_path) = create_entity_parent_pull_path(path, plan) {
+            let parent_path = shell_quote(&parent_path);
+            let path = shell_quote(path);
+            return Some(format!(
+                "run `afs pull {parent_path}` to update the parent from remote, then rerun `afs push {path} -y`"
+            ));
+        }
+
         let path = shell_quote(path);
         return Some(format!(
             "run `afs pull {path}` to update from remote, resolve any conflicts, then rerun `afs push {path} -y`"
         ));
     }
     None
+}
+
+fn create_entity_parent_pull_path(path: &str, plan: Option<&PushPlanOutput>) -> Option<String> {
+    let plan = plan?;
+    if !plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, PushOperationOutput::CreateEntity { .. }))
+    {
+        return None;
+    }
+
+    let path = Path::new(path);
+    let parent_scope = if path.file_name().and_then(|name| name.to_str()) == Some("page.md") {
+        path.parent()?.parent()?
+    } else {
+        path.parent()?
+    };
+    let page_parent = parent_scope.join("page.md");
+    let parent = if page_parent.exists() {
+        page_parent.as_path()
+    } else {
+        parent_scope
+    };
+    Some(parent.display().to_string())
 }
 
 fn shell_quote(value: &str) -> String {

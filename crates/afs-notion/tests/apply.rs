@@ -930,6 +930,50 @@ fn apply_parses_long_code_fences_from_rendered_code_blocks() {
 }
 
 #[test]
+fn apply_normalizes_text_code_fence_language_to_plain_text() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![code_block("code-1", "plain text", "Before")],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("code-1"),
+            content: "```text\nAfter\n```".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "code-1".to_string(),
+            body: json!({
+                "code": {
+                    "rich_text": rich_text_json("After"),
+                    "language": "plain text",
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_moves_existing_blocks() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",

@@ -1575,11 +1575,7 @@ fn parse_supported_block(
     }
 
     if let Some((language, code)) = parse_code_fence(trimmed) {
-        let language = if language.is_empty() {
-            "plain text".to_string()
-        } else {
-            language
-        };
+        let language = normalize_code_language(language);
         return Ok(NotionBlockPatch::new(
             "code",
             json!({
@@ -3327,6 +3323,18 @@ fn parse_code_fence(markdown: &str) -> Option<(String, String)> {
     }
     body.pop();
     Some((language.to_string(), body.join("\n")))
+}
+
+fn normalize_code_language(language: String) -> String {
+    if language.is_empty()
+        || ["plain", "plaintext", "text", "txt"]
+            .iter()
+            .any(|alias| language.eq_ignore_ascii_case(alias))
+    {
+        "plain text".to_string()
+    } else {
+        language
+    }
 }
 
 fn is_closing_code_fence(line: &str, marker: char, opening_len: usize) -> bool {
