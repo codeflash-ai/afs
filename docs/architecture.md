@@ -98,10 +98,10 @@ AFS/
 
 The physical root is platform-specific (`~/Library/CloudStorage/AFS` on macOS,
 `~/AFS` or a Cloud Files root on Windows, and `~/AFS` on Linux), but command
-handling treats `AFS/<connector>` as the mount boundary. macOS File Provider
-may expose legacy compatibility aliases such as `AFS-AFS/notion` for older
-per-mount domain registrations; those aliases are accepted only at the connector
-folder, not at the File Provider domain root.
+handling treats `AFS/<connector>` as the mount boundary. Older macOS File
+Provider experiments may leave stale folders such as `AFS-AFS/notion`; current
+code does not treat those aliases as mounts. They should be removed through File
+Provider repair/reset rather than used as active working folders.
 
 Every file operation resolves through this boundary:
 

@@ -229,11 +229,11 @@ Windows binaries accept `plain-files` and `windows-cloud-files`.
 
 The canonical user-facing virtual projection shape is `AFS/<connector>/...`,
 for example `~/Library/CloudStorage/AFS/notion` on macOS. Older macOS File
-Provider registrations may also appear under compatibility aliases such as
-`AFS-AFS/notion`; AFS accepts those connector folders for existing installs, but
-does not treat the File Provider domain root itself as a mount. Command paths
-are normalized before matching and path traversal or symlink escapes outside the
-connector folder are rejected.
+Provider registrations may have created legacy folders such as
+`AFS-AFS/notion`; those folders are stale artifacts and are not accepted as
+current mount paths. Run File Provider repair/reset after upgrading if Finder
+still shows the old folder. Command paths are normalized before matching and
+path traversal or symlink escapes outside the connector folder are rejected.
 
 Linux should expose the same online-only behavior through a FUSE projection
 helper rather than through inotify-triggered placeholder files. The daemon API for

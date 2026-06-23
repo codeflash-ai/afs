@@ -89,7 +89,17 @@ pub struct MountPathMatch {
 }
 
 pub fn mount_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
-    let mut roots = vec![mount.root.clone()];
+    let mut roots = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    if !(mount.projection == ProjectionMode::MacosFileProvider
+        && macos_file_provider_path_is_legacy_alias(&mount.root))
+    {
+        roots.push(mount.root.clone());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    roots.push(mount.root.clone());
 
     if matches!(
         mount.projection,
@@ -925,65 +935,29 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
-    let display_name = macos_file_provider_display_name(mount);
     let cloud_storage = home.join("Library").join("CloudStorage");
-    let domain_roots = vec![
-        cloud_storage.join(macos_file_provider_directory_name(&display_name)),
-        cloud_storage.join(format!("AFS-{display_name}")),
-        cloud_storage.join(format!("AgentFS-{display_name}")),
-    ];
-    let source_directory = source_root_directory_name(&mount.connector);
-    domain_roots
-        .into_iter()
-        .map(|domain_root| domain_root.join(&source_directory))
-        .collect()
+    vec![
+        cloud_storage
+            .join("AFS")
+            .join(source_root_directory_name(&mount.connector)),
+    ]
 }
 
 #[cfg(target_os = "macos")]
-fn macos_file_provider_directory_name(display_name: &str) -> String {
-    if display_name == "AFS" || display_name.starts_with("AFS-") {
-        display_name.to_string()
-    } else {
-        format!("AFS-{display_name}")
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_file_provider_display_name(mount: &MountConfig) -> String {
-    macos_file_provider_domain_path(&mount.root)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(strip_file_provider_directory_prefix)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| mount.mount_id.0.clone())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_file_provider_domain_path(root: &Path) -> &Path {
-    let Some(parent) = root.parent() else {
-        return root;
-    };
-    let Some(grandparent_name) = parent
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-    else {
-        return root;
-    };
-    if grandparent_name == "CloudStorage" {
-        parent
-    } else {
-        root
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn strip_file_provider_directory_prefix(name: &str) -> &str {
-    name.strip_prefix("AgentFS-")
-        .or_else(|| name.strip_prefix("AFS-"))
-        .filter(|stripped| !stripped.is_empty())
-        .unwrap_or(name)
+fn macos_file_provider_path_is_legacy_alias(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if name == "AFS-AFS" || name == "AgentFS-AFS" {
+            return ancestor
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|parent| parent.to_str())
+                .is_some_and(|parent| parent == "CloudStorage");
+        }
+        false
+    })
 }
 
 #[cfg(test)]
@@ -1100,14 +1074,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_file_provider_access_roots_strip_cloudstorage_domain_prefix() {
+    fn macos_file_provider_access_roots_use_single_afs_connector_root() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
             "/Users/test/Library/CloudStorage/AFS/notion",
         )
         .projection(ProjectionMode::MacosFileProvider);
-        assert_eq!(macos_file_provider_display_name(&mount), "AFS");
         let roots = mount_access_roots(&mount);
         let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
 
@@ -1123,34 +1096,16 @@ mod tests {
                     .join("notion")
             )
         );
-        assert!(
-            roots.contains(
-                &home
-                    .join("Library")
-                    .join("CloudStorage")
-                    .join("AFS-AFS")
-                    .join("notion")
-            )
-        );
-        assert!(
-            roots.contains(
-                &home
-                    .join("Library")
-                    .join("CloudStorage")
-                    .join("AgentFS-AFS")
-                    .join("notion")
-            )
-        );
         let matched = match_mount_path(
             &mount,
             &home
                 .join("Library")
                 .join("CloudStorage")
-                .join("AFS-AFS")
+                .join("AFS")
                 .join("notion")
                 .join("Page.md"),
         )
-        .expect("AFS-AFS connector path matches");
+        .expect("canonical connector path matches");
         assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
         assert!(
             match_mount_path(
@@ -1159,11 +1114,51 @@ mod tests {
                     .join("Library")
                     .join("CloudStorage")
                     .join("AFS-AFS")
+                    .join("notion")
                     .join("Page.md"),
             )
             .is_none(),
-            "the File Provider domain root must not masquerade as the connector root"
+            "legacy File Provider aliases must not resolve as current mounts"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_legacy_stored_root_maps_only_to_canonical_root() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            home.join("Library")
+                .join("CloudStorage")
+                .join("AFS-AFS")
+                .join("notion"),
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+
+        assert!(
+            match_mount_path(
+                &mount,
+                &home
+                    .join("Library")
+                    .join("CloudStorage")
+                    .join("AFS-AFS")
+                    .join("notion")
+                    .join("Page.md"),
+            )
+            .is_none()
+        );
+        let matched = match_mount_path(
+            &mount,
+            &home
+                .join("Library")
+                .join("CloudStorage")
+                .join("AFS")
+                .join("notion")
+                .join("Page.md"),
+        )
+        .expect("canonical root still resolves");
+        assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
     }
 
     #[cfg(target_os = "macos")]
