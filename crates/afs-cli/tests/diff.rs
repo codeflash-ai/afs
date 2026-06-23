@@ -12,7 +12,8 @@ use afs_core::shadow::ShadowDocument;
 use afs_notion::media::sha256_hex;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError,
+    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use serde_json::json;
 
@@ -336,6 +337,58 @@ fn diff_plans_new_database_row_file_as_create_entity() {
 }
 
 #[test]
+fn diff_database_directory_plans_pending_virtual_delete_under_scope() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("row-1"),
+                EntityKind::Page,
+                "Done task",
+                "Tasks/done-task/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save row");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow_for("row-1", "# Done\n\nDone body."),
+        )
+        .expect("save row shadow");
+    store
+        .save_virtual_mutation(virtual_delete_mutation(
+            &fixture.mount_id,
+            "delete:row-1",
+            "row-1",
+            "Tasks/done-task/page.md",
+        ))
+        .expect("save virtual delete");
+    fixture.write_tasks_schema();
+
+    let report = run_diff(&store, fixture.root.join("Tasks")).expect("diff report");
+    let plan = report.plan.expect("plan");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "confirm_plan");
+    assert_eq!(report.entity_id, "row-1");
+    assert_eq!(plan.summary.entities_archived, 1);
+    assert_eq!(plan.affected_entities, vec!["row-1"]);
+    assert_eq!(plan.operations[0].operation_type(), "archive_entity");
+}
+
+#[test]
 fn diff_rejects_new_database_row_property_outside_schema() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();
@@ -637,8 +690,12 @@ fn canonical_markdown(remote_id: &str, body: &str) -> String {
 }
 
 fn shadow(body: &str) -> ShadowDocument {
+    shadow_for("page-1", body)
+}
+
+fn shadow_for(remote_id: &str, body: &str) -> ShadowDocument {
     ShadowDocument::from_synced_body(
-        RemoteId::new("page-1"),
+        RemoteId::new(remote_id),
         body,
         9,
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
@@ -683,6 +740,27 @@ data_sources:
         id: "points-id"
         type: "number"
 "#
+}
+
+fn virtual_delete_mutation(
+    mount_id: &MountId,
+    local_id: &str,
+    remote_id: &str,
+    path: &str,
+) -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: local_id.to_string(),
+        mutation_kind: VirtualMutationKind::Delete,
+        target_remote_id: Some(RemoteId::new(remote_id)),
+        parent_remote_id: None,
+        original_path: None,
+        projected_path: PathBuf::from(path),
+        title: "Done task".to_string(),
+        content_path: None,
+        created_at: "2026-06-23T00:00:00Z".to_string(),
+        updated_at: "2026-06-23T00:00:00Z".to_string(),
+    }
 }
 
 trait OperationOutputExt {

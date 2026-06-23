@@ -1172,6 +1172,19 @@ where
             VirtualMutationKind::Rename => {}
         }
     }
+    if absolute_path.is_dir()
+        && scope_has_virtual_mutations(store, &mount.mount_id, &relative_path)?
+    {
+        return prepare_pending_scope(
+            store,
+            job,
+            state_root,
+            absolute_path,
+            mount,
+            relative_path,
+            validator,
+        );
+    }
     let entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
         .map_err(PushPrepareError::Store)?;
@@ -1469,6 +1482,24 @@ fn pending_create_read_path(
             pending.local_id
         )))
     })
+}
+
+fn scope_has_virtual_mutations<S>(
+    store: &S,
+    mount_id: &MountId,
+    relative_scope: &Path,
+) -> Result<bool, PushPrepareError>
+where
+    S: VirtualMutationRepository,
+{
+    Ok(store
+        .list_virtual_mutations(mount_id)
+        .map_err(PushPrepareError::Store)?
+        .iter()
+        .any(|mutation| {
+            relative_scope.as_os_str().is_empty()
+                || mutation.projected_path.starts_with(relative_scope)
+        }))
 }
 
 fn prepare_pending_scope<S, Validator>(
