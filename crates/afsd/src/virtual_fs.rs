@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ChildContainer, Connector, ListChildrenRequest};
-use afs_core::canonical::parse_canonical_markdown;
+use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::freshness::FreshnessTier;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
-use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path, page_listing_parent_path,
 };
@@ -820,16 +820,131 @@ where
             "read-only mounts do not accept virtual filesystem renames",
         ));
     }
-    if !new_filename.ends_with(".md") {
-        return Err(AfsError::Unsupported(
-            "virtual filesystem renames currently support only Markdown page.md files",
-        ));
-    }
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
     let mutations = store
         .list_virtual_mutations(mount_id)
         .map_err(AfsError::from)?;
     let new_parent_path = container_path(&mount, &entities, &mutations, new_parent_identifier)?;
+
+    if let Some(child_identifier) = identifier.strip_prefix(CHILDREN_PREFIX) {
+        let new_page_dir = new_parent_path.join(new_filename);
+        let new_path = page_document_path(&new_page_dir);
+        let title = title_from_filename(new_filename);
+
+        if child_identifier.starts_with(LOCAL_PREFIX) {
+            let mut mutation = store
+                .get_virtual_mutation(mount_id, child_identifier)
+                .map_err(AfsError::from)?
+                .ok_or_else(|| missing_identifier(identifier))?;
+            if mutation.mutation_kind != VirtualMutationKind::Create
+                || !is_page_document_path(&mutation.projected_path)
+            {
+                return Err(AfsError::Unsupported(
+                    "only pending-created page directories can be renamed by the virtual filesystem",
+                ));
+            }
+            let old_parent = page_listing_parent_path(&mutation.projected_path);
+            if old_parent != new_parent_path {
+                return Err(AfsError::Unsupported(
+                    "moving virtual filesystem page directories across parents is not supported yet",
+                ));
+            }
+            ensure_virtual_page_directory_available_for_rename(
+                store,
+                mount_id,
+                RenameOwner::Local(child_identifier),
+                &new_page_dir,
+                &new_path,
+            )?;
+            let old_path = content_path_for_relative(content_root, &mutation.projected_path)?;
+            let new_content_path = content_path_for_relative(content_root, &new_path)?;
+            rename_cached_page_if_present(&old_path, &new_content_path, &title)?;
+            mutation.projected_path = new_path;
+            mutation.title = title;
+            mutation.content_path = Some(new_content_path);
+            mutation.updated_at = now_string();
+            store
+                .save_virtual_mutation(mutation.clone())
+                .map_err(AfsError::from)?;
+            let index = ProviderIndex::new(&entities);
+            let item = pending_page_child_dir_item(&mount, &mutation, &index);
+            return Ok(VirtualFsMutationReport {
+                mount_id: mount_id.0.clone(),
+                identifier: item.identifier.clone(),
+                path: item.path.clone(),
+                item,
+            });
+        }
+
+        let remote_id = RemoteId::new(child_identifier);
+        let mut entity = require_entity(store, mount_id, &remote_id)?;
+        if entity.kind != EntityKind::Page {
+            return Err(AfsError::Unsupported(
+                "only page directories can be renamed by the virtual filesystem",
+            ));
+        }
+        let old_parent = page_listing_parent_path(&entity.path);
+        if old_parent != new_parent_path {
+            return Err(AfsError::Unsupported(
+                "moving virtual filesystem page directories across parents is not supported yet",
+            ));
+        }
+        ensure_virtual_page_directory_available_for_rename(
+            store,
+            mount_id,
+            RenameOwner::Remote(&remote_id),
+            &new_page_dir,
+            &new_path,
+        )?;
+        let old_path = content_path_for_relative(content_root, &entity.path)?;
+        let new_content_path = content_path_for_relative(content_root, &new_path)?;
+        rename_cached_page_if_present(&old_path, &new_content_path, &title)?;
+        let original_path = entity.path.clone();
+        entity.path = new_path.clone();
+        entity.title = title;
+        if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+            entity.hydration = HydrationState::Dirty;
+        }
+        store.save_entity(entity.clone()).map_err(AfsError::from)?;
+        record_virtual_local_change(store, &entity)?;
+        let now = now_string();
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: format!("rename:{}", remote_id.0),
+            mutation_kind: VirtualMutationKind::Rename,
+            target_remote_id: Some(remote_id.clone()),
+            parent_remote_id: None,
+            original_path: Some(original_path),
+            projected_path: new_path,
+            title: entity.title.clone(),
+            content_path: Some(new_content_path),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        store
+            .save_virtual_mutation(mutation)
+            .map_err(AfsError::from)?;
+        let refreshed = store.list_entities(mount_id).map_err(AfsError::from)?;
+        let index = ProviderIndex::new(&refreshed);
+        let item = page_child_dir_item(
+            &mount,
+            &page_container_path(&entity.path),
+            &entity.remote_id,
+            &index,
+        );
+        return Ok(VirtualFsMutationReport {
+            mount_id: mount_id.0.clone(),
+            identifier: item.identifier.clone(),
+            path: item.path.clone(),
+            item,
+        });
+    }
+
+    if !new_filename.ends_with(".md") {
+        return Err(AfsError::Unsupported(
+            "virtual filesystem renames currently support Markdown files or page directories",
+        ));
+    }
     let new_path = new_parent_path.join(new_filename);
     ensure_virtual_path_available_for_rename(store, mount_id, identifier, &new_path)?;
 
@@ -1274,6 +1389,75 @@ where
     Ok(())
 }
 
+enum RenameOwner<'a> {
+    Remote(&'a RemoteId),
+    Local(&'a str),
+}
+
+fn ensure_virtual_page_directory_available_for_rename<S>(
+    store: &S,
+    mount_id: &MountId,
+    owner: RenameOwner<'_>,
+    page_dir: &Path,
+    page_path: &Path,
+) -> AfsResult<()>
+where
+    S: EntityRepository + VirtualMutationRepository,
+{
+    if let Some(entity) = store
+        .find_entity_by_path(mount_id, page_path)
+        .map_err(AfsError::from)?
+        && !matches!(owner, RenameOwner::Remote(remote_id) if entity.remote_id == *remote_id)
+    {
+        return Err(AfsError::InvalidState(format!(
+            "virtual filesystem path `{}` already exists",
+            page_path.display()
+        )));
+    }
+    if let Some(mutation) = store
+        .find_virtual_mutation_by_path(mount_id, page_path)
+        .map_err(AfsError::from)?
+        && !matches!(owner, RenameOwner::Local(local_id) if mutation.local_id == local_id)
+    {
+        return Err(AfsError::InvalidState(format!(
+            "virtual filesystem path `{}` already exists",
+            page_path.display()
+        )));
+    }
+    for entity in store.list_entities(mount_id).map_err(AfsError::from)? {
+        if entity.kind == EntityKind::Page
+            && page_container_path(&entity.path) == page_dir
+            && !matches!(owner, RenameOwner::Remote(remote_id) if entity.remote_id == *remote_id)
+        {
+            return Err(AfsError::InvalidState(format!(
+                "virtual filesystem path `{}` already exists",
+                page_dir.display()
+            )));
+        }
+    }
+    for mutation in store
+        .list_virtual_mutations(mount_id)
+        .map_err(AfsError::from)?
+    {
+        if mutation.mutation_kind == VirtualMutationKind::Create
+            && is_page_document_path(&mutation.projected_path)
+            && page_container_path(&mutation.projected_path) == page_dir
+            && !matches!(owner, RenameOwner::Local(local_id) if mutation.local_id == local_id)
+        {
+            return Err(AfsError::InvalidState(format!(
+                "virtual filesystem path `{}` already exists",
+                page_dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn rename_cached_page_if_present(from: &Path, to: &Path, title: &str) -> AfsResult<()> {
+    rename_cached_file_if_present(from, to)?;
+    retitle_cached_page_if_present(to, title)
+}
+
 fn rename_cached_file_if_present(from: &Path, to: &Path) -> AfsResult<()> {
     if !from.exists() {
         return Ok(());
@@ -1293,6 +1477,58 @@ fn rename_cached_file_if_present(from: &Path, to: &Path) -> AfsResult<()> {
             to.display()
         ))
     })
+}
+
+fn retitle_cached_page_if_present(path: &Path, title: &str) -> AfsResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        AfsError::Io(format!(
+            "failed to read virtual filesystem content `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    if contents.trim().is_empty() {
+        return Ok(());
+    }
+    let Ok(parsed) = parse_canonical_markdown(&contents) else {
+        return Ok(());
+    };
+    if parsed.frontmatter.title.as_deref() == Some(title) {
+        return Ok(());
+    }
+    let frontmatter = retitled_frontmatter(&parsed.document.frontmatter, title);
+    let updated =
+        render_canonical_markdown(&CanonicalDocument::new(frontmatter, parsed.document.body));
+    write_binary_atomic(path, updated.as_bytes())
+}
+
+fn retitled_frontmatter(frontmatter: &str, title: &str) -> String {
+    let title_line = format!("title: {}\n", yaml_string(title));
+    let mut replaced = false;
+    let mut out = String::new();
+    for line in frontmatter.split_inclusive('\n') {
+        let line_without_ending = line.trim_end_matches(['\r', '\n']);
+        if !replaced && !line.starts_with([' ', '\t']) && line_without_ending.starts_with("title:")
+        {
+            out.push_str(&title_line);
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !replaced {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&title_line);
+    }
+    out
+}
+
+fn yaml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn new_local_id() -> String {
@@ -3153,6 +3389,150 @@ mod tests {
             .expect("get mutation")
             .expect("mutation");
         assert_eq!(mutation.projected_path, PathBuf::from("Home/Updated.md"));
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn rename_pending_page_directory_updates_overlay_and_moves_page_cache() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-rename-dir");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save parent page");
+        let created = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-root",
+            "Draft",
+        )
+        .expect("create virtual directory");
+        std::fs::write(
+            content_root.join("Home/Draft/page.md"),
+            b"---\ntitle: \"Draft\"\n---\nBody",
+        )
+        .expect("write pending page cache");
+
+        let renamed = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &created.identifier,
+            "children:page-root",
+            "Published",
+        )
+        .expect("rename virtual page directory");
+
+        assert_eq!(renamed.identifier, created.identifier);
+        assert_eq!(renamed.item.kind, VirtualFsItemKind::Folder);
+        assert_eq!(renamed.item.filename, "Published");
+        assert_eq!(renamed.item.path, "Home/Published");
+        assert!(!content_root.join("Home/Draft/page.md").exists());
+        let renamed_cache = std::fs::read_to_string(content_root.join("Home/Published/page.md"))
+            .expect("read renamed page cache");
+        assert!(renamed_cache.contains("title: \"Published\""));
+        let local_id = created
+            .identifier
+            .strip_prefix("children:")
+            .expect("pending page directory id");
+        let mutation = store
+            .get_virtual_mutation(&mount_id, local_id)
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(
+            mutation.projected_path,
+            PathBuf::from("Home/Published/page.md")
+        );
+        assert_eq!(mutation.title, "Published");
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn rename_existing_page_directory_records_pending_remote_rename_and_retitles_cache() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-rename-existing-dir");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save parent page");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("page-child"),
+                    EntityKind::Page,
+                    "Child",
+                    "Home/Child/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save child page");
+        std::fs::create_dir_all(content_root.join("Home/Child")).expect("create cache dir");
+        std::fs::write(
+            content_root.join("Home/Child/page.md"),
+            b"---\nafs:\n  id: page-child\n  type: page\ntitle: \"Child\"\n---\nBody",
+        )
+        .expect("write page cache");
+
+        let renamed = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-child",
+            "children:page-root",
+            "Renamed Child",
+        )
+        .expect("rename existing virtual page directory");
+
+        assert_eq!(renamed.identifier, "children:page-child");
+        assert_eq!(renamed.item.kind, VirtualFsItemKind::Folder);
+        assert_eq!(renamed.item.filename, "Renamed Child");
+        assert_eq!(renamed.item.path, "Home/Renamed Child");
+        assert!(!content_root.join("Home/Child/page.md").exists());
+        let renamed_cache =
+            std::fs::read_to_string(content_root.join("Home/Renamed Child/page.md"))
+                .expect("read renamed cache");
+        assert!(renamed_cache.contains("title: \"Renamed Child\""));
+        let entity = store
+            .get_entity(&mount_id, &RemoteId::new("page-child"))
+            .expect("get child entity")
+            .expect("child entity");
+        assert_eq!(entity.path, PathBuf::from("Home/Renamed Child/page.md"));
+        assert_eq!(entity.title, "Renamed Child");
+        assert_eq!(entity.hydration, HydrationState::Dirty);
+        let mutation = store
+            .get_virtual_mutation(&mount_id, "rename:page-child")
+            .expect("get rename mutation")
+            .expect("rename mutation");
+        assert_eq!(mutation.mutation_kind, VirtualMutationKind::Rename);
+        assert_eq!(
+            mutation.projected_path,
+            PathBuf::from("Home/Renamed Child/page.md")
+        );
+        assert_eq!(mutation.title, "Renamed Child");
 
         let _ = std::fs::remove_dir_all(state_root);
     }

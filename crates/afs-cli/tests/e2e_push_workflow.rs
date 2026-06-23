@@ -39,8 +39,8 @@ use afsd::reconcile::{DefaultFetchScheduleStrategy, reconcile_scheduled_pull};
 use afsd::scheduler::PullScheduler;
 use afsd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, source_root_identifier, trash_virtual_fs_item,
-    virtual_fs_children_with_content_root, virtual_fs_content_root,
+    refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
+    trash_virtual_fs_item, virtual_fs_children_with_content_root, virtual_fs_content_root,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -910,6 +910,140 @@ fn live_virtual_page_directory_delete_archives_remote_child_page() {
             .expect("list mutations after delete push")
             .is_empty(),
         "reconcile should clear the pending delete mutation"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live virtual rename parent {}", unique_suffix()),
+        vec![paragraph_child("Parent body before child page rename.")],
+    );
+    let original_child_title = format!("AFS live virtual rename child {}", unique_suffix());
+    let child = cleanup.create_page(
+        &parent.id,
+        &original_child_title,
+        vec![paragraph_child("Child body before rename.")],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &parent.id);
+    let content_root = fixture.content_root();
+    let source_root = source_root_identifier("notion");
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
+        .expect("refresh source root");
+    let source_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &source_root,
+    )
+    .expect("list source root");
+    let parent_folder = find_virtual_folder(&source_children.children, &parent.id);
+    refresh_virtual_fs_children(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("refresh parent children");
+    let parent_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("list parent children");
+    let child_folder = find_virtual_folder(&parent_children.children, &child.id);
+    materialize_virtual_fs_item_with_content_root(
+        &mut store,
+        &connector,
+        &content_root,
+        &fixture.mount_id,
+        &child.id,
+    )
+    .expect("hydrate child before rename");
+
+    let renamed_child_title = format!("AFS live virtual renamed child {}", unique_suffix());
+    let renamed = rename_virtual_fs_item(
+        &mut store,
+        &content_root,
+        &fixture.mount_id,
+        &child_folder.identifier,
+        &parent_folder.identifier,
+        &renamed_child_title,
+    )
+    .expect("rename child page directory");
+    assert_eq!(renamed.identifier, child_folder.identifier);
+    assert_eq!(renamed.item.filename, renamed_child_title);
+    assert!(renamed.item.path.ends_with(&renamed_child_title));
+    let renamed_page_path = fixture.root.join(&renamed.item.path).join("page.md");
+
+    let pending = store
+        .get_virtual_mutation(&fixture.mount_id, &format!("rename:{}", child.id))
+        .expect("get rename mutation")
+        .expect("rename mutation");
+    assert_eq!(
+        pending.mutation_kind,
+        afs_store::VirtualMutationKind::Rename
+    );
+    assert_eq!(pending.title, renamed_child_title);
+
+    let push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &renamed_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push child page rename");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.changed_remote_ids, vec![child.id.clone()]);
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, &format!("rename:{}", child.id))
+            .expect("get reconciled rename mutation")
+            .is_none(),
+        "rename mutation should be cleared after reconcile"
+    );
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(renamed_page_path.clone()),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean rename status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let renamed_remote = render_live_markdown(&connector, &child.id, &renamed_page_path);
+    assert!(
+        renamed_remote.contains(&format!("title: \"{renamed_child_title}\"")),
+        "{renamed_remote}"
+    );
+    assert!(renamed_remote.contains("Child body before rename."));
+    let parent_remote = render_live_page(&connector, &parent.id, &renamed_page_path);
+    assert!(
+        parent_remote.contains(&renamed_child_title),
+        "{parent_remote}"
+    );
+    assert!(
+        !parent_remote.contains(&original_child_title),
+        "{parent_remote}"
     );
 }
 
