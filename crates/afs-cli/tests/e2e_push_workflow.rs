@@ -2398,6 +2398,103 @@ fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_undo_child_page_create_archives_remote_page() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live undo page create parent {}", unique_suffix()),
+        vec![paragraph_child(
+            "Parent body before undoing child creation.",
+        )],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, parent_page_path, _markdown) =
+        pull_live_page(&connector, &scratch.id);
+    let child_title = format!("AFS live undo page create child {}", unique_suffix());
+    let child_dir = parent_page_path
+        .parent()
+        .expect("parent page directory")
+        .join(slug_for_test(&child_title));
+    fs::create_dir_all(&child_dir).expect("create undo child page directory");
+    let child_page_path = child_dir.join("page.md");
+    fs::write(
+        &child_page_path,
+        format!("---\ntitle: \"{child_title}\"\n---\nCreated child before undo.\n"),
+    )
+    .expect("write undo child page.md");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &child_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push child page create before undo");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("reconciled"));
+    let push_id = push.push_id.clone().expect("push id");
+    let created_page_id = push
+        .changed_remote_ids
+        .iter()
+        .find(|id| *id != &scratch.id)
+        .expect("created page id")
+        .clone();
+    cleanup.block_ids.push(created_page_id.clone());
+    let created_page = cleanup
+        .api
+        .retrieve_page(&created_page_id)
+        .expect("retrieve created child page");
+    assert!(
+        !created_page.archived && !created_page.in_trash,
+        "created child page should exist before undo: {created_page:#?}"
+    );
+
+    let log = run_log(
+        &store,
+        LogOptions {
+            path: Some(child_page_path.clone()),
+        },
+    )
+    .expect("log child page create push");
+    assert_eq!(log.entries.len(), 1, "{log:#?}");
+    assert_eq!(log.entries[0].push_id, push_id);
+    assert_eq!(log.entries[0].status, "reconciled");
+    assert_eq!(log.entries[0].apply_effect_count, 1);
+
+    let mut undo_applier = ConnectorUndoApplier::new(&connector);
+    let undo = run_undo_with_applier(&mut store, push_id.clone(), &mut undo_applier)
+        .expect("undo child page create");
+    assert!(undo.ok, "{undo:#?}");
+    assert_eq!(undo.action, "reverse_applied", "{undo:#?}");
+    assert_eq!(undo.status, "reverted");
+
+    let archived = cleanup
+        .api
+        .retrieve_page(&created_page_id)
+        .expect("retrieve archived created child page");
+    assert!(
+        archived.archived || archived.in_trash,
+        "undo should archive the created child page: {archived:#?}"
+    );
+    let reverted_log = run_log(
+        &store,
+        LogOptions {
+            path: Some(child_page_path),
+        },
+    )
+    .expect("log reverted child page create push");
+    assert_eq!(reverted_log.entries[0].push_id, push_id);
+    assert_eq!(reverted_log.entries[0].status, "reverted");
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_virtual_page_directory_delete_archives_remote_child_page() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

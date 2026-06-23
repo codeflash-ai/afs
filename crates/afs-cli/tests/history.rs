@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use afs_cli::history::{
     HistoryError, LogOptions, run_log, run_undo, run_undo_with_applier, undo_report_exit_code,
 };
-use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, PushId};
+use afs_core::journal::{
+    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, PushId, PushOperationId,
+};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
@@ -66,6 +68,58 @@ fn log_filters_journal_entries_by_projected_path() {
     assert_eq!(report.entries.len(), 1);
     assert_eq!(report.entries[0].push_id, "push-1");
     assert_eq!(report.entries[0].remote_ids, vec!["page-1"]);
+}
+
+#[test]
+fn log_filters_created_entity_journal_by_created_path() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    fs::create_dir_all(fixture.root.join("New child")).expect("create child dir");
+    fs::write(fixture.root.join("New child/page.md"), "").expect("write child page");
+    store
+        .save_entity(entity_record(
+            &fixture,
+            "created-page-1",
+            "New child/page.md",
+        ))
+        .expect("save created entity");
+    let operation = PushOperation::CreateEntity {
+        parent_id: RemoteId::new("page-1"),
+        parent_kind: Some(EntityKind::Page),
+        title: "New child".to_string(),
+        properties: Default::default(),
+        body: "Created child.".to_string(),
+        source_path: "New child/page.md".into(),
+    };
+    let push_id = PushId("push-create".to_string());
+    let operation_id = PushOperationId::for_operation(&push_id, 0, &operation);
+    let entry = JournalEntry::new(
+        push_id.clone(),
+        fixture.mount_id.clone(),
+        vec![RemoteId::new("page-1")],
+        PushPlan::new(vec![RemoteId::new("page-1")], vec![operation]),
+        JournalStatus::Reconciled,
+    )
+    .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+        operation_id,
+        operation_index: 0,
+        parent_id: RemoteId::new("page-1"),
+        entity_id: RemoteId::new("created-page-1"),
+    }]);
+    store.append_journal(entry).expect("append create journal");
+
+    let report = run_log(
+        &store,
+        LogOptions {
+            path: Some(fixture.root.join("New child/page.md")),
+        },
+    )
+    .expect("filtered created entity log");
+
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].push_id, push_id.0);
+    assert_eq!(report.entries[0].remote_ids, vec!["page-1"]);
+    assert_eq!(report.entries[0].apply_effect_count, 1);
 }
 
 #[test]

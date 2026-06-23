@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use afs_core::AfsError;
-use afs_core::journal::{JournalEntry, JournalStatus, PushId};
+use afs_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, PushId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::undo::{
     UndoApplier, UndoApplyRequest, UndoOperation, UndoPlan, UndoPlanStatus,
@@ -471,7 +471,23 @@ fn entry_matches_filter(entry: &JournalEntry, filter: &PathFilter) -> bool {
                 .plan
                 .affected_entities
                 .iter()
-                .any(|remote_id| remote_id == &filter.remote_id))
+                .any(|remote_id| remote_id == &filter.remote_id)
+            || entry
+                .apply_effects
+                .iter()
+                .any(|effect| apply_effect_matches_remote(effect, &filter.remote_id)))
+}
+
+fn apply_effect_matches_remote(effect: &JournalApplyEffect, remote_id: &RemoteId) -> bool {
+    match effect {
+        JournalApplyEffect::ArchivedEntity { entity_id, .. }
+        | JournalApplyEffect::UpdatedProperties { entity_id, .. }
+        | JournalApplyEffect::CreatedEntity { entity_id, .. } => entity_id == remote_id,
+        JournalApplyEffect::UpdatedBlock { .. }
+        | JournalApplyEffect::CreatedBlock { .. }
+        | JournalApplyEffect::MovedBlock { .. }
+        | JournalApplyEffect::ArchivedBlock { .. } => false,
+    }
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, HistoryError> {
