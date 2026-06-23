@@ -28,6 +28,9 @@ that filesystem contract.
   never reset or revert work you did not make.
 - Major behavior or architecture changes should include a docs update in the
   same change.
+- When changing some code, don't merely continue the current design if its not
+  a good fit for the proposed changes. Think about what the right design be
+  with the new change and redesign the code in a focused manner if pragmatic.
 
 ## State And Compatibility
 
