@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::path_projection::{page_container_path, page_listing_parent_path};
-use afs_store::{
-    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError,
-};
+use afs_store::{EntityRecord, EntityRepository, JournalRepository, MountRepository, StoreError};
 use afsd::{file_provider, source::source_display_name};
 use serde::Serialize;
 
@@ -120,15 +118,16 @@ where
         }
     };
     let mounts = store.load_mounts().map_err(InfoError::Store)?;
-    let mount = find_mount_for_path(&mounts, &target)
-        .cloned()
+    let (mount, matched) = file_provider::find_mount_for_path(&mounts, &target)
         .ok_or_else(|| InfoError::MountNotFound(target.clone()))?;
-    let relative_path = relative_entity_path(&mount, &target)?;
+    let mount = mount.clone();
+    let access_root = matched.access_root;
+    let relative_path = matched.relative_path;
     let entities = store
         .list_entities(&mount.mount_id)
         .map_err(InfoError::Store)?;
     let journals = store.list_journal().map_err(InfoError::Store)?;
-    let subject_context = resolve_subject(&mount, &relative_path, &target, &entities);
+    let subject_context = resolve_subject(&access_root, &relative_path, &entities);
     let children = child_summary(&entities, &subject_context.child_context);
     let journal_scope = journal_scope_entities(&entities, &subject_context);
     let journals = journal_summary(&journals, &mount.mount_id, &journal_scope);
@@ -157,7 +156,7 @@ where
             entity: subject_context
                 .entity
                 .as_ref()
-                .map(|entity| info_entity(&mount, entity)),
+                .map(|entity| info_entity(&access_root, entity)),
             schema_path: subject_context
                 .schema_path
                 .map(|path| path.display().to_string()),
@@ -205,9 +204,8 @@ struct SubjectContext {
 }
 
 fn resolve_subject(
-    mount: &MountConfig,
+    access_root: &Path,
     relative_path: &Path,
-    _absolute_path: &Path,
     entities: &[EntityRecord],
 ) -> SubjectContext {
     if relative_path.as_os_str().is_empty() {
@@ -223,7 +221,7 @@ fn resolve_subject(
         let role = role_for_exact_entity(&entity.kind);
         let child_context = child_context_for_entity(entity);
         let schema_path = if matches!(entity.kind, EntityKind::Database) {
-            Some(mount.root.join(&entity.path).join("_schema.yaml"))
+            Some(access_root.join(&entity.path).join("_schema.yaml"))
         } else {
             None
         };
@@ -248,7 +246,7 @@ fn resolve_subject(
     if let Some(entity) = nearest_directory_entity(relative_path, entities) {
         let role = role_for_exact_entity(&entity.kind);
         let schema_path = if matches!(entity.kind, EntityKind::Database) {
-            Some(mount.root.join(&entity.path).join("_schema.yaml"))
+            Some(access_root.join(&entity.path).join("_schema.yaml"))
         } else {
             None
         };
@@ -421,13 +419,13 @@ fn journal_summary(
     summary
 }
 
-fn info_entity(mount: &MountConfig, entity: &EntityRecord) -> InfoEntity {
+fn info_entity(access_root: &Path, entity: &EntityRecord) -> InfoEntity {
     InfoEntity {
         entity_id: entity.remote_id.0.clone(),
         kind: entity_kind_name(&entity.kind).to_string(),
         title: entity.title.clone(),
         path: afs_platform::logical_path_display(&entity.path),
-        absolute_path: mount.root.join(&entity.path).display().to_string(),
+        absolute_path: access_root.join(&entity.path).display().to_string(),
         hydration: hydration_name(&entity.hydration).to_string(),
         content_hash: entity.content_hash.clone(),
         remote_edited_at: entity.remote_edited_at.clone(),
@@ -476,16 +474,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, InfoError> {
             .map(|cwd| cwd.join(path))
             .map_err(|error| InfoError::CurrentDir(error.to_string()))
     }
-}
-
-fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
-}
-
-fn relative_entity_path(mount: &MountConfig, absolute_path: &Path) -> Result<PathBuf, InfoError> {
-    file_provider::match_mount_path(mount, absolute_path)
-        .map(|matched| matched.relative_path)
-        .ok_or_else(|| InfoError::MountNotFound(absolute_path.to_path_buf()))
 }
 
 fn entity_kind_name(kind: &EntityKind) -> &str {

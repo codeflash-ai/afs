@@ -10,7 +10,7 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, SqliteStateStore,
+    MountRepository, ProjectionMode, SqliteStateStore,
 };
 
 #[test]
@@ -195,6 +195,56 @@ fn info_runner_works_with_sqlite_state_store() {
 
     assert_eq!(report.subject.role, InfoRole::PageFile);
     assert_eq!(report.children.immediate, 2);
+}
+
+#[test]
+fn info_for_linux_fuse_reports_entity_absolute_path_under_source_root() {
+    let fixture = InfoFixture::new();
+    let visible_root = fixture.root.join("notion");
+    let visible_file = visible_root.join("roadmap/page.md");
+    if let Some(parent) = visible_file.parent() {
+        fs::create_dir_all(parent).expect("visible parent");
+    }
+    fs::write(&visible_file, "").expect("visible page");
+
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save linux fuse mount");
+    store
+        .save_entity(
+            entity_record(
+                &fixture.mount_id,
+                "page-1",
+                EntityKind::Page,
+                "Roadmap",
+                "roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save page");
+
+    let report = run_info(
+        &store,
+        InfoOptions {
+            path: Some(visible_file.clone()),
+        },
+    )
+    .expect("info report");
+
+    let expected = visible_file.display().to_string();
+    assert_eq!(report.subject.absolute_path, expected);
+    assert_eq!(
+        report
+            .subject
+            .entity
+            .as_ref()
+            .map(|entity| entity.absolute_path.as_str()),
+        Some(expected.as_str())
+    );
 }
 
 struct InfoFixture {

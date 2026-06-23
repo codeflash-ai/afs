@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 use afs_core::model::{EntityKind, HydrationState, RemoteId};
 use afs_store::{
     EntityRecord, EntityRepository, EntitySearchCandidate, EntitySearchRepository, MountConfig,
-    MountRepository, RemoteObservationRecord, RemoteObservationRepository, StoreError,
+    MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
+    StoreError,
 };
+use afsd::virtual_fs::source_root_directory_name;
 use serde::Serialize;
 
 const DEFAULT_LIMIT: usize = 10;
@@ -103,7 +105,7 @@ pub fn run_search<S>(store: &S, options: SearchOptions) -> Result<SearchReport, 
 where
     S: MountRepository + EntityRepository + EntitySearchRepository + RemoteObservationRepository,
 {
-    run_search_with_access_roots(store, options, |mount| mount.root.clone())
+    run_search_with_access_roots(store, options, default_access_root)
 }
 
 pub fn run_search_with_access_roots<S, F>(
@@ -533,6 +535,15 @@ fn source_display_name(connector: &str) -> String {
     match connector {
         "notion" => "Notion".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn default_access_root(mount: &MountConfig) -> PathBuf {
+    match mount.projection {
+        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles => mount
+            .root
+            .join(source_root_directory_name(&mount.connector)),
+        ProjectionMode::PlainFiles | ProjectionMode::MacosFileProvider => mount.root.clone(),
     }
 }
 

@@ -8,7 +8,7 @@ use afs_core::freshness::RemoteVersion;
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    RemoteObservationRecord, RemoteObservationRepository, SqliteStateStore,
+    ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, SqliteStateStore,
 };
 
 #[test]
@@ -264,6 +264,28 @@ fn notion_url_locate_keeps_workspace_fallback_when_root_entity_is_unknown() {
     assert_eq!(report.results[0].kind, "workspace");
     assert_eq!(report.results[0].path, ".");
     assert_eq!(report.results[0].state, "ready");
+}
+
+#[test]
+fn search_reports_linux_fuse_absolute_path_under_source_root() {
+    let fixture = SearchFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save linux fuse mount");
+    fixture.seed_entities(&mut store);
+
+    let report = run_search(&store, SearchOptions::new("initial")).expect("search");
+
+    let expected = fixture
+        .root
+        .join("notion/Product/Initial Idea/page.md")
+        .display()
+        .to_string();
+    assert_eq!(report.results[0].absolute_path, expected);
 }
 
 struct SearchFixture {
