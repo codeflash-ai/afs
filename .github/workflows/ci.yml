@@ -7,6 +7,26 @@ on:
   pull_request:
 
 jobs:
+  oauth-service:
+    name: OAuth service tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/oauth-service/package-lock.json
+      - name: Install OAuth service dependencies
+        run: npm ci
+        working-directory: apps/oauth-service
+      - name: Check OAuth service
+        run: npm run check
+        working-directory: apps/oauth-service
+      - name: Audit OAuth service dependencies
+        run: npm audit
+        working-directory: apps/oauth-service
+
   linux:
     name: Linux tests
     runs-on: ubuntu-latest

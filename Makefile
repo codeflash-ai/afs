@@ -6,6 +6,9 @@ NPM ?= npm
 DESKTOP_DIR := apps/desktop
 DESKTOP_NPM := $(NPM) --prefix $(DESKTOP_DIR)
 DESKTOP_NODE_MODULES_STAMP := $(DESKTOP_DIR)/node_modules/.package-lock.json
+OAUTH_SERVICE_DIR := apps/oauth-service
+OAUTH_SERVICE_NPM := $(NPM) --prefix $(OAUTH_SERVICE_DIR)
+OAUTH_SERVICE_NODE_MODULES_STAMP := $(OAUTH_SERVICE_DIR)/node_modules/.package-lock.json
 
 .DEFAULT_GOAL := help
 
@@ -14,10 +17,13 @@ help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 .PHONY: setup
-setup: $(DESKTOP_NODE_MODULES_STAMP) ## Install desktop npm dependencies.
+setup: $(DESKTOP_NODE_MODULES_STAMP) $(OAUTH_SERVICE_NODE_MODULES_STAMP) ## Install app npm dependencies.
 
 $(DESKTOP_NODE_MODULES_STAMP): $(DESKTOP_DIR)/package-lock.json $(DESKTOP_DIR)/package.json
 	$(DESKTOP_NPM) ci
+
+$(OAUTH_SERVICE_NODE_MODULES_STAMP): $(OAUTH_SERVICE_DIR)/package-lock.json $(OAUTH_SERVICE_DIR)/package.json
+	$(OAUTH_SERVICE_NPM) ci
 
 .PHONY: build-all
 build-all: build-release build-tauri ## Build all deliverables in release mode.
@@ -103,7 +109,7 @@ clean-start: ## Stop AFS and remove local app/state/mounts/credentials for fresh
 	scripts/clean-start.sh --yes
 
 .PHONY: check
-check: check-rust check-desktop ## Run Rust checks and desktop type/build checks.
+check: check-rust check-desktop check-oauth-service ## Run Rust and app checks.
 
 .PHONY: check-rust
 check-rust: ## Check all Rust workspace packages.
@@ -112,6 +118,14 @@ check-rust: ## Check all Rust workspace packages.
 .PHONY: check-desktop
 check-desktop: ## Run desktop TypeScript and Vite build checks.
 	$(DESKTOP_NPM) run build
+
+.PHONY: check-oauth-service
+check-oauth-service: $(OAUTH_SERVICE_NODE_MODULES_STAMP) ## Run OAuth service typecheck and tests.
+	$(OAUTH_SERVICE_NPM) run check
+
+.PHONY: audit-oauth-service
+audit-oauth-service: $(OAUTH_SERVICE_NODE_MODULES_STAMP) ## Audit OAuth service npm dependencies.
+	$(OAUTH_SERVICE_NPM) audit
 
 .PHONY: test
 test: test-rust ## Run the default test suite.
