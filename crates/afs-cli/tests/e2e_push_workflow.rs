@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::diff::run_diff;
+use afs_cli::history::{LogOptions, run_log, run_undo_with_applier};
 use afs_cli::inspect::{InspectOptions, run_inspect};
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::run_pull;
 use afs_cli::push::{PushOptions, run_push_with_daemon};
 use afs_cli::search::{SearchOptions, run_search};
 use afs_cli::status::{StatusOptions, run_status};
-use afs_connector::{Connector, FetchRequest};
+use afs_connector::{Connector, ConnectorUndoApplier, FetchRequest};
 use afs_core::canonical::render_canonical_markdown;
 use afs_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
@@ -557,6 +558,82 @@ fn live_inspect_explains_remote_and_local_drift_without_mutating() {
         !after_both.contains(&remote_marker),
         "inspect must not write remote drift into the local file:\n{after_both}"
     );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_push_log_and_undo_restores_remote_content() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let base = "Undo base body before push.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live undo {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let pushed_marker = format!("Undo pushed edit {}", unique_suffix());
+
+    fs::write(&page_path, original.replace(base, &pushed_marker)).expect("write undo edit");
+    let diff = run_diff(&store, &page_path).expect("diff undo edit");
+    let plan = diff.plan.as_ref().expect("undo edit plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push undo edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("reconciled"));
+    let push_id = push.push_id.clone().expect("push id");
+    let pushed_remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(pushed_remote.contains(&pushed_marker), "{pushed_remote}");
+
+    let log = run_log(
+        &store,
+        LogOptions {
+            path: Some(page_path.clone()),
+        },
+    )
+    .expect("log undo push");
+    assert_eq!(log.entries.len(), 1, "{log:#?}");
+    assert_eq!(log.entries[0].push_id, push_id);
+    assert_eq!(log.entries[0].status, "reconciled");
+    assert_eq!(log.entries[0].preimage_count, 1);
+    assert_eq!(log.entries[0].apply_effect_count, 1);
+
+    let mut undo_applier = ConnectorUndoApplier::new(&connector);
+    let undo = run_undo_with_applier(&mut store, push_id.clone(), &mut undo_applier)
+        .expect("undo live push");
+    assert!(undo.ok, "{undo:#?}");
+    assert_eq!(undo.action, "reverse_applied", "{undo:#?}");
+    assert_eq!(undo.status, "reverted");
+    assert_eq!(undo.changed_remote_ids, vec![scratch.id.clone()]);
+
+    let restored_remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(restored_remote.contains(base), "{restored_remote}");
+    assert!(
+        !restored_remote.contains(&pushed_marker),
+        "undo should restore remote content:\n{restored_remote}"
+    );
+    let reverted_log = run_log(
+        &store,
+        LogOptions {
+            path: Some(page_path),
+        },
+    )
+    .expect("log reverted undo push");
+    assert_eq!(reverted_log.entries[0].push_id, push_id);
+    assert_eq!(reverted_log.entries[0].status, "reverted");
 }
 
 #[test]
