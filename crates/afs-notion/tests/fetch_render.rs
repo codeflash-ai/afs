@@ -237,6 +237,83 @@ fn render_rich_text_line_breaks_inside_one_shadow_block() {
 }
 
 #[test]
+fn render_paragraph_escapes_literal_block_markers_at_start() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![
+            BlockTreeDto {
+                block: paragraph_block("heading-marker", vec![rich_text("# Literal heading")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("bullet-marker", vec![rich_text("- Literal bullet")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("number-marker", vec![rich_text("1. Literal number")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("quote-marker", vec![rich_text("> Literal quote")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("divider-marker", vec![rich_text("---")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block(
+                    "directive-marker",
+                    vec![rich_text("::afs{id=literal type=paragraph}")],
+                ),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "\\# Literal heading\n\n\\- Literal bullet\n\n\\1. Literal number\n\n\\> Literal quote\n\n\\---\n\n\\::afs{id=literal type=paragraph}\n"
+    );
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| (&block.remote_id, &block.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                &RemoteId::new("heading-marker"),
+                &MarkdownBlockKind::Paragraph
+            ),
+            (
+                &RemoteId::new("bullet-marker"),
+                &MarkdownBlockKind::Paragraph
+            ),
+            (
+                &RemoteId::new("number-marker"),
+                &MarkdownBlockKind::Paragraph
+            ),
+            (
+                &RemoteId::new("quote-marker"),
+                &MarkdownBlockKind::Paragraph
+            ),
+            (
+                &RemoteId::new("divider-marker"),
+                &MarkdownBlockKind::Paragraph
+            ),
+            (
+                &RemoteId::new("directive-marker"),
+                &MarkdownBlockKind::Paragraph
+            ),
+        ]
+    );
+}
+
+#[test]
 fn render_rich_text_escapes_literal_break_tags() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),

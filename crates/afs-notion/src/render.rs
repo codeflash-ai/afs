@@ -343,7 +343,7 @@ fn paragraph_block(block: &BlockDto, content: Option<&RichTextBlockDto>) -> Rend
     let Some(content) = content else {
         return directive_block(block, "malformed_paragraph", None);
     };
-    let text = rich_text_to_markdown(&content.rich_text);
+    let text = paragraph_text_to_markdown(&content.rich_text);
 
     if text.trim().is_empty() {
         // empty line
@@ -783,6 +783,10 @@ fn rich_text_to_markdown(rich_text: &[RichTextDto]) -> String {
         .collect::<String>()
 }
 
+fn paragraph_text_to_markdown(rich_text: &[RichTextDto]) -> String {
+    escape_paragraph_block_start_marker(rich_text_to_markdown(rich_text))
+}
+
 fn rich_text_part_to_markdown(part: &RichTextDto) -> String {
     let (mut text, link_applied) = match part.kind.as_str() {
         "equation" => (equation_to_markdown(part), false),
@@ -1034,6 +1038,58 @@ fn escape_markdown_text_with_options(text: &str, escape_inline_markers: bool) ->
 
 fn escape_markdown_link_label(text: &str) -> String {
     escape_markdown_text(text).replace(']', "\\]")
+}
+
+fn escape_paragraph_block_start_marker(text: String) -> String {
+    let Some((index, _)) = text
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, ' ' | '\t'))
+    else {
+        return text;
+    };
+
+    if paragraph_block_start_marker_needs_escape(&text[index..]) {
+        let mut escaped = String::with_capacity(text.len() + 1);
+        escaped.push_str(&text[..index]);
+        escaped.push('\\');
+        escaped.push_str(&text[index..]);
+        escaped
+    } else {
+        text
+    }
+}
+
+fn paragraph_block_start_marker_needs_escape(value: &str) -> bool {
+    value.starts_with("::afs")
+        || heading_marker(value)
+        || list_marker(value)
+        || quote_marker(value)
+        || divider_marker(value)
+}
+
+fn heading_marker(value: &str) -> bool {
+    let level = value.chars().take_while(|ch| *ch == '#').count();
+    (1..=6).contains(&level) && value[level..].starts_with(char::is_whitespace)
+}
+
+fn list_marker(value: &str) -> bool {
+    value.starts_with("- ")
+        || value.starts_with("* ")
+        || value.starts_with("+ ")
+        || ordered_list_marker(value)
+}
+
+fn ordered_list_marker(value: &str) -> bool {
+    let digit_count = value.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digit_count > 0 && value[digit_count..].starts_with(". ")
+}
+
+fn quote_marker(value: &str) -> bool {
+    value.starts_with("> ")
+}
+
+fn divider_marker(value: &str) -> bool {
+    value.trim_end() == "---"
 }
 
 fn break_tag_prefix(value: &str) -> Option<&'static str> {

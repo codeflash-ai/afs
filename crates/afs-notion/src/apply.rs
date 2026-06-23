@@ -2327,8 +2327,8 @@ impl InlineParser<'_> {
         }
         if self.allow_preimage {
             for token in self.preimage_tokens {
-                if let Some(offset) = self.input[start..].find(&token.markdown) {
-                    next = next.min(start + offset);
+                if let Some(index) = find_unescaped_marker(self.input, start, &token.markdown) {
+                    next = next.min(index);
                 }
             }
         }
@@ -2809,6 +2809,11 @@ fn unescape_markdown_text(value: &str) -> String {
             rest = &rest[2..];
             continue;
         }
+        if let Some(marker) = escaped_literal_block_start_marker(rest) {
+            unescaped.push(marker);
+            rest = &rest[1 + marker.len_utf8()..];
+            continue;
+        }
 
         let ch = rest.chars().next().expect("non-empty rest");
         unescaped.push(ch);
@@ -3225,6 +3230,19 @@ fn escaped_literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
             .strip_prefix('\\')
             .is_some_and(|rest| rest.starts_with(marker))
     })
+}
+
+fn escaped_literal_block_start_marker(value: &str) -> Option<char> {
+    let mut chars = value.chars();
+    if chars.next()? != '\\' {
+        return None;
+    }
+    let marker = chars.next()?;
+    if marker.is_ascii_digit() || matches!(marker, '#' | '-' | '*' | '+' | '>' | ':') {
+        Some(marker)
+    } else {
+        None
+    }
 }
 
 fn literal_inline_marker_prefix(value: &str) -> Option<&'static str> {

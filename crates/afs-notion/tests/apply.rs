@@ -278,6 +278,124 @@ fn apply_decodes_rendered_rich_text_line_breaks() {
 }
 
 #[test]
+fn apply_decodes_escaped_literal_block_markers_for_paragraphs() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            paragraph_block("heading-marker", "# Literal heading", false),
+            paragraph_block("bullet-marker", "- Literal bullet", false),
+            paragraph_block("number-marker", "1. Literal number", false),
+            paragraph_block("quote-marker", "> Literal quote", false),
+            paragraph_block("divider-marker", "---", false),
+            paragraph_block(
+                "directive-marker",
+                "::afs{id=literal type=paragraph}",
+                false,
+            ),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("heading-marker"),
+                content: "\\# Literal heading changed".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("bullet-marker"),
+                content: "\\- Literal bullet changed".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("number-marker"),
+                content: "\\1. Literal number changed".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("quote-marker"),
+                content: "\\> Literal quote changed".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("divider-marker"),
+                content: "\\--- changed".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("directive-marker"),
+                content: "\\::afs{id=literal type=paragraph} changed".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "heading-marker".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("# Literal heading changed"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "bullet-marker".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("- Literal bullet changed"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "number-marker".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("1. Literal number changed"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "quote-marker".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("> Literal quote changed"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "divider-marker".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("--- changed"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "directive-marker".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("::afs{id=literal type=paragraph} changed"),
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_decodes_escaped_literal_break_tags() {
     let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
         "2026-06-10T00:00:00.000Z",

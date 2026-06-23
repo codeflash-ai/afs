@@ -1275,6 +1275,72 @@ fn live_paragraph_literal_markdown_inline_marker_edits_preserve_literal_text() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_paragraph_literal_block_marker_edits_preserve_paragraph_text() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live literal block marker {}", unique_suffix()),
+        vec![paragraph_child("# Literal heading marker")],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    assert!(
+        original.contains("\\# Literal heading marker"),
+        "literal block marker should render escaped:\n{original}"
+    );
+
+    fs::write(
+        &page_path,
+        original.replace(
+            "\\# Literal heading marker",
+            "\\# Literal heading marker changed",
+        ),
+    )
+    .expect("write live literal block marker edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff live literal block marker edit");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("literal block marker edit plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_replaced, 0, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live literal block marker edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let after = live_block_snapshot(&connector, &source.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after literal block marker edit");
+    assert_eq!(first["block"]["type"], "paragraph", "{after:#?}");
+    let rich_text = &first["block"]["paragraph"]["rich_text"][0];
+    assert_eq!(rich_text["type"], "text", "{after:#?}");
+    assert_eq!(
+        rich_text["text"]["content"], "# Literal heading marker changed",
+        "{after:#?}"
+    );
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    assert!(
+        verified.contains("\\# Literal heading marker changed"),
+        "verified markdown should keep literal block marker escaped:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_table_width_change_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
