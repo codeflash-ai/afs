@@ -575,6 +575,17 @@ fn notion_read_only_link_change_validation(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let moved_child_page_block_ids = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::AppendBlock { content, .. } => {
+                moved_rendered_child_page_link_block(&shadow_blocks, &archived_block_ids, content)
+                    .map(|block| block.remote_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let mut validation = ValidationReport::clean();
     for operation in &plan.operations {
         match operation {
@@ -615,6 +626,26 @@ fn notion_read_only_link_change_validation(
                             .to_string(),
                     ),
                 ));
+            }
+            PushOperation::ArchiveBlock { block_id } => {
+                if moved_child_page_block_ids.contains(block_id) {
+                    continue;
+                }
+                let Some(shadow_block) = shadow_blocks.get(block_id).copied() else {
+                    continue;
+                };
+                if rendered_child_page_link_block(shadow_block) {
+                    validation.push(ValidationIssue::new(
+                        "notion_child_page_link_delete_unsupported",
+                        relative_path,
+                        Some(shadow_block.source_span.start_line),
+                        "deleting a rendered Notion child-page link is not supported from parent Markdown",
+                        Some(
+                            "delete the child page through its projected page directory instead"
+                                .to_string(),
+                        ),
+                    ));
+                }
             }
             _ => {}
         }

@@ -676,6 +676,70 @@ fn live_child_page_link_move_blocks_before_journaled_apply() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_child_page_link_delete_blocks_before_journaled_apply() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let anchor_text = "Anchor before child page delete.";
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live child link delete parent {}", unique_suffix()),
+        vec![paragraph_child(anchor_text)],
+    );
+    let child_title = format!("AFS live child link delete child {}", unique_suffix());
+    let child = cleanup.create_page(
+        &parent.id,
+        &child_title,
+        vec![paragraph_child("Child page body.")],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &parent.id);
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &parent.id);
+    let child_line = original
+        .lines()
+        .find(|line| line.contains(&child_title) && line.contains(&compact_notion_id(&child.id)))
+        .expect("rendered child_page line");
+    let line_to_delete = format!("\n\n{child_line}\n");
+    assert!(original.contains(&line_to_delete), "{original}");
+    fs::write(&page_path, original.replace(&line_to_delete, "\n")).expect("delete child link");
+
+    let diff = run_diff(&store, &page_path).expect("diff live child_page link delete");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_child_page_link_delete_unsupported"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live child_page link delete");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert_eq!(live_block_snapshot(&connector, &parent.id), before);
+
+    let child_page = cleanup
+        .api
+        .retrieve_page(&child.id)
+        .expect("retrieve child after blocked delete");
+    assert!(
+        !child_page.archived && !child_page.in_trash,
+        "child page should not be archived by blocked parent-link delete: {child_page:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

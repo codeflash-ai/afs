@@ -44,9 +44,9 @@ Moving an unchanged directive line plans a `move_block`. For Notion, safe
 childless directive moves are applied by appending a copy at the new position and
 archiving the old block because the public API rejects direct block
 repositioning; reconcile then rewrites the refreshed block ID into Markdown.
-Editing or moving a rendered child-page link in the parent Markdown is blocked
-before journaled apply; edit, move, rename, or delete the child page through its
-projected page directory instead.
+Editing, moving, or deleting a rendered child-page link in the parent Markdown is
+blocked before journaled apply; edit, move, rename, or delete the child page
+through its projected page directory instead.
 
 ## Database Rows
 
