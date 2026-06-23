@@ -151,6 +151,65 @@ fn prepare_push_plans_content_cache_absolute_media_byte_update() {
 }
 
 #[test]
+fn prepare_push_plans_media_update_with_parenthesized_href() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("notion");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "![Image](../.afs/media/Roadmap/image-(1).png)",
+                8,
+                [RemoteId::new("image-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let content_root = virtual_fs_content_root(&fixture.state_root, &fixture.mount_id);
+    let media_path = PathBuf::from(".afs/media/Roadmap/image-(1).png");
+    fixture.write_virtual_media_manifest(&media_path, "image-1", b"original image bytes");
+    fixture.write_virtual_media(&media_path, b"updated image bytes");
+    let absolute_media = content_root.join(&media_path);
+    fixture.write_virtual_page(
+        "Roadmap/page.md",
+        &canonical_markdown("page-1", &format!("![Image]({})", absolute_media.display())),
+    );
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Roadmap/page.md")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+    let plan = prepared.pipeline.plan.expect("plan");
+
+    assert_eq!(plan.summary.media_updated, 1);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateMedia {
+            block_id: RemoteId::new("image-1"),
+            local_path: media_path,
+            caption: "Image".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn prepare_push_plans_content_cache_absolute_file_media_byte_update() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.virtual_store("notion");

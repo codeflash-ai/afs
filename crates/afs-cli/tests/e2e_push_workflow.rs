@@ -3145,6 +3145,87 @@ fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_local_image_media_edit_with_escaped_caption_uploads_and_reconciles() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live escaped local image {}", unique_suffix()),
+        vec![media_child(
+            "image",
+            "https://www.w3.org/Icons/w3c_home.png",
+            "Original escaped image",
+        )],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    assert_local_image_markdown(&original, "Original escaped image");
+
+    let image_path = local_image_path(
+        &fixture.root,
+        &page_path,
+        &original,
+        "Original escaped image",
+    );
+    assert!(
+        image_path.is_file(),
+        "missing local image at {image_path:?}"
+    );
+    let uploaded_bytes = tiny_png_bytes();
+    fs::write(&image_path, uploaded_bytes).expect("overwrite local image bytes");
+
+    let original_image_line = markdown_image_line(&original, "Original escaped image");
+    let image_href = markdown_link_href(original_image_line);
+    let escaped_caption = "Updated \\](escaped image)";
+    let updated_image_line = format!("![{escaped_caption}]({image_href})");
+    fs::write(
+        &page_path,
+        original.replace(original_image_line, &updated_image_line),
+    )
+    .expect("write local image markdown edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff escaped local image edit");
+    let plan = diff.plan.as_ref().expect("escaped image edit plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.media_updated, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_updated, 0, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push escaped local image edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let reconciled = fs::read_to_string(&page_path).expect("read reconciled image page");
+    let reconciled_line = reconciled
+        .lines()
+        .find(|line| line.starts_with(&format!("![{escaped_caption}](")))
+        .unwrap_or_else(|| panic!("missing escaped image caption in:\n{reconciled}"));
+    assert_local_media_href(reconciled_line, "Updated ](escaped image)");
+    let reconciled_image_path =
+        local_media_path_from_line(&fixture.root, &page_path, reconciled_line);
+    assert_eq!(
+        fs::read(&reconciled_image_path).expect("read reconciled image"),
+        uploaded_bytes
+    );
+
+    let verified = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(
+        verified.contains(&format!("![{escaped_caption}](")),
+        "verified markdown should keep escaped caption:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_local_file_like_media_appends_upload_and_reconcile_local_links() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
@@ -4740,9 +4821,58 @@ fn markdown_link_line<'a>(markdown: &'a str, caption: &str) -> &'a str {
 }
 
 fn markdown_link_href(line: &str) -> &str {
-    let href_start = line.find("](").expect("markdown link start") + 2;
-    let href_end = line.rfind(')').expect("markdown link end");
+    let label_start = if line.starts_with("![") {
+        2
+    } else if line.starts_with('[') {
+        1
+    } else {
+        panic!("markdown link must start with `[` or `![`: {line:?}");
+    };
+    let label_end = find_markdown_link_label_end(line, label_start);
+    let href_start = label_end + 2;
+    let href_end = find_markdown_link_href_end(line, href_start);
     &line[href_start..href_end]
+}
+
+fn find_markdown_link_label_end(input: &str, start: usize) -> usize {
+    let mut escaped = false;
+    for (index, ch) in input.char_indices().skip_while(|(index, _)| *index < start) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == ']' && input[index + ch.len_utf8()..].starts_with('(') {
+            return index;
+        }
+    }
+    panic!("markdown link label is not closed: {input:?}");
+}
+
+fn find_markdown_link_href_end(input: &str, href_start: usize) -> usize {
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    for (offset, ch) in input[href_start..].char_indices() {
+        let index = href_start + offset;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' if paren_depth == 0 => return index,
+            ')' => paren_depth -= 1,
+            _ => {}
+        }
+    }
+    panic!("markdown link href is not closed: {input:?}");
 }
 
 fn assert_local_image_markdown(markdown: &str, caption: &str) {

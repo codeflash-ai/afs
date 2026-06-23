@@ -210,6 +210,57 @@ fn diff_plans_local_image_media_byte_update_from_manifest() {
 }
 
 #[test]
+fn diff_plans_local_image_media_byte_update_with_parenthesized_href() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let media_path = PathBuf::from(".afs/media/Roadmap/image-(1).png");
+    let original_bytes = b"original image bytes";
+    fixture.write_media(&media_path, original_bytes);
+    fixture.write_media_manifest(
+        &media_path,
+        "image-1",
+        "image",
+        "https://example.com/original-image.png",
+        original_bytes,
+    );
+    let original_body = "![Original image](.afs/media/Roadmap/image-(1).png)\n";
+    let path = fixture.write_page("Roadmap.md", original_body);
+    fs::write(fixture.root.join(&media_path), b"updated image bytes").expect("update media");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                original_body,
+                9,
+                [RemoteId::new("image-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let plan = report.plan.expect("plan");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "confirm_plan");
+    assert_eq!(plan.summary.media_updated, 1);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    match &plan.operations[0] {
+        afs_cli::diff::PushOperationOutput::UpdateMedia {
+            block_id,
+            local_path,
+            caption,
+        } => {
+            assert_eq!(block_id, "image-1");
+            assert_eq!(local_path, ".afs/media/Roadmap/image-(1).png");
+            assert_eq!(caption, "Original image");
+        }
+        operation => panic!("unexpected operation {operation:?}"),
+    }
+}
+
+#[test]
 fn diff_rejects_unresolved_conflict_markers() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();
