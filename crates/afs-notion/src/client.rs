@@ -739,6 +739,9 @@ mod tests {
 
     fn read_http_request_headers(stream: &mut TcpStream) {
         stream
+            .set_nonblocking(false)
+            .expect("set request stream blocking");
+        stream
             .set_read_timeout(Some(Duration::from_millis(500)))
             .expect("set request read timeout");
         let mut request = Vec::new();
