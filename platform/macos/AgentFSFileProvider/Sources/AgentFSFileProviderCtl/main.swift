@@ -266,14 +266,11 @@ private func userVisibleDomainURL(for domain: NSFileProviderDomain) throws -> UR
     .appendingPathComponent("Library", isDirectory: true)
     .appendingPathComponent("CloudStorage", isDirectory: true)
   let primaryDirectoryName = fileProviderDirectoryName(for: domain.displayName)
-  let candidates = [
-    cloudStorage.appendingPathComponent(primaryDirectoryName, isDirectory: true),
-    cloudStorage.appendingPathComponent("AgentFS-\(domain.displayName)", isDirectory: true),
-  ]
-  if let existing = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
-    return existing
+  let candidate = cloudStorage.appendingPathComponent(primaryDirectoryName, isDirectory: true)
+  if FileManager.default.fileExists(atPath: candidate.path) {
+    return candidate
   }
-  return candidates[0]
+  return candidate
 }
 
 private func fileProviderDirectoryName(for displayName: String) -> String {

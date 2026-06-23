@@ -89,7 +89,17 @@ pub struct MountPathMatch {
 }
 
 pub fn mount_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
-    let mut roots = vec![mount.root.clone()];
+    let mut roots = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    if !(mount.projection == ProjectionMode::MacosFileProvider
+        && macos_file_provider_path_is_legacy_alias(&mount.root))
+    {
+        roots.push(mount.root.clone());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    roots.push(mount.root.clone());
 
     if matches!(
         mount.projection,
@@ -856,15 +866,43 @@ fn absolute_reconcile_path(path: &Path) -> AfsResult<PathBuf> {
 
 fn relative_to_access_root(path: &Path, access_root: &Path) -> Option<PathBuf> {
     if let Ok(relative_path) = path.strip_prefix(access_root) {
-        return Some(relative_path.to_path_buf());
+        let relative_path = safe_mount_relative_path(relative_path)?;
+        if canonicalized_path_escapes_access_root(path, access_root) {
+            return None;
+        }
+        return Some(relative_path);
     }
 
     let canonical_path = canonicalize_existing_prefix(path)?;
     let canonical_root = canonicalize_existing_prefix(access_root)?;
     canonical_path
         .strip_prefix(canonical_root)
-        .map(Path::to_path_buf)
         .ok()
+        .and_then(safe_mount_relative_path)
+}
+
+fn safe_mount_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => safe.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(safe)
+}
+
+fn canonicalized_path_escapes_access_root(path: &Path, access_root: &Path) -> bool {
+    let Some(canonical_path) = canonicalize_existing_prefix(path) else {
+        return false;
+    };
+    let Some(canonical_root) = canonicalize_existing_prefix(access_root) else {
+        return false;
+    };
+    !canonical_path.starts_with(canonical_root)
 }
 
 fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
@@ -897,65 +935,29 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
-    let display_name = macos_file_provider_display_name(mount);
     let cloud_storage = home.join("Library").join("CloudStorage");
-    let domain_roots = vec![
-        cloud_storage.join(macos_file_provider_directory_name(&display_name)),
-        cloud_storage.join(format!("AFS-{display_name}")),
-        cloud_storage.join(format!("AgentFS-{display_name}")),
-    ];
-    let source_directory = source_root_directory_name(&mount.connector);
-    domain_roots
-        .into_iter()
-        .flat_map(|domain_root| [domain_root.join(&source_directory), domain_root])
-        .collect()
+    vec![
+        cloud_storage
+            .join("AFS")
+            .join(source_root_directory_name(&mount.connector)),
+    ]
 }
 
 #[cfg(target_os = "macos")]
-fn macos_file_provider_directory_name(display_name: &str) -> String {
-    if display_name == "AFS" || display_name.starts_with("AFS-") {
-        display_name.to_string()
-    } else {
-        format!("AFS-{display_name}")
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_file_provider_display_name(mount: &MountConfig) -> String {
-    macos_file_provider_domain_path(&mount.root)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(strip_file_provider_directory_prefix)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| mount.mount_id.0.clone())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_file_provider_domain_path(root: &Path) -> &Path {
-    let Some(parent) = root.parent() else {
-        return root;
-    };
-    let Some(grandparent_name) = parent
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-    else {
-        return root;
-    };
-    if grandparent_name == "CloudStorage" {
-        parent
-    } else {
-        root
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn strip_file_provider_directory_prefix(name: &str) -> &str {
-    name.strip_prefix("AgentFS-")
-        .or_else(|| name.strip_prefix("AFS-"))
-        .filter(|stripped| !stripped.is_empty())
-        .unwrap_or(name)
+fn macos_file_provider_path_is_legacy_alias(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if name == "AFS-AFS" || name == "AgentFS-AFS" {
+            return ancestor
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|parent| parent.to_str())
+                .is_some_and(|parent| parent == "CloudStorage");
+        }
+        false
+    })
 }
 
 #[cfg(test)]
@@ -1045,23 +1047,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn match_mount_path_rejects_parent_traversal() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS/notion");
+
+        assert!(match_mount_path(&mount, Path::new("/tmp/AFS/notion/../linear/page.md")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn match_mount_path_rejects_symlink_escape() {
+        let root = temp_root("afs-file-provider-symlink-root");
+        let outside = temp_root("afs-file-provider-symlink-outside");
+        let mount_root = root.join("notion");
+        fs::create_dir_all(&mount_root).expect("mount root");
+        fs::create_dir_all(&outside).expect("outside root");
+        std::os::unix::fs::symlink(&outside, mount_root.join("escape")).expect("symlink");
+
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", &mount_root);
+
+        assert!(match_mount_path(&mount, &mount_root.join("escape/page.md")).is_none());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_file_provider_access_roots_strip_cloudstorage_domain_prefix() {
+    fn macos_file_provider_access_roots_use_single_afs_connector_root() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
             "/Users/test/Library/CloudStorage/AFS/notion",
         )
         .projection(ProjectionMode::MacosFileProvider);
-        assert_eq!(macos_file_provider_display_name(&mount), "AFS");
         let roots = mount_access_roots(&mount);
         let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
 
         assert!(roots.contains(&PathBuf::from(
             "/Users/test/Library/CloudStorage/AFS/notion"
         )));
-        assert!(roots.contains(&home.join("Library").join("CloudStorage").join("AFS")));
         assert!(
             roots.contains(
                 &home
@@ -1071,33 +1096,68 @@ mod tests {
                     .join("notion")
             )
         );
+        let matched = match_mount_path(
+            &mount,
+            &home
+                .join("Library")
+                .join("CloudStorage")
+                .join("AFS")
+                .join("notion")
+                .join("Page.md"),
+        )
+        .expect("canonical connector path matches");
+        assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
         assert!(
-            roots.contains(
+            match_mount_path(
+                &mount,
                 &home
                     .join("Library")
                     .join("CloudStorage")
                     .join("AFS-AFS")
                     .join("notion")
+                    .join("Page.md"),
             )
+            .is_none(),
+            "legacy File Provider aliases must not resolve as current mounts"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_legacy_stored_root_maps_only_to_canonical_root() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            home.join("Library")
+                .join("CloudStorage")
+                .join("AFS-AFS")
+                .join("notion"),
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+
         assert!(
-            roots.contains(
+            match_mount_path(
+                &mount,
                 &home
                     .join("Library")
                     .join("CloudStorage")
-                    .join("AgentFS-AFS")
+                    .join("AFS-AFS")
+                    .join("notion")
+                    .join("Page.md"),
             )
+            .is_none()
         );
         let matched = match_mount_path(
             &mount,
             &home
                 .join("Library")
                 .join("CloudStorage")
-                .join("AFS-AFS")
+                .join("AFS")
                 .join("notion")
                 .join("Page.md"),
         )
-        .expect("AFS-AFS connector path matches");
+        .expect("canonical root still resolves");
         assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
     }
 
@@ -1464,7 +1524,6 @@ mod tests {
         )
     }
 
-    #[cfg(target_os = "macos")]
     fn temp_root(prefix: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = SystemTime::now()
