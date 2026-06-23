@@ -232,6 +232,82 @@ fn live_scratch_page_mount_edit_push_verifies_notion() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_block_type_replace_pushes_and_reconciles_notion() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let original_text = "Replace block paragraph original.";
+    let untouched_text = "Paragraph after replacement should remain.";
+    let replacement_text = "Replacement bullet from live replace";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live replace block {}", unique_suffix()),
+        vec![
+            paragraph_child(original_text),
+            paragraph_child(untouched_text),
+        ],
+    );
+    let original_block_id = first_live_child_block_id(&cleanup.api, &scratch.id);
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+
+    fs::write(
+        &page_path,
+        original.replace(original_text, &format!("- {replacement_text}")),
+    )
+    .expect("write live replace edit");
+    let diff = run_diff(&store, &page_path).expect("diff live replace edit");
+    let plan = diff.plan.as_ref().expect("replace plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.blocks_replaced, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_updated, 0, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live replace edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("reconciled"));
+    assert_eq!(push.apply_effect_count, 2);
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean replace status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let verified = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(
+        verified.contains(&format!("- {replacement_text}")),
+        "{verified}"
+    );
+    assert!(verified.contains(untouched_text), "{verified}");
+    assert!(
+        !verified.contains(original_text),
+        "replacement should archive the old paragraph:\n{verified}"
+    );
+    let after = live_block_snapshot(&connector, &scratch.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after replace");
+    assert_eq!(first["block"]["type"], "bulleted_list_item");
+    assert_ne!(first["block"]["id"], original_block_id);
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
