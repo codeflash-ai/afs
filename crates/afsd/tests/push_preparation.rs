@@ -340,6 +340,39 @@ fn prepare_push_blocks_rendered_child_page_link_delete_before_apply() {
 }
 
 #[test]
+fn prepare_push_blocks_rendered_link_to_page_retarget_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let original_link = "[Linked page](https://www.notion.so/11111111111111111111111111111111)";
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                original_link,
+                8,
+                [RemoteId::new("link-to-page-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "[Linked page](https://www.notion.so/22222222222222222222222222222222)",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_link_to_page_retarget_unsupported"
+    );
+}
+
+#[test]
 fn prepare_push_uses_shared_validator_for_direct_and_virtual_creates() {
     let fixture = PrepareFixture::new();
     let validator = RecordingValidator::default();

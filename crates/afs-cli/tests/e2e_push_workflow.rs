@@ -717,6 +717,79 @@ fn live_link_to_page_line_move_preserves_notion_block_type() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_link_to_page_retarget_blocks_before_journaled_apply() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let original_target = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live link retarget original {}", unique_suffix()),
+        vec![paragraph_child(
+            "Original target for link_to_page retarget.",
+        )],
+    );
+    let replacement_target = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live link retarget replacement {}", unique_suffix()),
+        vec![paragraph_child(
+            "Replacement target for link_to_page retarget.",
+        )],
+    );
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live link retarget source {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "link_to_page",
+            "link_to_page": { "type": "page_id", "page_id": original_target.id }
+        })],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &source.id);
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let link_line = original
+        .lines()
+        .find(|line| {
+            line.starts_with("[Linked page](")
+                && line.contains(&compact_notion_id(&original_target.id))
+        })
+        .expect("rendered link_to_page line");
+    let edited_link_line = link_line.replace(
+        &compact_notion_id(&original_target.id),
+        &compact_notion_id(&replacement_target.id),
+    );
+    assert_ne!(link_line, edited_link_line);
+    fs::write(&page_path, original.replace(link_line, &edited_link_line))
+        .expect("write live link_to_page retarget");
+
+    let diff = run_diff(&store, &page_path).expect("diff live link_to_page retarget");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_link_to_page_retarget_unsupported"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live link_to_page retarget");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert_eq!(live_block_snapshot(&connector, &source.id), before);
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_child_page_link_move_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

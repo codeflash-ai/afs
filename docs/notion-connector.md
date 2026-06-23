@@ -130,6 +130,8 @@ The first Notion apply path is intentionally conservative:
 - rendered read-only block moves that the planner represents as append+archive,
   such as `link_to_page` lines, preserve the existing Notion payload instead of
   reparsing the Markdown as a paragraph;
+- rendered `link_to_page` retargets are blocked before journaled apply because
+  the public Notion API does not reliably patch those targets;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the Synced Tree version carried by the push executor;
 - after apply, the daemon reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed Synced Tree shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
 

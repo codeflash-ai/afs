@@ -589,8 +589,8 @@ fn notion_read_only_link_change_validation(
     let mut validation = ValidationReport::clean();
     for operation in &plan.operations {
         match operation {
-            PushOperation::UpdateBlock { block_id, .. }
-            | PushOperation::ReplaceBlock { block_id, .. } => {
+            PushOperation::UpdateBlock { block_id, content }
+            | PushOperation::ReplaceBlock { block_id, content } => {
                 let Some(shadow_block) = shadow_blocks.get(block_id).copied() else {
                     continue;
                 };
@@ -606,8 +606,23 @@ fn notion_read_only_link_change_validation(
                         ),
                     ));
                 }
+                if let Some(issue) =
+                    rendered_link_to_page_edit_validation(relative_path, shadow_block, content)
+                {
+                    validation.push(issue);
+                }
             }
             PushOperation::AppendBlock { content, .. } => {
+                if let Some(issue) = moved_rendered_link_to_page_edit_validation(
+                    relative_path,
+                    &shadow_blocks,
+                    &archived_block_ids,
+                    content,
+                ) {
+                    validation.push(issue);
+                    continue;
+                }
+
                 let Some(shadow_block) = moved_rendered_child_page_link_block(
                     &shadow_blocks,
                     &archived_block_ids,
@@ -676,6 +691,91 @@ fn rendered_child_page_link_block(block: &ShadowBlock) -> bool {
     };
     notion_id_from_href(href)
         .is_some_and(|notion_id| compact_notion_id(block.remote_id.as_str()) == notion_id)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedReadOnlyLink {
+    label: String,
+    target_id: String,
+}
+
+fn rendered_link_to_page_edit_validation(
+    relative_path: &Path,
+    shadow_block: &ShadowBlock,
+    content: &str,
+) -> Option<ValidationIssue> {
+    let shadow_link = rendered_link_to_page_block_info(shadow_block)?;
+    let edited_link = rendered_link_to_page_markdown_info(content.trim());
+    let retargeted = edited_link.as_ref().is_some_and(|edited_link| {
+        edited_link.label == shadow_link.label && edited_link.target_id != shadow_link.target_id
+    });
+    let (code, message, suggested_fix) = if retargeted {
+        (
+            "notion_link_to_page_retarget_unsupported",
+            "retargeting a rendered Notion link-to-page block is not supported from Markdown",
+            "restore the original Notion link target; move or delete the link block instead",
+        )
+    } else {
+        (
+            "notion_link_to_page_edit_unsupported",
+            "editing a rendered Notion link-to-page block is not supported from Markdown",
+            "restore the rendered link exactly; move or delete the link block instead",
+        )
+    };
+
+    Some(ValidationIssue::new(
+        code,
+        relative_path,
+        Some(shadow_block.source_span.start_line),
+        message,
+        Some(suggested_fix.to_string()),
+    ))
+}
+
+fn moved_rendered_link_to_page_edit_validation(
+    relative_path: &Path,
+    shadow_blocks: &BTreeMap<&RemoteId, &ShadowBlock>,
+    archived_block_ids: &BTreeSet<RemoteId>,
+    content: &str,
+) -> Option<ValidationIssue> {
+    let Some((_label, href)) = parse_markdown_link_exact(content.trim()) else {
+        return None;
+    };
+    let linked_notion_id = notion_id_from_href(href)?;
+    let content_link = rendered_link_to_page_markdown_info(content.trim());
+    let shadow_block = shadow_blocks.values().copied().find(|block| {
+        archived_block_ids.contains(&block.remote_id)
+            && rendered_link_to_page_block_info(block).is_some_and(|shadow_link| {
+                content_link
+                    .as_ref()
+                    .is_some_and(|content_link| content_link.label == shadow_link.label)
+                    || shadow_link.target_id == linked_notion_id
+            })
+    })?;
+    if rendered_bodies_equivalent(&shadow_block.text, content) {
+        return None;
+    }
+
+    rendered_link_to_page_edit_validation(relative_path, shadow_block, content)
+}
+
+fn rendered_link_to_page_block_info(block: &ShadowBlock) -> Option<RenderedReadOnlyLink> {
+    let info = rendered_link_to_page_markdown_info(block.text.trim())?;
+    if compact_notion_id(block.remote_id.as_str()) == info.target_id {
+        return None;
+    }
+    Some(info)
+}
+
+fn rendered_link_to_page_markdown_info(input: &str) -> Option<RenderedReadOnlyLink> {
+    let (label, href) = parse_markdown_link_exact(input)?;
+    if !matches!(label, "Linked page" | "Linked database") {
+        return None;
+    }
+    Some(RenderedReadOnlyLink {
+        label: label.to_string(),
+        target_id: notion_id_from_href(href)?,
+    })
 }
 
 fn notion_id_from_href(href: &str) -> Option<String> {
