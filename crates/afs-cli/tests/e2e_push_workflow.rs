@@ -2900,6 +2900,80 @@ fn live_code_block_ignores_fence_marker_with_trailing_text() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_text_code_fence_alias_pushes_as_plain_text() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live text code alias {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "code",
+            "code": {
+                "rich_text": rich_text_json("Before"),
+                "language": "plain text",
+            }
+        })],
+    );
+
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    assert!(
+        original.contains("```plain text\nBefore\n```"),
+        "code block should render with Notion's plain text language:\n{original}"
+    );
+
+    fs::write(
+        &page_path,
+        original.replace("```plain text\nBefore\n```", "```text\nAfter alias\n```"),
+    )
+    .expect("write text code alias edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff text code alias edit");
+    let plan = diff.plan.as_ref().expect("plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push text code alias edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let snapshot = live_block_snapshot(&connector, &source.id);
+    let block = snapshot
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("live code block after text alias edit");
+    assert_eq!(block["block"]["type"], "code");
+    assert_eq!(block["block"]["code"]["language"], "plain text");
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    assert!(
+        verified.contains("```plain text\nAfter alias\n```"),
+        "verified markdown should render the normalized plain text language:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
