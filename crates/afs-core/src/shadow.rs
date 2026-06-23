@@ -369,12 +369,21 @@ fn classify_block(lines: &[&str], start: usize, end: usize) -> MarkdownBlockKind
 
 fn consume_code_fence(lines: &[&str], start: usize, fence: FenceMarker) -> usize {
     for (offset, line) in lines[start + 1..].iter().enumerate() {
-        if line.trim_start().starts_with(&fence.marker) {
+        if is_code_fence_closer(line, &fence) {
             return start + offset + 2;
         }
     }
 
     lines.len()
+}
+
+fn is_code_fence_closer(line: &str, fence: &FenceMarker) -> bool {
+    let trimmed = line.trim_start();
+    let closing_len = trimmed
+        .chars()
+        .take_while(|ch| *ch == fence.marker_char)
+        .count();
+    closing_len >= fence.marker_len && trimmed[closing_len..].trim().is_empty()
 }
 
 fn consume_while(lines: &[&str], start: usize, predicate: impl Fn(&str) -> bool) -> usize {
@@ -441,7 +450,8 @@ fn fence_marker(line: &str) -> Option<FenceMarker> {
     }
 
     Some(FenceMarker {
-        marker: std::iter::repeat(marker_char).take(marker_len).collect(),
+        marker_char,
+        marker_len,
     })
 }
 
@@ -457,5 +467,6 @@ fn kind_tag(kind: &MarkdownBlockKind) -> &'static str {
 }
 
 struct FenceMarker {
-    marker: String,
+    marker_char: char,
+    marker_len: usize,
 }
