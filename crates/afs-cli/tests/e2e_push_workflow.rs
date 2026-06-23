@@ -20,7 +20,7 @@ use afs_core::conflict::{
     has_unresolved_conflict_markers,
 };
 use afs_core::explain::{RemoteChangeAction, RemoteChangeState};
-use afs_core::hydration::{HydrationReason, HydrationRequest};
+use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::{HttpNotionApi, NotionApi};
 use afs_notion::dto::{
@@ -31,9 +31,12 @@ use afs_notion::dto::{
 use afs_notion::media::resolve_media_href_with_content_root;
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
-    ConnectionId, EntityRepository, InMemoryStateStore, ProjectionMode, VirtualMutationRepository,
+    ConnectionId, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
+    VirtualMutationRepository,
 };
-use afsd::hydration::{HydrationExecutor, HydrationOutcome};
+use afsd::hydration::{HydrationExecutor, HydrationOutcome, HydrationQueue};
+use afsd::reconcile::{DefaultFetchScheduleStrategy, reconcile_scheduled_pull};
+use afsd::scheduler::PullScheduler;
 use afsd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, materialize_virtual_fs_item_with_content_root,
     refresh_virtual_fs_children, source_root_identifier, trash_virtual_fs_item,
@@ -975,6 +978,150 @@ fn live_remote_fast_forward_updates_clean_file_and_preserves_pending_file() {
         !protected_contents.contains(&remote_marker),
         "pending local content must not be overwritten by remote fast-forward"
     );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_scheduled_pull_queues_and_applies_remote_fast_forward() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live scheduled pull parent {}", unique_suffix()),
+        vec![paragraph_child("Scheduler parent body.")],
+    );
+    let child = cleanup.create_page(
+        &parent.id,
+        &format!("AFS live scheduled pull child {}", unique_suffix()),
+        vec![paragraph_child("Scheduler child base body.")],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(parent.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount scheduled pull workspace");
+    let mounts = store.load_mounts().expect("load scheduled pull mounts");
+    let strategy = DefaultFetchScheduleStrategy;
+    let policy = HydrationPolicy::default();
+    let mut scheduler = PullScheduler::new(Default::default());
+    let mut queue = HydrationQueue::new();
+
+    let initial_tick = scheduler.tick().expect("initial scheduled pull tick");
+    let initial = reconcile_scheduled_pull(
+        &mut store,
+        &mut queue,
+        &mounts,
+        &initial_tick,
+        &connector,
+        &strategy,
+        &policy,
+    )
+    .expect("initial live scheduled pull");
+    assert_eq!(initial.mounts_polled, 1, "{initial:#?}");
+    assert!(
+        initial.enumerated >= 2,
+        "scheduled pull should enumerate parent and child: {initial:#?}"
+    );
+    assert!(
+        initial.queued_hydrations >= 1,
+        "scheduled pull should queue root policy hydration: {initial:#?}"
+    );
+    HydrationExecutor::new(&mut store, &connector)
+        .drain_queue(&mut queue)
+        .expect("drain initial policy hydration");
+
+    let child_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(child.id.clone()))
+        .expect("get scheduled child entity")
+        .expect("scheduled child entity");
+    let child_relative_path = child_entity.path.clone();
+    let child_path = fixture.root.join(&child_relative_path);
+    let child_hydration = HydrationExecutor::new(&mut store, &connector)
+        .hydrate_request(HydrationRequest::new(
+            fixture.mount_id.clone(),
+            RemoteId::new(child.id.clone()),
+            child_relative_path.clone(),
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        ))
+        .expect("hydrate scheduled child");
+    assert_eq!(child_hydration, HydrationOutcome::Hydrated);
+    let hydrated_child = fs::read_to_string(&child_path).expect("read hydrated scheduled child");
+    assert!(
+        hydrated_child.contains("Scheduler child base body."),
+        "{hydrated_child}"
+    );
+
+    std::thread::sleep(Duration::from_millis(1200));
+    let remote_marker = format!("Scheduler remote fast-forward {}", unique_suffix());
+    append_remote_paragraph(&cleanup.api, &child.id, &remote_marker);
+    // Notion can report page edit times with coarse precision; keep the test
+    // focused on the scheduler path by making the local synced version stale.
+    let mut stale_child = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(child.id.clone()))
+        .expect("get scheduled child before remote update")
+        .expect("scheduled child before remote update");
+    stale_child.set_synced_tree_remote_version(Some("1970-01-01T00:00:00.000Z".to_string()));
+    store
+        .save_entity(stale_child)
+        .expect("mark scheduled child synced version stale");
+
+    let update_tick = scheduler
+        .advance_by(Duration::from_secs(15))
+        .expect("remote update scheduled pull tick");
+    let update = reconcile_scheduled_pull(
+        &mut store,
+        &mut queue,
+        &mounts,
+        &update_tick,
+        &connector,
+        &strategy,
+        &policy,
+    )
+    .expect("remote update scheduled pull");
+    assert!(
+        update.queued_hydrations >= 1,
+        "remote update should queue hydration: {update:#?}"
+    );
+
+    let mut queued = Vec::new();
+    while let Some(request) = queue.pop_ready() {
+        queued.push(request);
+    }
+    assert!(
+        queued.iter().any(|request| {
+            request.remote_id == RemoteId::new(child.id.clone())
+                && request.reason == HydrationReason::RemoteFastForward
+        }),
+        "scheduled pull should queue child remote fast-forward hydration: {queued:#?}"
+    );
+    for request in queued {
+        queue.queue_request(request);
+    }
+
+    let drain = HydrationExecutor::new(&mut store, &connector)
+        .drain_queue(&mut queue)
+        .expect("drain scheduled remote fast-forward");
+    assert!(
+        drain.hydrated >= 1,
+        "remote fast-forward should hydrate at least one page: {drain:#?}"
+    );
+    let updated_child = fs::read_to_string(&child_path).expect("read fast-forwarded child");
+    assert!(updated_child.contains(&remote_marker), "{updated_child}");
 }
 
 #[test]
