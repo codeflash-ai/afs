@@ -74,7 +74,47 @@ pub fn validate_markdown_table_separator(line: &str, width: usize) -> AfsResult<
 }
 
 fn unescape_markdown_table_cell(cell: &str) -> String {
-    cell.replace("\\|", "|").replace("<br>", "\n")
+    let mut unescaped = String::with_capacity(cell.len());
+    let mut rest = cell;
+
+    while !rest.is_empty() {
+        if let Some(tag) = escaped_break_tag_prefix(rest) {
+            unescaped.push('\\');
+            unescaped.push_str(tag);
+            rest = &rest[tag.len() + 1..];
+            continue;
+        }
+        if let Some(tag) = break_tag_prefix(rest) {
+            unescaped.push('\n');
+            rest = &rest[tag.len()..];
+            continue;
+        }
+        if rest.starts_with("\\|") {
+            unescaped.push('|');
+            rest = &rest[2..];
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("non-empty rest");
+        unescaped.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+
+    unescaped
+}
+
+fn escaped_break_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>"].into_iter().find(|tag| {
+        value
+            .strip_prefix('\\')
+            .is_some_and(|rest| rest.starts_with(tag))
+    })
+}
+
+fn break_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>"]
+        .into_iter()
+        .find(|tag| value.starts_with(tag))
 }
 
 fn malformed_table() -> AfsError {
@@ -101,5 +141,12 @@ mod tests {
         let row = parse_markdown_table_row("| A\\|B | hello<br>world |").expect("row");
 
         assert_eq!(row, vec!["A|B", "hello\nworld"]);
+    }
+
+    #[test]
+    fn preserves_escaped_literal_break_tags_for_rich_text_parser() {
+        let row = parse_markdown_table_row("| literal \\<br> tag |").expect("row");
+
+        assert_eq!(row, vec!["literal \\<br> tag"]);
     }
 }

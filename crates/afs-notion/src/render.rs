@@ -1004,13 +1004,39 @@ fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) ->
 }
 
 fn escape_markdown_text(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('\n', "<br>")
+    let mut escaped = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while !rest.is_empty() {
+        if let Some(tag) = break_tag_prefix(rest) {
+            escaped.push('\\');
+            escaped.push_str(tag);
+            rest = &rest[tag.len()..];
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("non-empty rest");
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("<br>"),
+            _ => escaped.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+
+    escaped
 }
 
 fn escape_markdown_link_label(text: &str) -> String {
-    text.replace('[', "\\[")
+    escape_markdown_text(text)
+        .replace('[', "\\[")
         .replace(']', "\\]")
-        .replace('\n', "<br>")
+}
+
+fn break_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>"]
+        .into_iter()
+        .find(|tag| value.starts_with(tag))
 }
 
 fn escape_directive_value(value: &str) -> String {

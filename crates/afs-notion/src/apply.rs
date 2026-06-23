@@ -2735,11 +2735,32 @@ fn notion_ids_equal(left: &str, right: &str) -> bool {
 }
 
 fn unescape_markdown_text(value: &str) -> String {
-    value
-        .replace("<br />", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br>", "\n")
-        .replace("\\\\", "\\")
+    let mut unescaped = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while !rest.is_empty() {
+        if let Some(tag) = escaped_break_tag_prefix(rest) {
+            unescaped.push_str(tag);
+            rest = &rest[tag.len() + 1..];
+            continue;
+        }
+        if let Some(tag) = break_tag_prefix(rest) {
+            unescaped.push('\n');
+            rest = &rest[tag.len()..];
+            continue;
+        }
+        if rest.starts_with("\\\\") {
+            unescaped.push('\\');
+            rest = &rest[2..];
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("non-empty rest");
+        unescaped.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+
+    unescaped
 }
 
 fn unescape_markdown_link_label(value: &str) -> String {
@@ -3109,13 +3130,47 @@ fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) ->
 }
 
 fn escape_markdown_text(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('\n', "<br>")
+    let mut escaped = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while !rest.is_empty() {
+        if let Some(tag) = break_tag_prefix(rest) {
+            escaped.push('\\');
+            escaped.push_str(tag);
+            rest = &rest[tag.len()..];
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("non-empty rest");
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("<br>"),
+            _ => escaped.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+
+    escaped
 }
 
 fn escape_markdown_link_label(text: &str) -> String {
-    text.replace('[', "\\[")
+    escape_markdown_text(text)
+        .replace('[', "\\[")
         .replace(']', "\\]")
-        .replace('\n', "<br>")
+}
+
+fn escaped_break_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>"].into_iter().find(|tag| {
+        value
+            .strip_prefix('\\')
+            .is_some_and(|rest| rest.starts_with(tag))
+    })
+}
+
+fn break_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>"]
+        .into_iter()
+        .find(|tag| value.starts_with(tag))
 }
 
 fn parse_code_fence(markdown: &str) -> Option<(String, String)> {
