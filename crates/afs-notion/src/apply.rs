@@ -1394,7 +1394,7 @@ fn parse_supported_block(
             kind,
             json!({
                 "url": href,
-                "caption": rich_text_payload(label, preimage)?,
+                "caption": rich_text_payload(&label, preimage)?,
             }),
         ));
     }
@@ -1421,7 +1421,7 @@ fn parse_supported_block(
                 "external": {
                     "url": href,
                 },
-                "caption": rich_text_payload(label, preimage)?,
+                "caption": rich_text_payload(&label, preimage)?,
             }),
         ));
     }
@@ -1474,7 +1474,7 @@ fn parse_append_block(
                 "file_upload": {
                     "id": upload_id,
                 },
-                "caption": rich_text_payload(caption, None)?,
+                "caption": rich_text_payload(&caption, None)?,
             }),
         ));
     }
@@ -1959,7 +1959,7 @@ impl InlineParser<'_> {
                 )));
             }
 
-            let mut parts = parse_nested(label, self.preimage_tokens, false)?;
+            let mut parts = parse_nested(&label, self.preimage_tokens, false)?;
             for part in &mut parts {
                 part.apply_link(href)?;
             }
@@ -2141,23 +2141,41 @@ fn parse_database_mention_arg(input: &str) -> AfsResult<String> {
     }
 }
 
-fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
+fn parse_markdown_link(input: &str) -> Option<(String, &str, usize)> {
     if !input.starts_with('[') {
         return None;
     }
-    let label_end = input.find("](")?;
+    let label_end = find_markdown_link_label_end(input)?;
     let href_start = label_end + 2;
     let href_end = input[href_start..]
         .find(')')
         .map(|offset| href_start + offset)?;
     Some((
-        &input[1..label_end],
+        unescape_markdown_link_label(&input[1..label_end]),
         &input[href_start..href_end],
         href_end + 1,
     ))
 }
 
-fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(&'a str, &'a str)> {
+fn find_markdown_link_label_end(input: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (index, ch) in input.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == ']' && input[index + ch.len_utf8()..].starts_with('(') {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(String, &'a str)> {
     let (label, href, consumed) = match kind {
         "image" => {
             let link = input.strip_prefix('!')?;
@@ -2175,7 +2193,7 @@ fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(&'a str, &'a 
     }
 }
 
-fn parse_local_media_markdown(input: &str) -> Option<(&str, &str, bool)> {
+fn parse_local_media_markdown(input: &str) -> Option<(String, &str, bool)> {
     if let Some((caption, href)) = parse_media_markdown("image", input)
         && !is_external_url(href)
     {
@@ -2423,6 +2441,22 @@ fn unescape_markdown_text(value: &str) -> String {
         .replace("<br/>", "\n")
         .replace("<br>", "\n")
         .replace("\\\\", "\\")
+}
+
+fn unescape_markdown_link_label(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(next @ ('[' | ']')) = chars.peek().copied()
+        {
+            output.push(next);
+            chars.next();
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn preimage_part_to_request_value(part: &RichTextDto) -> AfsResult<Value> {

@@ -1218,6 +1218,84 @@ fn apply_updates_bookmark_and_embed_blocks_from_markdown_links() {
 }
 
 #[test]
+fn apply_unescapes_rendered_link_labels_before_url_and_media_updates() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            url_block(
+                "bookmark-1",
+                "bookmark",
+                "https://example.com/original-bookmark",
+                "Original [bookmark](draft)",
+            ),
+            media_block(
+                "image-1",
+                "image",
+                "https://example.com/original-image.png",
+                "Original [image](draft)",
+            ),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("bookmark-1"),
+                content: "[Original \\[bookmark\\](draft)](https://example.com/updated-bookmark)"
+                    .to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("image-1"),
+                content: "![Original \\[image\\](draft)](https://example.com/updated-image.png)"
+                    .to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply escaped link-label updates");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "bookmark-1".to_string(),
+                body: json!({
+                    "bookmark": {
+                        "url": "https://example.com/updated-bookmark",
+                        "caption": rich_text_json("Original [bookmark](draft)"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "image-1".to_string(),
+                body: json!({
+                    "image": {
+                        "external": {
+                            "url": "https://example.com/updated-image.png",
+                        },
+                        "caption": rich_text_json("Original [image](draft)"),
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_updates_external_media_blocks_from_markdown_links() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
