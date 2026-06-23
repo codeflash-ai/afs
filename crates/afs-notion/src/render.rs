@@ -1033,9 +1033,7 @@ fn escape_markdown_text_with_options(text: &str, escape_inline_markers: bool) ->
 }
 
 fn escape_markdown_link_label(text: &str) -> String {
-    escape_markdown_text(text)
-        .replace('[', "\\[")
-        .replace(']', "\\]")
+    escape_markdown_text(text).replace(']', "\\]")
 }
 
 fn break_tag_prefix(value: &str) -> Option<&'static str> {
@@ -1046,9 +1044,19 @@ fn break_tag_prefix(value: &str) -> Option<&'static str> {
 
 fn literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
     literal_inline_tag_prefix(value).or_else(|| {
-        ["@date(", "@page(", "@database(", "@user("]
-            .into_iter()
-            .find(|marker| value.starts_with(marker))
+        [
+            "**",
+            "~~",
+            "`",
+            "[",
+            "_",
+            "@date(",
+            "@page(",
+            "@database(",
+            "@user(",
+        ]
+        .into_iter()
+        .find(|marker| value.starts_with(marker))
     })
 }
 

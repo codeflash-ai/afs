@@ -1186,6 +1186,95 @@ fn live_paragraph_literal_explicit_mention_marker_edits_preserve_literal_text() 
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_paragraph_literal_markdown_inline_marker_edits_preserve_literal_text() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live literal markdown marker {}", unique_suffix()),
+        vec![paragraph_child(
+            "Literal **bold** _italic_ ~~strike~~ `code` [link](https://example.com)",
+        )],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    assert!(
+        original.contains(
+            "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com)"
+        ),
+        "literal markdown inline markers should render escaped:\n{original}"
+    );
+
+    fs::write(
+        &page_path,
+        original.replace(
+            "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com)",
+            "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com) changed",
+        ),
+    )
+    .expect("write live literal markdown inline marker edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff live literal markdown inline marker edit");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff
+        .plan
+        .as_ref()
+        .expect("literal markdown inline marker edit plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live literal markdown inline marker edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let after = live_block_snapshot(&connector, &source.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after literal markdown inline marker edit");
+    let rich_text = first["block"]["paragraph"]["rich_text"]
+        .as_array()
+        .expect("live paragraph rich text");
+    let plain_text = rich_text
+        .iter()
+        .map(|part| part["plain_text"].as_str().unwrap_or_default())
+        .collect::<String>();
+    assert_eq!(
+        plain_text,
+        "Literal **bold** _italic_ ~~strike~~ `code` [link](https://example.com) changed",
+        "{after:#?}"
+    );
+    for part in rich_text {
+        assert_eq!(part["type"], "text", "{after:#?}");
+        assert!(part["text"]["link"].is_null(), "{after:#?}");
+        assert!(part["mention"].is_null(), "{after:#?}");
+        assert!(part["equation"].is_null(), "{after:#?}");
+        assert!(part["annotations"]["bold"] != true, "{after:#?}");
+        assert!(part["annotations"]["italic"] != true, "{after:#?}");
+        assert!(part["annotations"]["strikethrough"] != true, "{after:#?}");
+        assert!(part["annotations"]["code"] != true, "{after:#?}");
+    }
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    assert!(
+        verified.contains(
+            "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com) changed"
+        ),
+        "verified markdown should keep literal markdown inline markers escaped:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_table_width_change_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

@@ -1800,7 +1800,7 @@ fn rich_text(content: &str) -> Value {
 }
 
 fn rich_text_payload(content: &str, preimage: Option<&[RichTextDto]>) -> AfsResult<Value> {
-    let parts = parse_rich_text_markdown(content, preimage)?;
+    let parts = coalesce_adjacent_text_parts(parse_rich_text_markdown(content, preimage)?);
     Ok(Value::Array(
         parts
             .iter()
@@ -1983,6 +1983,32 @@ impl RichTextWritePart {
             Self::Preimage(part) => preimage_part_to_request_value(part),
         }
     }
+}
+
+fn coalesce_adjacent_text_parts(parts: Vec<RichTextWritePart>) -> Vec<RichTextWritePart> {
+    let mut coalesced = Vec::with_capacity(parts.len());
+
+    for part in parts {
+        match (coalesced.last_mut(), part) {
+            (
+                Some(RichTextWritePart::Text {
+                    content,
+                    link,
+                    annotations,
+                }),
+                RichTextWritePart::Text {
+                    content: next_content,
+                    link: next_link,
+                    annotations: next_annotations,
+                },
+            ) if link == &next_link && annotations == &next_annotations => {
+                content.push_str(&next_content);
+            }
+            (_, part) => coalesced.push(part),
+        }
+    }
+
+    coalesced
 }
 
 impl From<&RichTextAnnotationsDto> for InlineAnnotations {
@@ -2449,7 +2475,7 @@ fn parse_markdown_link(input: &str) -> Option<(String, &str, usize)> {
     let href_start = label_end + 2;
     let href_end = find_markdown_link_href_end(input, href_start)?;
     Some((
-        unescape_markdown_link_label(&input[1..label_end]),
+        input[1..label_end].to_string(),
         &input[href_start..href_end],
         href_end + 1,
     ))
@@ -2790,22 +2816,6 @@ fn unescape_markdown_text(value: &str) -> String {
     }
 
     unescaped
-}
-
-fn unescape_markdown_link_label(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\'
-            && let Some(next @ ('[' | ']')) = chars.peek().copied()
-        {
-            output.push(next);
-            chars.next();
-        } else {
-            output.push(ch);
-        }
-    }
-    output
 }
 
 fn preimage_part_to_request_value(part: &RichTextDto) -> AfsResult<Value> {
@@ -3188,9 +3198,7 @@ fn escape_markdown_text_with_options(text: &str, escape_inline_markers: bool) ->
 }
 
 fn escape_markdown_link_label(text: &str) -> String {
-    escape_markdown_text(text)
-        .replace('[', "\\[")
-        .replace(']', "\\]")
+    escape_markdown_text(text).replace(']', "\\]")
 }
 
 fn escaped_literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
@@ -3200,6 +3208,12 @@ fn escaped_literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
         "<br>",
         "</u>",
         "<u>",
+        "**",
+        "~~",
+        "`",
+        "[",
+        "]",
+        "_",
         "@date(",
         "@page(",
         "@database(",
@@ -3215,9 +3229,19 @@ fn escaped_literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
 
 fn literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
     literal_inline_tag_prefix(value).or_else(|| {
-        ["@date(", "@page(", "@database(", "@user("]
-            .into_iter()
-            .find(|marker| value.starts_with(marker))
+        [
+            "**",
+            "~~",
+            "`",
+            "[",
+            "_",
+            "@date(",
+            "@page(",
+            "@database(",
+            "@user(",
+        ]
+        .into_iter()
+        .find(|marker| value.starts_with(marker))
     })
 }
 
