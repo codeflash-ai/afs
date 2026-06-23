@@ -1583,7 +1583,38 @@ where
                     validator,
                 );
             }
-            VirtualMutationKind::Rename => {}
+            VirtualMutationKind::Rename => {
+                let remote_id = mutation.target_remote_id.clone().ok_or_else(|| {
+                    PushPrepareError::Core(AfsError::InvalidState(format!(
+                        "pending rename `{}` is missing a target remote id",
+                        mutation.local_id
+                    )))
+                })?;
+                let entity = store
+                    .get_entity(&mount.mount_id, &remote_id)
+                    .map_err(PushPrepareError::Store)?
+                    .ok_or_else(|| StoreError::EntityMissing {
+                        mount_id: mount.mount_id.clone(),
+                        remote_id: remote_id.clone(),
+                    })
+                    .map_err(PushPrepareError::Store)?;
+                if representative.is_none() {
+                    representative = Some(entity);
+                }
+                shadows.push(
+                    store
+                        .load_shadow(&mount.mount_id, &remote_id)
+                        .map_err(PushPrepareError::Store)?,
+                );
+                operations.push(PushOperation::UpdateProperties {
+                    entity_id: remote_id.clone(),
+                    properties: BTreeMap::from([(
+                        "title".to_string(),
+                        afs_core::planner::PropertyValue::String(mutation.title.clone()),
+                    )]),
+                });
+                affected.push(remote_id);
+            }
         }
     }
     let entity = representative.ok_or_else(|| {

@@ -549,6 +549,26 @@ where
         Ok(())
     }
 
+    fn rename_path(
+        &self,
+        old_path: &Path,
+        new_parent_path: &Path,
+        filename: &str,
+    ) -> Result<(), FuseError> {
+        let item = self.resolve_path(old_path)?;
+        ensure_writable_item(&item)?;
+        let new_parent = self.resolve_path(new_parent_path)?;
+        if new_parent.kind != VirtualFsItemKind::Folder {
+            return Err(FuseError::NotDirectory);
+        }
+        let report = self
+            .client
+            .rename(&item.identifier, &new_parent.identifier, filename)?;
+        self.remove_cached_path(old_path);
+        self.cache_item_at(child_path(new_parent_path, filename), report.item);
+        Ok(())
+    }
+
     fn update_cached_materialized_path(&self, identifier: &str, materialized_path: &str) {
         let mut cache = self.cache.lock().expect("fuse item cache");
         let byte_size = std::fs::metadata(materialized_path)
@@ -973,22 +993,9 @@ where
         name: &OsStr,
     ) -> FuseResult<()> {
         let old_path = child_path(Path::new(origin_parent), &origin_name.to_string_lossy());
-        let item = self.resolve_path(&old_path)?;
-        if item.kind != VirtualFsItemKind::File {
-            return Err(FuseError::ReadOnly.into());
-        }
-        ensure_writable_item(&item)?;
-        let new_parent = self.resolve_path(Path::new(parent))?;
-        if new_parent.kind != VirtualFsItemKind::Folder {
-            return Err(FuseError::NotDirectory.into());
-        }
         let filename = name.to_str().ok_or(FuseError::Invalid)?;
-        let report = self
-            .client
-            .rename(&item.identifier, &new_parent.identifier, filename)?;
-        self.remove_cached_path(&old_path);
-        self.cache_item_at(child_path(Path::new(parent), filename), report.item);
-        Ok(())
+        self.rename_path(&old_path, Path::new(parent), filename)
+            .map_err(Into::into)
     }
 
     async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> FuseResult<()> {
@@ -1355,6 +1362,7 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::new()),
@@ -1403,6 +1411,7 @@ mod tests {
                         )],
                     ),
                 ]),
+                renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
@@ -1441,6 +1450,7 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
@@ -1476,6 +1486,7 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
@@ -1505,6 +1516,60 @@ mod tests {
                 .lock()
                 .expect("fuse item cache")
                 .contains_key(Path::new("/Draft/page.md"))
+        );
+    }
+
+    #[test]
+    fn rename_path_accepts_folder_items_for_page_directory_rename() {
+        let root = test_root_item();
+        let page_dir = test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        let page_file = test_named_item("page-draft", "page.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                renamed: RefCell::new(Vec::new()),
+                trashed: RefCell::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft"), page_dir),
+                (PathBuf::from("/Draft/page.md"), page_file),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.rename_path(Path::new("/Draft"), Path::new(ROOT_PATH), "Published")
+            .expect("rename folder");
+
+        assert_eq!(
+            fs.client.renamed.borrow().as_slice(),
+            &[(
+                "children:page-draft".to_string(),
+                ROOT_CONTAINER_IDENTIFIER.to_string(),
+                "Published".to_string()
+            )]
+        );
+        assert!(
+            !fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/Draft"))
+        );
+        assert!(
+            !fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/Draft/page.md"))
+        );
+        assert!(
+            fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/Published"))
         );
     }
 
@@ -1568,6 +1633,7 @@ mod tests {
         mount_id: String,
         root: VirtualFsItem,
         children: BTreeMap<String, Vec<VirtualFsItem>>,
+        renamed: RefCell<Vec<(String, String, String)>>,
         trashed: RefCell<Vec<String>>,
     }
 
@@ -1640,11 +1706,26 @@ mod tests {
 
         fn rename(
             &self,
-            _identifier: &str,
-            _new_parent_identifier: &str,
-            _new_filename: &str,
+            identifier: &str,
+            new_parent_identifier: &str,
+            new_filename: &str,
         ) -> Result<VirtualFsMutationReport, FuseError> {
-            Err(FuseError::Daemon("unexpected rename request".to_string()))
+            self.renamed.borrow_mut().push((
+                identifier.to_string(),
+                new_parent_identifier.to_string(),
+                new_filename.to_string(),
+            ));
+            let kind = if identifier.starts_with("children:") {
+                VirtualFsItemKind::Folder
+            } else {
+                VirtualFsItemKind::File
+            };
+            Ok(VirtualFsMutationReport {
+                mount_id: self.mount_id.clone(),
+                identifier: identifier.to_string(),
+                path: new_filename.to_string(),
+                item: test_named_item(identifier, new_filename, kind),
+            })
         }
 
         fn trash(&self, _identifier: &str) -> Result<VirtualFsMutationReport, FuseError> {

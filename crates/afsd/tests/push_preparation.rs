@@ -1,11 +1,12 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use afs_core::planner::PushOperation;
+use afs_core::planner::{PropertyValue, PushOperation};
 use afs_core::push::PushPipelineAction;
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_core::validation::ValidationReport;
@@ -717,6 +718,95 @@ fn prepare_push_allows_notion_table_trailing_row_delete_before_apply() {
     assert!(prepared.pipeline.validation.is_clean());
     let plan = prepared.pipeline.plan.expect("plan");
     assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+}
+
+#[test]
+fn prepare_push_plans_pending_page_directory_rename_under_parent_scope() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-parent"),
+            EntityKind::Page,
+            "Home",
+            "Home/page.md",
+        ))
+        .expect("save parent page");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-child"),
+                EntityKind::Page,
+                "Renamed Child",
+                "Home/Renamed Child/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save renamed child page");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-child"),
+                "Child body.",
+                8,
+                [RemoteId::new("block-child")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "afs:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Child\"\n",
+            ),
+        )
+        .expect("save child shadow");
+    fixture.write_virtual_page(
+        "Home/Renamed Child/page.md",
+        "---\nafs:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Renamed Child\"\n---\nChild body.",
+    );
+    fs::create_dir_all(fixture.root.join("Home")).expect("visible parent dir");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "rename:page-child".to_string(),
+            mutation_kind: VirtualMutationKind::Rename,
+            target_remote_id: Some(RemoteId::new("page-child")),
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("Home/Child/page.md")),
+            projected_path: PathBuf::from("Home/Renamed Child/page.md"),
+            title: "Renamed Child".to_string(),
+            content_path: Some(
+                virtual_fs_content_path(
+                    &fixture.state_root,
+                    &fixture.mount_id,
+                    Path::new("Home/Renamed Child/page.md"),
+                )
+                .expect("content path"),
+            ),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save rename mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Home")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare parent scope rename");
+    let plan = prepared.pipeline.plan.expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateProperties {
+            entity_id: RemoteId::new("page-child"),
+            properties: BTreeMap::from([(
+                "title".to_string(),
+                PropertyValue::String("Renamed Child".to_string()),
+            )]),
+        }]
+    );
 }
 
 #[test]
