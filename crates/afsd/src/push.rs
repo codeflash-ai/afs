@@ -879,6 +879,12 @@ fn moved_rendered_link_to_page_edit_validation(
 }
 
 fn rendered_link_to_page_block_info(block: &ShadowBlock) -> Option<RenderedReadOnlyLink> {
+    if let Some(native_kind) = block.native_kind.as_deref()
+        && native_kind != "link_to_page"
+    {
+        return None;
+    }
+
     let info = rendered_link_to_page_markdown_info(block.text.trim())?;
     if compact_notion_id(block.remote_id.as_str()) == info.target_id {
         return None;

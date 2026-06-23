@@ -790,6 +790,75 @@ fn live_link_to_page_retarget_blocks_before_journaled_apply() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_paragraph_notion_link_labeled_like_link_to_page_can_be_edited() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let original_target = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live paragraph link original {}", unique_suffix()),
+        vec![paragraph_child("Original target for paragraph link.")],
+    );
+    let replacement_target = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live paragraph link replacement {}", unique_suffix()),
+        vec![paragraph_child("Replacement target for paragraph link.")],
+    );
+    let original_url = notion_object_url(&original_target.id);
+    let replacement_url = notion_object_url(&replacement_target.id);
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live paragraph link source {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": { "rich_text": [linked_text_part("Linked page", &original_url)] }
+        })],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let original_line = format!("[Linked page]({original_url})");
+    assert!(original.contains(&original_line), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(&original_line, &format!("[Linked page]({replacement_url})")),
+    )
+    .expect("write live paragraph link edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff live paragraph link edit");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("paragraph link edit plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live paragraph link edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let after = live_block_snapshot(&connector, &source.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after paragraph link edit");
+    assert_eq!(first["block"]["type"], "paragraph");
+    let first_json = serde_json::to_string(first).expect("paragraph block json");
+    assert!(
+        first_json.contains(&replacement_target.id)
+            || first_json.contains(&compact_notion_id(&replacement_target.id)),
+        "{after:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_table_width_change_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
@@ -3412,6 +3481,18 @@ fn text_part(text: &str) -> Value {
     json!({
         "type": "text",
         "text": { "content": text }
+    })
+}
+
+fn linked_text_part(text: &str, url: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": {
+            "content": text,
+            "link": { "url": url }
+        },
+        "href": url,
+        "plain_text": text
     })
 }
 

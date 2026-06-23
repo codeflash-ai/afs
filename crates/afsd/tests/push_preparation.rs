@@ -373,6 +373,44 @@ fn prepare_push_blocks_rendered_link_to_page_retarget_before_apply() {
 }
 
 #[test]
+fn prepare_push_allows_paragraph_link_labeled_like_link_to_page() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let original_link = "[Linked page](https://www.notion.so/11111111111111111111111111111111)";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        original_link,
+        8,
+        [RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].native_kind = Some("paragraph".to_string());
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "[Linked page](https://www.notion.so/22222222222222222222222222222222)",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert!(prepared.pipeline.validation.is_clean());
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(plan.summary.blocks_updated, 1);
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "[Linked page](https://www.notion.so/22222222222222222222222222222222)"
+                .to_string(),
+        }]
+    );
+}
+
+#[test]
 fn prepare_push_blocks_rendered_link_preview_edit_before_apply() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("notion");
