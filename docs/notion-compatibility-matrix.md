@@ -43,7 +43,7 @@ Support terms:
 | Code | Read/write | Fenced code block | Simple language and content edits round-trip. |
 | Divider | Read/write | `---` |  |
 | Equation | Read/write | Display math block | Inline equations are covered by rich text. |
-| Table | Read/write with stable shape | Markdown table | Cell edits, row appends, and trailing row deletes are supported. Width/header-mode changes are blocked. |
+| Table | Read/write with stable shape | Markdown table | Cell edits, row appends, and trailing row deletes are supported. Width/header-mode changes are blocked before journaled apply. |
 | Bookmark | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
 | Embed | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
 | Link preview | Read-only | Markdown link | The current Notion API rejects safe creation/write shapes for this block. |

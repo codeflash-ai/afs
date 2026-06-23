@@ -790,6 +790,65 @@ fn live_link_to_page_retarget_blocks_before_journaled_apply() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_table_width_change_blocks_before_journaled_apply() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live table width guard {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "table",
+            "table": {
+                "table_width": 2,
+                "has_column_header": true,
+                "has_row_header": false,
+                "children": [
+                    table_row_child("Task", "Owner"),
+                    table_row_child("Seed", "Alex")
+                ]
+            }
+        })],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &source.id);
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let edited = original
+        .replace("| Task | Owner |", "| Task | Owner | Status |")
+        .replace("| --- | --- |", "| --- | --- | --- |")
+        .replace("| Seed | Alex |", "| Seed | Alex | Todo |");
+    assert_ne!(edited, original, "{original}");
+    fs::write(&page_path, edited).expect("write live table width edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff live table width edit");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_table_width_change_unsupported"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live table width edit");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert_eq!(live_block_snapshot(&connector, &source.id), before);
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_child_page_link_move_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

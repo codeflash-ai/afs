@@ -9,6 +9,7 @@ pub mod database;
 pub mod dto;
 pub mod fetch;
 pub mod mapping;
+pub mod markdown_table;
 pub mod media;
 pub mod oauth;
 pub mod projection;

@@ -26,6 +26,7 @@ use crate::dto::{
     PagePropertyDto, RichTextAnnotationsDto, RichTextDto, TableBlockDto,
 };
 use crate::fetch::fetch_page_bundle;
+use crate::markdown_table::{parse_markdown_table_row, validate_markdown_table_separator};
 use crate::media::resolve_media_href_with_content_root;
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
@@ -1542,51 +1543,6 @@ fn parse_markdown_table(
     };
 
     Ok(ParsedMarkdownTable { rows })
-}
-
-fn parse_markdown_table_row(line: &str) -> AfsResult<Vec<String>> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('|') || !trimmed.ends_with('|') || trimmed.len() < 2 {
-        return Err(AfsError::Unsupported("writing malformed Notion tables"));
-    }
-
-    let inner = &trimmed[1..trimmed.len() - 1];
-    let mut cells = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    for ch in inner.chars() {
-        if ch == '|' && !escaped {
-            cells.push(unescape_markdown_table_cell(current.trim()));
-            current.clear();
-        } else {
-            current.push(ch);
-        }
-        escaped = ch == '\\' && !escaped;
-        if ch != '\\' {
-            escaped = false;
-        }
-    }
-    cells.push(unescape_markdown_table_cell(current.trim()));
-
-    Ok(cells)
-}
-
-fn validate_markdown_table_separator(line: &str, width: usize) -> AfsResult<()> {
-    let cells = parse_markdown_table_row(line)?;
-    let valid = cells.len() == width
-        && cells.iter().all(|cell| {
-            let trimmed = cell.trim();
-            trimmed.contains('-') && trimmed.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(AfsError::Unsupported("writing malformed Notion tables"))
-    }
-}
-
-fn unescape_markdown_table_cell(cell: &str) -> String {
-    cell.replace("\\|", "|").replace("<br>", "\n")
 }
 
 fn parse_supported_block(

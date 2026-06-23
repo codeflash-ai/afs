@@ -30,10 +30,12 @@ use afs_core::push::{
     plan_push_pipeline,
 };
 use afs_core::shadow::{
-    ShadowBlock, ShadowDocument, rendered_bodies_equivalent, segment_markdown_body,
+    MarkdownBlockKind, ShadowBlock, ShadowDocument, rendered_bodies_equivalent,
+    segment_markdown_body,
 };
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
+use afs_notion::markdown_table::parse_markdown_table_shape;
 use afs_notion::media::{
     load_media_manifest, media_manifest_entry, resolve_media_href_with_content_root, sha256_hex,
 };
@@ -526,7 +528,7 @@ fn parse_markdown_link_exact(input: &str) -> Option<(&str, &str)> {
     Some((&input[1..label_end], &input[href_start..href_end]))
 }
 
-fn validate_notion_read_only_link_changes(
+fn validate_notion_pre_apply_semantics(
     mount: &MountConfig,
     relative_path: &Path,
     shadow: &ShadowDocument,
@@ -546,7 +548,7 @@ fn validate_notion_read_only_link_changes(
     let Some(plan) = pipeline.plan.as_ref() else {
         return;
     };
-    let validation = notion_read_only_link_change_validation(relative_path, shadow, plan);
+    let validation = notion_pre_apply_semantic_validation(relative_path, shadow, plan);
     if validation.is_clean() {
         return;
     }
@@ -557,7 +559,7 @@ fn validate_notion_read_only_link_changes(
     pipeline.action = PushPipelineAction::FixValidation;
 }
 
-fn notion_read_only_link_change_validation(
+fn notion_pre_apply_semantic_validation(
     relative_path: &Path,
     shadow: &ShadowDocument,
     plan: &PushPlan,
@@ -608,6 +610,11 @@ fn notion_read_only_link_change_validation(
                 }
                 if let Some(issue) =
                     rendered_link_to_page_edit_validation(relative_path, shadow_block, content)
+                {
+                    validation.push(issue);
+                }
+                if let Some(issue) =
+                    notion_table_shape_change_validation(relative_path, shadow_block, content)
                 {
                     validation.push(issue);
                 }
@@ -667,6 +674,51 @@ fn notion_read_only_link_change_validation(
     }
 
     validation
+}
+
+fn notion_table_shape_change_validation(
+    relative_path: &Path,
+    shadow_block: &ShadowBlock,
+    content: &str,
+) -> Option<ValidationIssue> {
+    let MarkdownBlockKind::TableWithRows {
+        has_column_header, ..
+    } = &shadow_block.kind
+    else {
+        return None;
+    };
+    let original = parse_markdown_table_shape(&shadow_block.text).ok()?;
+    let edited = parse_markdown_table_shape(content).ok()?;
+
+    if edited.width != original.width
+        || edited
+            .row_widths
+            .iter()
+            .any(|row_width| *row_width != original.width)
+    {
+        return Some(ValidationIssue::new(
+            "notion_table_width_change_unsupported",
+            relative_path,
+            Some(shadow_block.source_span.start_line),
+            "changing the width of an existing Notion table is not supported from Markdown",
+            Some(
+                "restore the original table column count; edit cells or append/remove rows instead"
+                    .to_string(),
+            ),
+        ));
+    }
+
+    if !has_column_header && edited.header.iter().any(|cell| !cell.trim().is_empty()) {
+        return Some(ValidationIssue::new(
+            "notion_table_header_mode_change_unsupported",
+            relative_path,
+            Some(shadow_block.source_span.start_line),
+            "changing the header mode of an existing Notion table is not supported from Markdown",
+            Some("keep the rendered blank header row, or change table header settings directly in Notion".to_string()),
+        ));
+    }
+
+    None
 }
 
 fn moved_rendered_child_page_link_block<'a>(
@@ -1057,7 +1109,7 @@ where
         },
         &mut pipeline,
     );
-    validate_notion_read_only_link_changes(&mount, &relative_path, &shadow, &mut pipeline);
+    validate_notion_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
 
     Ok(PreparedPush {
         absolute_path,

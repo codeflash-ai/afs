@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::PushOperation;
 use afs_core::push::PushPipelineAction;
-use afs_core::shadow::ShadowDocument;
+use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_core::validation::ValidationReport;
 use afs_notion::media::sha256_hex;
 use afs_store::{
@@ -369,6 +369,78 @@ fn prepare_push_blocks_rendered_link_to_page_retarget_before_apply() {
     assert_eq!(
         prepared.pipeline.validation.issues[0].code,
         "notion_link_to_page_retarget_unsupported"
+    );
+}
+
+#[test]
+fn prepare_push_blocks_notion_table_width_change_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let body = "| Name | Status |\n| --- | --- |\n| Old task | Todo |";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        body,
+        8,
+        [RemoteId::new("table-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: vec![RemoteId::new("row-1")],
+        has_column_header: true,
+        has_row_header: false,
+    };
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "| Name | Status | Owner |\n| --- | --- | --- |\n| Old task | Todo | Alex |",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_table_width_change_unsupported"
+    );
+}
+
+#[test]
+fn prepare_push_blocks_notion_table_header_mode_change_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let body = "|  |  |\n| --- | --- |\n| Old task | Todo |";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        body,
+        8,
+        [RemoteId::new("table-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: vec![RemoteId::new("row-1")],
+        has_column_header: false,
+        has_row_header: false,
+    };
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "| Name | Status |\n| --- | --- |\n| Old task | Todo |",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_table_header_mode_change_unsupported"
     );
 }
 
