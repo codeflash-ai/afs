@@ -145,6 +145,79 @@ fn runtime_answers_virtual_fs_children_while_pull_worker_is_blocked() {
 }
 
 #[test]
+fn runtime_answers_file_provider_children_from_cache_while_pull_worker_is_blocked() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (children_tx, children_rx) = mpsc::channel();
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("file-provider-children-while-blocked"),
+        BlockingVirtualFsRunner {
+            started: started_tx,
+            release: Arc::clone(&release),
+            children_tx,
+            refresh_tx,
+        },
+    )
+    .expect("spawn runtime");
+    let pull_handle = runtime.handle();
+
+    let pull_thread = thread::spawn(move || {
+        pull_handle.request(DaemonRequest::Pull {
+            path: PathBuf::from("Roadmap.md"),
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("pull started");
+
+    let metadata_handle = runtime.handle();
+    let (response_tx, response_rx) = mpsc::channel();
+    let metadata_thread = thread::spawn(move || {
+        let response = metadata_handle.request(DaemonRequest::FileProviderChildren {
+            mount_id: "notion-main".to_string(),
+            container_identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
+        });
+        response_tx.send(response).expect("send metadata response");
+    });
+
+    let children_call = children_rx.recv_timeout(Duration::from_secs(1));
+    let response = response_rx.recv_timeout(Duration::from_secs(1));
+    let refresh_before_release = refresh_rx.recv_timeout(Duration::from_millis(100));
+
+    release_blocked_runner(&release);
+    assert!(pull_thread.join().expect("pull thread").ok);
+    metadata_thread.join().expect("metadata thread");
+
+    assert_eq!(
+        children_call.expect("file provider children should read cache while pull is active"),
+        (
+            "notion-main".to_string(),
+            ROOT_CONTAINER_IDENTIFIER.to_string()
+        )
+    );
+    assert!(
+        response
+            .expect("file provider children response should not wait for pull")
+            .ok
+    );
+    assert!(
+        refresh_before_release.is_err(),
+        "interactive refresh should remain serialized behind active mutating work"
+    );
+    assert_eq!(
+        refresh_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued interactive child refresh"),
+        (
+            "notion-main".to_string(),
+            ROOT_CONTAINER_IDENTIFIER.to_string()
+        )
+    );
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_file_provider_children_bypasses_active_background_refreshes() {
     let config = relay_config("file-provider-bypasses-background");
     let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
@@ -505,8 +578,9 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
         mount_id: "notion-main".to_string(),
         container_identifier: "children:page-a".to_string(),
     });
-    let page_a_children = simulation.expect_started(SchedulerExpectedStart::new(
-        SchedulerOpKind::FileProviderChildren,
+    simulation.assert_response_ok(directory_open);
+    let page_a_children_refresh = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::RefreshChildren,
         "children:page-a",
     ));
 
@@ -515,18 +589,17 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
         mount_id: "notion-main".to_string(),
         identifier: "page-open".to_string(),
     });
-    simulation.expect_no_start();
-
-    simulation.advance_to(
-        30,
-        SchedulerInputAction::Complete(SchedulerOpKind::FileProviderChildren, "children:page-a"),
-    );
-    simulation.release(page_a_children);
-    simulation.assert_response_ok(directory_open);
     let page_open = simulation.expect_started(SchedulerExpectedStart::new(
         SchedulerOpKind::FileProviderRead,
         "page-open",
     ));
+
+    simulation.advance_to(
+        30,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-a"),
+    );
+    simulation.release(page_a_children_refresh);
+    simulation.expect_no_start();
 
     simulation.advance_to(40, SchedulerInputAction::OtherOperation("ManualSync.md"));
     let pull = simulation.request(DaemonRequest::Pull {
@@ -602,8 +675,8 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
             ROOT_CONTAINER_IDENTIFIER,
         ),
         SchedulerTimelineEntry::new(0, SchedulerOpKind::RefreshChildren, "source:notion"),
-        SchedulerTimelineEntry::new(10, SchedulerOpKind::FileProviderChildren, "children:page-a"),
-        SchedulerTimelineEntry::new(30, SchedulerOpKind::FileProviderRead, "page-open"),
+        SchedulerTimelineEntry::new(10, SchedulerOpKind::RefreshChildren, "children:page-a"),
+        SchedulerTimelineEntry::new(20, SchedulerOpKind::FileProviderRead, "page-open"),
         SchedulerTimelineEntry::new(50, SchedulerOpKind::Pull, "ManualSync.md"),
         SchedulerTimelineEntry::new(60, SchedulerOpKind::RefreshChildren, "children:page-a1"),
         SchedulerTimelineEntry::new(80, SchedulerOpKind::RefreshChildren, "children:page-b"),
@@ -1187,6 +1260,15 @@ impl SchedulerPolicySimulation {
                 .projection(ProjectionMode::LinuxFuse),
             )
             .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-a"),
+                EntityKind::Page,
+                "A",
+                "A/page.md",
+            ))
+            .expect("save cached page");
         drop(store);
 
         let (started_tx, started_rx) = mpsc::channel();
@@ -1384,7 +1466,6 @@ impl SchedulerInputAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SchedulerOpKind {
     RefreshChildren,
-    FileProviderChildren,
     FileProviderRead,
     Pull,
 }
@@ -1512,33 +1593,6 @@ impl ScriptedSchedulerState {
         self.save_entities(state_root, entries)
     }
 
-    fn save_interactive_children(
-        &self,
-        state_root: PathBuf,
-        container_identifier: &str,
-    ) -> AfsResult<usize> {
-        let entries = match container_identifier {
-            "children:page-a" => vec![
-                EntityRecord::new(
-                    self.mount_id.clone(),
-                    RemoteId::new("page-a"),
-                    EntityKind::Page,
-                    "A",
-                    "A/page.md",
-                ),
-                EntityRecord::new(
-                    self.mount_id.clone(),
-                    RemoteId::new("page-a1"),
-                    EntityKind::Page,
-                    "A1",
-                    "A/A1/page.md",
-                ),
-            ],
-            _ => Vec::new(),
-        };
-        self.save_entities(state_root, entries)
-    }
-
     fn save_entities(&self, state_root: PathBuf, entries: Vec<EntityRecord>) -> AfsResult<usize> {
         let saved = entries.len();
         let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
@@ -1600,27 +1654,17 @@ impl RuntimeJobRunner for ScriptedSchedulerRunner {
             .save_refresh_results(state_root, &container_identifier)
     }
 
-    fn run_file_provider_children(
+    fn run_virtual_fs_children(
         &self,
-        state_root: PathBuf,
+        _state_root: PathBuf,
         mount_id: String,
         container_identifier: String,
     ) -> DaemonResponse {
-        self.state.start_blocking(
-            SchedulerOpKind::FileProviderChildren,
-            container_identifier.clone(),
-        );
-        match self
-            .state
-            .save_interactive_children(state_root, &container_identifier)
-        {
-            Ok(_) => DaemonResponse::ok(json!({
-                "mount_id": mount_id,
-                "container_identifier": container_identifier,
-                "children": []
-            })),
-            Err(error) => DaemonResponse::error("test_store_error", error.to_string()),
-        }
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "container_identifier": container_identifier,
+            "children": []
+        }))
     }
 
     fn run_file_provider_read(
@@ -1808,7 +1852,7 @@ impl RuntimeJobRunner for BlockingBackgroundRefreshRunner {
         Ok(0)
     }
 
-    fn run_file_provider_children(
+    fn run_virtual_fs_children(
         &self,
         _state_root: PathBuf,
         mount_id: String,
