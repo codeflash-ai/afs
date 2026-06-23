@@ -498,6 +498,122 @@ fn live_directive_block_move_pushes_and_reconciles_notion() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_link_to_page_line_move_preserves_notion_block_type() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let target = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live link move target {}", unique_suffix()),
+        vec![paragraph_child("Target for link_to_page move.")],
+    );
+    let anchor_text = "Anchor before link_to_page.";
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live link move source {}", unique_suffix()),
+        vec![
+            paragraph_child(anchor_text),
+            json!({
+                "object": "block",
+                "type": "link_to_page",
+                "link_to_page": { "type": "page_id", "page_id": target.id }
+            }),
+        ],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &source.id);
+    let original_link_id = before
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find_map(|entry| {
+                (entry["block"]["type"] == "link_to_page")
+                    .then(|| entry["block"]["id"].as_str())
+                    .flatten()
+            })
+        })
+        .expect("link_to_page block id")
+        .to_string();
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let link_line = original
+        .lines()
+        .find(|line| {
+            line.starts_with("[Linked page](") && line.contains(&compact_notion_id(&target.id))
+        })
+        .expect("rendered link_to_page line");
+    let original_order = format!("{anchor_text}\n\n{link_line}\n");
+    assert!(original.contains(&original_order), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(
+            &original_order,
+            &format!("{link_line}\n\n{anchor_text}\n\n"),
+        ),
+    )
+    .expect("write live link_to_page move");
+
+    let diff = run_diff(&store, &page_path).expect("diff live link_to_page move");
+    let plan = diff.plan.as_ref().expect("link_to_page move plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.blocks_created, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_archived, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_moved, 0, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live link_to_page move");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.apply_effect_count, 2);
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean link_to_page move status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let after = live_block_snapshot(&connector, &source.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after link_to_page move");
+    assert_ne!(first["block"]["id"], original_link_id);
+    assert_eq!(first["block"]["type"], "link_to_page");
+    assert_eq!(
+        compact_notion_id(
+            first["block"]["link_to_page"]["page_id"]
+                .as_str()
+                .expect("moved link target page id")
+        ),
+        compact_notion_id(&target.id)
+    );
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    let link_index = verified
+        .lines()
+        .position(|line| {
+            line.starts_with("[Linked page](") && line.contains(&compact_notion_id(&target.id))
+        })
+        .expect("reconciled link_to_page line");
+    let anchor_index = verified
+        .lines()
+        .position(|line| line == anchor_text)
+        .expect("reconciled anchor paragraph");
+    assert!(link_index < anchor_index, "{verified}");
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

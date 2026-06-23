@@ -13,7 +13,7 @@ use afs_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUn
 use afs_core::journal::JournalApplyEffect;
 use afs_core::model::RemoteId;
 use afs_core::planner::{PropertyValue, PushOperation};
-use afs_core::shadow::segment_markdown_body;
+use afs_core::shadow::{rendered_bodies_equivalent, segment_markdown_body};
 use afs_core::undo::{UndoOperation, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
 use serde::Serialize;
@@ -64,9 +64,11 @@ pub fn apply_plan(
     let bundles = fetch_affected_bundles(api, &request.plan.affected_entities, &create_parent_ids)?;
     let current_blocks = block_map(&bundles);
     let block_parents = block_parent_index(&bundles);
+    let archived_block_ids = archived_block_ids(&request.plan.operations);
     let mut changed_remote_ids = Vec::new();
     let mut effects = Vec::new();
     let mut append_chains: BTreeMap<(RemoteId, Option<RemoteId>), RemoteId> = BTreeMap::new();
+    let mut preserved_append_archive_moves = BTreeSet::new();
 
     for (operation_index, operation) in request.plan.operations.iter().enumerate() {
         match operation {
@@ -171,11 +173,29 @@ pub fn apply_plan(
                 after,
                 content,
             } => {
-                let patch = parse_append_block(api, content, request.local_root)?;
                 let after = block_parents.normalize_after(parent_id, after.as_ref());
                 let chain_key = (parent_id.clone(), after.clone());
                 let effective_after = append_chains.get(&chain_key).cloned().or(after);
-                let body = append_body(patch.append_child(), effective_after.as_ref());
+                let preserved = preserved_archived_block_append_child(
+                    parent_id,
+                    content,
+                    &current_blocks,
+                    &block_parents,
+                    &archived_block_ids,
+                    &mut preserved_append_archive_moves,
+                )?;
+                let (body, preserved_source_id) = if let Some((source_id, child)) = preserved {
+                    (
+                        append_body(child, effective_after.as_ref()),
+                        Some(source_id),
+                    )
+                } else {
+                    let patch = parse_append_block(api, content, request.local_root)?;
+                    (
+                        append_body(patch.append_child(), effective_after.as_ref()),
+                        None,
+                    )
+                };
                 let result = api.append_block_children(parent_id.as_str(), body)?;
                 let created = result.results.first().ok_or_else(|| {
                     AfsError::InvalidState(
@@ -184,6 +204,9 @@ pub fn apply_plan(
                 })?;
                 let created_id = RemoteId::new(created.id.clone());
                 append_chains.insert(chain_key, created_id.clone());
+                if let Some(source_id) = preserved_source_id {
+                    append_chains.insert((parent_id.clone(), Some(source_id)), created_id.clone());
+                }
                 effects.push(JournalApplyEffect::CreatedBlock {
                     operation_id: request.operation_ids[operation_index].clone(),
                     operation_index,
@@ -385,6 +408,16 @@ fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
         .collect()
 }
 
+fn archived_block_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::ArchiveBlock { block_id } => Some(block_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
     operations
         .iter()
@@ -444,6 +477,14 @@ impl BlockParentIndex {
         }
 
         Some(original)
+    }
+
+    fn same_containing_page(&self, parent_id: &RemoteId, block_id: &RemoteId) -> bool {
+        let Some(block_page_id) = self.containing_pages.get(block_id) else {
+            return false;
+        };
+        let parent_page_id = self.containing_pages.get(parent_id).unwrap_or(parent_id);
+        block_page_id == parent_page_id
     }
 }
 
@@ -613,6 +654,86 @@ fn current_block<'a>(
     })
 }
 
+fn preserved_archived_block_append_child(
+    parent_id: &RemoteId,
+    content: &str,
+    current_blocks: &BTreeMap<RemoteId, &BlockDto>,
+    block_parents: &BlockParentIndex,
+    archived_block_ids: &BTreeSet<RemoteId>,
+    used_block_ids: &mut BTreeSet<RemoteId>,
+) -> AfsResult<Option<(RemoteId, Value)>> {
+    for block_id in archived_block_ids {
+        if used_block_ids.contains(block_id) {
+            continue;
+        }
+        let Some(block) = current_blocks.get(block_id).copied() else {
+            continue;
+        };
+        if !block_parents.same_containing_page(parent_id, block_id) {
+            continue;
+        }
+        let Some(rendered) = rendered_read_only_block_markdown(block)? else {
+            continue;
+        };
+        if rendered_bodies_equivalent(&rendered, content) {
+            let child = existing_block_append_child(block)?;
+            used_block_ids.insert(block_id.clone());
+            return Ok(Some((block_id.clone(), child)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn rendered_read_only_block_markdown(block: &BlockDto) -> AfsResult<Option<String>> {
+    match block.kind.as_str() {
+        "link_to_page" => {
+            let payload = block
+                .link_to_page
+                .as_ref()
+                .ok_or_else(|| missing_block_payload(block))?;
+            let link = match payload.kind.as_str() {
+                "page_id" => payload
+                    .page_id
+                    .as_deref()
+                    .map(|id| ("Linked page", notion_object_url(id))),
+                "database_id" => payload
+                    .database_id
+                    .as_deref()
+                    .map(|id| ("Linked database", notion_object_url(id))),
+                _ => None,
+            };
+            Ok(link.map(|(label, href)| markdown_link_preserving_whitespace(label, &href)))
+        }
+        "child_page" => {
+            let title = block
+                .child_page
+                .as_ref()
+                .map(|child| child.title.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("Untitled child page");
+            Ok(Some(markdown_link_preserving_whitespace(
+                title,
+                &notion_object_url(&block.id),
+            )))
+        }
+        "link_preview" => {
+            let payload = block
+                .link_preview
+                .as_ref()
+                .ok_or_else(|| missing_block_payload(block))?;
+            let label = rich_text_list_plain_text(&payload.caption)
+                .filter(|caption| !caption.trim().is_empty())
+                .unwrap_or_else(|| payload.url.clone());
+            Ok(Some(markdown_link_preserving_whitespace(
+                &label,
+                &payload.url,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn existing_block_append_child(block: &BlockDto) -> AfsResult<Value> {
     if block.has_children {
         return Err(AfsError::Unsupported(
@@ -657,7 +778,7 @@ fn existing_block_payload(block: &BlockDto) -> AfsResult<Value> {
         "pdf" => file_payload(block, block.pdf.as_ref()),
         "audio" => file_payload(block, block.audio.as_ref()),
         "synced_block" => serialize_existing_payload(block, block.synced_block.as_ref()),
-        "link_to_page" => serialize_existing_payload(block, block.link_to_page.as_ref()),
+        "link_to_page" => link_to_page_payload(block),
         "table_of_contents" => serialize_existing_payload(block, block.table_of_contents.as_ref()),
         "breadcrumb" => serialize_existing_payload(block, block.breadcrumb.as_ref()),
         "column_list" => serialize_existing_payload(block, block.column_list.as_ref()),
@@ -684,6 +805,26 @@ fn file_payload(block: &BlockDto, payload: Option<&FileBlockDto>) -> AfsResult<V
         ));
     }
     serialize_existing_payload(block, Some(payload))
+}
+
+fn link_to_page_payload(block: &BlockDto) -> AfsResult<Value> {
+    let payload = block
+        .link_to_page
+        .as_ref()
+        .ok_or_else(|| missing_block_payload(block))?;
+    match payload.kind.as_str() {
+        "page_id" => Ok(json!({
+            "type": "page_id",
+            "page_id": payload.page_id.as_deref().ok_or_else(|| missing_block_payload(block))?,
+        })),
+        "database_id" => Ok(json!({
+            "type": "database_id",
+            "database_id": payload.database_id.as_deref().ok_or_else(|| missing_block_payload(block))?,
+        })),
+        _ => Err(AfsError::Unsupported(
+            "moving malformed Notion link_to_page blocks",
+        )),
+    }
 }
 
 fn serialize_existing_payload<T: Serialize>(
@@ -2856,6 +2997,18 @@ fn rich_text_part_plain_text(part: &RichTextDto) -> String {
             .unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+fn rich_text_list_plain_text(rich_text: &[RichTextDto]) -> Option<String> {
+    if rich_text.is_empty() {
+        return None;
+    }
+    Some(
+        rich_text
+            .iter()
+            .map(rich_text_part_plain_text)
+            .collect::<String>(),
+    )
 }
 
 fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
