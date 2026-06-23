@@ -1136,12 +1136,12 @@ where
     S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
     Validator: SourcePushValidator + ?Sized,
 {
-    let absolute_path = absolute_path(&job.target_path)?;
+    let mut absolute_path = absolute_path(&job.target_path)?;
     let mounts = store.load_mounts().map_err(PushPrepareError::Store)?;
     let mount = find_mount_for_path(&mounts, &absolute_path)
         .cloned()
         .ok_or_else(|| PushPrepareError::MountNotFound(absolute_path.clone()))?;
-    let relative_path = relative_entity_path(&mount, &absolute_path)?;
+    let mut relative_path = relative_entity_path(&mount, &absolute_path)?;
     if let Some(pending) = store
         .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
         .map_err(PushPrepareError::Store)?
@@ -1185,9 +1185,20 @@ where
             validator,
         );
     }
-    let entity = store
+    let mut entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
         .map_err(PushPrepareError::Store)?;
+    if entity.is_none() && absolute_path.is_dir() {
+        let page_relative_path = page_document_path(&relative_path);
+        if let Some(page_entity) = store
+            .find_entity_by_path(&mount.mount_id, &page_relative_path)
+            .map_err(PushPrepareError::Store)?
+        {
+            absolute_path = page_document_path(&absolute_path);
+            relative_path = page_relative_path;
+            entity = Some(page_entity);
+        }
+    }
 
     let Some(entity) = entity else {
         if relative_path.as_os_str().is_empty() || absolute_path.is_dir() {

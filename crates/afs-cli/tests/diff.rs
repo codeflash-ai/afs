@@ -87,6 +87,42 @@ fn diff_reports_tight_rendered_lists_as_noop_against_shadow() {
 }
 
 #[test]
+fn diff_page_directory_targets_page_document() {
+    let fixture = DiffFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nSame paragraph."))
+        .expect("save shadow");
+    fixture.write_page("Roadmap/page.md", "# Roadmap\n\nSame paragraph.");
+
+    let report = run_diff(&store, fixture.root.join("Roadmap")).expect("diff report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "noop");
+    assert_eq!(report.entity_id, "page-1");
+    assert!(report.plan.unwrap().operations.is_empty());
+}
+
+#[test]
 fn diff_virtual_projection_reads_daemon_content_cache() {
     let fixture = DiffFixture::new();
     let state_root = fixture.root.join("state");
