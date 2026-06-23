@@ -2423,9 +2423,7 @@ fn parse_markdown_link(input: &str) -> Option<(String, &str, usize)> {
     }
     let label_end = find_markdown_link_label_end(input)?;
     let href_start = label_end + 2;
-    let href_end = input[href_start..]
-        .find(')')
-        .map(|offset| href_start + offset)?;
+    let href_end = find_markdown_link_href_end(input, href_start)?;
     Some((
         unescape_markdown_link_label(&input[1..label_end]),
         &input[href_start..href_end],
@@ -2448,6 +2446,31 @@ fn find_markdown_link_label_end(input: &str) -> Option<usize> {
             return Some(index);
         }
     }
+    None
+}
+
+fn find_markdown_link_href_end(input: &str, href_start: usize) -> Option<usize> {
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+
+    for (offset, ch) in input[href_start..].char_indices() {
+        let index = href_start + offset;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' if paren_depth == 0 => return Some(index),
+            ')' => paren_depth -= 1,
+            _ => {}
+        }
+    }
+
     None
 }
 

@@ -859,6 +859,68 @@ fn live_paragraph_notion_link_labeled_like_link_to_page_can_be_edited() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_paragraph_link_with_parentheses_href_can_be_edited() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let href = "https://example.com/docs(foo)";
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live paragraph paren link {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": { "rich_text": [linked_text_part("Paren link", href)] }
+        })],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let original_line = format!("[Paren link]({href})");
+    assert!(original.contains(&original_line), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(&original_line, &format!("[Paren link changed]({href})")),
+    )
+    .expect("write live parenthesized paragraph link edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff live parenthesized paragraph link edit");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("paragraph link edit plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live parenthesized paragraph link edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let after = live_block_snapshot(&connector, &source.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after paragraph link edit");
+    assert_eq!(first["block"]["type"], "paragraph");
+    let link_url = first["block"]["paragraph"]["rich_text"][0]["text"]["link"]["url"]
+        .as_str()
+        .expect("live paragraph link url");
+    assert_eq!(link_url, href, "{after:#?}");
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    assert!(
+        verified.contains(&format!("[Paren link changed]({href})")),
+        "verified markdown should preserve the parenthesized href:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_table_width_change_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
