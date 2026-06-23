@@ -411,7 +411,7 @@ fn restore_archived_block_child(
     if native_kind.unwrap_or("link_to_page") == "link_to_page"
         && let Some((label, href, consumed)) = parse_markdown_link(trimmed)
         && consumed == trimmed.len()
-        && let Some(target_id) = notion_page_id_from_href(href)
+        && let Some(target_id) = notion_page_id_from_href(&href)
     {
         match label.as_str() {
             "Linked page" => {
@@ -1720,7 +1720,7 @@ fn parse_append_block(
     let trimmed = markdown.trim_end_matches('\n');
     if let Some((caption, href, image_syntax)) = parse_local_media_markdown(trimmed) {
         let Some(local_root) = local_root else {
-            if image_syntax || looks_like_media_href(href) {
+            if image_syntax || looks_like_media_href(&href) {
                 return Err(AfsError::InvalidState(
                     "local media upload requires an apply local root".to_string(),
                 ));
@@ -1728,9 +1728,9 @@ fn parse_append_block(
             return parse_supported_block(markdown, None, None);
         };
         let Some(local_path) =
-            resolve_media_href_with_content_root(Path::new("page.md"), href, local_root)
+            resolve_media_href_with_content_root(Path::new("page.md"), &href, local_root)
         else {
-            if image_syntax || looks_like_media_href(href) {
+            if image_syntax || looks_like_media_href(&href) {
                 return Err(AfsError::Unsupported(
                     "appended local media blocks must reference .afs/media under the projection output root",
                 ));
@@ -2242,7 +2242,7 @@ impl InlineParser<'_> {
         if rest.starts_with('[')
             && let Some((label, href, consumed)) = parse_markdown_link(rest)
         {
-            if let Some(id) = notion_page_id_from_href(href) {
+            if let Some(id) = notion_page_id_from_href(&href) {
                 if self.preimage_has_mention("database", &id) {
                     return Ok(Some((
                         vec![RichTextWritePart::DatabaseMention {
@@ -2263,7 +2263,7 @@ impl InlineParser<'_> {
 
             let mut parts = parse_nested(&label, self.preimage_tokens, false)?;
             for part in &mut parts {
-                part.apply_link(href)?;
+                part.apply_link(&href)?;
             }
             return Ok(Some((parts, consumed)));
         }
@@ -2467,7 +2467,7 @@ fn parse_database_mention_arg(input: &str) -> AfsResult<String> {
     }
 }
 
-fn parse_markdown_link(input: &str) -> Option<(String, &str, usize)> {
+fn parse_markdown_link(input: &str) -> Option<(String, String, usize)> {
     if !input.starts_with('[') {
         return None;
     }
@@ -2476,9 +2476,27 @@ fn parse_markdown_link(input: &str) -> Option<(String, &str, usize)> {
     let href_end = find_markdown_link_href_end(input, href_start)?;
     Some((
         input[1..label_end].to_string(),
-        &input[href_start..href_end],
+        unescape_markdown_link_href(&input[href_start..href_end]),
         href_end + 1,
     ))
+}
+
+fn unescape_markdown_link_href(href: &str) -> String {
+    let mut unescaped = String::with_capacity(href.len());
+    let mut chars = href.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(next) => unescaped.push(next),
+                None => unescaped.push('\\'),
+            }
+        } else {
+            unescaped.push(ch);
+        }
+    }
+
+    unescaped
 }
 
 fn find_markdown_link_label_end(input: &str) -> Option<usize> {
@@ -2524,7 +2542,7 @@ fn find_markdown_link_href_end(input: &str, href_start: usize) -> Option<usize> 
     None
 }
 
-fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(String, &'a str)> {
+fn parse_media_markdown(kind: &str, input: &str) -> Option<(String, String)> {
     let (label, href, consumed) = match kind {
         "image" => {
             let link = input.strip_prefix('!')?;
@@ -2542,15 +2560,15 @@ fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(String, &'a s
     }
 }
 
-fn parse_local_media_markdown(input: &str) -> Option<(String, &str, bool)> {
+fn parse_local_media_markdown(input: &str) -> Option<(String, String, bool)> {
     if let Some((caption, href)) = parse_media_markdown("image", input)
-        && !is_external_url(href)
+        && !is_external_url(&href)
     {
         return Some((caption, href, true));
     }
 
     if let Some((caption, href)) = parse_media_markdown("file", input)
-        && !is_external_url(href)
+        && !is_external_url(&href)
     {
         return Some((caption, href, false));
     }
@@ -3134,7 +3152,11 @@ fn rich_text_list_plain_text(rich_text: &[RichTextDto]) -> Option<String> {
 
 fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
     wrap_preserving_whitespace(label, |value| {
-        format!("[{}]({href})", escape_markdown_link_label(value))
+        format!(
+            "[{}]({})",
+            escape_markdown_link_label(value),
+            escape_markdown_link_href(href)
+        )
     })
 }
 
@@ -3204,6 +3226,12 @@ fn escape_markdown_text_with_options(text: &str, escape_inline_markers: bool) ->
 
 fn escape_markdown_link_label(text: &str) -> String {
     escape_markdown_text(text).replace(']', "\\]")
+}
+
+fn escape_markdown_link_href(href: &str) -> String {
+    href.replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
 }
 
 fn escaped_literal_inline_marker_prefix(value: &str) -> Option<&'static str> {

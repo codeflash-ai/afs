@@ -210,7 +210,7 @@ fn diff_plans_local_image_media_byte_update_from_manifest() {
 }
 
 #[test]
-fn diff_plans_local_image_media_byte_update_with_parenthesized_href() {
+fn diff_plans_local_image_media_byte_update_with_escaped_parenthesized_href() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();
     let media_path = PathBuf::from(".afs/media/Roadmap/image-(1).png");
@@ -223,7 +223,7 @@ fn diff_plans_local_image_media_byte_update_with_parenthesized_href() {
         "https://example.com/original-image.png",
         original_bytes,
     );
-    let original_body = "![Original image](.afs/media/Roadmap/image-(1).png)\n";
+    let original_body = "![Original image](.afs/media/Roadmap/image-\\(1\\).png)\n";
     let path = fixture.write_page("Roadmap.md", original_body);
     fs::write(fixture.root.join(&media_path), b"updated image bytes").expect("update media");
     store

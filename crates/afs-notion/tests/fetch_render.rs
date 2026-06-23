@@ -1431,6 +1431,27 @@ fn render_rich_text_annotations_links_mentions_and_equations() {
 }
 
 #[test]
+fn render_rich_text_link_escapes_unbalanced_href_parentheses() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block(
+                "paragraph-1",
+                vec![linked_text("Paren link", "https://example.com/docs/foo)")],
+            ),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "[Paren link](https://example.com/docs/foo\\))\n"
+    );
+}
+
+#[test]
 fn render_database_row_properties_as_frontmatter() {
     let mut row = page("row-1", "Fix login bug");
     row.properties.insert(

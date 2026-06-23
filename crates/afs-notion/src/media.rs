@@ -235,7 +235,8 @@ fn resolve_media_href_inner(
         return None;
     }
 
-    let decoded = percent_decode(href)?;
+    let unescaped = unescape_markdown_href(href);
+    let decoded = percent_decode(&unescaped)?;
     let decoded_path = Path::new(&decoded);
     if decoded_path.is_absolute() {
         let content_root = content_root?;
@@ -252,6 +253,24 @@ fn resolve_media_href_inner(
     } else {
         None
     }
+}
+
+fn unescape_markdown_href(href: &str) -> String {
+    let mut unescaped = String::with_capacity(href.len());
+    let mut chars = href.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(next) => unescaped.push(next),
+                None => unescaped.push('\\'),
+            }
+        } else {
+            unescaped.push(ch);
+        }
+    }
+
+    unescaped
 }
 
 fn markdown_parent_dir(page_path: &Path) -> PathBuf {
@@ -591,6 +610,19 @@ mod tests {
                 "../../.afs/media/Tasks/Fix login/image-0123456789ab.png",
             ),
             Some(Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolves_markdown_escaped_local_media_href() {
+        assert_eq!(
+            resolve_media_href(
+                Path::new("Tasks/Fix login/page.md"),
+                "../../.afs/media/Tasks/Fix login \\(new\\)/image-0123456789ab.png",
+            ),
+            Some(
+                Path::new(".afs/media/Tasks/Fix login (new)/image-0123456789ab.png").to_path_buf()
+            )
         );
     }
 

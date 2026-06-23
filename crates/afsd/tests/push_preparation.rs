@@ -151,7 +151,7 @@ fn prepare_push_plans_content_cache_absolute_media_byte_update() {
 }
 
 #[test]
-fn prepare_push_plans_media_update_with_parenthesized_href() {
+fn prepare_push_plans_media_update_with_escaped_parenthesized_href() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.virtual_store("notion");
     store
@@ -171,7 +171,7 @@ fn prepare_push_plans_media_update_with_parenthesized_href() {
             &fixture.mount_id,
             ShadowDocument::from_synced_body(
                 RemoteId::new("page-1"),
-                "![Image](../.afs/media/Roadmap/image-(1).png)",
+                "![Image](../.afs/media/Roadmap/image-\\(1\\).png)",
                 8,
                 [RemoteId::new("image-1")],
             )
@@ -183,9 +183,14 @@ fn prepare_push_plans_media_update_with_parenthesized_href() {
     fixture.write_virtual_media_manifest(&media_path, "image-1", b"original image bytes");
     fixture.write_virtual_media(&media_path, b"updated image bytes");
     let absolute_media = content_root.join(&media_path);
+    let escaped_absolute_media = absolute_media
+        .display()
+        .to_string()
+        .replace('(', "\\(")
+        .replace(')', "\\)");
     fixture.write_virtual_page(
         "Roadmap/page.md",
-        &canonical_markdown("page-1", &format!("![Image]({})", absolute_media.display())),
+        &canonical_markdown("page-1", &format!("![Image]({escaped_absolute_media})")),
     );
 
     let prepared = prepare_push(

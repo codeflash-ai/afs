@@ -863,7 +863,8 @@ fn live_paragraph_link_with_parentheses_href_can_be_edited() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
     let mut cleanup = LiveCleanup::new(api);
-    let href = "https://example.com/docs(foo)";
+    let href = "https://example.com/docs/foo)";
+    let markdown_href = href.replace(')', "\\)");
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("AFS live paragraph paren link {}", unique_suffix()),
@@ -875,11 +876,14 @@ fn live_paragraph_link_with_parentheses_href_can_be_edited() {
     );
     let connector = NotionConnector::new(NotionConfig::default());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
-    let original_line = format!("[Paren link]({href})");
+    let original_line = format!("[Paren link]({markdown_href})");
     assert!(original.contains(&original_line), "{original}");
     fs::write(
         &page_path,
-        original.replace(&original_line, &format!("[Paren link changed]({href})")),
+        original.replace(
+            &original_line,
+            &format!("[Paren link changed]({markdown_href})"),
+        ),
     )
     .expect("write live parenthesized paragraph link edit");
 
@@ -914,8 +918,8 @@ fn live_paragraph_link_with_parentheses_href_can_be_edited() {
 
     let verified = render_live_page(&connector, &source.id, &page_path);
     assert!(
-        verified.contains(&format!("[Paren link changed]({href})")),
-        "verified markdown should preserve the parenthesized href:\n{verified}"
+        verified.contains(&format!("[Paren link changed]({markdown_href})")),
+        "verified markdown should preserve the escaped parenthesized href:\n{verified}"
     );
 }
 

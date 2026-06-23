@@ -1558,6 +1558,57 @@ fn apply_parses_markdown_link_hrefs_with_balanced_parentheses() {
 }
 
 #[test]
+fn apply_decodes_markdown_link_hrefs_with_escaped_parentheses() {
+    let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
+        "2026-06-10T00:00:00.000Z",
+        vec![linked_text("Docs", "https://example.com/docs/foo)")],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "[Docs updated](https://example.com/docs/foo\\))".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "paragraph-1".to_string(),
+            body: json!({
+                "paragraph": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": {
+                            "content": "Docs updated",
+                            "link": {
+                                "url": "https://example.com/docs/foo)",
+                            },
+                        },
+                    }],
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_rejects_link_to_page_retargeting_before_api_mutation() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",

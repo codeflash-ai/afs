@@ -451,6 +451,7 @@ fn file_media_block(
             }
 
             let label = title.unwrap_or_else(|| media_default_label(media_type).to_string());
+            let markdown_url = escape_markdown_link_href(&markdown_url);
             let markdown = if media_type == "image" {
                 format!("![{}]({markdown_url})", escape_markdown_link_label(&label))
             } else {
@@ -968,7 +969,11 @@ fn rich_text_part_plain_text(part: &RichTextDto) -> String {
 
 fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
     wrap_preserving_whitespace(label, |value| {
-        format!("[{}]({href})", escape_markdown_link_label(value))
+        format!(
+            "[{}]({})",
+            escape_markdown_link_label(value),
+            escape_markdown_link_href(href)
+        )
     })
 }
 
@@ -1038,6 +1043,12 @@ fn escape_markdown_text_with_options(text: &str, escape_inline_markers: bool) ->
 
 fn escape_markdown_link_label(text: &str) -> String {
     escape_markdown_text(text).replace(']', "\\]")
+}
+
+fn escape_markdown_link_href(href: &str) -> String {
+    href.replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
 }
 
 fn escape_paragraph_block_start_marker(text: String) -> String {
