@@ -210,6 +210,94 @@ fn prepare_push_plans_content_cache_absolute_file_media_byte_update() {
 }
 
 #[test]
+fn prepare_push_blocks_rendered_child_page_link_move_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let child_id = "11111111-1111-1111-1111-111111111111";
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(child_id),
+                EntityKind::Page,
+                "Child Page",
+                "Roadmap/child-page/page.md",
+            )
+            .with_hydration(HydrationState::Stub),
+        )
+        .expect("save child page");
+    let child_link = "[Child Page](https://www.notion.so/11111111111111111111111111111111)";
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                format!("Intro.\n\n{child_link}"),
+                8,
+                [RemoteId::new("paragraph-1"), RemoteId::new(child_id)],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", &format!("{child_link}\n\nIntro."));
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_child_page_link_move_unsupported"
+    );
+}
+
+#[test]
+fn prepare_push_blocks_rendered_child_page_link_label_edit_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let child_id = "11111111-1111-1111-1111-111111111111";
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(child_id),
+                EntityKind::Page,
+                "Child Page",
+                "Roadmap/child-page/page.md",
+            )
+            .with_hydration(HydrationState::Stub),
+        )
+        .expect("save child page");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "[Child Page](https://www.notion.so/11111111111111111111111111111111)",
+                8,
+                [RemoteId::new(child_id)],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "[Edited Child Page](https://www.notion.so/11111111111111111111111111111111)",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_child_page_link_edit_unsupported"
+    );
+}
+
+#[test]
 fn prepare_push_uses_shared_validator_for_direct_and_virtual_creates() {
     let fixture = PrepareFixture::new();
     let validator = RecordingValidator::default();

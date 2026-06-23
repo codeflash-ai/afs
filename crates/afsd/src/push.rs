@@ -29,8 +29,9 @@ use afs_core::push::{
     PushReconciler, PushStage, RemotePrecondition, execute_journaled_push_with_host,
     plan_push_pipeline,
 };
-use afs_core::shadow::ShadowDocument;
-use afs_core::shadow::segment_markdown_body;
+use afs_core::shadow::{
+    ShadowBlock, ShadowDocument, rendered_bodies_equivalent, segment_markdown_body,
+};
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::media::{
@@ -525,6 +526,162 @@ fn parse_markdown_link_exact(input: &str) -> Option<(&str, &str)> {
     Some((&input[1..label_end], &input[href_start..href_end]))
 }
 
+fn validate_notion_read_only_link_changes(
+    mount: &MountConfig,
+    relative_path: &Path,
+    shadow: &ShadowDocument,
+    pipeline: &mut PushPipelineResult,
+) {
+    if mount.connector != "notion" {
+        return;
+    }
+    if !matches!(
+        pipeline.action,
+        PushPipelineAction::ProceedToApply
+            | PushPipelineAction::ConfirmPlan
+            | PushPipelineAction::ConfirmDangerousPlan
+    ) {
+        return;
+    }
+    let Some(plan) = pipeline.plan.as_ref() else {
+        return;
+    };
+    let validation = notion_read_only_link_change_validation(relative_path, shadow, plan);
+    if validation.is_clean() {
+        return;
+    }
+
+    pipeline.validation.extend(validation);
+    pipeline.plan = None;
+    pipeline.guardrail = GuardrailDecision::Proceed;
+    pipeline.action = PushPipelineAction::FixValidation;
+}
+
+fn notion_read_only_link_change_validation(
+    relative_path: &Path,
+    shadow: &ShadowDocument,
+    plan: &PushPlan,
+) -> ValidationReport {
+    let shadow_blocks = shadow
+        .blocks
+        .iter()
+        .map(|block| (&block.remote_id, block))
+        .collect::<BTreeMap<_, _>>();
+    let archived_block_ids = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::ArchiveBlock { block_id } => Some(block_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut validation = ValidationReport::clean();
+    for operation in &plan.operations {
+        match operation {
+            PushOperation::UpdateBlock { block_id, .. }
+            | PushOperation::ReplaceBlock { block_id, .. } => {
+                let Some(shadow_block) = shadow_blocks.get(block_id).copied() else {
+                    continue;
+                };
+                if rendered_child_page_link_block(shadow_block) {
+                    validation.push(ValidationIssue::new(
+                        "notion_child_page_link_edit_unsupported",
+                        relative_path,
+                        Some(shadow_block.source_span.start_line),
+                        "editing a rendered Notion child-page link is not supported from parent Markdown",
+                        Some(
+                            "edit, move, rename, or delete the child page through its projected page directory instead"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            }
+            PushOperation::AppendBlock { content, .. } => {
+                let Some(shadow_block) = moved_rendered_child_page_link_block(
+                    &shadow_blocks,
+                    &archived_block_ids,
+                    content,
+                ) else {
+                    continue;
+                };
+
+                validation.push(ValidationIssue::new(
+                    "notion_child_page_link_move_unsupported",
+                    relative_path,
+                    Some(shadow_block.source_span.start_line),
+                    "moving a rendered Notion child-page link is not supported from parent Markdown",
+                    Some(
+                        "move, rename, or delete the child page through its projected page directory instead"
+                            .to_string(),
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    validation
+}
+
+fn moved_rendered_child_page_link_block<'a>(
+    shadow_blocks: &BTreeMap<&RemoteId, &'a ShadowBlock>,
+    archived_block_ids: &BTreeSet<RemoteId>,
+    content: &str,
+) -> Option<&'a ShadowBlock> {
+    let Some((_label, href)) = parse_markdown_link_exact(content.trim()) else {
+        return None;
+    };
+    let linked_notion_id = notion_id_from_href(href)?;
+    shadow_blocks.values().copied().find(|block| {
+        archived_block_ids.contains(&block.remote_id)
+            && compact_notion_id(block.remote_id.as_str()) == linked_notion_id
+            && rendered_bodies_equivalent(&block.text, content)
+    })
+}
+
+fn rendered_child_page_link_block(block: &ShadowBlock) -> bool {
+    let Some((_label, href)) = parse_markdown_link_exact(block.text.trim()) else {
+        return false;
+    };
+    notion_id_from_href(href)
+        .is_some_and(|notion_id| compact_notion_id(block.remote_id.as_str()) == notion_id)
+}
+
+fn notion_id_from_href(href: &str) -> Option<String> {
+    let trimmed = href.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("https://www.notion.so/")
+        || lower.starts_with("https://notion.so/")
+        || lower.starts_with("https://app.notion.com/"))
+    {
+        return None;
+    }
+
+    let without_query = trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    without_query.rsplit('/').find_map(compact_notion_id_suffix)
+}
+
+fn compact_notion_id_suffix(value: &str) -> Option<String> {
+    let compact = compact_notion_id(value);
+    if compact.len() < 32 {
+        return None;
+    }
+
+    Some(compact[compact.len() - 32..].to_string())
+}
+
+fn compact_notion_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_lowercase()
+}
+
 fn media_markdown_shape_matches_kind(shape: MediaMarkdownShape, kind: &str) -> bool {
     matches!(
         (shape, kind),
@@ -769,6 +926,7 @@ where
         },
         &mut pipeline,
     );
+    validate_notion_read_only_link_changes(&mount, &relative_path, &shadow, &mut pipeline);
 
     Ok(PreparedPush {
         absolute_path,

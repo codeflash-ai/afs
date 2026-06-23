@@ -31,8 +31,8 @@ use afs_notion::dto::{
 use afs_notion::media::resolve_media_href_with_content_root;
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
-    ConnectionId, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
-    VirtualMutationRepository,
+    ConnectionId, EntityRepository, InMemoryStateStore, JournalRepository, MountRepository,
+    ProjectionMode, VirtualMutationRepository,
 };
 use afsd::hydration::{HydrationExecutor, HydrationOutcome, HydrationQueue};
 use afsd::reconcile::{DefaultFetchScheduleStrategy, reconcile_scheduled_pull};
@@ -610,6 +610,68 @@ fn live_link_to_page_line_move_preserves_notion_block_type() {
         .position(|line| line == anchor_text)
         .expect("reconciled anchor paragraph");
     assert!(link_index < anchor_index, "{verified}");
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_child_page_link_move_blocks_before_journaled_apply() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let anchor_text = "Anchor before child page.";
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live child link move parent {}", unique_suffix()),
+        vec![paragraph_child(anchor_text)],
+    );
+    let child_title = format!("AFS live child link move child {}", unique_suffix());
+    let child = cleanup.create_page(
+        &parent.id,
+        &child_title,
+        vec![paragraph_child("Child page body.")],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &parent.id);
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &parent.id);
+    let child_line = original
+        .lines()
+        .find(|line| line.contains(&child_title) && line.contains(&compact_notion_id(&child.id)))
+        .expect("rendered child_page line");
+    let original_order = format!("{anchor_text}\n\n{child_line}\n");
+    assert!(original.contains(&original_order), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(
+            &original_order,
+            &format!("{child_line}\n\n{anchor_text}\n\n"),
+        ),
+    )
+    .expect("write live child_page link move");
+
+    let diff = run_diff(&store, &page_path).expect("diff live child_page link move");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_child_page_link_move_unsupported"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live child_page link move");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert_eq!(live_block_snapshot(&connector, &parent.id), before);
 }
 
 #[test]
