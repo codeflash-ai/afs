@@ -6,16 +6,17 @@ use std::sync::Mutex;
 use afs_connector::{ApplyPlanRequest, Connector};
 use afs_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use afs_core::model::{EntityKind, MountId, RemoteId};
-use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
+use afs_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
-    DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, IdRefDto,
-    LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto,
-    PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
-    TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, ToDoBlockDto, UrlBlockDto,
+    BlockDto, BlockListDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
+    DataSourceSummaryDto, DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto,
+    FileBlockDto, IdRefDto, LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto,
+    PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto,
+    SelectOptionDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, ToDoBlockDto,
+    UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -542,13 +543,13 @@ fn apply_appends_tier_one_markdown_block_shapes() {
 }
 
 #[test]
-fn apply_rejects_existing_block_moves_before_api_mutation() {
+fn apply_moves_existing_blocks() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
         vec![
             paragraph_block("paragraph-1", "First.", false),
             paragraph_block("paragraph-2", "Second.", false),
-            paragraph_block("directive-1", "Directive placeholder.", false),
+            table_of_contents_block("directive-1"),
         ],
     ));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -570,7 +571,13 @@ fn apply_rejects_existing_block_moves_before_api_mutation() {
     let operation_ids = operation_ids(&push_id, &plan);
     let mount_id = MountId::new("notion-main");
 
-    let error = connector
+    assert!(
+        connector
+            .supported_push_operations()
+            .contains(&PushOperationKind::MoveBlock)
+    );
+
+    let result = connector
         .apply(ApplyPlanRequest {
             push_id: &push_id,
             mount_id: &mount_id,
@@ -579,13 +586,60 @@ fn apply_rejects_existing_block_moves_before_api_mutation() {
             remote_preconditions: &[],
             local_root: None,
         })
-        .expect_err("move should be rejected");
+        .expect("apply");
 
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
     assert_eq!(
-        error,
-        AfsError::Unsupported("Notion API does not support moving existing blocks")
+        result.effects,
+        vec![
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-1"),
+            },
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-2"),
+            },
+            JournalApplyEffect::ArchivedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                block_id: RemoteId::new("directive-1"),
+            },
+        ]
     );
-    assert!(api.writes.lock().expect("writes").is_empty());
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        *writes,
+        vec![
+            append_call(
+                "paragraph-1",
+                json!({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": rich_text_json("Inserted paragraph."),
+                    },
+                }),
+            ),
+            append_call(
+                "created-1",
+                json!({
+                    "object": "block",
+                    "type": "table_of_contents",
+                    "table_of_contents": {
+                        "color": Value::Null,
+                    },
+                }),
+            ),
+            WriteCall::Delete {
+                block_id: "directive-1".to_string(),
+            },
+        ]
+    );
 }
 
 #[test]
@@ -3312,6 +3366,12 @@ fn table_block(id: &str, width: u16, has_column_header: bool) -> BlockDto {
         has_column_header,
         has_row_header: false,
     });
+    block
+}
+
+fn table_of_contents_block(id: &str) -> BlockDto {
+    let mut block = block(id, "table_of_contents");
+    block.table_of_contents = Some(ColorOnlyBlockDto { color: None });
     block
 }
 

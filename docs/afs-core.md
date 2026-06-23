@@ -76,7 +76,9 @@ The first planner is deliberately conservative:
   plus archive-old-block so connectors without a native move API can still
   converge remote order;
 - directive edits fail validation instead of becoming lossy updates;
-- directive moves are represented as block moves.
+- directive moves are represented as block moves. Connectors may apply those
+  natively or, where the remote API lacks a safe reposition primitive, by
+  creating a copy at the new position and archiving the old block.
 
 This is not the final Notion-grade diff engine from `plan.md`; it is the first correct contract surface. Later exact/structural/residual passes can improve the internals while preserving the same `ShadowDocument -> PushPlan` boundary.
 

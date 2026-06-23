@@ -439,6 +439,12 @@ Markdown edits that change a block's remote type are reported as
 block at the old block's position and archives the old block after the new ID is
 journaled.
 
+Unchanged directive-line reorders are reported as `move_block` operations. The
+Notion public API does not directly reposition existing blocks, so AFS applies
+safe childless directive moves by creating a copy at the requested position,
+archiving the old block, and reconciling the refreshed block ID back into local
+Markdown.
+
 The JSON report has the same validation, plan, degradation, guardrail, and stage fields as `afs diff`. Its `action` is one of:
 
 - `fix_validation`;

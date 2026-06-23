@@ -129,6 +129,94 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
 }
 
 #[test]
+fn mount_pull_directive_move_pushes_copy_archive_and_status_clean() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![
+        paragraph_block("block-1", "First paragraph."),
+        synced_block("synced-1", "source-block-1"),
+    ]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount");
+
+    run_pull(&mut store, &connector, &fixture.root).expect("pull");
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read pulled page");
+    let directive_line = original
+        .lines()
+        .find(|line| line.contains("id=synced-1"))
+        .expect("synced block directive line");
+    let original_order = format!("First paragraph.\n\n{directive_line}\n");
+    assert!(original.contains(&original_order), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(
+            &original_order,
+            &format!("{directive_line}\n\nFirst paragraph.\n"),
+        ),
+    )
+    .expect("write directive move");
+
+    let diff = run_diff(&store, &page_path).expect("diff directive move");
+    let plan = diff.plan.as_ref().expect("plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.blocks_created, 0, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_moved, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push directive move");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.apply_effect_count, 2);
+
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status");
+    assert!(status.clean, "{status:#?}");
+    assert_eq!(status.summary.dirty, 0);
+
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, WriteCall::Append { .. })),
+        "{calls:#?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, WriteCall::Delete { block_id } if block_id == "synced-1")),
+        "{calls:#?}"
+    );
+}
+
+#[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_scratch_page_mount_edit_push_verifies_notion() {
     std::env::var(TOKEN_ENV).expect("NOTION_TOKEN");
@@ -307,6 +395,105 @@ fn live_block_type_replace_pushes_and_reconciles_notion() {
         .expect("first live block after replace");
     assert_eq!(first["block"]["type"], "bulleted_list_item");
     assert_ne!(first["block"]["id"], original_block_id);
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_directive_block_move_pushes_and_reconciles_notion() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let anchor_text = "Move anchor paragraph.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live directive move {}", unique_suffix()),
+        vec![
+            paragraph_child(anchor_text),
+            json!({
+                "object": "block",
+                "type": "table_of_contents",
+                "table_of_contents": { "color": "default" }
+            }),
+        ],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &scratch.id);
+    let table_of_contents_id = before
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find_map(|entry| {
+                (entry["block"]["type"] == "table_of_contents")
+                    .then(|| entry["block"]["id"].as_str())
+                    .flatten()
+            })
+        })
+        .expect("table_of_contents block id")
+        .to_string();
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let directive_line = original
+        .lines()
+        .find(|line| line.contains(&table_of_contents_id))
+        .expect("table_of_contents directive line");
+    let original_order = format!("{anchor_text}\n\n{directive_line}\n");
+    assert!(original.contains(&original_order), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(
+            &original_order,
+            &format!("{directive_line}\n\n{anchor_text}\n\n"),
+        ),
+    )
+    .expect("write live directive move");
+
+    let diff = run_diff(&store, &page_path).expect("diff live directive move");
+    let plan = diff.plan.as_ref().expect("directive move plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.blocks_created, 0, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_moved, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live directive move");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("reconciled"));
+    assert_eq!(push.apply_effect_count, 2);
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean directive move status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let after = live_block_snapshot(&connector, &scratch.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after move");
+    assert_ne!(first["block"]["id"], table_of_contents_id);
+    assert_eq!(first["block"]["type"], "table_of_contents");
+
+    let verified = render_live_page(&connector, &scratch.id, &page_path);
+    let directive_index = verified
+        .lines()
+        .position(|line| line.contains("type=table_of_contents"))
+        .expect("reconciled directive line");
+    let anchor_index = verified
+        .lines()
+        .position(|line| line == anchor_text)
+        .expect("reconciled anchor paragraph");
+    assert!(directive_index < anchor_index, "{verified}");
 }
 
 #[test]
@@ -2924,17 +3111,21 @@ struct MutableNotionApi {
 
 impl MutableNotionApi {
     fn new() -> Self {
+        Self::with_blocks(vec![
+            paragraph_block("block-1", "First paragraph."),
+            synced_block("synced-1", "source-block-1"),
+            paragraph_block("block-2", "Second paragraph."),
+            paragraph_block("block-3", "Third paragraph."),
+            paragraph_block("block-4", "Fourth paragraph."),
+            paragraph_block("block-5", "Fifth paragraph."),
+            paragraph_block("block-6", "Sixth paragraph."),
+        ])
+    }
+
+    fn with_blocks(blocks: Vec<BlockDto>) -> Self {
         Self {
             page: page("page-1", "Initial Idea"),
-            blocks: Mutex::new(vec![
-                paragraph_block("block-1", "First paragraph."),
-                synced_block("synced-1", "source-block-1"),
-                paragraph_block("block-2", "Second paragraph."),
-                paragraph_block("block-3", "Third paragraph."),
-                paragraph_block("block-4", "Fourth paragraph."),
-                paragraph_block("block-5", "Fifth paragraph."),
-                paragraph_block("block-6", "Sixth paragraph."),
-            ]),
+            blocks: Mutex::new(blocks),
             append_count: Mutex::new(0),
             calls: Mutex::new(Vec::new()),
         }
@@ -3022,8 +3213,8 @@ impl NotionApi for MutableNotionApi {
         let mut append_count = self.append_count.lock().expect("append count");
         *append_count += 1;
         let created_id = format!("created-{}", *append_count);
-        let text = body_text(&body).unwrap_or_else(|| "Created.".to_string());
-        let block = paragraph_block(&created_id, &text);
+        let block = appended_block_from_body(&created_id, &body)
+            .unwrap_or_else(|| paragraph_block(&created_id, "Created."));
         let after = body
             .pointer("/position/after_block/id")
             .and_then(serde_json::Value::as_str);
@@ -3113,6 +3304,25 @@ fn synced_block(id: &str, source_block_id: &str) -> BlockDto {
         }),
     });
     block
+}
+
+fn appended_block_from_body(id: &str, body: &Value) -> Option<BlockDto> {
+    let child = body.pointer("/children/0")?;
+    let kind = child.get("type")?.as_str()?;
+    if kind == "synced_block" {
+        let mut block = BlockDto {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            ..Default::default()
+        };
+        block.synced_block = Some(
+            serde_json::from_value(child.get(kind)?.clone()).unwrap_or_else(|_| Default::default()),
+        );
+        return Some(block);
+    }
+
+    let text = body_text(body).unwrap_or_else(|| "Created.".to_string());
+    Some(paragraph_block(id, &text))
 }
 
 fn rich_text(text: &str) -> RichTextDto {

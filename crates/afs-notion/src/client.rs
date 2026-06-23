@@ -587,10 +587,10 @@ impl NotionApi for HttpNotionApi {
         parent_id: &str,
         after: Option<&str>,
     ) -> AfsResult<BlockDto> {
-        self.patch_json(
-            &format!("/v1/blocks/{block_id}"),
-            move_block_body(parent_id, after),
-        )
+        let _ = (block_id, parent_id, after);
+        Err(AfsError::Unsupported(
+            "Notion API does not support moving existing blocks directly",
+        ))
     }
 
     fn append_block_children(
@@ -755,25 +755,4 @@ mod tests {
             );
         }
     }
-}
-
-fn move_block_body(parent_id: &str, after: Option<&str>) -> serde_json::Value {
-    let mut body = json!({
-        "parent": {
-            "type": "page_id",
-            "page_id": parent_id,
-        },
-        "position": {
-            "type": "start",
-        },
-    });
-    if let Some(after) = after {
-        body["position"] = json!({
-            "type": "after_block",
-            "after_block": {
-                "id": after,
-            },
-        });
-    }
-    body
 }

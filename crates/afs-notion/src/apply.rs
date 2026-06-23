@@ -16,12 +16,13 @@ use afs_core::planner::{PropertyValue, PushOperation};
 use afs_core::shadow::segment_markdown_body;
 use afs_core::undo::{UndoOperation, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::client::NotionApi;
 use crate::dto::{
-    BlockDto, BlockTreeDto, DataSourceDto, NotionPageBundle, PageDto, PagePropertyDto,
-    RichTextAnnotationsDto, RichTextDto, TableBlockDto,
+    BlockDto, BlockTreeDto, DataSourceDto, FileBlockDto, NotionPageBundle, PageDto,
+    PagePropertyDto, RichTextAnnotationsDto, RichTextDto, TableBlockDto,
 };
 use crate::fetch::fetch_page_bundle;
 use crate::media::resolve_media_href_with_content_root;
@@ -59,16 +60,6 @@ pub fn apply_plan(
     request: ApplyPlanRequest<'_>,
 ) -> AfsResult<ApplyPlanResult> {
     validate_operation_ids(&request)?;
-    if request
-        .plan
-        .operations
-        .iter()
-        .any(|operation| matches!(operation, PushOperation::MoveBlock { .. }))
-    {
-        return Err(AfsError::Unsupported(
-            "Notion API does not support moving existing blocks",
-        ));
-    }
     let create_parent_ids = create_parent_ids(&request.plan.operations);
     let bundles = fetch_affected_bundles(api, &request.plan.affected_entities, &create_parent_ids)?;
     let current_blocks = block_map(&bundles);
@@ -201,27 +192,45 @@ pub fn apply_plan(
                 });
             }
             PushOperation::MoveBlock { block_id, after } => {
-                current_block(&current_blocks, block_id)?;
+                let current = current_block(&current_blocks, block_id)?;
                 let parent_id = block_parents
-                    .containing_pages
+                    .direct_parents
                     .get(block_id)
+                    .or_else(|| block_parents.containing_pages.get(block_id))
                     .ok_or_else(|| {
                         AfsError::InvalidState(format!(
-                            "push referenced block `{}` without a containing Notion page",
+                            "push referenced block `{}` without a containing Notion parent",
                             block_id.0
                         ))
-                    })?;
-                let after = block_parents.normalize_after(parent_id, after.as_ref());
-                let effective_after = append_chains
-                    .get(&(parent_id.clone(), after.clone()))
-                    .cloned()
-                    .or(after);
-                api.move_block(
-                    block_id.as_str(),
-                    parent_id.as_str(),
-                    effective_after.as_ref().map(RemoteId::as_str),
-                )?;
-                effects.push(JournalApplyEffect::MovedBlock {
+                    })?
+                    .clone();
+                let after = block_parents.normalize_after(&parent_id, after.as_ref());
+                let chain_key = (parent_id.clone(), after.clone());
+                let effective_after = append_chains.get(&chain_key).cloned().or(after);
+                let body = append_body(
+                    existing_block_append_child(current)?,
+                    effective_after.as_ref(),
+                );
+                let result = api.append_block_children(parent_id.as_str(), body)?;
+                let created = result.results.first().ok_or_else(|| {
+                    AfsError::InvalidState(
+                        "notion append block children returned no moved block copy".to_string(),
+                    )
+                })?;
+                let created_id = RemoteId::new(created.id.clone());
+                append_chains.insert(chain_key, created_id.clone());
+                append_chains.insert(
+                    (parent_id.clone(), Some(block_id.clone())),
+                    created_id.clone(),
+                );
+                effects.push(JournalApplyEffect::CreatedBlock {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    parent_id,
+                    block_id: created_id,
+                });
+                api.delete_block(block_id.as_str())?;
+                effects.push(JournalApplyEffect::ArchivedBlock {
                     operation_id: request.operation_ids[operation_index].clone(),
                     operation_index,
                     block_id: block_id.clone(),
@@ -602,6 +611,99 @@ fn current_block<'a>(
             block_id.0
         ))
     })
+}
+
+fn existing_block_append_child(block: &BlockDto) -> AfsResult<Value> {
+    if block.has_children {
+        return Err(AfsError::Unsupported(
+            "moving Notion blocks with children requires native block move support",
+        ));
+    }
+
+    let payload = existing_block_payload(block)?;
+    let mut object = Map::new();
+    object.insert("object".to_string(), json!("block"));
+    object.insert("type".to_string(), json!(block.kind.as_str()));
+    object.insert(block.kind.clone(), payload);
+    Ok(Value::Object(object))
+}
+
+fn existing_block_payload(block: &BlockDto) -> AfsResult<Value> {
+    match block.kind.as_str() {
+        "paragraph" => serialize_existing_payload(block, block.paragraph.as_ref()),
+        "heading_1" => serialize_existing_payload(block, block.heading_1.as_ref()),
+        "heading_2" => serialize_existing_payload(block, block.heading_2.as_ref()),
+        "heading_3" => serialize_existing_payload(block, block.heading_3.as_ref()),
+        "heading_4" => serialize_existing_payload(block, block.heading_4.as_ref()),
+        "bulleted_list_item" => {
+            serialize_existing_payload(block, block.bulleted_list_item.as_ref())
+        }
+        "numbered_list_item" => {
+            serialize_existing_payload(block, block.numbered_list_item.as_ref())
+        }
+        "to_do" => serialize_existing_payload(block, block.to_do.as_ref()),
+        "quote" => serialize_existing_payload(block, block.quote.as_ref()),
+        "callout" => serialize_existing_payload(block, block.callout.as_ref()),
+        "code" => serialize_existing_payload(block, block.code.as_ref()),
+        "table" => serialize_existing_payload(block, block.table.as_ref()),
+        "table_row" => serialize_existing_payload(block, block.table_row.as_ref()),
+        "toggle" => serialize_existing_payload(block, block.toggle.as_ref()),
+        "equation" => serialize_existing_payload(block, block.equation.as_ref()),
+        "embed" => serialize_existing_payload(block, block.embed.as_ref()),
+        "bookmark" => serialize_existing_payload(block, block.bookmark.as_ref()),
+        "image" => file_payload(block, block.image.as_ref()),
+        "video" => file_payload(block, block.video.as_ref()),
+        "file" => file_payload(block, block.file.as_ref()),
+        "pdf" => file_payload(block, block.pdf.as_ref()),
+        "audio" => file_payload(block, block.audio.as_ref()),
+        "synced_block" => serialize_existing_payload(block, block.synced_block.as_ref()),
+        "link_to_page" => serialize_existing_payload(block, block.link_to_page.as_ref()),
+        "table_of_contents" => serialize_existing_payload(block, block.table_of_contents.as_ref()),
+        "breadcrumb" => serialize_existing_payload(block, block.breadcrumb.as_ref()),
+        "column_list" => serialize_existing_payload(block, block.column_list.as_ref()),
+        "column" => serialize_existing_payload(block, block.column.as_ref()),
+        "template" => serialize_existing_payload(block, block.template.as_ref()),
+        "meeting_notes" => serialize_existing_payload(block, block.meeting_notes.as_ref()),
+        "transcription" => serialize_existing_payload(block, block.transcription.as_ref()),
+        "tab" => serialize_existing_payload(block, block.tab.as_ref()),
+        "ai_block" => serialize_existing_payload(block, block.ai_block.as_ref()),
+        "custom_block" => serialize_existing_payload(block, block.custom_block.as_ref()),
+        "button" => serialize_existing_payload(block, block.button.as_ref()),
+        "child_page" | "child_database" | "link_preview" => Err(AfsError::Unsupported(
+            "moving this Notion block type by copy is not supported",
+        )),
+        _ => Err(AfsError::Unsupported("moving this Notion block type")),
+    }
+}
+
+fn file_payload(block: &BlockDto, payload: Option<&FileBlockDto>) -> AfsResult<Value> {
+    let payload = payload.ok_or_else(|| missing_block_payload(block))?;
+    if payload.external.is_none() {
+        return Err(AfsError::Unsupported(
+            "moving Notion-hosted media blocks requires a fresh local upload",
+        ));
+    }
+    serialize_existing_payload(block, Some(payload))
+}
+
+fn serialize_existing_payload<T: Serialize>(
+    block: &BlockDto,
+    payload: Option<&T>,
+) -> AfsResult<Value> {
+    let payload = payload.ok_or_else(|| missing_block_payload(block))?;
+    serde_json::to_value(payload).map_err(|error| {
+        AfsError::InvalidState(format!(
+            "failed to encode Notion block `{}` payload: {error}",
+            block.id
+        ))
+    })
+}
+
+fn missing_block_payload(block: &BlockDto) -> AfsError {
+    AfsError::InvalidState(format!(
+        "notion block `{}` is missing its `{}` payload",
+        block.id, block.kind
+    ))
 }
 
 fn current_page<'a>(bundles: &'a [NotionPageBundle], page_id: &RemoteId) -> AfsResult<&'a PageDto> {
