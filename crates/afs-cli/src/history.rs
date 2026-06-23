@@ -225,6 +225,7 @@ where
         Err(error) => {
             let action = match &error {
                 AfsError::NotImplemented(_) => "reverse_apply_not_implemented",
+                AfsError::RemoteNotFound(_) => "reverse_apply_remote_not_found",
                 _ => "reverse_apply_failed",
             };
             return Ok(UndoReport {

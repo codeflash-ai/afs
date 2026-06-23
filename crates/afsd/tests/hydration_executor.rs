@@ -74,6 +74,28 @@ fn executor_fetches_render_using_projected_entity_path() {
 }
 
 #[test]
+fn executor_removes_clean_stub_when_remote_is_not_found() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let source = FakeHydrationSource::remote_not_found();
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate deleted stub");
+
+    assert_eq!(outcome, HydrationOutcome::RemoteDeleted);
+    assert!(!fixture.page_path().exists());
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &fixture.remote_id)
+            .expect("get deleted entity")
+            .is_none()
+    );
+}
+
+#[test]
 fn executor_replaces_clean_hydrated_file() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Hydrated);
@@ -590,7 +612,7 @@ impl Drop for HydrationFixture {
 #[derive(Clone, Debug, Default)]
 struct FakeHydrationSource {
     entities: BTreeMap<RemoteId, HydratedEntity>,
-    failure: Option<String>,
+    failure: Option<AfsError>,
     request_paths: RefCell<Vec<PathBuf>>,
 }
 
@@ -608,7 +630,15 @@ impl FakeHydrationSource {
     fn failing(message: &str) -> Self {
         Self {
             entities: BTreeMap::new(),
-            failure: Some(message.to_string()),
+            failure: Some(AfsError::InvalidState(message.to_string())),
+            request_paths: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn remote_not_found() -> Self {
+        Self {
+            entities: BTreeMap::new(),
+            failure: Some(AfsError::RemoteNotFound("missing page".to_string())),
             request_paths: RefCell::new(Vec::new()),
         }
     }
@@ -624,8 +654,8 @@ impl FakeHydrationSource {
 
 impl HydrationSource for FakeHydrationSource {
     fn fetch_render(&self, request: &HydrationRequest) -> AfsResult<HydratedEntity> {
-        if let Some(message) = &self.failure {
-            return Err(AfsError::InvalidState(message.clone()));
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
         }
         self.request_paths.borrow_mut().push(request.path.clone());
 

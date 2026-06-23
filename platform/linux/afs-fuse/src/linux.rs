@@ -356,6 +356,12 @@ where
     T: DeserializeOwned,
 {
     if let Some(error) = response.error {
+        if error.code == "remote_not_found"
+            || (error.code == "invalid_state"
+                && error.message.contains("not present in daemon state"))
+        {
+            return Err(FuseError::NotFound);
+        }
         return Err(FuseError::Daemon(format!(
             "{}: {}",
             error.code, error.message
@@ -376,6 +382,24 @@ enum FuseError {
     NotDirectory,
     ReadOnly,
     Invalid,
+}
+
+impl FuseError {
+    fn is_remote_missing(&self) -> bool {
+        match self {
+            Self::NotFound => true,
+            Self::Daemon(message) => daemon_error_is_remote_missing(message),
+            Self::Io(_) | Self::NotFile | Self::NotDirectory | Self::ReadOnly | Self::Invalid => {
+                false
+            }
+        }
+    }
+}
+
+fn daemon_error_is_remote_missing(message: &str) -> bool {
+    message.starts_with("remote_not_found:")
+        || (message.starts_with("invalid_state:")
+            && message.contains("not present in daemon state"))
 }
 
 impl From<FuseError> for fuse3::Errno {
@@ -475,7 +499,14 @@ where
         if parent_item.kind != VirtualFsItemKind::Folder {
             return Err(FuseError::NotDirectory);
         }
-        let children = self.client.children(&parent_item.identifier)?;
+        let children = match self.client.children(&parent_item.identifier) {
+            Ok(children) => children,
+            Err(error) if error.is_remote_missing() => {
+                self.remove_cached_path(parent);
+                return Err(FuseError::NotFound);
+            }
+            Err(error) => return Err(error),
+        };
         let mut found = None;
         let mut cache = self.cache.lock().expect("fuse item cache");
         for child in children.children {
@@ -492,7 +523,14 @@ where
         if item.kind != VirtualFsItemKind::File {
             return Err(FuseError::NotFile);
         }
-        let report = self.client.materialize(&item.identifier)?;
+        let report = match self.client.materialize(&item.identifier) {
+            Ok(report) => report,
+            Err(error) if error.is_remote_missing() => {
+                self.remove_cached_identifier(&item.identifier);
+                return Err(FuseError::NotFound);
+            }
+            Err(error) => return Err(error),
+        };
         self.update_cached_materialized_path(&report.identifier, &report.path);
         Ok(PathBuf::from(report.path))
     }
@@ -537,6 +575,13 @@ where
             .lock()
             .expect("fuse item cache")
             .retain(|cached_path, _| cached_path != &path && !cached_path.starts_with(&path));
+    }
+
+    fn remove_cached_identifier(&self, identifier: &str) {
+        self.cache
+            .lock()
+            .expect("fuse item cache")
+            .retain(|_, item| item.identifier != identifier);
     }
 
     fn open_handle(&self, fh: u64) -> Result<OpenHandle, FuseError> {
@@ -980,7 +1025,14 @@ where
             return Err(FuseError::NotDirectory.into());
         }
         let parent_path = normalize_path(Path::new(path));
-        let children = self.client.children(&item.identifier)?;
+        let children = match self.client.children(&item.identifier) {
+            Ok(children) => children,
+            Err(error) if error.is_remote_missing() => {
+                self.remove_cached_path(&parent_path);
+                return Err(FuseError::NotFound.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut entries = Vec::new();
         entries.push(DirectoryEntry {
             kind: FileType::Directory,
@@ -1036,7 +1088,14 @@ where
             .and_then(|path| self.resolve_path(path).ok())
             .map(|item| attr_for_item(&item))
             .unwrap_or(parent_attr);
-        let children = self.client.children(&item.identifier)?;
+        let children = match self.client.children(&item.identifier) {
+            Ok(children) => children,
+            Err(error) if error.is_remote_missing() => {
+                self.remove_cached_path(&parent_path);
+                return Err(FuseError::NotFound.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut entries = Vec::new();
         entries.push(DirectoryEntryPlus {
             kind: FileType::Directory,
@@ -1372,6 +1431,41 @@ mod tests {
     }
 
     #[test]
+    fn resolve_path_removes_stale_cached_remote_folder_when_children_are_missing() {
+        let root = test_root_item();
+        let parent = test_named_item("children:page-root", "Page", VirtualFsItemKind::Folder);
+        let stale_dir = test_named_item("children:page-stale", "Stale", VirtualFsItemKind::Folder);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                trashed: RefCell::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Page"), parent),
+                (PathBuf::from("/Page/Stale"), stale_dir),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .resolve_path(Path::new("/Page/Stale/page.md"))
+            .expect_err("stale cached folder should disappear");
+
+        assert!(matches!(error, FuseError::NotFound));
+        assert!(
+            !fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/Page/Stale"))
+        );
+    }
+
+    #[test]
     fn trash_path_accepts_folder_items_for_page_directory_delete() {
         let root = test_root_item();
         let page_dir = test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
@@ -1502,7 +1596,7 @@ mod tests {
         ) -> Result<VirtualFsChildrenReport, FuseError> {
             let children = self.children.get(container_identifier).ok_or_else(|| {
                 FuseError::Daemon(format!(
-                    "unexpected children request {container_identifier}"
+                    "invalid_state: virtual filesystem item `{container_identifier}` is not present in daemon state"
                 ))
             })?;
             Ok(VirtualFsChildrenReport {

@@ -165,6 +165,7 @@ impl DiffError {
             Self::Prepare(AfsError::Validation(_)) => "validation_failed",
             Self::Prepare(AfsError::Conflict(_)) => "conflict",
             Self::Prepare(AfsError::Guardrail(_)) => "guardrail",
+            Self::Prepare(AfsError::RemoteNotFound(_)) => "remote_not_found",
             Self::Prepare(AfsError::InvalidState(_)) => "invalid_state",
             Self::Prepare(AfsError::Unsupported(_)) => "unsupported",
             Self::Prepare(AfsError::Io(_)) => "io_error",

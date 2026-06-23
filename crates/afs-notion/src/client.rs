@@ -229,6 +229,9 @@ impl HttpNotionApi {
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            if status == StatusCode::NOT_FOUND {
+                return Err(AfsError::RemoteNotFound(body));
+            }
             if is_notion_rate_limited(status) && attempt < notion_rate_limit_retries() {
                 record_notion_rate_limit(attempt, retry_after);
                 continue;

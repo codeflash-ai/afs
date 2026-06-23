@@ -389,7 +389,11 @@ pub fn materialize_virtual_fs_item<S, Source>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: HydrationSource + ?Sized,
 {
     let mount = require_virtual_mount(store, mount_id)?;
@@ -421,6 +425,12 @@ where
         match executor.hydrate_request(request)? {
             HydrationOutcome::Hydrated => VirtualFsMaterializeOutcome::Hydrated,
             HydrationOutcome::SkippedDirty => VirtualFsMaterializeOutcome::SkippedDirty,
+            HydrationOutcome::RemoteDeleted => {
+                return Err(AfsError::RemoteNotFound(format!(
+                    "remote item `{}` was deleted",
+                    remote_id.0
+                )));
+            }
         }
     };
 
@@ -454,7 +464,8 @@ where
         + EntityRepository
         + ShadowRepository
         + VirtualMutationRepository
-        + FreshnessStateRepository,
+        + FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: HydrationSource + ?Sized,
 {
     let mount = require_virtual_mount(store, mount_id)?;
@@ -538,6 +549,12 @@ where
         match executor.hydrate_request(request)? {
             HydrationOutcome::Hydrated => VirtualFsMaterializeOutcome::Hydrated,
             HydrationOutcome::SkippedDirty => VirtualFsMaterializeOutcome::SkippedDirty,
+            HydrationOutcome::RemoteDeleted => {
+                return Err(AfsError::RemoteNotFound(format!(
+                    "remote item `{}` was deleted",
+                    remote_id.0
+                )));
+            }
         }
     };
 

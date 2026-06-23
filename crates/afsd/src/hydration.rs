@@ -11,7 +11,7 @@ use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
-    ShadowRepository, StoreError,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, StoreError,
 };
 
 use crate::media::{
@@ -55,12 +55,14 @@ pub struct HydratedAssetMedia {
 pub struct HydrationDrainReport {
     pub hydrated: usize,
     pub skipped_dirty: usize,
+    pub remote_deleted: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HydrationOutcome {
     Hydrated,
     SkippedDirty,
+    RemoteDeleted,
 }
 
 pub struct HydrationExecutor<'a, S, Source: ?Sized> {
@@ -71,7 +73,11 @@ pub struct HydrationExecutor<'a, S, Source: ?Sized> {
 
 impl<'a, S, Source> HydrationExecutor<'a, S, Source>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + FreshnessStateRepository
+        + RemoteObservationRepository,
     Source: HydrationSource + ?Sized,
 {
     pub fn new(store: &'a mut S, source: &'a Source) -> Self {
@@ -117,7 +123,13 @@ where
 
         let mut render_request = request.clone();
         render_request.path = entity.path.clone();
-        let rendered = self.source.fetch_render(&render_request)?;
+        let rendered = match self.source.fetch_render(&render_request) {
+            Ok(rendered) => rendered,
+            Err(error) if is_remote_not_found(&error) => {
+                return self.reconcile_remote_not_found(&mount, entity, &path, can_replace);
+            }
+            Err(error) => return Err(error),
+        };
         if rendered.shadow.entity_id != request.remote_id {
             return Err(AfsError::InvalidState(format!(
                 "hydration source returned shadow for `{}` while hydrating `{}`",
@@ -171,6 +183,7 @@ where
             match self.hydrate_request(request.clone()) {
                 Ok(HydrationOutcome::Hydrated) => report.hydrated += 1,
                 Ok(HydrationOutcome::SkippedDirty) => report.skipped_dirty += 1,
+                Ok(HydrationOutcome::RemoteDeleted) => report.remote_deleted += 1,
                 Err(error) => {
                     queue.queue_request(request);
                     return Err(error);
@@ -312,6 +325,60 @@ where
         self.store
             .save_freshness_state(freshness)
             .map_err(AfsError::from)
+    }
+
+    fn reconcile_remote_not_found(
+        &mut self,
+        mount: &MountConfig,
+        entity: EntityRecord,
+        path: &Path,
+        can_replace: bool,
+    ) -> AfsResult<HydrationOutcome> {
+        self.record_deleted_remote_observation(mount, &entity)?;
+        if !can_replace {
+            self.mark_dirty_if_allowed(entity)?;
+            return Ok(HydrationOutcome::SkippedDirty);
+        }
+
+        remove_clean_projection(path)?;
+        self.store
+            .delete_entity(&mount.mount_id, &entity.remote_id)
+            .map_err(AfsError::from)?;
+        Ok(HydrationOutcome::RemoteDeleted)
+    }
+
+    fn record_deleted_remote_observation(
+        &mut self,
+        mount: &MountConfig,
+        entity: &EntityRecord,
+    ) -> AfsResult<()> {
+        let observed_at = crate::freshness::freshness_timestamp();
+        let observation = RemoteObservationRecord::new(
+            mount.mount_id.clone(),
+            entity.remote_id.clone(),
+            entity.kind.clone(),
+            entity.title.clone(),
+            entity.path.clone(),
+            observed_at.clone(),
+        )
+        .deleted(true);
+        self.store
+            .save_remote_observation(observation)
+            .map_err(AfsError::from)?;
+
+        if let Some(mut freshness) = self
+            .store
+            .get_freshness_state(&mount.mount_id, &entity.remote_id)
+            .map_err(AfsError::from)?
+        {
+            freshness.remote_hint_pending = true;
+            freshness.last_checked_at = Some(observed_at);
+            self.store
+                .save_freshness_state(freshness)
+                .map_err(AfsError::from)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -527,6 +594,36 @@ fn request_path(mount: &MountConfig, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         mount.root.join(path)
+    }
+}
+
+fn remove_clean_projection(path: &Path) -> AfsResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AfsError::Io(format!(
+                "failed to remove deleted remote projection `{}`: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    if path.file_name().is_some_and(|name| name == "page.md")
+        && let Some(directory) = path.parent()
+    {
+        let _ = std::fs::remove_dir(directory);
+    }
+    Ok(())
+}
+
+fn is_remote_not_found(error: &AfsError) -> bool {
+    match error {
+        AfsError::RemoteNotFound(_) => true,
+        AfsError::Io(message) => {
+            message.contains("HTTP 404") && message.contains("object_not_found")
+        }
+        _ => false,
     }
 }
 

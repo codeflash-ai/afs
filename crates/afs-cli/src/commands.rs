@@ -4480,6 +4480,7 @@ fn history_error_exit_code(error: &HistoryError) -> i32 {
 fn afs_error_exit_code(error: &AfsError) -> i32 {
     match error {
         AfsError::Validation(_) => EXIT_VALIDATION,
+        AfsError::RemoteNotFound(_) => 5,
         AfsError::NotImplemented(_) => 5,
         _ => EXIT_INTERNAL,
     }
@@ -4490,6 +4491,7 @@ fn afs_error_code(error: &AfsError) -> &'static str {
         AfsError::Validation(_) => "validation_failed",
         AfsError::Conflict(_) => "conflict",
         AfsError::Guardrail(_) => "guardrail",
+        AfsError::RemoteNotFound(_) => "remote_not_found",
         AfsError::InvalidState(_) => "invalid_state",
         AfsError::Unsupported(_) => "unsupported",
         AfsError::NotImplemented(_) => "not_implemented",

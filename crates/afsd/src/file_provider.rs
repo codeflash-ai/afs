@@ -75,7 +75,8 @@ where
         + EntityRepository
         + ShadowRepository
         + VirtualMutationRepository
-        + FreshnessStateRepository,
+        + FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: HydrationSource + ?Sized,
 {
     virtual_fs::materialize_virtual_fs_item(store, source, mount_id, identifier)

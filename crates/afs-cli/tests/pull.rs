@@ -860,6 +860,35 @@ fn pull_mount_root_preserves_shadow_remote_timestamp_for_non_rehydrated_pages() 
 }
 
 #[test]
+fn pull_file_removes_clean_stub_when_remote_is_not_found() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    let child_id = RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let child_path = fixture.child_file("roadmap");
+    assert!(child_path.exists());
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_missing_page(child_id.as_str()),
+        &child_path,
+    )
+    .expect("pull deleted child");
+
+    assert!(report.ok);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.skipped_dirty, 0);
+    assert!(!child_path.exists());
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &child_id)
+            .expect("get deleted entity")
+            .is_none()
+    );
+}
+
+#[test]
 fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_changed() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -1062,6 +1091,18 @@ impl PullFixture {
                 "2026-06-11T00:00:00.000Z",
             )),
         )
+    }
+
+    fn connector_missing_page(&self, missing_page_id: &str) -> NotionConnector {
+        let mut api = FixtureNotionApi::new(
+            self.root_page_id.as_str(),
+            self.canonical_root_page_id.as_str(),
+            "Roadmap",
+            "Root body.",
+            "2026-06-11T00:00:00.000Z",
+        );
+        api.pages.remove(missing_page_id);
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(api))
     }
 
     fn root_file(&self, slug: &str) -> PathBuf {
@@ -1375,7 +1416,11 @@ impl NotionApi for FixtureNotionApi {
         self.pages
             .get(page_id)
             .cloned()
-            .ok_or_else(|| afs_core::AfsError::InvalidState(format!("missing page {page_id}")))
+            .ok_or_else(|| {
+                afs_core::AfsError::Io(format!(
+                    "notion api returned HTTP 404 Not Found: {{\"object\":\"error\",\"status\":404,\"code\":\"object_not_found\",\"message\":\"Could not find block with ID: {page_id}.\"}}"
+                ))
+            })
     }
 
     fn retrieve_database(&self, database_id: &str) -> afs_core::AfsResult<DatabaseDto> {

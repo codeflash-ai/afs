@@ -2885,6 +2885,7 @@ fn afs_error_code(error: &AfsError) -> &'static str {
         AfsError::Validation(_) => "validation_failed",
         AfsError::Conflict(_) => "conflict",
         AfsError::Guardrail(_) => "guardrail",
+        AfsError::RemoteNotFound(_) => "remote_not_found",
         AfsError::InvalidState(_) => "invalid_state",
         AfsError::Unsupported(_) => "unsupported",
         AfsError::NotImplemented(_) => "not_implemented",

@@ -154,6 +154,7 @@ impl InspectError {
             Self::Store(StoreError::ShadowMissing { .. }) => "shadow_missing",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
             Self::Store(_) => "store_error",
+            Self::RemoteFetch(AfsError::RemoteNotFound(_)) => "remote_fetch_not_found",
             Self::RemoteFetch(AfsError::Unsupported(_)) => "remote_fetch_unsupported",
             Self::RemoteFetch(_) => "remote_fetch_failed",
             Self::UnsupportedEntity { .. } => "unsupported_entity",
