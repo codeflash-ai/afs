@@ -419,7 +419,7 @@ inspect /Users/alice/Library/CloudStorage/AFS/notion/Roadmap/page.md
 
 ## Initial `afs diff --json` Shape
 
-The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its Synced Tree shadow snapshot, and returns the core push-pipeline decision without applying anything. If the file contains unresolved inline conflict markers, validation returns `unresolved_conflict_markers` before planning. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. For Notion image blocks, it also compares local `.afs/media/` files against `.afs/media/manifest.json` and reports `update_media` when the image bytes or Markdown caption changed. The JSON report includes:
+The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its Synced Tree shadow snapshot, and returns the core push-pipeline decision without applying anything. If the file contains unresolved inline conflict markers, validation returns `unresolved_conflict_markers` before planning. If the path is a new Markdown file directly inside a projected database directory, or a new row directory's `page.md` below a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. For Notion image blocks, it also compares local `.afs/media/` files against `.afs/media/manifest.json` and reports `update_media` when the image bytes or Markdown caption changed. The JSON report includes:
 
 - `validation`: machine-readable issues with file, line, message, and suggested fix;
 - `plan.summary`: block/entity/property counts;

@@ -2554,6 +2554,115 @@ fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_database_row_directory_create_pushes_row_and_reconciles() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live row directory scratch {}", unique_suffix()),
+        Vec::new(),
+    );
+    let database = cleanup.create_database(
+        &scratch.id,
+        &format!("AFS live row directory database {}", unique_suffix()),
+    );
+
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let connector = NotionConnector::new(NotionConfig::default());
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live database row directory root page");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live database row directory root");
+
+    let database_dir = fixture.database_dir();
+    let new_row_dir = database_dir.join("directory-created-row");
+    fs::create_dir_all(&new_row_dir).expect("create row directory");
+    let new_row_path = new_row_dir.join("page.md");
+    fs::write(
+        &new_row_path,
+        "---\ntitle: AFS live directory created row\nNotes: \"Created from row directory\"\nPoints: 21\nStatus: Todo\nDone: false\n---\n# Directory row body\n\nCreated from database/new-row/page.md.\n",
+    )
+    .expect("write live database row directory page");
+
+    let diff = run_diff(&store, &new_row_path).expect("diff database row directory create");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff
+        .plan
+        .as_ref()
+        .expect("database row directory create plan");
+    assert_eq!(plan.summary.entities_created, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &new_row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push database row directory create");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    let created_row_id = push
+        .changed_remote_ids
+        .iter()
+        .find(|id| *id != &database.id)
+        .expect("created database row id")
+        .clone();
+    cleanup.block_ids.push(created_row_id.clone());
+
+    let row_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(created_row_id.clone()))
+        .expect("get created row entity")
+        .expect("created row entity");
+    let reconciled_row_path = fixture.root.join(&row_entity.path);
+    assert!(
+        reconciled_row_path.exists(),
+        "row directory create should reconcile to {}",
+        reconciled_row_path.display()
+    );
+    assert_eq!(file_name(&reconciled_row_path), "page.md");
+    let created_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(reconciled_row_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("created row directory status");
+    assert!(created_status.clean, "{created_status:#?}");
+
+    let created = render_live_markdown(&connector, &created_row_id, &reconciled_row_path);
+    for expected in [
+        "title: \"AFS live directory created row\"",
+        "\"Notes\": \"Created from row directory\"",
+        "\"Points\": 21",
+        "\"Status\": \"Todo\"",
+        "\"Done\": false",
+        "Created from database/new-row/page.md.",
+    ] {
+        assert!(
+            created.contains(expected),
+            "missing {expected:?}\n{created}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_remote_fast_forward_updates_clean_file_and_preserves_pending_file() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

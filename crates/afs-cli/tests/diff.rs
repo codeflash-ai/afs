@@ -337,6 +337,60 @@ fn diff_plans_new_database_row_file_as_create_entity() {
 }
 
 #[test]
+fn diff_plans_new_database_row_page_document_as_create_entity() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    fixture.write_tasks_schema();
+    let path = fixture.write_raw(
+        "Tasks/new-task/page.md",
+        "---\ntitle: New task\nStatus: Todo\nTags:\n  - Backend\nDone: false\nPoints: 5\n---\n# Notes\n\n- [ ] Wire create\n",
+    );
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let plan = report.plan.expect("plan");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "confirm_plan");
+    assert_eq!(report.entity_id, "database-1");
+    assert_eq!(plan.summary.entities_created, 1);
+    assert_eq!(plan.affected_entities, vec!["database-1"]);
+    match &plan.operations[0] {
+        afs_cli::diff::PushOperationOutput::CreateEntity {
+            parent_id,
+            title,
+            keys,
+            body,
+            source_path,
+            ..
+        } => {
+            assert_eq!(parent_id, "database-1");
+            assert_eq!(title, "New task");
+            assert_eq!(
+                keys,
+                &vec![
+                    "Done".to_string(),
+                    "Points".to_string(),
+                    "Status".to_string(),
+                    "Tags".to_string(),
+                ]
+            );
+            assert_eq!(body, "# Notes\n\n- [ ] Wire create\n");
+            assert_eq!(source_path, "Tasks/new-task/page.md");
+        }
+        operation => panic!("unexpected operation {operation:?}"),
+    }
+}
+
+#[test]
 fn diff_database_directory_plans_pending_virtual_delete_under_scope() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();

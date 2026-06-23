@@ -191,4 +191,4 @@ roadmap/
       page.md
 ```
 
-Row directories are normal page directories. Their `page.md` stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. Creating a row is still ergonomic: create a new `.md` file directly in the database directory with YAML frontmatter and no `afs.id`; `afs push -y` creates the Notion page, reads it back, saves the durable entity/shadow rows, and replaces the temporary filename with the canonical projected row directory. `_view.csv` remains future work.
+Row directories are normal page directories. Their `page.md` stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. Creating a row accepts either the canonical page-directory shape (`database/new-row/page.md`) or the ergonomic shortcut (`database/new-row.md`) with YAML frontmatter and no `afs.id`; `afs push -y` creates the Notion page, reads it back, saves the durable entity/shadow rows, and replaces shortcut files with the canonical projected row directory. `_view.csv` remains future work.
