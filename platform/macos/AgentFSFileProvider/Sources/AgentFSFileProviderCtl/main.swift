@@ -274,6 +274,9 @@ private func userVisibleDomainURL(for domain: NSFileProviderDomain) throws -> UR
 }
 
 private func fileProviderDirectoryName(for displayName: String) -> String {
+  if displayName.isEmpty {
+    return "AFS"
+  }
   if displayName == "AFS" || displayName.hasPrefix("AFS-") {
     return displayName
   }

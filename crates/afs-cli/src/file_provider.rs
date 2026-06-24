@@ -1013,13 +1013,21 @@ fn resolve_macos_file_provider_domain(
 }
 
 pub fn macos_file_provider_display_name(root: &Path, fallback: &str) -> String {
-    macos_file_provider_domain_path(root)
+    let Some(name) = macos_file_provider_domain_path(root)
         .file_name()
         .and_then(|name| name.to_str())
-        .map(strip_file_provider_directory_prefix)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| fallback.to_string())
+    else {
+        return fallback.to_string();
+    };
+    if name == "AFS" {
+        return String::new();
+    }
+    let stripped = strip_file_provider_directory_prefix(name);
+    if stripped.is_empty() {
+        fallback.to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 fn macos_file_provider_domain_path(root: &Path) -> &Path {
@@ -1360,7 +1368,14 @@ mod tests {
                 std::path::Path::new("/Users/example/Library/CloudStorage/AFS/notion"),
                 "fallback",
             ),
-            "AFS"
+            ""
+        );
+        assert_eq!(
+            super::macos_file_provider_display_name(
+                std::path::Path::new("/Users/example/Library/CloudStorage/AFS"),
+                "fallback",
+            ),
+            ""
         );
         assert_eq!(
             super::macos_file_provider_display_name(
