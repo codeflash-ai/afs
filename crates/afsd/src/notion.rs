@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{Connector, FetchRequest};
-use afs_core::model::MountId;
+use afs_core::model::{MountId, RemoteId};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use afs_notion::dto::NotionPageBundle;
@@ -452,5 +452,9 @@ impl HydrationSource for NotionConnector {
             remote_edited_at: bundle.page.last_edited_time,
             assets,
         })
+    }
+
+    fn fetch_database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<Option<String>> {
+        self.database_schema_yaml(database_id).map(Some)
     }
 }

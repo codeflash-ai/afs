@@ -9,20 +9,24 @@ use std::time::Duration;
 use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
 use afs_core::journal::PushId;
-use afs_core::model::{MountId, RemoteId};
+use afs_core::model::{EntityKind, MountId, RemoteId};
+use afs_core::path_projection::{page_document_path, page_listing_parent_path};
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, HttpNotionOAuthClient,
     NotionOAuthBrokerStart,
 };
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
-    open_credential_store,
+    EntityRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    SqliteStateStore, open_credential_store,
 };
 use afsd::execution::PushJobReport;
 use afsd::file_provider as daemon_file_provider;
+use afsd::hydration::write_parent_database_schema_cache;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
-use afsd::virtual_fs::{VirtualFsChildrenReport, virtual_fs_ancestor_container_identifiers};
+use afsd::virtual_fs::{
+    VirtualFsChildrenReport, virtual_fs_ancestor_container_identifiers, virtual_fs_content_root,
+};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2408,6 +2412,11 @@ fn push(args: &[String], json: bool) -> i32 {
     {
         return command_error(json, error, EXIT_INTERNAL);
     }
+    if let Err(error) =
+        repair_missing_database_schema_for_target("push", &mut store, &state_root, &target_path)
+    {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
     let selection = match select_push_targets(&store, target_path, Some(state_root.clone())) {
         Ok(selection) => selection,
         Err(error) => return push_target_error(json, error),
@@ -2425,6 +2434,11 @@ fn push(args: &[String], json: bool) -> i32 {
     let mut reports = Vec::new();
     let stderr_is_terminal = io::stderr().is_terminal();
     for target in &selection.targets {
+        if let Err(error) =
+            repair_missing_database_schema_for_target("push", &mut store, &state_root, target)
+        {
+            return command_error(json, error, EXIT_INTERNAL);
+        }
         let target_label = target.display().to_string();
         let spinner_config =
             spinner_config_for_command("push", &target_label, json, stderr_is_terminal);
@@ -2689,6 +2703,11 @@ fn diff(args: &[String], json: bool) -> i32 {
     let target_path = PathBuf::from(path);
     if let Err(error) =
         reconcile_projection_changes("diff", &mut store, &state_root, Some(&target_path))
+    {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    if let Err(error) =
+        repair_missing_database_schema_for_target("diff", &mut store, &state_root, &target_path)
     {
         return command_error(json, error, EXIT_INTERNAL);
     }
@@ -4795,6 +4814,81 @@ fn reconcile_projection_changes(
                 command,
                 "projection_reconcile_failed",
                 format!("failed to reconcile macOS File Provider changes: {error}"),
+            )
+        })
+}
+
+fn repair_missing_database_schema_for_target(
+    command: &'static str,
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target_path: &Path,
+) -> Result<(), CommandError> {
+    let absolute_path = absolute_command_path(target_path);
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| CommandError::new(command, "store_error", error.to_string()))?;
+    let Some((mount, matched)) = daemon_file_provider::find_mount_for_path(&mounts, &absolute_path)
+    else {
+        return Ok(());
+    };
+    if mount.connector != "notion" {
+        return Ok(());
+    }
+
+    let mut relative_path = matched.relative_path;
+    let mut entity = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| CommandError::new(command, "store_error", error.to_string()))?;
+    if entity.is_none() && absolute_path.is_dir() {
+        let page_relative_path = page_document_path(&relative_path);
+        if let Some(page_entity) = store
+            .find_entity_by_path(&mount.mount_id, &page_relative_path)
+            .map_err(|error| CommandError::new(command, "store_error", error.to_string()))?
+        {
+            relative_path = page_relative_path;
+            entity = Some(page_entity);
+        }
+    }
+    let Some(entity) = entity.filter(|entity| entity.kind == EntityKind::Page) else {
+        return Ok(());
+    };
+
+    let parent_path = page_listing_parent_path(&relative_path);
+    let Some(database) = store
+        .find_entity_by_path(&mount.mount_id, &parent_path)
+        .map_err(|error| CommandError::new(command, "store_error", error.to_string()))?
+        .filter(|entity| entity.kind == EntityKind::Database)
+    else {
+        return Ok(());
+    };
+
+    let output_root = if mount.projection.uses_virtual_filesystem() {
+        virtual_fs_content_root(state_root, &mount.mount_id)
+    } else {
+        mount.root.clone()
+    };
+    if output_root
+        .join(&database.path)
+        .join("_schema.yaml")
+        .exists()
+    {
+        return Ok(());
+    }
+
+    let credentials = open_credential_store(state_root);
+    let connector =
+        resolve_source_for_path(store, credentials.as_ref(), &absolute_path).map_err(|error| {
+            CommandError::new(command, error.code(), error.message())
+                .with_optional_suggested_command(error.suggested_command())
+        })?;
+    write_parent_database_schema_cache(store, &connector, mount, &entity, &output_root)
+        .map(|_| ())
+        .map_err(|error| {
+            CommandError::new(
+                command,
+                afs_error_code(&error),
+                format!("failed to repair Notion database schema cache: {error}"),
             )
         })
 }

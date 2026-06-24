@@ -53,7 +53,7 @@ use crate::autosave::{
 };
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
-use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::hydration::{HydratedEntity, HydrationSource, write_parent_database_schema_cache};
 use crate::media::{render_document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use crate::shadow_match::shadows_match;
 use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
@@ -103,6 +103,7 @@ where
             Some(&job.target_path),
         )?;
     }
+    repair_missing_database_schema_for_target(store, source, &job.target_path, state_root)?;
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     execute_prepared_push(store, source, prepared, state_root)
 }
@@ -1376,6 +1377,71 @@ where
         shadows: Vec::new(),
         pipeline,
     })
+}
+
+fn repair_missing_database_schema_for_target<S, Source>(
+    store: &S,
+    source: &Source,
+    target_path: &Path,
+    state_root: Option<&Path>,
+) -> AfsResult<()>
+where
+    S: MountRepository + EntityRepository,
+    Source: HydrationSource + ?Sized,
+{
+    let absolute_path = absolute_path(target_path).map_err(AfsError::from)?;
+    let mounts = store.load_mounts().map_err(AfsError::from)?;
+    let Some(mount) = find_mount_for_path(&mounts, &absolute_path).cloned() else {
+        return Ok(());
+    };
+    if mount.connector != "notion" {
+        return Ok(());
+    }
+    let mut relative_path = relative_entity_path(&mount, &absolute_path).map_err(AfsError::from)?;
+    let mut entity = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(AfsError::from)?;
+    if entity.is_none() && absolute_path.is_dir() {
+        let page_relative_path = page_document_path(&relative_path);
+        if let Some(page_entity) = store
+            .find_entity_by_path(&mount.mount_id, &page_relative_path)
+            .map_err(AfsError::from)?
+        {
+            relative_path = page_relative_path;
+            entity = Some(page_entity);
+        }
+    }
+    let Some(entity) = entity.filter(|entity| entity.kind == EntityKind::Page) else {
+        return Ok(());
+    };
+    let parent_path = page_container_path(&relative_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let Some(database) = store
+        .find_entity_by_path(&mount.mount_id, &parent_path)
+        .map_err(AfsError::from)?
+        .filter(|entity| entity.kind == EntityKind::Database)
+    else {
+        return Ok(());
+    };
+    let output_root = if mount.projection.uses_virtual_filesystem() {
+        let Some(state_root) = state_root else {
+            return Ok(());
+        };
+        virtual_fs_content_root(state_root, &mount.mount_id)
+    } else {
+        mount.root.clone()
+    };
+    if output_root
+        .join(&database.path)
+        .join("_schema.yaml")
+        .exists()
+    {
+        return Ok(());
+    }
+    write_parent_database_schema_cache(store, source, &mount, &entity, &output_root)?;
+    Ok(())
 }
 
 fn prepare_pending_create<S, Validator>(

@@ -7,6 +7,7 @@ use afs_core::conflict::{
 };
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
+use afs_core::path_projection::page_listing_parent_path;
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
@@ -27,6 +28,10 @@ pub trait HydrationEngine {
 
 pub trait HydrationSource {
     fn fetch_render(&self, request: &HydrationRequest) -> AfsResult<HydratedEntity>;
+
+    fn fetch_database_schema_yaml(&self, _database_id: &RemoteId) -> AfsResult<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +141,8 @@ where
                 rendered.shadow.entity_id.0, request.remote_id.0
             )));
         }
+
+        write_parent_database_schema_cache(self.store, self.source, &mount, &entity, &output_root)?;
 
         if !can_replace {
             if file_has_unresolved_conflict_markers(&path)? {
@@ -634,6 +641,51 @@ fn is_stub_file(path: &Path) -> AfsResult<bool> {
 
     let contents = read_to_string(path)?;
     Ok(contents.contains(CanonicalDocument::STUB_MARKER))
+}
+
+pub fn write_parent_database_schema_cache<S, Source>(
+    store: &S,
+    source: &Source,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    output_root: &Path,
+) -> AfsResult<bool>
+where
+    S: EntityRepository,
+    Source: HydrationSource + ?Sized,
+{
+    let Some(database) = parent_database_entity(store, &mount.mount_id, entity)? else {
+        return Ok(false);
+    };
+    let Some(schema) = source.fetch_database_schema_yaml(&database.remote_id)? else {
+        return Ok(false);
+    };
+    write_atomic(
+        &output_root.join(&database.path).join("_schema.yaml"),
+        schema,
+    )?;
+    Ok(true)
+}
+
+fn parent_database_entity<S>(
+    store: &S,
+    mount_id: &MountId,
+    entity: &EntityRecord,
+) -> AfsResult<Option<EntityRecord>>
+where
+    S: EntityRepository,
+{
+    if entity.kind != afs_core::model::EntityKind::Page {
+        return Ok(None);
+    }
+    let parent_path = page_listing_parent_path(&entity.path);
+    if parent_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    Ok(store
+        .find_entity_by_path(mount_id, &parent_path)
+        .map_err(AfsError::from)?
+        .filter(|entity| entity.kind == afs_core::model::EntityKind::Database))
 }
 
 fn file_has_unresolved_conflict_markers(path: &Path) -> AfsResult<bool> {

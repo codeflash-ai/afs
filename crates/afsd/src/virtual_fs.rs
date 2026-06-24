@@ -21,7 +21,9 @@ use afs_store::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
+use crate::hydration::{
+    HydrationExecutor, HydrationOutcome, HydrationSource, write_parent_database_schema_cache,
+};
 use crate::shadow_match::parsed_matches_shadow;
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
@@ -412,6 +414,7 @@ where
 
     let path = mount.root.join(&entity.path);
     let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
+        write_parent_database_schema_cache(store, source, &mount, &entity, &mount.root)?;
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(
@@ -535,6 +538,7 @@ where
 
     let path = content_path_for_relative(content_root, &entity.path)?;
     let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
+        write_parent_database_schema_cache(store, source, &mount, &entity, content_root)?;
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(

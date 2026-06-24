@@ -14,7 +14,9 @@ use afs_core::conflict::{
 use afs_core::freshness::RemoteVersion;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
-use afs_core::path_projection::{is_page_document_path, page_container_path};
+use afs_core::path_projection::{
+    is_page_document_path, page_container_path, page_listing_parent_path,
+};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ProjectionMode,
@@ -716,6 +718,7 @@ where
         Err(error) => return Err(PullError::Connector(error)),
     };
     let media_root = projection_output_root(state_root, mount)?;
+    write_parent_database_schema_cache(store, source, mount, &entity, &media_root)?;
     write_assets(&media_root, &rendered.assets)?;
 
     if can_replace {
@@ -865,6 +868,53 @@ fn projection_output_root(
     }
 
     Ok(mount.root.clone())
+}
+
+fn write_parent_database_schema_cache<S, Source>(
+    store: &S,
+    source: &Source,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    output_root: &Path,
+) -> Result<(), PullError>
+where
+    S: EntityRepository,
+    Source: SourceAdapter,
+{
+    let Some(database) = parent_database_entity(store, mount, entity)? else {
+        return Ok(());
+    };
+    let Some(schema) = source
+        .database_schema_yaml(&database.remote_id)
+        .map_err(PullError::Connector)?
+    else {
+        return Ok(());
+    };
+    write_atomic(
+        &output_root.join(&database.path).join("_schema.yaml"),
+        schema,
+    )
+}
+
+fn parent_database_entity<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+) -> Result<Option<EntityRecord>, PullError>
+where
+    S: EntityRepository,
+{
+    if entity.kind != EntityKind::Page {
+        return Ok(None);
+    }
+    let parent_path = page_listing_parent_path(&entity.path);
+    if parent_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    Ok(store
+        .find_entity_by_path(&mount.mount_id, &parent_path)
+        .map_err(PullError::Store)?
+        .filter(|entity| entity.kind == EntityKind::Database))
 }
 
 fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> {
@@ -1378,7 +1428,8 @@ mod tests {
     use afs_core::planner::PushOperationKind;
     use afs_core::shadow::{ShadowDocument, segment_markdown_body};
     use afs_store::{
-        EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ShadowRepository,
+        EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
+        ShadowRepository,
     };
 
     use super::{can_replace_file, write_atomic};
@@ -1561,6 +1612,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pull_virtual_database_row_writes_parent_schema_cache() {
+        let fixture = PullFixture::new();
+        let state_root = fixture.root.join("state");
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).expect("save mount");
+        let database_id = RemoteId::new("database-1");
+        let row_id = RemoteId::new("row-1");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                database_id.clone(),
+                EntityKind::Database,
+                "Tasks",
+                "Tasks",
+            ))
+            .expect("save database");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                row_id.clone(),
+                EntityKind::Page,
+                "Fix login bug",
+                "Tasks/Fix Login Bug/page.md",
+            ))
+            .expect("save row");
+        let source = FakePullSource::new(
+            Vec::new(),
+            vec![hydrated_entity(
+                &row_id,
+                "Fix login bug",
+                "Original row body.\n",
+                Vec::new(),
+            )],
+        )
+        .with_schema(&database_id, "title: Tasks\nproperties: {}\n");
+
+        let report = super::pull_entity_path(
+            &mut store,
+            &source,
+            &mount,
+            PathBuf::from("Tasks/Fix Login Bug/page.md").as_path(),
+            fixture.root.join("Tasks/Fix Login Bug/page.md"),
+            Some(&state_root),
+        )
+        .expect("pull row");
+
+        assert_eq!(report.hydrated, 1);
+        let schema_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &fixture.mount_id)
+                .join("Tasks/_schema.yaml");
+        assert_eq!(
+            std::fs::read_to_string(schema_path).expect("schema cache"),
+            "title: Tasks\nproperties: {}\n"
+        );
+    }
+
     struct PullFixture {
         mount: MountConfig,
         mount_id: MountId,
@@ -1664,6 +1774,7 @@ mod tests {
     struct FakePullSource {
         entries: Vec<afs_core::model::TreeEntry>,
         rendered: BTreeMap<RemoteId, HydratedEntity>,
+        schemas: BTreeMap<RemoteId, String>,
     }
 
     impl FakePullSource {
@@ -1674,7 +1785,13 @@ mod tests {
                     .into_iter()
                     .map(|entity| (entity.shadow.entity_id.clone(), entity))
                     .collect(),
+                schemas: BTreeMap::new(),
             }
+        }
+
+        fn with_schema(mut self, database_id: &RemoteId, schema: &str) -> Self {
+            self.schemas.insert(database_id.clone(), schema.to_string());
+            self
         }
     }
 
@@ -1743,7 +1860,11 @@ mod tests {
 
     impl SourcePushValidator for FakePullSource {}
 
-    impl SourceAdapter for FakePullSource {}
+    impl SourceAdapter for FakePullSource {
+        fn database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<Option<String>> {
+            Ok(self.schemas.get(database_id).cloned())
+        }
+    }
 
     fn tree_entry(
         mount_id: &MountId,

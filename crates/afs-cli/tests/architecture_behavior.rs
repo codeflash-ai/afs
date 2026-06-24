@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use afs_cli::diff::run_diff_with_state_root;
 use afs_cli::status::{StatusOptions, StatusState, run_status};
 use afs_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
@@ -197,6 +198,80 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
 }
 
 #[test]
+fn virtual_database_row_open_caches_schema_before_local_title_diff() {
+    let fixture = BehaviorFixture::new();
+    let mut store = fixture.store();
+    fixture.seed_workspace(&mut store);
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Teamspace Home/Tasks",
+        ))
+        .expect("save database");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("row-1"),
+            EntityKind::Page,
+            "Fix login bug",
+            "Teamspace Home/Tasks/Fix Login Bug/page.md",
+        ))
+        .expect("save database row");
+
+    let source = FakeSource::new();
+    source.insert_remote_body("row-1", "Original row body.\n");
+    source.set_schema("database-1", tasks_schema());
+    let content_root = virtual_fs_content_root(&fixture.state_root, &fixture.mount_id);
+
+    let materialized = materialize_virtual_fs_item_with_content_root(
+        &mut store,
+        &source,
+        &content_root,
+        &fixture.mount_id,
+        "row-1",
+    )
+    .expect("open database row");
+    assert_eq!(materialized.hydration, HydrationState::Hydrated);
+    assert_eq!(
+        fs::read_to_string(fixture.content_path("Teamspace Home/Tasks/_schema.yaml"))
+            .expect("schema cache"),
+        tasks_schema()
+    );
+
+    let local_file = fixture.content_path("Teamspace Home/Tasks/Fix Login Bug/page.md");
+    let edited = fs::read_to_string(&local_file)
+        .expect("read row")
+        .replace("title: Launch Plan", "title: Fix login bug renamed");
+    commit_virtual_fs_write(
+        &mut store,
+        &content_root,
+        &fixture.mount_id,
+        "row-1",
+        edited.as_bytes(),
+    )
+    .expect("local row title edit");
+
+    let diff = run_diff_with_state_root(
+        &store,
+        fixture
+            .root
+            .join("Teamspace Home/Tasks/Fix Login Bug/page.md"),
+        Some(&fixture.state_root),
+    )
+    .expect("diff edited row");
+    assert!(
+        diff.validation
+            .iter()
+            .all(|issue| issue.code != "notion_schema_missing"),
+        "{diff:#?}"
+    );
+    assert!(diff.ok, "{diff:#?}");
+}
+
+#[test]
 fn unknown_local_path_reports_no_matching_mount() {
     let fixture = BehaviorFixture::new();
     let store = SqliteStateStore::open(fixture.state_root.clone()).expect("open sqlite store");
@@ -280,6 +355,7 @@ struct ListRequestSnapshot {
 struct FakeSource {
     remote_bodies: RefCell<BTreeMap<RemoteId, String>>,
     after_apply: RefCell<BTreeMap<RemoteId, String>>,
+    schemas: RefCell<BTreeMap<RemoteId, String>>,
     list_requests: RefCell<Vec<ListRequestSnapshot>>,
     apply_count: Cell<usize>,
 }
@@ -292,15 +368,28 @@ impl FakeSource {
                 "## Launch\n\nOriginal launch plan.\n".to_string(),
             )])),
             after_apply: RefCell::new(BTreeMap::new()),
+            schemas: RefCell::new(BTreeMap::new()),
             list_requests: RefCell::new(Vec::new()),
             apply_count: Cell::new(0),
         }
+    }
+
+    fn insert_remote_body(&self, remote_id: &str, body: &str) {
+        self.remote_bodies
+            .borrow_mut()
+            .insert(RemoteId::new(remote_id), body.to_string());
     }
 
     fn set_body_after_apply(&self, remote_id: &str, body: &str) {
         self.after_apply
             .borrow_mut()
             .insert(RemoteId::new(remote_id), body.to_string());
+    }
+
+    fn set_schema(&self, database_id: &str, schema: &str) {
+        self.schemas
+            .borrow_mut()
+            .insert(RemoteId::new(database_id), schema.to_string());
     }
 
     fn remote_body(&self, remote_id: &str) -> String {
@@ -335,6 +424,10 @@ impl HydrationSource for FakeSource {
             .cloned()
             .ok_or_else(|| AfsError::InvalidState("missing fake remote body".to_string()))?;
         Ok(hydrated_entity(&request.remote_id, "Launch Plan", &body))
+    }
+
+    fn fetch_database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<Option<String>> {
+        Ok(self.schemas.borrow().get(database_id).cloned())
     }
 }
 
@@ -520,6 +613,21 @@ fn block_count(body: &str) -> usize {
     body.split("\n\n")
         .filter(|block| !block.trim().is_empty())
         .count()
+}
+
+fn tasks_schema() -> &'static str {
+    r#"afs:
+  type: notion_database_schema
+  database_id: "database-1"
+title: "Tasks"
+data_sources:
+  - id: "source-1"
+    name: "Tasks"
+    properties:
+      Name:
+        id: "name-id"
+        type: "title"
+"#
 }
 
 fn unique_temp_path(prefix: &str) -> PathBuf {

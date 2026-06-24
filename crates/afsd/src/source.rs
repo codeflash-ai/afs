@@ -298,6 +298,12 @@ impl HydrationSource for ResolvedSource {
             Self::Notion(source) => source.fetch_render(request),
         }
     }
+
+    fn fetch_database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<Option<String>> {
+        match self {
+            Self::Notion(source) => source.fetch_database_schema_yaml(database_id),
+        }
+    }
 }
 
 pub trait SourcePushValidator {
