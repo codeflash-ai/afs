@@ -90,13 +90,21 @@ Suggested concrete folder:
 ```
 
 On macOS, the real AFS root is assigned by File Provider and must be read from
-`NSFileProviderManager.getUserVisibleURL`. Packaged builds normally resolve to
-`~/Library/CloudStorage/AFS`; local development bundles can resolve to names
-such as `~/Library/CloudStorage/AgentFS`. Each connector gets a stable child
-folder such as `notion`, `linear`, or `gmail`. AFS should not create a Documents
-alias or symlink; the app should show the actual CloudStorage folder directly.
-This step should be framed as "Where should your Notion files appear?" rather
-than "configure mount root."
+`NSFileProviderManager.getUserVisibleURL`. Packaged builds and the local
+development bundle identify the host app as `AFS`, so new installs should
+resolve to `~/Library/CloudStorage/AFS`. Older roots such as `AgentFS` and
+`AFS-AFS` are repair aliases only. Each connector gets a stable child folder
+such as `notion`, `linear`, or `gmail`. AFS should not create a Documents alias
+or symlink; the app should show the actual CloudStorage folder directly. This
+step should be framed as "Where should your Notion files appear?" rather than
+"configure mount root."
+
+Local diagnostics live under the AFS state root in `logs/`. Desktop actions and
+File Provider repair failures are mirrored to `desktop.log` with event markers
+such as `[file_provider.open_domain_failed]`; daemon-managed runs continue to
+write afsd logs in the same folder. The UI should point support and power users
+to that one directory instead of asking them to inspect terminal output,
+launchd, and helper logs separately.
 
 ### 4. Create Workspace Mount
 

@@ -7,6 +7,7 @@ pub mod bundle;
 pub mod capabilities;
 pub mod cloud_files;
 pub mod daemon;
+pub mod logs;
 pub mod paths;
 pub mod process;
 
@@ -29,6 +30,10 @@ pub use daemon::{
     DaemonProcessManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonProcessStartReport,
     DaemonProcessStopReport, DaemonStartMode, DefaultDaemonProcessManager, MACOS_LAUNCHD_LABEL,
     daemon_socket_path,
+};
+pub use logs::{
+    DESKTOP_LOG_FILENAME, FILE_PROVIDER_LOG_FILENAME, LOGS_DIR_NAME, append_service_log, logs_dir,
+    service_log_path,
 };
 pub use paths::{
     DefaultHostPaths, HostPaths, ReportPath, default_mount_root, default_state_root,

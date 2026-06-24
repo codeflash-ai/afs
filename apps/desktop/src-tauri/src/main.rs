@@ -13,6 +13,8 @@ use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(target_os = "macos")]
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
@@ -58,8 +60,8 @@ use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use afs_platform::{
-    bundled_binary_next_to_current_exe, default_state_root as platform_default_state_root,
-    user_home as platform_user_home,
+    append_service_log, bundled_binary_next_to_current_exe,
+    default_state_root as platform_default_state_root, user_home as platform_user_home,
 };
 use afs_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -480,12 +482,20 @@ async fn run_notion_connection_flow(
                 &message,
                 action.activity_kind(),
             ) {
-                eprintln!("afs desktop could not record Notion access activity: {error}");
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Notion access activity: {error}"),
+                );
             }
             ActionReport { ok: true, message }
         }
         Ok(Err(message)) | Err(message) => {
-            eprintln!("afs desktop {} failed: {message}", action.failure_label());
+            desktop_log(
+                "warn",
+                "notion_access.failed",
+                format!("{} failed: {message}", action.failure_label()),
+            );
             ActionReport { ok: false, message }
         }
     };
@@ -2672,9 +2682,13 @@ fn connection_secret_refs(state_root: &Path) -> Vec<String> {
 
 fn stop_daemon_for_reset(state_root: &Path) {
     if let Err(error) = run_daemon_control(&daemon_control_args_any_manager("stop", state_root)) {
-        eprintln!(
-            "afs desktop could not stop afsd during local state reset: {}",
-            error.message()
+        desktop_log(
+            "warn",
+            "reset.stop_afsd_failed",
+            format!(
+                "could not stop afsd during local state reset: {}",
+                error.message()
+            ),
         );
     }
 }
@@ -2683,9 +2697,13 @@ fn reset_platform_projection_state() {
     #[cfg(target_os = "macos")]
     {
         if let Err(error) = run_macos_file_provider_helper("reset", Vec::new()) {
-            eprintln!(
-                "afs desktop could not reset macOS File Provider domains during local state reset: {}",
-                error.message()
+            desktop_log(
+                "warn",
+                "reset.file_provider_failed",
+                format!(
+                    "could not reset macOS File Provider domains during local state reset: {}",
+                    error.message()
+                ),
             );
         }
     }
@@ -2696,7 +2714,11 @@ fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
     let credentials = open_credential_store(state_root);
     for secret_ref in secret_refs {
         if let Err(error) = credentials.delete(&secret_ref) {
-            eprintln!("afs desktop could not delete credential `{secret_ref}`: {error}");
+            desktop_log(
+                "warn",
+                "reset.credential_delete_failed",
+                format!("could not delete credential `{secret_ref}`: {error}"),
+            );
         }
     }
 }
@@ -2735,9 +2757,13 @@ fn start_state_change_watcher(app: AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         let state_root = default_state_root();
         if let Err(error) = fs::create_dir_all(&state_root) {
-            eprintln!(
-                "afs desktop could not create state watch directory `{}`: {error}",
-                state_root.display()
+            desktop_log(
+                "warn",
+                "watcher.create_state_dir_failed",
+                format!(
+                    "could not create state watch directory `{}`: {error}",
+                    state_root.display()
+                ),
             );
             return;
         }
@@ -2748,15 +2774,23 @@ fn start_state_change_watcher(app: AppHandle) {
         }) {
             Ok(watcher) => watcher,
             Err(error) => {
-                eprintln!("afs desktop could not start state watcher: {error}");
+                desktop_log(
+                    "warn",
+                    "watcher.start_failed",
+                    format!("could not start state watcher: {error}"),
+                );
                 return;
             }
         };
 
         if let Err(error) = watcher.watch(&state_root, RecursiveMode::Recursive) {
-            eprintln!(
-                "afs desktop could not watch state directory `{}`: {error}",
-                state_root.display()
+            desktop_log(
+                "warn",
+                "watcher.watch_state_failed",
+                format!(
+                    "could not watch state directory `{}`: {error}",
+                    state_root.display()
+                ),
             );
             return;
         }
@@ -2775,7 +2809,11 @@ fn start_state_change_watcher(app: AppHandle) {
                     }
                     refresh_desktop_surfaces(&app);
                 }
-                Ok(Err(error)) => eprintln!("afs desktop state watcher event failed: {error}"),
+                Ok(Err(error)) => desktop_log(
+                    "warn",
+                    "watcher.event_failed",
+                    format!("state watcher event failed: {error}"),
+                ),
                 Err(_) => break,
             }
         }
@@ -2788,17 +2826,25 @@ fn watch_virtual_content_roots(
 ) -> Vec<PathBuf> {
     let content_root = virtual_fs_content_base(state_root);
     if let Err(error) = fs::create_dir_all(&content_root) {
-        eprintln!(
-            "afs desktop could not create virtual content watch directory `{}`: {error}",
-            content_root.display()
+        desktop_log(
+            "warn",
+            "watcher.create_content_dir_failed",
+            format!(
+                "could not create virtual content watch directory `{}`: {error}",
+                content_root.display()
+            ),
         );
         return Vec::new();
     }
 
     if let Err(error) = watcher.watch(&content_root, RecursiveMode::Recursive) {
-        eprintln!(
-            "afs desktop could not watch virtual content root `{}`: {error}",
-            content_root.display()
+        desktop_log(
+            "warn",
+            "watcher.watch_content_failed",
+            format!(
+                "could not watch virtual content root `{}`: {error}",
+                content_root.display()
+            ),
         );
         return Vec::new();
     }
@@ -3156,6 +3202,12 @@ fn launch_agent_path() -> Option<PathBuf> {
 
 fn action_error(message: String) -> ActionReport {
     ActionReport { ok: false, message }
+}
+
+fn desktop_log(level: &str, event: &str, message: impl AsRef<str>) {
+    let message = message.as_ref();
+    let _ = append_service_log(&default_state_root(), "desktop", level, event, message);
+    eprintln!("afs desktop [{event}] {message}");
 }
 
 fn mount_access_root(mount: &MountConfig) -> PathBuf {
@@ -3629,7 +3681,15 @@ fn reveal_missing_virtual_mount_path(path: &Path, mount: &MountConfig) -> Result
             #[cfg(target_os = "macos")]
             {
                 signal_virtual_projection_refresh(mount);
-                return reveal_macos_path_in_finder(path);
+                let target = reveal_target(path);
+                if wait_for_path_to_exist(&target, Duration::from_secs(8)) {
+                    return reveal_macos_path_in_finder(&target);
+                }
+                open_virtual_projection(mount)?;
+                return Err(format!(
+                    "The file is still being materialized. Finder opened the AFS folder; try Reveal again once {} appears.",
+                    target.display()
+                ));
             }
 
             #[cfg(not(target_os = "macos"))]
@@ -3639,6 +3699,18 @@ fn reveal_missing_virtual_mount_path(path: &Path, mount: &MountConfig) -> Result
         }
         MissingVirtualRevealAction::OpenProjectionRoot => open_virtual_projection(mount),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_path_to_exist(path: &Path, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(125));
+    }
+    path.exists()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3792,14 +3864,22 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
     match running_daemon_build(state_root) {
         Some(build) if build == current_build => return Ok(()),
         Some(build) => {
-            eprintln!(
-                "afs desktop detected running afsd build {} but bundled afsd is {}; restarting afsd",
-                build.build_id, current_build.build_id
+            desktop_log(
+                "warn",
+                "daemon.build_mismatch",
+                format!(
+                    "detected running afsd build {} but bundled afsd is {}; restarting afsd",
+                    build.build_id, current_build.build_id
+                ),
             );
             return restart_daemon_for_current_binary(state_root);
         }
         None if daemon_is_ready(state_root) => {
-            eprintln!("afs desktop detected an older afsd without build metadata; restarting afsd");
+            desktop_log(
+                "warn",
+                "daemon.missing_build_metadata",
+                "detected an older afsd without build metadata; restarting afsd",
+            );
             return restart_daemon_for_current_binary(state_root);
         }
         None => {}
@@ -4514,9 +4594,13 @@ fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
     match reload_daemon_mounts_once(state_root) {
         Ok(()) => Ok(()),
         Err(error) if error.is_unsupported_schema_version() => {
-            eprintln!(
-                "afs desktop detected a stale afsd schema reader during reload: {}",
-                error.message
+            desktop_log(
+                "warn",
+                "daemon.reload_stale_schema",
+                format!(
+                    "detected a stale afsd schema reader during reload: {}",
+                    error.message
+                ),
             );
             restart_daemon_for_current_binary(state_root)?;
             reload_daemon_mounts_once(state_root).map_err(|retry_error| {
@@ -4817,9 +4901,13 @@ fn running_daemon_build(state_root: &Path) -> Option<DaemonBuildInfo> {
 fn signal_virtual_projection_refresh(mount: &MountConfig) {
     for identifier in virtual_projection_refresh_signal_identifiers(mount) {
         if let Err(error) = signal_virtual_projection_container(mount, &identifier) {
-            eprintln!(
-                "afs desktop could not signal {}:{} refresh: {error}",
-                mount.mount_id.0, identifier
+            desktop_log(
+                "warn",
+                "file_provider.signal_failed",
+                format!(
+                    "could not signal {}:{} refresh: {error}",
+                    mount.mount_id.0, identifier
+                ),
             );
         }
     }
@@ -5027,16 +5115,24 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
         }
         Err(error) => {
             let first_error = error.message();
-            eprintln!(
-                "afs desktop could not open macOS File Provider domain `{}`: {first_error}",
-                afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID
+            desktop_log(
+                "warn",
+                "file_provider.open_domain_failed",
+                format!(
+                    "could not open macOS File Provider domain `{}`: {first_error}",
+                    afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID
+                ),
             );
 
             if let Err(error) = register_macos_virtual_projection(
                 &mount.mount_id.0,
                 &mount.root.display().to_string(),
             ) {
-                eprintln!("afs desktop could not re-register macOS File Provider domain: {error}");
+                desktop_log(
+                    "warn",
+                    "file_provider.reregister_failed",
+                    format!("could not re-register macOS File Provider domain: {error}"),
+                );
             } else if open_macos_file_provider_domain(
                 afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
             )
@@ -8071,6 +8167,7 @@ fn windows_wide_null(value: &str) -> Vec<u16> {
 }
 
 fn main() {
+    desktop_log("info", "app.start", "AFS desktop starting");
     let Some(single_instance_guard) = acquire_desktop_single_instance() else {
         return;
     };

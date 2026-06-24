@@ -3245,6 +3245,24 @@ function SearchResultList({
 }
 
 function LocatedPath({ item }: { item: LocatedItem }) {
+  const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState("");
+
+  async function revealLocatedPath() {
+    setRevealing(true);
+    setRevealError("");
+    try {
+      const report = await callCommand<ActionReport>("reveal_path", { path: item.localPath }, { ok: true, message: "" });
+      if (!report.ok) {
+        setRevealError(report.message);
+      }
+    } catch (error) {
+      setRevealError(errorMessage(error));
+    } finally {
+      setRevealing(false);
+    }
+  }
+
   return (
     <div className="located-path">
       <div>
@@ -3256,10 +3274,11 @@ function LocatedPath({ item }: { item: LocatedItem }) {
         <SecondaryButton compact icon={<Copy />} onClick={() => copyText(item.localPath)}>
           Copy Path
         </SecondaryButton>
-        <SecondaryButton compact icon={<FolderOpen />} onClick={() => void callCommand("reveal_path", { path: item.localPath }, { ok: true })}>
-          Reveal in Finder
+        <SecondaryButton compact busy={revealing} icon={<FolderOpen />} onClick={() => void revealLocatedPath()}>
+          {revealing ? "Preparing..." : "Reveal in Finder"}
         </SecondaryButton>
       </div>
+      {revealError && <p className="field-error">{revealError}</p>}
     </div>
   );
 }
@@ -3474,18 +3493,20 @@ function PrimaryButton({
   children,
   icon,
   compact,
+  busy,
   disabled,
   onClick,
 }: {
   children: React.ReactNode;
   icon?: React.ReactNode;
   compact?: boolean;
+  busy?: boolean;
   disabled?: boolean;
   onClick?: () => void;
 }) {
   return (
-    <button className={`primary-button ${compact ? "compact" : ""}`} disabled={disabled} onClick={onClick}>
-      {icon}
+    <button className={`primary-button ${compact ? "compact" : ""}`} disabled={disabled || busy} onClick={onClick} aria-busy={busy ? "true" : "false"}>
+      {busy ? <Loader2 className="spin-icon" /> : icon}
       <span>{children}</span>
     </button>
   );
@@ -3495,18 +3516,20 @@ function SecondaryButton({
   children,
   icon,
   compact,
+  busy,
   disabled,
   onClick,
 }: {
   children: React.ReactNode;
   icon?: React.ReactNode;
   compact?: boolean;
+  busy?: boolean;
   disabled?: boolean;
   onClick?: () => void;
 }) {
   return (
-    <button className={`secondary-button ${compact ? "compact" : ""}`} disabled={disabled} onClick={onClick}>
-      {icon}
+    <button className={`secondary-button ${compact ? "compact" : ""}`} disabled={disabled || busy} onClick={onClick} aria-busy={busy ? "true" : "false"}>
+      {busy ? <Loader2 className="spin-icon" /> : icon}
       <span>{children}</span>
     </button>
   );
