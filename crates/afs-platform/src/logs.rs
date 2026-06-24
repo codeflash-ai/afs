@@ -1,5 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +34,8 @@ pub fn append_service_log(
         fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(
+    lock_log_file(&file)?;
+    let result = writeln!(
         file,
         "{} [{}] [{}] [{}] {}",
         unix_ms(),
@@ -40,7 +43,39 @@ pub fn append_service_log(
         sanitize_token(level),
         sanitize_token(event),
         sanitize_line(message)
-    )
+    );
+    let unlock_result = unlock_log_file(&file);
+    result.and(unlock_result)
+}
+
+#[cfg(unix)]
+fn lock_log_file(file: &fs::File) -> io::Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlock_log_file(file: &fs::File) -> io::Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_log_file(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn unlock_log_file(_file: &fs::File) -> io::Result<()> {
+    Ok(())
 }
 
 fn unix_ms() -> u128 {

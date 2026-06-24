@@ -998,6 +998,9 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
+    if !macos_file_provider_path_is_under_cloud_storage(&mount.root) {
+        return Vec::new();
+    }
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
@@ -1016,6 +1019,16 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
             .join("AFS-AFS")
             .join(source_root_directory_name(&mount.connector)),
     ]
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_path_is_under_cloud_storage(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "CloudStorage")
+    })
 }
 
 #[cfg(target_os = "macos")]

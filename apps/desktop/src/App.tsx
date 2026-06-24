@@ -254,6 +254,47 @@ const sampleSnapshot: DesktopSnapshot = {
   ],
 };
 
+const loadingSnapshot: DesktopSnapshot = {
+  ...sampleSnapshot,
+  health: {
+    state: "checking_freshness",
+    attentionCount: 0,
+  },
+  connection: {
+    ...sampleSnapshot.connection,
+    workspaceName: "Loading",
+    accountLabel: "",
+    status: "loading",
+  },
+  mount: {
+    ...sampleSnapshot.mount,
+    workspaceName: "Loading",
+    localPath: "~/Library/CloudStorage/AFS",
+    notionUrl: null,
+    accessScope: "Checking access",
+    status: "loading",
+    provider: null,
+  },
+  pendingChanges: [],
+  activity: [],
+};
+
+const snapshotLoadFailed: DesktopSnapshot = {
+  ...loadingSnapshot,
+  health: {
+    state: "stopped",
+    attentionCount: 0,
+  },
+  connection: {
+    ...loadingSnapshot.connection,
+    status: "unknown",
+  },
+  mount: {
+    ...loadingSnapshot.mount,
+    status: "unknown",
+  },
+};
+
 const samplePushPlan: PushPlan = {
   title: "Review Push",
   summary: "3 files will update Notion.",
@@ -403,7 +444,9 @@ function useNotionSearchResults(query: string, enabled = true) {
 }
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<DesktopSnapshot>(sampleSnapshot);
+  const [snapshot, setSnapshot] = useState<DesktopSnapshot>(() =>
+    isTauriRuntime() ? loadingSnapshot : sampleSnapshot,
+  );
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
@@ -542,7 +585,7 @@ export default function App() {
       }
       await refreshSnapshot();
     })().catch(() => {
-      setSnapshot(sampleSnapshot);
+      setSnapshot(isTauriRuntime() ? snapshotLoadFailed : sampleSnapshot);
       setSnapshotLoaded(true);
     });
   }, []);
@@ -2204,6 +2247,16 @@ function SettingsView({
     setDiagnosticMessage("Copied diagnostics summary.");
   }
 
+  async function openLogsFolder() {
+    setDiagnosticMessage("");
+    const report = await callCommand<ActionReport>(
+      "open_logs_folder",
+      undefined,
+      { ok: true, message: "Opened logs folder." },
+    );
+    setDiagnosticMessage(report.message);
+  }
+
   async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar", enabled: boolean) {
     setBusySetting(key);
     setSettingsMessage("");
@@ -2370,6 +2423,9 @@ function SettingsView({
           <div className="button-row">
             <SecondaryButton compact onClick={copyDiagnostics}>
               Copy Summary
+            </SecondaryButton>
+            <SecondaryButton compact icon={<FolderOpen />} onClick={() => void openLogsFolder()}>
+              Open Logs
             </SecondaryButton>
             <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
               {runtimeNeedsRepair ? "Start AFS" : "Repair AFS"}

@@ -61,7 +61,8 @@ use afs_notion::oauth::{
 };
 use afs_platform::{
     append_service_log, bundled_binary_next_to_current_exe,
-    default_state_root as platform_default_state_root, user_home as platform_user_home,
+    default_state_root as platform_default_state_root, logs_dir as platform_logs_dir,
+    user_home as platform_user_home,
 };
 use afs_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -77,8 +78,9 @@ use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request
 use afsd::push::execute_auto_save_push_job_with_content_root;
 use afsd::source::{resolve_source_for_mount_id, resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::{
-    commit_virtual_fs_write, source_root_directory_name, source_root_identifier,
-    virtual_fs_content_base, virtual_fs_content_path, virtual_fs_content_root,
+    commit_virtual_fs_write, materialize_virtual_fs_item_with_content_root,
+    source_root_directory_name, source_root_identifier, virtual_fs_content_base,
+    virtual_fs_content_path, virtual_fs_content_root,
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -1251,6 +1253,27 @@ async fn open_path(path: String) -> ActionReport {
         Ok(expanded) => ActionReport {
             ok: true,
             message: format!("Opened {}", expanded.display()),
+        },
+        Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+async fn open_logs_folder() -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let path = platform_logs_dir(&default_state_root());
+        fs::create_dir_all(&path).map_err(|error| {
+            format!("Could not create logs folder `{}`: {error}", path.display())
+        })?;
+        open_in_file_manager(&path).map(|()| path)
+    })
+    .await
+    .map_err(|error| format!("Open logs worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(path) => ActionReport {
+            ok: true,
+            message: format!("Opened logs folder {}", path.display()),
         },
         Err(message) => ActionReport { ok: false, message },
     }
@@ -3680,8 +3703,9 @@ fn reveal_missing_virtual_mount_path(path: &Path, mount: &MountConfig) -> Result
         MissingVirtualRevealAction::RevealRequestedPath => {
             #[cfg(target_os = "macos")]
             {
-                signal_virtual_projection_refresh(mount);
                 let target = reveal_target(path);
+                ensure_visible_virtual_file_for_reveal(&target, mount)?;
+                signal_virtual_projection_refresh(mount);
                 if wait_for_path_to_exist(&target, Duration::from_secs(8)) {
                     return reveal_macos_path_in_finder(&target);
                 }
@@ -3699,6 +3723,108 @@ fn reveal_missing_virtual_mount_path(path: &Path, mount: &MountConfig) -> Result
         }
         MissingVirtualRevealAction::OpenProjectionRoot => open_virtual_projection(mount),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_visible_virtual_file_for_reveal(path: &Path, mount: &MountConfig) -> Result<(), String> {
+    let Some(path_match) = daemon_file_provider::match_mount_path(mount, path) else {
+        return Ok(());
+    };
+
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let Some(entity) = store
+        .find_entity_by_path(&mount.mount_id, &path_match.relative_path)
+        .map_err(|error| format!("Could not inspect mounted pages: {error}"))?
+    else {
+        return Ok(());
+    };
+    if entity.kind != EntityKind::Page {
+        return Ok(());
+    }
+
+    let content_root = virtual_fs_content_root(&state_root, &mount.mount_id);
+    let content_path = virtual_fs_content_path(&state_root, &mount.mount_id, &entity.path)
+        .map_err(|error| format!("Could not resolve the local content cache: {error}"))?;
+    if !content_path.exists() {
+        if matches!(
+            entity.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            return Err(
+                "This file has local changes but no materialized cache. Open Pending Changes to resolve it before revealing in Finder."
+                    .to_string(),
+            );
+        }
+        let credentials = open_credential_store(&state_root);
+        let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount.mount_id)
+            .map_err(|error| error.message())?;
+        materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &connector,
+            &content_root,
+            &mount.mount_id,
+            &entity.remote_id.0,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not hydrate `{}` before revealing it: {error}",
+                entity.title
+            )
+        })?;
+    }
+
+    write_visible_file_from_cache_for_reveal(&content_path, path)
+}
+
+#[cfg(target_os = "macos")]
+fn write_visible_file_from_cache_for_reveal(
+    cache_path: &Path,
+    visible_path: &Path,
+) -> Result<(), String> {
+    if visible_path.exists() {
+        if visible_path.is_file() {
+            return Ok(());
+        }
+        return Err(format!(
+            "Could not reveal `{}` because a non-file item already exists there.",
+            visible_path.display()
+        ));
+    }
+
+    let contents = fs::read(cache_path).map_err(|error| {
+        format!(
+            "Could not read materialized cache `{}`: {error}",
+            cache_path.display()
+        )
+    })?;
+    if let Some(parent) = visible_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Could not create Finder folder `{}`: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let file_name = visible_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("page.md");
+    let temp_path = visible_path.with_file_name(format!(".{file_name}.afs-reveal-tmp"));
+    fs::write(&temp_path, contents).map_err(|error| {
+        format!(
+            "Could not write Finder temp file `{}`: {error}",
+            temp_path.display()
+        )
+    })?;
+    fs::rename(&temp_path, visible_path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "Could not materialize Finder file `{}`: {error}",
+            visible_path.display()
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -6586,6 +6712,24 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reveal_materializes_visible_file_from_content_cache() {
+        let temp = TestTempDir::new("reveal-cache");
+        let cache = temp.path().join("cache/page.md");
+        let visible = temp.path().join("CloudStorage/AFS/notion/Page/page.md");
+        fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
+        fs::write(&cache, "# Page\n\nCached body").expect("write cache");
+
+        super::write_visible_file_from_cache_for_reveal(&cache, &visible)
+            .expect("materialize visible");
+
+        assert_eq!(
+            fs::read_to_string(&visible).expect("read visible"),
+            "# Page\n\nCached body"
+        );
+    }
+
     #[test]
     fn missing_non_macos_virtual_reveal_opens_projection_root() {
         let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
@@ -8240,6 +8384,7 @@ fn main() {
             save_notion_file,
             set_auto_save_for_file,
             open_path,
+            open_logs_folder,
             open_in_vs_code,
             reveal_path,
             show_main_window,
