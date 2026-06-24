@@ -218,14 +218,8 @@ impl DaemonProcessManager for DefaultDaemonProcessManager {
     ) -> Result<DaemonProcessStopReport, DaemonProcessError> {
         let mut stopped_managed_process = false;
 
-        if mode.should_use_launchd_for_current_target()
-            && paths
-                .launch_agent
-                .as_ref()
-                .is_some_and(|path| path.exists())
-        {
-            stop_launchd(paths)?;
-            stopped_managed_process = true;
+        if mode.should_use_launchd_for_current_target() && paths.launch_agent.is_some() {
+            stopped_managed_process = stop_launchd(paths)?;
         }
 
         if paths.pid_file.exists() {
@@ -329,11 +323,9 @@ fn start_launchd(
         .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
 
     let domain = launchd_domain()?;
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(&domain)
-        .arg(launch_agent)
-        .output();
+    let _ = fs::remove_file(&paths.pid_file);
+    launchctl_bootout_service(&domain);
+    launchctl_bootout_plist(&domain, launch_agent);
     run_launchctl(
         Command::new("launchctl")
             .arg("bootstrap")
@@ -369,26 +361,24 @@ fn start_launchd(
 }
 
 #[cfg(target_os = "macos")]
-fn stop_launchd(paths: &DaemonProcessPaths) -> Result<(), DaemonProcessError> {
+fn stop_launchd(paths: &DaemonProcessPaths) -> Result<bool, DaemonProcessError> {
     let Some(launch_agent) = &paths.launch_agent else {
-        return Ok(());
+        return Ok(false);
     };
     let domain = launchd_domain()?;
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(&domain)
-        .arg(launch_agent)
-        .output();
+    let had_launch_agent = launch_agent.exists();
+    let unloaded_service = launchctl_bootout_service(&domain);
+    let unloaded_plist = launchctl_bootout_plist(&domain, launch_agent);
     if launch_agent.exists() {
         fs::remove_file(launch_agent)
             .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
     }
-    Ok(())
+    Ok(had_launch_agent || unloaded_service || unloaded_plist)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn stop_launchd(_paths: &DaemonProcessPaths) -> Result<(), DaemonProcessError> {
-    Ok(())
+fn stop_launchd(_paths: &DaemonProcessPaths) -> Result<bool, DaemonProcessError> {
+    Ok(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -427,6 +417,30 @@ fn run_launchctl(command: &mut Command) -> Result<(), DaemonProcessError> {
             message
         },
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_bootout_service(domain: &str) -> bool {
+    Command::new("launchctl")
+        .arg("bootout")
+        .arg(launchd_service_target(domain))
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_bootout_plist(domain: &str, launch_agent: &Path) -> bool {
+    Command::new("launchctl")
+        .arg("bootout")
+        .arg(domain)
+        .arg(launch_agent)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchd_service_target(domain: &str) -> String {
+    format!("{domain}/{MACOS_LAUNCHD_LABEL}")
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -510,7 +524,7 @@ fn xml_escape(value: &str) -> String {
 mod tests {
     use super::{
         DaemonManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonStartMode,
-        daemon_socket_path, launch_agent_plist, xml_escape,
+        daemon_socket_path, launch_agent_plist, launchd_service_target, xml_escape,
     };
     use std::path::PathBuf;
 
@@ -572,6 +586,14 @@ mod tests {
             Some(DaemonManager::Session)
         );
         assert_eq!(DaemonStartMode::Launchd.resolve_for_target("windows"), None);
+    }
+
+    #[test]
+    fn launchd_service_target_uses_user_domain_and_label() {
+        assert_eq!(
+            launchd_service_target("gui/501"),
+            "gui/501/ai.codeflash.afs.afsd"
+        );
     }
 
     #[test]
