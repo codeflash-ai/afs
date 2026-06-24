@@ -536,7 +536,24 @@ fn send_daemon_request(
     timeout: Duration,
 ) -> Result<DaemonResponse, DaemonClientError> {
     let endpoint = control_endpoint(options, paths)?;
-    send_endpoint_request_with_timeout(&endpoint, request, timeout)
+    send_endpoint_request_with_timeout(&endpoint, request, timeout).or_else(|error| {
+        if cfg!(unix) && matches!(error, DaemonClientError::NotAvailable(_)) {
+            control_tcp_addr(options, paths)
+                .and_then(|addr| {
+                    send_endpoint_request_with_timeout(
+                        &DaemonEndpoint::LocalTcp(addr),
+                        request,
+                        timeout,
+                    )
+                })
+                .map_err(|fallback| match fallback {
+                    DaemonClientError::NotAvailable(_) => error,
+                    fallback => fallback,
+                })
+        } else {
+            Err(error)
+        }
+    })
 }
 
 fn control_endpoint(
@@ -555,7 +572,6 @@ fn control_endpoint(
     }
 }
 
-#[cfg(windows)]
 fn control_tcp_addr(
     options: &DaemonOptions,
     paths: &DaemonPaths,
@@ -574,12 +590,10 @@ fn control_tcp_addr(
     parse_tcp_addr(&value).map_err(DaemonClientError::Protocol)
 }
 
-#[cfg(windows)]
 fn tcp_addr_disabled(value: &str) -> bool {
     matches!(value, "0" | "off" | "none" | "disabled")
 }
 
-#[cfg(windows)]
 fn parse_tcp_addr(value: &str) -> Result<std::net::SocketAddr, String> {
     value
         .parse()
@@ -754,6 +768,9 @@ fn default_state_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use afsd::ipc::{DaemonBuildInfo, DaemonRuntimeStatus, DaemonWatchStatus};
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
 
     #[test]
     fn parses_daemon_start_options() {
@@ -804,6 +821,81 @@ mod tests {
             false,
             "macos"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_falls_back_to_tcp_when_unix_socket_is_absent() {
+        let root = temp_root("afs-daemon-control-tcp-fallback");
+        std::fs::create_dir_all(&root).expect("state root");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept tcp request");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone tcp stream"))
+                    .read_line(&mut line)
+                    .expect("read request");
+                let request: DaemonRequest = serde_json::from_str(&line).expect("decode request");
+                let response = match request {
+                    DaemonRequest::Ping => DaemonResponse::ok(serde_json::json!({})),
+                    DaemonRequest::Status => DaemonResponse::ok(DaemonStatusReport {
+                        status: "ok".to_string(),
+                        build: DaemonBuildInfo {
+                            version: "0.1.3".to_string(),
+                            build_id: "test-build".to_string(),
+                        },
+                        runtime: DaemonRuntimeStatus {
+                            active_job: false,
+                            active_job_detail: None,
+                            pending_requests: 0,
+                            pending_hydrations: 0,
+                            deferred_hydrations: 0,
+                            pending_freshness: 0,
+                            ready_freshness: 0,
+                            deferred_freshness: 0,
+                            freshness_budget_units: 0,
+                            ready_freshness_budget_units: 0,
+                            pending_scheduled_pull: false,
+                            scheduler_mode: "polling".to_string(),
+                            active_interval_ms: 15_000,
+                            cold_interval_ms: 300_000,
+                        },
+                        watches: DaemonWatchStatus {
+                            watched_mounts: 0,
+                            watched_roots: Vec::new(),
+                        },
+                    }),
+                    other => DaemonResponse::error(
+                        "unexpected_request",
+                        format!("unexpected request: {other:?}"),
+                    ),
+                };
+                afsd::ipc::write_response(&mut stream, &response).expect("write response");
+            }
+        });
+
+        let report = run_daemon_control(&[
+            "status".to_string(),
+            "--state-dir".to_string(),
+            root.display().to_string(),
+            "--tcp-addr".to_string(),
+            addr.to_string(),
+        ])
+        .expect("daemon status");
+
+        assert!(report.ok);
+        assert_eq!(report.state, DaemonRunState::Running);
+        assert_eq!(
+            report
+                .daemon_status
+                .as_ref()
+                .map(|status| status.build.build_id.as_str()),
+            Some("test-build")
+        );
+        server.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
@@ -862,7 +954,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(windows)]
     fn temp_root(prefix: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};

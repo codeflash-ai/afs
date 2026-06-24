@@ -293,7 +293,16 @@ pub fn send_request(
     request: &DaemonRequest,
 ) -> Result<DaemonResponse, DaemonClientError> {
     let endpoint = DaemonEndpoint::for_state_root(state_root)?;
-    send_endpoint_request(&endpoint, request)
+    send_endpoint_request(&endpoint, request).or_else(|error| {
+        if matches!(error, DaemonClientError::NotAvailable(_)) {
+            send_configured_tcp_request(request, None).map_err(|fallback| match fallback {
+                DaemonClientError::NotAvailable(_) => error,
+                fallback => fallback,
+            })
+        } else {
+            Err(error)
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -303,7 +312,16 @@ pub fn send_request_with_timeout(
     timeout: Duration,
 ) -> Result<DaemonResponse, DaemonClientError> {
     let endpoint = DaemonEndpoint::for_state_root(state_root)?;
-    send_endpoint_request_with_timeout(&endpoint, request, timeout)
+    send_endpoint_request_with_timeout(&endpoint, request, timeout).or_else(|error| {
+        if matches!(error, DaemonClientError::NotAvailable(_)) {
+            send_configured_tcp_request(request, Some(timeout)).map_err(|fallback| match fallback {
+                DaemonClientError::NotAvailable(_) => error,
+                fallback => fallback,
+            })
+        } else {
+            Err(error)
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -404,7 +422,6 @@ pub fn send_request_with_timeout(
     send_endpoint_request_with_timeout(&endpoint, request, timeout)
 }
 
-#[cfg(not(unix))]
 fn configured_tcp_addr() -> Result<SocketAddr, DaemonClientError> {
     match std::env::var("AFS_DAEMON_TCP_ADDR") {
         Ok(value) if matches!(value.as_str(), "0" | "off" | "none" | "disabled") => {
@@ -416,6 +433,18 @@ fn configured_tcp_addr() -> Result<SocketAddr, DaemonClientError> {
             DaemonClientError::Protocol(format!("invalid AFS_DAEMON_TCP_ADDR `{value}`: {error}"))
         }),
         Err(_) => Ok(default_tcp_addr()),
+    }
+}
+
+#[cfg(unix)]
+fn send_configured_tcp_request(
+    request: &DaemonRequest,
+    timeout: Option<Duration>,
+) -> Result<DaemonResponse, DaemonClientError> {
+    let addr = configured_tcp_addr()?;
+    match timeout {
+        Some(timeout) => send_tcp_request_with_timeout(addr, request, timeout),
+        None => send_tcp_request(addr, request),
     }
 }
 
@@ -471,8 +500,17 @@ where
 mod tests {
     #[cfg(unix)]
     use super::DaemonClientError;
-    use super::{DaemonEndpoint, DaemonRequest, DaemonTransport};
+    use super::{DaemonEndpoint, DaemonRequest, DaemonResponse, DaemonTransport};
+    #[cfg(unix)]
+    use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
+    use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn virtual_fs_item_command_decodes_as_platform_neutral_request() {
@@ -620,6 +658,47 @@ mod tests {
         let endpoint = DaemonEndpoint::for_state_root(&root).expect("endpoint");
 
         assert_eq!(endpoint, DaemonEndpoint::UnixSocket(root.join("afsd.sock")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_state_root_request_falls_back_to_tcp_when_socket_is_absent() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        let addr = listener.local_addr().expect("local addr");
+        let original = std::env::var("AFS_DAEMON_TCP_ADDR").ok();
+        unsafe {
+            std::env::set_var("AFS_DAEMON_TCP_ADDR", addr.to_string());
+        }
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept tcp request");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone tcp stream"))
+                .read_line(&mut line)
+                .expect("read request");
+            let request: DaemonRequest = serde_json::from_str(&line).expect("decode request");
+            assert_eq!(request, DaemonRequest::Ping);
+            super::write_response(&mut stream, &DaemonResponse::ok(serde_json::json!({})))
+                .expect("write response");
+        });
+
+        let root =
+            std::env::temp_dir().join(format!("afs-ipc-tcp-fallback-{}", std::process::id()));
+        let response =
+            super::send_request_with_timeout(&root, &DaemonRequest::Ping, Duration::from_secs(1))
+                .expect("tcp fallback response");
+
+        assert!(response.ok);
+        server.join().expect("server thread");
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var("AFS_DAEMON_TCP_ADDR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("AFS_DAEMON_TCP_ADDR");
+            },
+        }
     }
 
     #[cfg(unix)]
