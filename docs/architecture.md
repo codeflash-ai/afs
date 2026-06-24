@@ -98,12 +98,12 @@ AFS/
 
 The physical root is platform-specific. On macOS, File Provider assigns the
 user-visible root and AFS reads it from `NSFileProviderManager`; packaged builds
-normally appear as `~/Library/CloudStorage/AFS`, while local development bundles
-can appear as `~/Library/CloudStorage/AgentFS`. Windows uses a Cloud Files root
+and the local development bundle identify the host app as `AFS`, so new roots
+should appear as `~/Library/CloudStorage/AFS`. Windows uses a Cloud Files root
 and Linux uses `~/AFS` or the configured FUSE mount. Command handling treats the
 connector child folder, such as `<root>/notion`, as the mount boundary and
-normalizes known macOS File Provider root names so existing local paths continue
-to resolve during upgrades.
+normalizes older macOS File Provider root names such as `AgentFS` and `AFS-AFS`
+only so existing local paths continue to resolve during upgrades.
 
 Every file operation resolves through this boundary:
 

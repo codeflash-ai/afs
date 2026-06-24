@@ -5,7 +5,7 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>AgentFS</string>
+  <string>AFS</string>
   <key>CFBundleExecutable</key>
   <string>AgentFSFileProvider</string>
   <key>CFBundleIdentifier</key>

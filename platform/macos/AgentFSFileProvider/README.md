@@ -4,7 +4,7 @@ This package contains the macOS online-only projection:
 
 - a `NSFileProviderReplicatedExtension` implementation;
 - `agentfs-file-providerctl`, a small domain registration helper;
-- a minimal containing `AgentFS.app` bundle template; and
+- a minimal containing `AFS.app` bundle template; and
 - Command Line Tools scripts for a local ad-hoc development bundle.
 
 The extension delegates all durable state and network work to `afsd`. These
@@ -47,8 +47,8 @@ sandboxed app extensions should not depend on a Unix socket in `~/.afs`.
 platform/macos/AgentFSFileProvider/scripts/install-dev-bundle.sh
 ```
 
-The script builds `AgentFS.app`, embeds `AgentFSFileProvider.appex`, signs both
-ad-hoc, installs the app to `~/Applications/AgentFS.app`, registers it with
+The script builds `AFS.app`, embeds `AgentFSFileProvider.appex`, signs both
+ad-hoc, installs the app to `~/Applications/AFS.app`, registers it with
 LaunchServices, and starts the tiny background containing app.
 
 After creating a mount with `--projection macos-file-provider`, register it:

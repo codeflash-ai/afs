@@ -3,13 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_ROOT="${ROOT}/.build/dev-bundle"
-APP="${BUILD_ROOT}/AgentFS.app"
+APP="${BUILD_ROOT}/AFS.app"
 APPEX="${APP}/Contents/PlugIns/AgentFSFileProvider.appex"
 ARCH="$(uname -m)"
 TARGET="${ARCH}-apple-macos14.0"
 SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
 
-rm -rf "${APP}"
+rm -rf "${APP}" "${BUILD_ROOT}/AgentFS.app"
 mkdir -p \
   "${APP}/Contents/MacOS" \
   "${APP}/Contents/PlugIns" \
@@ -22,7 +22,7 @@ swiftc \
   -target "${TARGET}" \
   -framework AppKit \
   "${ROOT}/App/AgentFSHost.swift" \
-  -o "${APP}/Contents/MacOS/AgentFS"
+  -o "${APP}/Contents/MacOS/AFS"
 
 swiftc \
   -target "${TARGET}" \

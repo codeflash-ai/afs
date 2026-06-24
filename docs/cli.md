@@ -257,8 +257,8 @@ already-materialized macOS replicas.
 current platform's virtual projection: `macos_file_provider` on macOS,
 `linux_fuse` on Linux, and `windows_cloud_files` on Windows. The macOS path
 shells out to the signed app-bundle helper at
-`AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL`
-can override the helper path for development. On Linux this command can be rerun
+`AFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL` can
+override the helper path for development. On Linux this command can be rerun
 to repair or restart the per-mount systemd user service for `afs-fuse`;
 `AFS_FUSE_BIN` can override the helper binary path for development.
 

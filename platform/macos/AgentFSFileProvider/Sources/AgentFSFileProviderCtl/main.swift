@@ -76,7 +76,7 @@ private enum Command {
     case .register(let mountId, let displayName):
       let identifier = NSFileProviderDomainIdentifier(mountId)
       if let existing = try getDomains().first(where: { $0.identifier == identifier }) {
-        if existing.displayName == displayName {
+        if existing.displayName == displayName && !shouldReplaceExistingDomain(existing, displayName: displayName) {
           return FileProviderCtlReport(
             ok: true,
             action: "register",
@@ -306,6 +306,19 @@ private func fileProviderDirectoryName(for displayName: String) -> String {
     return displayName
   }
   return "AFS-\(displayName)"
+}
+
+private func shouldReplaceExistingDomain(_ domain: NSFileProviderDomain, displayName: String) -> Bool {
+  let expectedName = fileProviderDirectoryName(for: displayName)
+  do {
+    let url = try userVisibleDomainURLFromManager(for: domain)
+    guard let url else {
+      return false
+    }
+    return url.lastPathComponent != expectedName
+  } catch {
+    return true
+  }
 }
 
 private func realHomeDirectoryURL() -> URL {

@@ -1150,6 +1150,9 @@ pub fn macos_file_provider_helper_path() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let package_dir = manifest_dir.join("../../platform/macos/AgentFSFileProvider");
     candidates.push(
+        package_dir.join(".build/dev-bundle/AFS.app/Contents/MacOS/agentfs-file-providerctl"),
+    );
+    candidates.push(
         package_dir.join(".build/dev-bundle/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
     );
     candidates.push(package_dir.join(".build/debug/agentfs-file-providerctl"));
