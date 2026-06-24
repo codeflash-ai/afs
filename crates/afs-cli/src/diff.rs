@@ -265,7 +265,7 @@ impl From<ValidationIssue> for ValidationIssueOutput {
     fn from(value: ValidationIssue) -> Self {
         Self {
             code: value.code,
-            file: value.file.display().to_string(),
+            file: afs_platform::logical_path_display(&value.file),
             line: value.line,
             message: value.message,
             suggested_fix: value.suggested_fix,
@@ -451,7 +451,7 @@ impl From<PushOperation> for PushOperationOutput {
                     })
                     .collect(),
                 body,
-                source_path: source_path.display().to_string(),
+                source_path: afs_platform::logical_path_display(&source_path),
             },
         }
     }

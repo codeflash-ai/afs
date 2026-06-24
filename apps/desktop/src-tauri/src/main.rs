@@ -1268,7 +1268,7 @@ async fn open_in_vs_code(path: String) -> ActionReport {
 async fn reveal_path(path: String) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(move || {
         let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
-        reveal_in_file_manager(&expanded).map(|()| expanded)
+        reveal_virtual_mount_or_path(&expanded).map(|()| expanded)
     })
     .await
     .map_err(|error| format!("Reveal worker failed: {error}"))
@@ -3533,6 +3533,9 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let target = reveal_target(path);
+        if !target.exists() {
+            return Err(format!("The file {} does not exist.", target.display()));
+        }
         Command::new("open")
             .arg("-R")
             .arg(&target)
@@ -3561,6 +3564,17 @@ fn reveal_target(path: &Path) -> PathBuf {
     }
 
     path.with_extension("md")
+}
+
+fn reveal_virtual_mount_or_path(path: &Path) -> Result<(), String> {
+    if !path.exists()
+        && let Some(mount) = virtual_mount_for_path(path)
+        && mount.projection.uses_virtual_filesystem()
+    {
+        return open_virtual_projection(&mount);
+    }
+
+    reveal_in_file_manager(path)
 }
 
 fn choose_folder_with_dialog(
@@ -4937,7 +4951,7 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
             let first_error = error.message();
             eprintln!(
                 "afs desktop could not open macOS File Provider domain `{}`: {first_error}",
-                mount.mount_id.0
+                afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID
             );
 
             if let Err(error) = register_macos_virtual_projection(

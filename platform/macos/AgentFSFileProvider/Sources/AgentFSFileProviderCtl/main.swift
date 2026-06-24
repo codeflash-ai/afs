@@ -99,8 +99,23 @@ private enum Command {
       if #available(macOS 13.0, *) {
         domain.supportsSyncingTrash = false
       }
-      try waitForVoid { completion in
-        NSFileProviderManager.add(domain, completionHandler: completion)
+      do {
+        try waitForVoid { completion in
+          NSFileProviderManager.add(domain, completionHandler: completion)
+        }
+      } catch {
+        guard isFileProviderDomainAlreadyExists(error) else {
+          throw error
+        }
+        let existing = try getDomains().first(where: { $0.identifier == identifier }) ?? domain
+        return FileProviderCtlReport(
+          ok: true,
+          action: "register",
+          domain: DomainReport(existing),
+          domains: nil,
+          url: nil,
+          message: "already registered \(mountId)"
+        )
       }
       return FileProviderCtlReport(
         ok: true,
@@ -201,6 +216,16 @@ private func fileProviderItemIdentifier(_ identifier: String) -> NSFileProviderI
     return .rootContainer
   }
   return NSFileProviderItemIdentifier(identifier)
+}
+
+private func isFileProviderDomainAlreadyExists(_ error: Error) -> Bool {
+  let nsError = error as NSError
+  if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileWriteFileExistsError {
+    return true
+  }
+
+  let message = nsError.localizedDescription.lowercased()
+  return message.contains("already exists") || message.contains("same name already exists")
 }
 
 private struct FileProviderCtlReport: Encodable {
