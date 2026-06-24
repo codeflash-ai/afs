@@ -264,7 +264,7 @@ fn stop_daemon(
     }
 
     let mut stopped_managed_process = false;
-    if !stopped_by_shutdown {
+    if should_stop_managed_process(options.mode, stopped_by_shutdown, std::env::consts::OS) {
         stopped_managed_process = DefaultDaemonProcessManager
             .stop(options.mode, paths)
             .map_err(daemon_process_error)?
@@ -317,6 +317,14 @@ fn request_graceful_shutdown(options: &DaemonOptions, paths: &DaemonPaths) -> bo
         DAEMON_CONTROL_REQUEST_TIMEOUT,
     )
     .is_ok_and(|response| response.ok)
+}
+
+fn should_stop_managed_process(
+    mode: StartMode,
+    stopped_by_shutdown: bool,
+    target_os: &str,
+) -> bool {
+    !stopped_by_shutdown || mode.should_use_launchd_for_target(target_os)
 }
 
 fn status_report(
@@ -775,6 +783,27 @@ mod tests {
             .expect_err("parse should fail");
 
         assert_eq!(error.code(), "usage");
+    }
+
+    #[test]
+    fn launchd_stop_unloads_manager_after_graceful_shutdown() {
+        assert!(should_stop_managed_process(StartMode::Auto, true, "macos"));
+        assert!(should_stop_managed_process(
+            StartMode::Launchd,
+            true,
+            "macos"
+        ));
+        assert!(!should_stop_managed_process(
+            StartMode::Session,
+            true,
+            "macos"
+        ));
+        assert!(!should_stop_managed_process(StartMode::Auto, true, "linux"));
+        assert!(should_stop_managed_process(
+            StartMode::Session,
+            false,
+            "macos"
+        ));
     }
 
     #[cfg(windows)]
