@@ -1029,16 +1029,21 @@ fn macos_file_provider_path_is_legacy_alias(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-    use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use afs_core::model::MountId;
+    #[cfg(target_os = "macos")]
+    use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId};
+    #[cfg(target_os = "macos")]
     use afs_core::shadow::ShadowDocument;
-    use afs_store::{
-        EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
-        ShadowRepository,
-    };
+    #[cfg(target_os = "macos")]
+    use afs_store::{EntityRecord, EntityRepository, ShadowRepository};
+    use afs_store::{InMemoryStateStore, MountRepository, ProjectionMode};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    #[cfg(target_os = "macos")]
+    use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn match_mount_path_resolves_relative_path_under_mount_root() {

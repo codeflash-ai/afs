@@ -48,6 +48,17 @@ pub fn document_with_absolute_media_hrefs(
     document
 }
 
+pub(crate) fn has_missing_local_media_hrefs(
+    markdown: &str,
+    page_path: &Path,
+    output_root: &Path,
+) -> bool {
+    local_media_hrefs(markdown).into_iter().any(|href| {
+        resolve_media_href_with_content_root(page_path, href, output_root)
+            .is_some_and(|local_path| !output_root.join(local_path).exists())
+    })
+}
+
 fn absolutize_media_hrefs(body: &str, page_path: &Path, output_root: &Path) -> String {
     let mut rewritten = String::with_capacity(body.len());
     let mut rest = body;
@@ -77,6 +88,48 @@ fn absolutize_media_hrefs(body: &str, page_path: &Path, output_root: &Path) -> S
     rewritten
 }
 
+fn local_media_hrefs(markdown: &str) -> Vec<&str> {
+    let mut hrefs = Vec::new();
+    let mut offset = 0;
+
+    while let Some(label_end_offset) = markdown[offset..].find("](") {
+        let label_end = offset + label_end_offset;
+        let href_start = label_end + 2;
+        let Some(href_end) = find_markdown_link_href_end(markdown, href_start) else {
+            break;
+        };
+        hrefs.push(&markdown[href_start..href_end]);
+        offset = href_end + 1;
+    }
+
+    hrefs
+}
+
+fn find_markdown_link_href_end(input: &str, href_start: usize) -> Option<usize> {
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+
+    for (offset, ch) in input[href_start..].char_indices() {
+        let index = href_start + offset;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' if paren_depth == 0 => return Some(index),
+            ')' => paren_depth -= 1,
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn absolute_media_href(output_root: &Path, local_path: &Path) -> String {
     output_root
         .join(local_path)
@@ -86,7 +139,7 @@ fn absolute_media_href(output_root: &Path, local_path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::document_with_absolute_media_hrefs;
+    use super::{document_with_absolute_media_hrefs, has_missing_local_media_hrefs};
     use afs_core::model::CanonicalDocument;
     use std::path::Path;
 
@@ -106,5 +159,27 @@ mod tests {
             rewritten.body,
             "![Image](C:/Users/runner/AppData/Local/Temp/afs/.content/notion-main/files/.afs/media/Roadmap/image-1.png)\n"
         );
+    }
+
+    #[test]
+    fn detects_missing_local_media_hrefs_with_escaped_parentheses() {
+        let root = std::env::temp_dir().join(format!("afs-media-missing-{}", std::process::id()));
+        let media_path = root.join(".afs/media/Roadmap/image (1).png");
+        std::fs::create_dir_all(media_path.parent().expect("media parent")).expect("mkdir media");
+        std::fs::write(&media_path, b"image").expect("write media");
+
+        assert!(!has_missing_local_media_hrefs(
+            "![Image](.afs/media/Roadmap/image \\(1\\).png)\n",
+            Path::new("page.md"),
+            &root,
+        ));
+        std::fs::remove_file(&media_path).expect("remove media");
+        assert!(has_missing_local_media_hrefs(
+            "![Image](.afs/media/Roadmap/image \\(1\\).png)\n",
+            Path::new("page.md"),
+            &root,
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

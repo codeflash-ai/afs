@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::file_provider::{self, ProjectionRefreshBase};
 use crate::hydration::{HydratedAsset, HydratedEntity};
 use crate::media::{
-    document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
-    update_hydrated_media_manifest,
+    document_with_absolute_media_hrefs, has_missing_local_media_hrefs,
+    render_document_with_absolute_media_hrefs, update_hydrated_media_manifest,
 };
 use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 use crate::source::SourceAdapter;
@@ -248,6 +248,11 @@ where
             }
         }
     }
+    let repair =
+        repair_missing_media_for_hydrated_entries(store, source, mount, &entries, state_root)?;
+    hydrated += repair.hydrated;
+    skipped_dirty += repair.skipped_dirty;
+    conflicts.extend(repair.conflicts);
 
     Ok(PullReport {
         ok: skipped_dirty == 0,
@@ -262,6 +267,86 @@ where
         skipped_dirty,
         conflicts,
     })
+}
+
+struct MissingMediaRepairReport {
+    hydrated: usize,
+    skipped_dirty: usize,
+    conflicts: Vec<PullConflict>,
+}
+
+fn repair_missing_media_for_hydrated_entries<S, Source>(
+    store: &mut S,
+    source: &Source,
+    mount: &MountConfig,
+    entries: &[TreeEntry],
+    state_root: Option<&Path>,
+) -> Result<MissingMediaRepairReport, PullError>
+where
+    S: EntityRepository
+        + ShadowRepository
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
+    Source: SourceAdapter,
+{
+    let output_root = projection_output_root(state_root, mount)?;
+    let mut report = MissingMediaRepairReport {
+        hydrated: 0,
+        skipped_dirty: 0,
+        conflicts: Vec::new(),
+    };
+
+    for entry in entries {
+        let Some(entity) = store
+            .get_entity(&mount.mount_id, &entry.remote_id)
+            .map_err(PullError::Store)?
+        else {
+            continue;
+        };
+        if !should_repair_missing_media_for_entity(&entity) {
+            continue;
+        }
+
+        let path = projection_content_path(state_root, mount, &entity.path)?;
+        if !projection_has_missing_media(&path, &entity.path, &output_root)? {
+            continue;
+        }
+
+        match hydrate_entity(store, source, mount, entity, state_root)? {
+            HydrationOutcome::Hydrated => report.hydrated += 1,
+            HydrationOutcome::RemoteDeleted => {}
+            HydrationOutcome::SkippedDirty => report.skipped_dirty += 1,
+            HydrationOutcome::Conflicted(conflict) => {
+                report.skipped_dirty += 1;
+                report.conflicts.push(conflict);
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn should_repair_missing_media_for_entity(entity: &EntityRecord) -> bool {
+    entity.kind == EntityKind::Page && entity.hydration == HydrationState::Hydrated
+}
+
+fn projection_has_missing_media(
+    path: &Path,
+    page_path: &Path,
+    output_root: &Path,
+) -> Result<bool, PullError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let markdown = std::fs::read_to_string(path).map_err(|error| PullError::ReadFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    Ok(has_missing_local_media_hrefs(
+        &markdown,
+        page_path,
+        output_root,
+    ))
 }
 
 fn pull_virtual_directory_path<S, Source>(
@@ -1276,15 +1361,29 @@ impl PullError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use afs_connector::{
+        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
+        ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
+        ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    };
+    use afs_core::AfsResult;
     use afs_core::canonical::render_canonical_markdown;
+    use afs_core::freshness::RemoteObservation;
+    use afs_core::hydration::{HydrationReason, HydrationRequest};
     use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use afs_core::planner::PushOperationKind;
     use afs_core::shadow::{ShadowDocument, segment_markdown_body};
-    use afs_store::{EntityRecord, EntityRepository, InMemoryStateStore, ShadowRepository};
+    use afs_store::{
+        EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ShadowRepository,
+    };
 
     use super::{can_replace_file, write_atomic};
+    use crate::hydration::{HydratedAsset, HydratedAssetMedia, HydratedEntity, HydrationSource};
+    use crate::source::{SourceAdapter, SourcePushValidator};
     use afs_store::MountConfig;
 
     #[test]
@@ -1389,6 +1488,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mount_root_pull_repairs_missing_media_for_hydrated_child() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let root_id = RemoteId::new("root-page");
+        let child_id = RemoteId::new("child-page");
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+            .with_remote_root_id(root_id.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+
+        let media_path = PathBuf::from(".afs/media/Roadmap/Design Notes/image-child.png");
+        let source = FakePullSource::new(
+            vec![
+                tree_entry(
+                    &fixture.mount_id,
+                    &root_id,
+                    "Roadmap",
+                    "Roadmap/page.md",
+                    HydrationState::Stub,
+                ),
+                tree_entry(
+                    &fixture.mount_id,
+                    &child_id,
+                    "Design Notes",
+                    "Roadmap/Design Notes/page.md",
+                    HydrationState::Stub,
+                ),
+            ],
+            vec![
+                hydrated_entity(&root_id, "Roadmap", "# Roadmap\n\nRoot body.\n", Vec::new()),
+                hydrated_entity(
+                    &child_id,
+                    "Design Notes",
+                    "![Sketch](../../.afs/media/Roadmap/Design Notes/image-child.png)\n",
+                    vec![HydratedAsset {
+                        path: media_path.clone(),
+                        bytes: b"image bytes".to_vec(),
+                        media: Some(HydratedAssetMedia {
+                            block_id: "image-child".to_string(),
+                            kind: "image".to_string(),
+                            source_url: "https://example.com/image-child.png".to_string(),
+                        }),
+                    }],
+                ),
+            ],
+        );
+
+        super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+            .expect("initial root pull");
+        let child_entity = store
+            .get_entity(&fixture.mount_id, &child_id)
+            .expect("load child")
+            .expect("child entity");
+        assert_eq!(
+            super::hydrate_entity(&mut store, &source, &mount, child_entity, None)
+                .expect("hydrate child"),
+            super::HydrationOutcome::Hydrated
+        );
+        let absolute_media_path = fixture.root.join(&media_path);
+        assert!(absolute_media_path.exists());
+        std::fs::remove_file(&absolute_media_path).expect("remove media");
+
+        let report =
+            super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+                .expect("repair root pull");
+
+        assert_eq!(report.hydrated, 2);
+        assert_eq!(
+            std::fs::read(&absolute_media_path).expect("repaired media"),
+            b"image bytes"
+        );
+    }
+
     struct PullFixture {
         mount: MountConfig,
         mount_id: MountId,
@@ -1485,6 +1657,148 @@ mod tests {
                 .expect("save entity");
 
             store
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakePullSource {
+        entries: Vec<afs_core::model::TreeEntry>,
+        rendered: BTreeMap<RemoteId, HydratedEntity>,
+    }
+
+    impl FakePullSource {
+        fn new(entries: Vec<afs_core::model::TreeEntry>, rendered: Vec<HydratedEntity>) -> Self {
+            Self {
+                entries,
+                rendered: rendered
+                    .into_iter()
+                    .map(|entity| (entity.shadow.entity_id.clone(), entity))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Connector for FakePullSource {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind("fake")
+        }
+
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::default()
+        }
+
+        fn supported_push_operations(&self) -> BTreeSet<PushOperationKind> {
+            BTreeSet::new()
+        }
+
+        fn enumerate(
+            &self,
+            _request: EnumerateRequest,
+        ) -> AfsResult<Vec<afs_core::model::TreeEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        fn observe(&self, _request: ObserveRequest) -> AfsResult<RemoteObservation> {
+            Err(afs_core::AfsError::NotImplemented("fake observe"))
+        }
+
+        fn list_children(&self, _request: ListChildrenRequest) -> AfsResult<ListChildrenResult> {
+            Err(afs_core::AfsError::NotImplemented("fake list children"))
+        }
+
+        fn fetch(&self, _request: FetchRequest) -> AfsResult<NativeEntity> {
+            Err(afs_core::AfsError::NotImplemented("fake fetch"))
+        }
+
+        fn render(&self, _entity: &NativeEntity) -> AfsResult<CanonicalDocument> {
+            Err(afs_core::AfsError::NotImplemented("fake render"))
+        }
+
+        fn parse(&self, _document: &CanonicalDocument) -> AfsResult<ParsedEntity> {
+            Err(afs_core::AfsError::NotImplemented("fake parse"))
+        }
+
+        fn check_concurrency(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<()> {
+            Err(afs_core::AfsError::NotImplemented("fake check concurrency"))
+        }
+
+        fn apply(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult> {
+            Err(afs_core::AfsError::NotImplemented("fake apply"))
+        }
+
+        fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult> {
+            Err(afs_core::AfsError::NotImplemented("fake apply undo"))
+        }
+    }
+
+    impl HydrationSource for FakePullSource {
+        fn fetch_render(&self, request: &HydrationRequest) -> AfsResult<HydratedEntity> {
+            assert_eq!(request.reason, HydrationReason::ExplicitPull);
+            self.rendered
+                .get(&request.remote_id)
+                .cloned()
+                .ok_or_else(|| afs_core::AfsError::InvalidState("missing rendered entity".into()))
+        }
+    }
+
+    impl SourcePushValidator for FakePullSource {}
+
+    impl SourceAdapter for FakePullSource {}
+
+    fn tree_entry(
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+        title: &str,
+        path: &str,
+        hydration: HydrationState,
+    ) -> afs_core::model::TreeEntry {
+        afs_core::model::TreeEntry {
+            mount_id: mount_id.clone(),
+            remote_id: remote_id.clone(),
+            kind: EntityKind::Page,
+            title: title.to_string(),
+            path: PathBuf::from(path),
+            hydration,
+            content_hash: None,
+            remote_edited_at: Some("2026-06-11T00:00:00.000Z".to_string()),
+            stub_frontmatter: None,
+        }
+    }
+
+    fn hydrated_entity(
+        remote_id: &RemoteId,
+        title: &str,
+        body: &str,
+        assets: Vec<HydratedAsset>,
+    ) -> HydratedEntity {
+        let document = CanonicalDocument::new(
+            format!(
+                "afs:\n  id: {}\n  type: page\ntitle: {title}\n",
+                remote_id.0
+            ),
+            body.to_string(),
+        );
+        let body_start_line = document.frontmatter.lines().count() + 3;
+        let native_block_count = segment_markdown_body(&document.body, body_start_line)
+            .into_iter()
+            .filter(|block| !block.is_directive())
+            .count();
+        let block_ids =
+            (0..native_block_count).map(|index| RemoteId::new(format!("{}-{index}", remote_id.0)));
+        let shadow = ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            document.body.clone(),
+            body_start_line,
+            block_ids,
+        )
+        .expect("shadow")
+        .with_frontmatter(document.frontmatter.clone());
+
+        HydratedEntity {
+            document,
+            shadow,
+            remote_edited_at: Some("2026-06-11T00:00:00.000Z".to_string()),
+            assets,
         }
     }
 

@@ -17,6 +17,7 @@ use std::time::Duration;
 use afs_store::MountConfig;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use afsd::ipc::{DaemonRequest, send_request_with_timeout};
+#[cfg(target_os = "windows")]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -162,6 +163,7 @@ impl WindowsCloudFilesLifecycleAction {
     }
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WindowsCloudFilesProviderState {
@@ -169,6 +171,7 @@ enum WindowsCloudFilesProviderState {
     Stopped,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WindowsCloudFilesProcessMetadata {
     mount_id: String,
@@ -180,6 +183,7 @@ struct WindowsCloudFilesProcessMetadata {
     stderr_log: PathBuf,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct WindowsCloudFilesLifecycleReport {
     message: String,
@@ -574,6 +578,7 @@ fn status_windows_cloud_files_lifecycle(
     ))
 }
 
+#[cfg(target_os = "windows")]
 fn windows_cloud_files_lifecycle_report(
     action: WindowsCloudFilesLifecycleAction,
     mount: &MountConfig,
@@ -617,6 +622,7 @@ fn windows_cloud_files_lifecycle_report(
     }
 }
 
+#[cfg(target_os = "windows")]
 fn windows_cloud_files_lifecycle_message(
     action: WindowsCloudFilesLifecycleAction,
     mount_id: &str,
@@ -690,10 +696,12 @@ fn windows_cloud_files_registration_marker_exists(state_root: &Path, mount_id: &
         .exists()
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_lifecycle_dir(state_root: &Path) -> PathBuf {
     state_root.join("cloud-files-lifecycle")
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_lifecycle_file(state_root: &Path, mount_id: &str) -> PathBuf {
     windows_cloud_files_lifecycle_dir(state_root).join(format!(
         "{}.json",
@@ -701,10 +709,12 @@ fn windows_cloud_files_lifecycle_file(state_root: &Path, mount_id: &str) -> Path
     ))
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_log_dir(state_root: &Path) -> PathBuf {
     state_root.join("logs")
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_stdout_log_path(state_root: &Path, mount_id: &str) -> PathBuf {
     windows_cloud_files_log_dir(state_root).join(format!(
         "afs-cloud-files.{}.out.log",
@@ -712,6 +722,7 @@ fn windows_cloud_files_stdout_log_path(state_root: &Path, mount_id: &str) -> Pat
     ))
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_stderr_log_path(state_root: &Path, mount_id: &str) -> PathBuf {
     windows_cloud_files_log_dir(state_root).join(format!(
         "afs-cloud-files.{}.err.log",
@@ -719,6 +730,7 @@ fn windows_cloud_files_stderr_log_path(state_root: &Path, mount_id: &str) -> Pat
     ))
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_lifecycle_fragment(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -738,6 +750,7 @@ fn windows_cloud_files_lifecycle_fragment(value: &str) -> String {
     format!("{sanitized}-{:016x}", stable_lifecycle_hash(value))
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn stable_lifecycle_hash(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in value.as_bytes() {
@@ -872,6 +885,7 @@ fn configure_hidden_windows_command(command: &mut Command) {
     command.creation_flags(HIDDEN_WINDOWS_PROCESS_FLAGS);
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_register_args(
     state_root: &Path,
     mount: &MountConfig,
@@ -889,6 +903,7 @@ fn windows_cloud_files_register_args(
     ]
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_open_args(mount: &MountConfig) -> Vec<String> {
     vec![
         "--mount-id".to_string(),
@@ -915,6 +930,7 @@ pub fn windows_cloud_files_run_command_args(state_root: &Path, mount: &MountConf
     args
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_unregister_args(state_root: &Path, mount_id: &str) -> Vec<String> {
     vec![
         "--mount-id".to_string(),

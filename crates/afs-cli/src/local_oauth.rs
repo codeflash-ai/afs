@@ -377,9 +377,9 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
 
-    use super::{
-        LocalOAuthAuthorization, browser_command, retryable_callback_error, wait_for_oauth_callback,
-    };
+    #[cfg(target_os = "windows")]
+    use super::browser_command;
+    use super::{LocalOAuthAuthorization, retryable_callback_error, wait_for_oauth_callback};
 
     #[cfg(target_os = "windows")]
     #[test]
