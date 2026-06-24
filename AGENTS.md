@@ -47,6 +47,19 @@ that filesystem contract.
   fails cleanly with an update-required outcome, and pending local work is not
   silently discarded.
 
+## Live Mode Agent Semantics
+
+- Live Mode is the desktop background sync loop. When it is enabled, safe local
+  edits can be pushed and clean remote changes can be pulled without an agent
+  manually running `afs pull` or `afs push` after every file edit.
+- Agent guidance should tell agents to edit mounted Markdown directly and stop
+  unless the user asks for review or push. Use `afs status`/`afs diff` for
+  inspection; reserve `afs pull`/`afs push` for explicit requests, recovery, or
+  cases where Live Mode reports paused/review-needed/conflicted state.
+- Live Mode must stay conservative. It should pause for conflicts, remote drift,
+  destructive or large plans, unsupported operations, and anything requiring
+  user approval rather than trying to be fully autonomous.
+
 ## macOS File Provider Notes
 
 - The CloudStorage-visible file, the File Provider local replica, and daemon

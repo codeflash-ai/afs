@@ -11,6 +11,8 @@ Working rules:
 - Use `afs status <path>` to see pending local changes and `afs diff <path>` to review planned Notion operations before pushing.
 - Push intentional changes with `afs push <path>`; use `afs push <path> -y` only after review or explicit approval.
 - Use `afs pull <path>` only to refresh clean local files now. Use `afs push <path>` to make Notion match local edits.
+- If desktop Live Mode is on, safe edits may sync automatically. Do not run routine `afs pull` or `afs push` after every edit.
+- When Live Mode pauses for review, conflict, remote drift, or a large/destructive plan, use `afs status` and `afs diff` before taking recovery action.
 - Keep edits narrow and preserve the document shape unless the user requests a broader rewrite.
 
 Notion facts:

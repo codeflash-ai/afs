@@ -34,6 +34,8 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("afs status <path>"));
     assert!(agents.contains("afs diff <path>"));
     assert!(agents.contains("Use `afs push <path>` to make Notion match local edits"));
+    assert!(agents.contains("If desktop Live Mode is on"));
+    assert!(agents.contains("Do not run routine `afs pull` or `afs push`"));
     assert!(agents.contains("Notion facts:"));
     assert!(agents.contains("Pages are directories"));
     assert!(agents.contains("Edit `page.md` for the page body"));

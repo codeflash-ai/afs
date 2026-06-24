@@ -340,8 +340,9 @@ AFS projects connected company sources, including Notion, into the local filesys
 3. Do not edit AFS identity frontmatter, block IDs, `::afs{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
 4. Leave edits pending for AFS review and tell the user what changed.
 5. If an AFS CLI is available, use `afs status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
-6. Only push when the user explicitly asks. Run `afs diff <file>` first, then `afs push <file> -y` for safe plans.
-7. If push says the remote changed since last sync, run `afs pull <file>`, resolve any inline conflict markers in the Markdown, rerun `afs diff <file>`, then push again.
+6. If desktop Live Mode is on, safe local edits may sync automatically. Do not run routine `afs pull` or `afs push` after every edit.
+7. Only push when the user explicitly asks or when Live Mode pauses for review. Run `afs diff <file>` first, then `afs push <file> -y` for safe plans.
+8. If push says the remote changed since last sync, run `afs pull <file>`, resolve any inline conflict markers in the Markdown, rerun `afs diff <file>`, then push again.
 
 ## Creating Notion Content
 
@@ -779,6 +780,8 @@ mod tests {
         assert!(skill.contains("name: afs"));
         assert!(skill.contains("~/Library/CloudStorage/AFS/notion"));
         assert!(skill.contains("pending for AFS review"));
+        assert!(skill.contains("If desktop Live Mode is on"));
+        assert!(skill.contains("Do not run routine `afs pull` or `afs push`"));
         assert!(skill.contains("afs diff <file>"));
         assert!(skill.contains("Creating Notion Content"));
         assert!(skill.contains("parent-page/new-page/page.md"));

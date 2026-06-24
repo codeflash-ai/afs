@@ -30,7 +30,8 @@ The skill tells agents:
 - Agents should not edit AFS identity frontmatter, block IDs, `::afs{...}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
 - For Notion, agents should read the mount-local `AGENTS.md` for the concrete page and row creation contract: pages are directories, a new child page is created by writing `parent-page/new-page/page.md`, new page frontmatter needs `title: "..."`, and generated `afs:` identity frontmatter is omitted until AFS adds it after push.
 - `afs status` is optional and only needed when the agent needs to inspect pending changes.
-- Agents should only push when the user explicitly asks. The safe sequence is `afs diff <file>`, then `afs push <file> -y` for safe plans.
+- If desktop Live Mode is on, agents should expect safe local edits and clean remote changes to sync in the background. They should not run routine `afs pull` or `afs push` after every edit.
+- Agents should only push when the user explicitly asks or when Live Mode pauses for review. The safe sequence is `afs diff <file>`, then `afs push <file> -y` for safe plans.
 - If push reports that the remote changed since last sync, the recovery sequence is `afs pull <file>`, resolve any inline conflict markers, rerun `afs diff <file>`, then push again.
 - If the agent sandbox cannot execute the host `afs` CLI, it should use the MCP fallback tool named `afs` with CLI-style `argv` arguments. AFS installs the required local MCP credentials for supported agents.
 

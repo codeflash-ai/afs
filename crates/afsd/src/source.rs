@@ -136,6 +136,8 @@ AgentFS projects {source} as local Markdown. Browse directories normally; online
 - Use `afs info .` for mount context, `afs status <path>` for pending local changes, and `afs diff <path>` for planned remote operations before pushing.\n\
 - Push intentional changes with `afs push <path>`; use `afs push <path> -y` only after review or explicit approval.\n\
 - Use `afs pull <path>` only to force a clean local file or plain-files projection to match latest remote now. Use `afs push <path>` to make {source} match local edits.\n\
+- If desktop Live Mode is on, safe edits may sync automatically. Do not run routine `afs pull` or `afs push` after every edit.\n\
+- When Live Mode pauses for review, conflict, remote drift, or a large/destructive plan, use `afs status` and `afs diff` before recovery.\n\
 - Do not edit `AGENTS.md`, `CLAUDE.md`, `_schema.yaml`, AFS identity frontmatter, or `::afs{{...}}` directives unless explicitly asked.\n\
 - If a file has conflict markers, resolve the Markdown to the intended final content, remove every marker line, then rerun `afs diff` and `afs push`.\n"
     )
