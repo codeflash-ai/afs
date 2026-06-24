@@ -172,6 +172,31 @@ fn appending_a_paragraph_produces_append_after_last_existing_block() {
 }
 
 #[test]
+fn inserting_paragraph_before_equivalent_local_media_keeps_media_block_identity() {
+    let shadow = shadow(
+        "```python\nprint(\"hi\")\n```\n\n[cars](.afs/media/Roadmap/cars.mp4)\n\nfaah from remote",
+        ["code-1", "video-1", "paragraph-1"],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "```python\nprint(\"hi\")\n```\n\nfaaah\n\n[cars](/tmp/afs-content/notion-main/files/.afs/media/Roadmap/cars.mp4)\n\nfaah from remote",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("code-1")),
+            content: "faaah".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn appending_consecutive_list_items_produces_one_append_per_item() {
     let shadow = shadow("Existing paragraph.", ["paragraph-1"]);
     let edited =

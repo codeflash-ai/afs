@@ -363,6 +363,7 @@ fn align_blocks(
 
     align_directives(shadow, edited_blocks, &mut matches, &mut used_shadow);
     align_exact_hashes(shadow, edited_blocks, &mut matches, &mut used_shadow);
+    align_equivalent_bodies(shadow, edited_blocks, &mut matches, &mut used_shadow);
     let degradation =
         align_residual_by_order(shadow, edited_blocks, &mut matches, &mut used_shadow);
 
@@ -411,6 +412,65 @@ fn align_exact_hashes(
             && used_shadow.insert(*shadow_index)
         {
             matches[edited_index] = Some(*shadow_index);
+        }
+    }
+}
+
+fn align_equivalent_bodies(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+) {
+    let residual_edited = edited_blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| matches[*index].is_none() && !block.is_directive())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let residual_shadow = shadow
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| !used_shadow.contains(index) && !block.kind.is_directive())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    let mut edited_candidates = BTreeMap::<usize, Vec<usize>>::new();
+    let mut shadow_candidate_counts = BTreeMap::<usize, usize>::new();
+    for edited_index in residual_edited {
+        let candidates = residual_shadow
+            .iter()
+            .copied()
+            .filter(|shadow_index| {
+                rendered_bodies_equivalent(
+                    &shadow.blocks[*shadow_index].text,
+                    &edited_blocks[edited_index].text,
+                )
+            })
+            .collect::<Vec<_>>();
+        for shadow_index in &candidates {
+            *shadow_candidate_counts.entry(*shadow_index).or_default() += 1;
+        }
+        if !candidates.is_empty() {
+            edited_candidates.insert(edited_index, candidates);
+        }
+    }
+
+    for (edited_index, candidates) in edited_candidates {
+        if matches[edited_index].is_some() {
+            continue;
+        }
+        let unique_candidates = candidates
+            .into_iter()
+            .filter(|shadow_index| {
+                !used_shadow.contains(shadow_index)
+                    && shadow_candidate_counts.get(shadow_index) == Some(&1)
+            })
+            .collect::<Vec<_>>();
+        if let [shadow_index] = unique_candidates.as_slice() {
+            matches[edited_index] = Some(*shadow_index);
+            used_shadow.insert(*shadow_index);
         }
     }
 }
