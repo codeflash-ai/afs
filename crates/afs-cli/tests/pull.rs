@@ -609,7 +609,7 @@ fn pull_virtual_file_conflict_reports_source_directory_path() {
 }
 
 #[test]
-fn pull_virtual_database_directory_enumerates_children_without_reading_cache_directory() {
+fn pull_virtual_database_directory_hydrates_rows_when_under_limit() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("afs-cli-pull-state");
     let mut store = InMemoryStateStore::new();
@@ -630,7 +630,7 @@ fn pull_virtual_database_directory_enumerates_children_without_reading_cache_dir
 
     assert!(report.ok);
     assert_eq!(report.enumerated, 1);
-    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.hydrated, 1);
     assert_eq!(report.stubbed, 0);
     assert!(
         content_root
@@ -647,6 +647,50 @@ fn pull_virtual_database_directory_enumerates_children_without_reading_cache_dir
         .expect("find row")
         .expect("row entity");
     assert_eq!(row.kind, EntityKind::Page);
+    assert_eq!(row.hydration, HydrationState::Hydrated);
+    assert!(
+        content_root
+            .join("roadmap")
+            .join("tasks")
+            .join("fix-login-bug")
+            .join("page.md")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_virtual_database_directory_leaves_rows_online_only_when_over_limit() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector_with_row_count("Roadmap", 6);
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.source_database_dir(),
+        Some(&state_root),
+    )
+    .expect("pull virtual database directory");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 6);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.stubbed, 0);
+    assert!(
+        !content_root
+            .join("roadmap")
+            .join("tasks")
+            .join("fix-login-bug")
+            .join("page.md")
+            .exists()
+    );
 
     let _ = fs::remove_dir_all(state_root);
 }
@@ -1097,6 +1141,22 @@ impl PullFixture {
         )
     }
 
+    fn connector_with_row_count(&self, root_title: &str, row_count: usize) -> NotionConnector {
+        NotionConnector::with_api(
+            NotionConfig::default(),
+            Arc::new(
+                FixtureNotionApi::new(
+                    self.root_page_id.as_str(),
+                    self.canonical_root_page_id.as_str(),
+                    root_title,
+                    "Root body.",
+                    "2026-06-11T00:00:00.000Z",
+                )
+                .with_database_row_count(row_count),
+            ),
+        )
+    }
+
     fn connector_missing_page(&self, missing_page_id: &str) -> NotionConnector {
         let mut api = FixtureNotionApi::new(
             self.root_page_id.as_str(),
@@ -1412,6 +1472,37 @@ impl FixtureNotionApi {
                 last_edited_time,
             ));
         fixture
+    }
+
+    fn with_database_row_count(mut self, row_count: usize) -> Self {
+        let data_source_id = "dddddddddddddddddddddddddddddddd";
+        let last_edited_time = "2026-06-11T00:00:00.000Z";
+        let rows = (0..row_count)
+            .map(|index| {
+                let row_id = format!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeee{index:02x}");
+                let title = if index == 0 {
+                    "Fix login bug".to_string()
+                } else {
+                    format!("Fix login bug {index}")
+                };
+                self.pages.insert(
+                    row_id.clone(),
+                    database_row_page(&row_id, &title, last_edited_time),
+                );
+                self.children
+                    .insert((row_id.clone(), None), PaginatedListDto::default());
+                database_row_page(&row_id, &title, last_edited_time)
+            })
+            .collect();
+        self.data_source_pages.insert(
+            (data_source_id.to_string(), None),
+            PaginatedListDto {
+                results: rows,
+                next_cursor: None,
+                has_more: false,
+            },
+        );
+        self
     }
 }
 

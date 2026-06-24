@@ -34,6 +34,8 @@ use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 use crate::source::SourceAdapter;
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
+const DATABASE_DIRECTORY_ROW_HYDRATION_LIMIT: isize = 5;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullReport {
     pub ok: bool,
@@ -360,7 +362,10 @@ fn pull_virtual_directory_path<S, Source>(
     state_root: Option<&Path>,
 ) -> Result<Option<PullReport>, PullError>
 where
-    S: EntityRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
     if !mount.projection.uses_virtual_filesystem() {
@@ -372,6 +377,8 @@ where
     };
 
     let mut enumerated = 0;
+    let mut row_ids = Vec::new();
+    let is_database_directory = target.schema_database_id.is_some();
     if let Some(container) = target.container {
         let result = source
             .list_children(ListChildrenRequest {
@@ -381,15 +388,29 @@ where
             })
             .map_err(PullError::Connector)?;
         enumerated = result.entries.len();
+        let should_hydrate_rows = is_database_directory
+            && state_root.is_some()
+            && should_hydrate_database_directory_rows(
+                enumerated,
+                DATABASE_DIRECTORY_ROW_HYDRATION_LIMIT,
+            );
         for entry in result.entries {
+            let row_id = entry.remote_id.clone();
+            let is_row = entry.kind == EntityKind::Page;
             let existing = store
                 .get_entity(&entry.mount_id, &entry.remote_id)
                 .map_err(PullError::Store)?;
             let record = virtual_child_entity_record(entry, existing.as_ref());
             store.save_entity(record).map_err(PullError::Store)?;
+            if should_hydrate_rows && is_row {
+                row_ids.push(row_id);
+            }
         }
     }
 
+    let mut hydrated = 0;
+    let mut skipped_dirty = 0;
+    let mut conflicts = Vec::new();
     if let Some(database_id) = target.schema_database_id
         && let Some(state_root) = state_root
         && let Some(schema) = source
@@ -401,8 +422,32 @@ where
         write_atomic(&directory.join("_schema.yaml"), schema)?;
     }
 
+    for row_id in row_ids {
+        let Some(row) = store
+            .get_entity(&mount.mount_id, &row_id)
+            .map_err(PullError::Store)?
+        else {
+            continue;
+        };
+        if matches!(
+            row.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            continue;
+        }
+        match hydrate_entity(store, source, mount, row, state_root)? {
+            HydrationOutcome::Hydrated => hydrated += 1,
+            HydrationOutcome::RemoteDeleted => {}
+            HydrationOutcome::SkippedDirty => skipped_dirty += 1,
+            HydrationOutcome::Conflicted(conflict) => {
+                skipped_dirty += 1;
+                conflicts.push(conflict);
+            }
+        }
+    }
+
     Ok(Some(PullReport {
-        ok: true,
+        ok: skipped_dirty == 0,
         command: "pull".to_string(),
         via: "cli".to_string(),
         mount_id: mount.mount_id.0.clone(),
@@ -410,10 +455,14 @@ where
         target: target_path.display().to_string(),
         enumerated,
         stubbed: 0,
-        hydrated: 0,
-        skipped_dirty: 0,
-        conflicts: Vec::new(),
+        hydrated,
+        skipped_dirty,
+        conflicts,
     }))
+}
+
+fn should_hydrate_database_directory_rows(row_count: usize, limit: isize) -> bool {
+    limit >= 0 && row_count <= limit as usize
 }
 
 fn virtual_child_entity_record(entry: TreeEntry, existing: Option<&EntityRecord>) -> EntityRecord {
@@ -1537,6 +1586,13 @@ mod tests {
             )
             .expect("check replace")
         );
+    }
+
+    #[test]
+    fn database_directory_row_hydration_limit_can_be_disabled() {
+        assert!(!super::should_hydrate_database_directory_rows(1, -1));
+        assert!(super::should_hydrate_database_directory_rows(5, 5));
+        assert!(!super::should_hydrate_database_directory_rows(6, 5));
     }
 
     #[test]
