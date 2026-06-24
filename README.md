@@ -69,7 +69,7 @@ Common targets:
 | `make lint` | Runs Rust formatting checks and clippy with warnings denied. |
 | `make fmt` | Formats all Rust code. |
 | `make dev-desktop` | Starts the desktop Vite dev server at `http://127.0.0.1:1420/`. |
-| `make dev-tauri` | Starts the Tauri desktop app in development mode. |
+| `make dev-tauri` | Builds fresh debug desktop sidecars, then starts the Tauri desktop app in development mode. |
 | `make build-tauri` | Builds the packaged Tauri desktop app. |
 | `make run-cli ARGS='status --json'` | Runs the `afs` CLI with custom arguments. |
 | `make clean` | Removes Rust and desktop build outputs. |

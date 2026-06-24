@@ -17,6 +17,10 @@ Start the Tauri desktop app in development mode:
 make dev-tauri
 ```
 
+Tauri dev mode builds fresh debug `afs` and `afsd` sidecars before launching
+the app. This keeps the desktop build ID and the daemon build ID aligned when
+you switch commits or rebuild from source.
+
 Equivalent direct command:
 
 ```sh

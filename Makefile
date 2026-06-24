@@ -100,6 +100,10 @@ audit-mas-readiness: ## Run static checks for Mac App Store release readiness.
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
 	$(DESKTOP_DIR)/scripts/prepare-macos-file-provider.sh
 
+.PHONY: prepare-desktop-dev-sidecars
+prepare-desktop-dev-sidecars: ## Build debug desktop sidecars used by Tauri dev.
+	$(DESKTOP_NPM) run dev:prepare
+
 .PHONY: clean-start-plan
 clean-start-plan: ## Print the local AFS clean-start reset actions without deleting anything.
 	scripts/clean-start.sh

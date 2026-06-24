@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
+    "dev:prepare": "node ./scripts/prepare-dev-sidecars.mjs",
     "build": "tsc && vite build",
     "build:mac": "tauri build --bundles dmg && bash ./scripts/postprocess-dmg-volume-icon.sh",
     "build:mas": "VITE_AFS_DISTRIBUTION_CHANNEL=mas AFS_DISTRIBUTION_CHANNEL=mas tauri build --bundles app",

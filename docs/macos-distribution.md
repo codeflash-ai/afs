@@ -12,6 +12,10 @@ make setup
 make dev-tauri
 ```
 
+The Tauri dev command runs `apps/desktop/scripts/prepare-dev-sidecars.mjs`
+before starting Vite. That script builds fresh debug `afs` and `afsd` binaries
+so the desktop app does not restart into a stale daemon from an earlier commit.
+
 Start the daemon manually when testing CLI or File Provider behavior outside the
 desktop app:
 

@@ -38,6 +38,7 @@ use afs_cli::push::{
 use afs_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
+#[cfg(test)]
 use afs_cli::status::StatusState;
 #[cfg(test)]
 use afs_cli::status::StatusSyncState;

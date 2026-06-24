@@ -4,7 +4,7 @@
   "version": "0.1.3",
   "identifier": "ai.codeflash.afs",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node ./scripts/dev-command.mjs",
     "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "npm run build",
     "beforeBundleCommand": "node ./scripts/prepare-bundle.mjs",
