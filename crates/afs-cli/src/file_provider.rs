@@ -59,9 +59,18 @@ impl FileProviderHelperError {
                 "agentfs-file-providerctl was not found; build or install platform/macos/AgentFSFileProvider first"
                     .to_string()
             }
+            Self::Failed(message) if macos_file_provider_application_unavailable(message) => {
+                format!(
+                    "{message}. The AgentFS macOS File Provider app or extension is not available to macOS. For local development, run `platform/macos/AgentFSFileProvider/scripts/install-dev-bundle.sh`, then reopen AFS and enable the File Provider if macOS asks."
+                )
+            }
             Self::Failed(message) => message.clone(),
         }
     }
+}
+
+fn macos_file_provider_application_unavailable(message: &str) -> bool {
+    message.contains("The application cannot be used right now")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1404,6 +1413,17 @@ mod tests {
             super::macos_file_provider_display_name(std::path::Path::new("/"), "fallback"),
             "fallback"
         );
+    }
+
+    #[test]
+    fn macos_file_provider_unavailable_error_is_actionable() {
+        let message = super::FileProviderHelperError::Failed(
+            "The application cannot be used right now.".to_string(),
+        )
+        .message();
+
+        assert!(message.contains("install-dev-bundle.sh"));
+        assert!(message.contains("enable the File Provider"));
     }
 
     #[test]

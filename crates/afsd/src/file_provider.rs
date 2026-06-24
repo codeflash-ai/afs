@@ -31,7 +31,7 @@ pub use crate::virtual_fs::{
 };
 
 pub const MACOS_FILE_PROVIDER_DOMAIN_ID: &str = "afs";
-pub const MACOS_FILE_PROVIDER_DISPLAY_NAME: &str = "AFS";
+pub const MACOS_FILE_PROVIDER_DISPLAY_NAME: &str = "";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileProviderReadReport {
@@ -1004,7 +1004,16 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     let cloud_storage = home.join("Library").join("CloudStorage");
     vec![
         cloud_storage
+            .join("AgentFS")
+            .join(source_root_directory_name(&mount.connector)),
+        cloud_storage
             .join("AFS")
+            .join(source_root_directory_name(&mount.connector)),
+        cloud_storage
+            .join("AgentFS-AFS")
+            .join(source_root_directory_name(&mount.connector)),
+        cloud_storage
+            .join("AFS-AFS")
             .join(source_root_directory_name(&mount.connector)),
     ]
 }
@@ -1185,7 +1194,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_file_provider_access_roots_use_single_afs_connector_root() {
+    fn macos_file_provider_access_roots_include_system_assigned_connector_roots() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
@@ -1203,7 +1212,25 @@ mod tests {
                 &home
                     .join("Library")
                     .join("CloudStorage")
+                    .join("AgentFS")
+                    .join("notion")
+            )
+        );
+        assert!(
+            roots.contains(
+                &home
+                    .join("Library")
+                    .join("CloudStorage")
                     .join("AFS")
+                    .join("notion")
+            )
+        );
+        assert!(
+            roots.contains(
+                &home
+                    .join("Library")
+                    .join("CloudStorage")
+                    .join("AgentFS-AFS")
                     .join("notion")
             )
         );
@@ -1212,30 +1239,17 @@ mod tests {
             &home
                 .join("Library")
                 .join("CloudStorage")
-                .join("AFS")
+                .join("AgentFS")
                 .join("notion")
                 .join("Page.md"),
         )
         .expect("canonical connector path matches");
         assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
-        assert!(
-            match_mount_path(
-                &mount,
-                &home
-                    .join("Library")
-                    .join("CloudStorage")
-                    .join("AFS-AFS")
-                    .join("notion")
-                    .join("Page.md"),
-            )
-            .is_none(),
-            "legacy File Provider aliases must not resolve as current mounts"
-        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_file_provider_legacy_stored_root_maps_only_to_canonical_root() {
+    fn macos_file_provider_legacy_stored_root_maps_to_system_assigned_roots() {
         let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
         let mount = MountConfig::new(
             MountId::new("notion-main"),
@@ -1247,28 +1261,16 @@ mod tests {
         )
         .projection(ProjectionMode::MacosFileProvider);
 
-        assert!(
-            match_mount_path(
-                &mount,
-                &home
-                    .join("Library")
-                    .join("CloudStorage")
-                    .join("AFS-AFS")
-                    .join("notion")
-                    .join("Page.md"),
-            )
-            .is_none()
-        );
         let matched = match_mount_path(
             &mount,
             &home
                 .join("Library")
                 .join("CloudStorage")
-                .join("AFS")
+                .join("AgentFS")
                 .join("notion")
                 .join("Page.md"),
         )
-        .expect("canonical root still resolves");
+        .expect("system-assigned root still resolves");
         assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
     }
 

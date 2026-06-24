@@ -89,12 +89,14 @@ Suggested concrete folder:
 ~/Library/CloudStorage/AFS/notion
 ```
 
-On macOS, the real AFS root should live at `~/Library/CloudStorage/AFS` because
-that is the user-visible location controlled by File Provider. Each connector
-gets a stable child folder such as `notion`, `linear`, or `gmail`. AFS should not
-create a Documents alias or symlink; the app should show the CloudStorage folder
-directly. This step should be framed as "Where should your Notion files appear?"
-rather than "configure mount root."
+On macOS, the real AFS root is assigned by File Provider and must be read from
+`NSFileProviderManager.getUserVisibleURL`. Packaged builds normally resolve to
+`~/Library/CloudStorage/AFS`; local development bundles can resolve to names
+such as `~/Library/CloudStorage/AgentFS`. Each connector gets a stable child
+folder such as `notion`, `linear`, or `gmail`. AFS should not create a Documents
+alias or symlink; the app should show the actual CloudStorage folder directly.
+This step should be framed as "Where should your Notion files appear?" rather
+than "configure mount root."
 
 ### 4. Create Workspace Mount
 

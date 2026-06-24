@@ -198,7 +198,7 @@ fn pull_virtual_file_target_does_not_stat_projection_path_as_directory() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn pull_macos_file_provider_uses_canonical_afs_connector_root() {
+fn pull_macos_file_provider_accepts_system_assigned_connector_roots() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("afs-cli-pull-macos-state");
     let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
@@ -207,10 +207,10 @@ fn pull_macos_file_provider_uses_canonical_afs_connector_root() {
         .join("CloudStorage")
         .join("AFS")
         .join("notion");
-    let alias_root = home
+    let system_assigned_root = home
         .join("Library")
         .join("CloudStorage")
-        .join("AFS-AFS")
+        .join("AgentFS")
         .join("notion");
     let mut store = InMemoryStateStore::new();
     store
@@ -222,19 +222,20 @@ fn pull_macos_file_provider_uses_canonical_afs_connector_root() {
         .expect("save macos file provider mount");
     let connector = fixture.connector("Roadmap");
 
-    assert!(
-        run_pull_with_state_root(&mut store, &connector, &alias_root, Some(&state_root)).is_err(),
-        "legacy File Provider alias roots should not resolve as active mounts"
-    );
-    run_pull_with_state_root(&mut store, &connector, &mount_root, Some(&state_root))
-        .expect("pull through canonical file provider connector root");
+    run_pull_with_state_root(
+        &mut store,
+        &connector,
+        &system_assigned_root,
+        Some(&state_root),
+    )
+    .expect("pull through system-assigned file provider connector root");
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        mount_root.join("roadmap").join("page.md"),
+        system_assigned_root.join("roadmap").join("page.md"),
         Some(&state_root),
     )
-    .expect("pull through canonical file provider file");
+    .expect("pull through system-assigned file provider file");
 
     assert!(report.ok);
     assert_eq!(report.hydrated, 1);

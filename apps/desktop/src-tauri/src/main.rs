@@ -3268,7 +3268,36 @@ fn macos_cloud_storage_dir() -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn macos_afs_cloud_storage_root() -> PathBuf {
-    macos_cloud_storage_dir().join("AFS")
+    macos_file_provider_cloud_storage_roots()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| macos_cloud_storage_dir().join("AFS"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_cloud_storage_roots() -> Vec<PathBuf> {
+    let cloud_storage = macos_cloud_storage_dir();
+    let mut roots = Vec::new();
+    if let Ok(root) =
+        macos_file_provider_domain_url(afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+    {
+        roots.push(root);
+    }
+    roots.push(cloud_storage.join("AFS"));
+    roots.push(cloud_storage.join("AgentFS"));
+    roots.push(cloud_storage.join("AFS-AFS"));
+    roots.push(cloud_storage.join("AgentFS-AFS"));
+    dedupe_path_list(roots)
+}
+
+fn dedupe_path_list(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.iter().any(|existing| existing == &path) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 fn resolve_mount_root(path: &str) -> Result<PathBuf, String> {
@@ -3315,6 +3344,12 @@ fn normalize_desktop_mount_root(root: &Path) -> Result<PathBuf, String> {
         if root == macos_cloud_storage_dir() || root == macos_afs_cloud_storage_root() {
             return Ok(default_notion_mount_root());
         }
+        if macos_file_provider_cloud_storage_roots()
+            .into_iter()
+            .any(|provider_root| root == provider_root)
+        {
+            return Ok(root.join(source_root_directory_name("notion")));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3342,11 +3377,17 @@ fn validate_desktop_mount_root(
     #[cfg(target_os = "macos")]
     {
         if *projection == ProjectionMode::MacosFileProvider {
-            let afs_root = absolute_path(&macos_afs_cloud_storage_root())?;
             let root = absolute_path(root)?;
-            if !root.starts_with(&afs_root) || root == afs_root {
+            let provider_roots = macos_file_provider_cloud_storage_roots()
+                .into_iter()
+                .filter_map(|provider_root| absolute_path(&provider_root).ok())
+                .collect::<Vec<_>>();
+            let inside_provider_root = provider_roots
+                .iter()
+                .any(|provider_root| root.starts_with(provider_root) && root != *provider_root);
+            if !inside_provider_root {
                 return Err(format!(
-                    "Choose a source folder inside the AFS CloudStorage root, for example {}.",
+                    "Choose a source folder inside the AFS File Provider root, for example {}.",
                     absolute_display_path(&default_notion_mount_root())
                 ));
             }
@@ -5176,24 +5217,38 @@ fn refresh_notion_mount_after_connect(
     clear_mount_cached_projection(store, state_root, &mount.mount_id)?;
     reload_daemon_mounts(state_root)?;
 
-    if mount.projection.uses_virtual_filesystem() {
-        activate_virtual_projection_mount(state_root, &mount, true)?;
-    }
+    let projection_warning = if mount.projection.uses_virtual_filesystem() {
+        match activate_virtual_projection_mount(state_root, &mount, true) {
+            Ok(()) => None,
+            Err(error) if recoverable_macos_file_provider_activation_error(&error) => {
+                Some(format!(
+                    "The Notion connection was updated, but macOS File Provider needs repair before Finder can show the folder: {error}"
+                ))
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
 
-    if let Some(preserved) = preserved {
-        return Ok(format!(
+    let mut message = if let Some(preserved) = preserved {
+        format!(
             "AFS preserved {} local Notion change{} at `{}` and refreshed the mounted folder for the latest Notion access.",
             preserved.count,
             if preserved.count == 1 { "" } else { "s" },
             preserved.directory.display()
-        ));
-    }
-
-    if connection_changed {
-        Ok("AFS refreshed the mounted folder for the newly connected workspace.".to_string())
+        )
+    } else if connection_changed {
+        "AFS refreshed the mounted folder for the newly connected workspace.".to_string()
     } else {
-        Ok("AFS refreshed the mounted folder for the latest Notion access.".to_string())
+        "AFS refreshed the mounted folder for the latest Notion access.".to_string()
+    };
+
+    if let Some(warning) = projection_warning {
+        message.push(' ');
+        message.push_str(&warning);
     }
+    Ok(message)
 }
 
 fn connection_metadata_changed(
@@ -5201,6 +5256,11 @@ fn connection_metadata_changed(
     next: Option<&ConnectionRecord>,
 ) -> bool {
     previous.map(connection_metadata_key) != next.map(connection_metadata_key)
+}
+
+fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
+    message.contains("The application cannot be used right now")
+        || message.contains("agentfs-file-providerctl was not found")
 }
 
 fn connection_metadata_key(
@@ -6519,7 +6579,17 @@ mod tests {
         )
         .expect_err("non-CloudStorage path rejected");
 
-        assert!(error.contains("inside the AFS CloudStorage root"));
+        assert!(error.contains("inside the AFS File Provider root"));
+    }
+
+    #[test]
+    fn file_provider_unavailable_error_is_recoverable_after_access_change() {
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "Could not register macOS File Provider: The application cannot be used right now."
+        ));
+        assert!(!super::recoverable_macos_file_provider_activation_error(
+            "Could not load the top-level Notion folder"
+        ));
     }
 
     #[test]
