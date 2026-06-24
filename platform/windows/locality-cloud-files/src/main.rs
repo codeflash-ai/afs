@@ -3208,7 +3208,7 @@ mod tests {
 
         assert!(path_is_under_sync_root(
             &context,
-            Path::new(r"c:\users\ada\loc\notion\Draft.md")
+            Path::new(r"c:\users\ada\locality\notion\Draft.md")
         ));
         assert!(!path_is_under_sync_root(
             &context,

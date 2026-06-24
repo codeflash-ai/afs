@@ -91,6 +91,10 @@ notary_args() {
     return 0
   fi
 
+  return 1
+}
+
+notary_credentials_error() {
   fail "notary credentials unavailable; create keychain profile '${NOTARY_PROFILE}' or set APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID"
 }
 
@@ -303,6 +307,7 @@ main() {
     while IFS= read -r -d '' arg; do
       submit_args+=("${arg}")
     done < <(notary_args)
+    [[ "${#submit_args[@]}" -gt 0 ]] || notary_credentials_error
   fi
 
   log "commit ${commit_full}"
