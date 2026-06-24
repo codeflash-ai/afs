@@ -3536,12 +3536,7 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
         if !target.exists() {
             return Err(format!("The file {} does not exist.", target.display()));
         }
-        Command::new("open")
-            .arg("-R")
-            .arg(&target)
-            .spawn()
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        reveal_macos_path_in_finder(&target)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -3566,15 +3561,57 @@ fn reveal_target(path: &Path) -> PathBuf {
     path.with_extension("md")
 }
 
+#[cfg(target_os = "macos")]
+fn reveal_macos_path_in_finder(path: &Path) -> Result<(), String> {
+    Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn reveal_virtual_mount_or_path(path: &Path) -> Result<(), String> {
     if !path.exists()
         && let Some(mount) = virtual_mount_for_path(path)
         && mount.projection.uses_virtual_filesystem()
     {
-        return open_virtual_projection(&mount);
+        return reveal_missing_virtual_mount_path(path, &mount);
     }
 
     reveal_in_file_manager(path)
+}
+
+fn reveal_missing_virtual_mount_path(path: &Path, mount: &MountConfig) -> Result<(), String> {
+    match missing_virtual_reveal_action(mount) {
+        MissingVirtualRevealAction::RevealRequestedPath => {
+            #[cfg(target_os = "macos")]
+            {
+                signal_virtual_projection_refresh(mount);
+                return reveal_macos_path_in_finder(path);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                open_virtual_projection(mount)
+            }
+        }
+        MissingVirtualRevealAction::OpenProjectionRoot => open_virtual_projection(mount),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingVirtualRevealAction {
+    RevealRequestedPath,
+    OpenProjectionRoot,
+}
+
+fn missing_virtual_reveal_action(mount: &MountConfig) -> MissingVirtualRevealAction {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        MissingVirtualRevealAction::RevealRequestedPath
+    } else {
+        MissingVirtualRevealAction::OpenProjectionRoot
+    }
 }
 
 fn choose_folder_with_dialog(
@@ -6375,6 +6412,32 @@ mod tests {
         assert_eq!(
             super::mount_access_root(&mount),
             std::path::PathBuf::from("/tmp/AFS")
+        );
+    }
+
+    #[test]
+    fn missing_macos_file_provider_reveal_keeps_requested_path_target() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/Users/test/Library/CloudStorage/AFS/notion",
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+
+        assert_eq!(
+            super::missing_virtual_reveal_action(&mount),
+            super::MissingVirtualRevealAction::RevealRequestedPath
+        );
+    }
+
+    #[test]
+    fn missing_non_macos_virtual_reveal_opens_projection_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+            .projection(ProjectionMode::LinuxFuse);
+
+        assert_eq!(
+            super::missing_virtual_reveal_action(&mount),
+            super::MissingVirtualRevealAction::OpenProjectionRoot
         );
     }
 
