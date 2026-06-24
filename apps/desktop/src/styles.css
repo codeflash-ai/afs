@@ -334,6 +334,7 @@ p {
 .primary-button,
 .secondary-button,
 .live-mode-button,
+.live-mode-control,
 .text-button {
   display: inline-flex;
   align-items: center;
@@ -371,6 +372,7 @@ p {
 .primary-button:active:not(:disabled),
 .secondary-button:active:not(:disabled),
 .live-mode-button:active:not(:disabled),
+.live-mode-control:active:not(:disabled),
 .text-button:active:not(:disabled),
 .sidebar-link:active:not(:disabled),
 .option-row:active:not(:disabled),
@@ -403,6 +405,7 @@ p {
 .workspace-card .primary-button,
 .workspace-card .secondary-button,
 .workspace-card .live-mode-button,
+.workspace-card .live-mode-control,
 .attention-panel .primary-button,
 .attention-panel .secondary-button,
 .suggestion-card .primary-button,
@@ -413,7 +416,8 @@ p {
 .footer-actions .secondary-button,
 .button-row .primary-button,
 .button-row .secondary-button,
-.button-row .live-mode-button {
+.button-row .live-mode-button,
+.button-row .live-mode-control {
   margin-top: 0;
 }
 
@@ -448,6 +452,58 @@ p {
   background: var(--accent);
   color: #fff;
   box-shadow: 0 12px 24px rgba(8, 123, 114, 0.2);
+}
+
+.live-mode-control {
+  position: relative;
+  justify-content: space-between;
+  min-width: 170px;
+  padding: 0 10px 0 13px;
+  border: 1px solid rgba(8, 123, 114, 0.22);
+  background: rgba(232, 248, 244, 0.72);
+  color: var(--accent);
+}
+
+.live-mode-control:hover:not(:disabled) {
+  border-color: rgba(8, 123, 114, 0.35);
+  background: rgba(232, 248, 244, 0.95);
+  box-shadow: 0 8px 20px rgba(20, 30, 43, 0.08);
+}
+
+.live-mode-control.active {
+  border-color: rgba(8, 123, 114, 0.42);
+  background: rgba(232, 248, 244, 0.92);
+  color: var(--accent);
+  box-shadow: 0 12px 24px rgba(8, 123, 114, 0.12);
+}
+
+.live-mode-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.live-mode-control.has-tooltip:hover::after,
+.live-mode-control.has-tooltip:focus-visible::after {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  width: min(320px, 72vw);
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 14px 28px rgba(20, 30, 43, 0.14);
+  color: var(--ink);
+  content: attr(data-tooltip);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  pointer-events: none;
+  text-align: left;
+  white-space: normal;
 }
 
 .secondary-button:disabled,
@@ -1701,6 +1757,7 @@ p {
 
 .toggle {
   position: relative;
+  display: inline-block;
   width: 42px;
   height: 24px;
   border: 0;

@@ -335,6 +335,12 @@ function liveModeReportNeedsRefresh(message: string) {
   return message.includes("synced") || message.includes("pulled") || message.includes("paused");
 }
 
+function liveModeTooltip(enabled: boolean) {
+  return enabled
+    ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
+    : "Turn on Live Mode to keep this local Notion folder in sync while you work. AFS still pauses for conflicts, large changes, or anything that needs review.";
+}
+
 function emptyUpdateStatus(): UpdateStatus {
   return { state: "idle", message: "", update: null };
 }
@@ -1546,12 +1552,20 @@ function HomeView({
             </div>
             <div className="button-row">
               <button
-                className={`live-mode-button ${liveModeEnabled ? "active" : ""}`}
+                className={`live-mode-control has-tooltip ${liveModeEnabled ? "active" : ""}`}
                 aria-pressed={liveModeEnabled}
+                aria-label={`${liveModeEnabled ? "Turn off" : "Turn on"} Live Mode`}
+                data-tooltip={liveModeTooltip(liveModeEnabled)}
+                title={liveModeTooltip(liveModeEnabled)}
                 onClick={toggleLiveMode}
               >
-                {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
-                <span>Live Mode</span>
+                <span className="live-mode-copy">
+                  {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+                  <span>Live Mode</span>
+                </span>
+                <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
+                  <i />
+                </span>
               </button>
               <SecondaryButton icon={<FolderOpen />} onClick={() => void openWorkspaceFolder(snapshot.mount.localPath)}>
                 Open Folder
