@@ -5,7 +5,8 @@ export const GOOGLE_DOCS_OAUTH_SCOPES = [
   "openid",
   "email",
   "profile",
-  "https://www.googleapis.com/auth/documents"
+  "https://www.googleapis.com/auth/documents",
+  "https://www.googleapis.com/auth/drive.file"
 ];
 
 export interface GoogleDocsTokenResponse {
