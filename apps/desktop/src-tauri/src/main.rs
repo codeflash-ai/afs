@@ -2761,6 +2761,7 @@ fn remove_desktop_support_state() -> Result<(), String> {
         let home = home_dir().map_err(|error| format!("HOME is not set: {error}"))?;
         for path in [
             home.join("Library/LaunchAgents/ai.codeflash.locality.localityd.plist"),
+            home.join("Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality"),
             home.join("Library/Group Containers/group.ai.codeflash.locality"),
             home.join("Library/Application Support/ai.codeflash.locality"),
             home.join("Library/Caches/ai.codeflash.locality"),

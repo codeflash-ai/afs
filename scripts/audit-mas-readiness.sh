@@ -72,7 +72,7 @@ done
 for entitlements in "${HOST_ENTITLEMENTS}" "${EXTENSION_ENTITLEMENTS}"; do
   require_plist_key "${entitlements}" "com.apple.security.app-sandbox"
   require_plist_key "${entitlements}" "com.apple.security.application-groups"
-  require_plist_string "${entitlements}" "group.ai.codeflash.locality"
+  require_plist_string "${entitlements}" "C484HB7Q6S.group.ai.codeflash.locality"
   require_plist_key "${entitlements}" "com.apple.security.network.client"
 done
 

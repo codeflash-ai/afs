@@ -1212,7 +1212,7 @@ fn macos_app_group_container() -> Option<PathBuf> {
         PathBuf::from(home)
             .join("Library")
             .join("Group Containers")
-            .join("group.ai.codeflash.locality")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
     })
 }
 

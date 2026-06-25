@@ -265,6 +265,7 @@ remove_credentials() {
 remove_support_files() {
   if [[ "$(uname -s)" == "Darwin" ]]; then
     remove_path "${HOME}/Library/LaunchAgents/ai.codeflash.locality.localityd.plist"
+    remove_path "${HOME}/Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality"
     remove_path "${HOME}/Library/Group Containers/group.ai.codeflash.locality"
     remove_path "${HOME}/Library/Application Support/ai.codeflash.locality"
     remove_path "${HOME}/Library/Caches/ai.codeflash.locality"

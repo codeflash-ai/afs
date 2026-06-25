@@ -91,7 +91,7 @@ Required Apple-side setup:
 - Developer ID Application certificate installed locally or available in CI.
 - App IDs and entitlements for `ai.codeflash.locality` and
   `ai.codeflash.locality.Locality.FileProvider`.
-- Application group `group.ai.codeflash.locality`.
+- Application group `C484HB7Q6S.group.ai.codeflash.locality`.
 - Notary credentials, preferably an App Store Connect API key in CI.
 
 Find the local signing identity:
@@ -400,7 +400,7 @@ Remaining App Store work:
 - Create or confirm App Store App IDs for `ai.codeflash.locality` and
   `ai.codeflash.locality.Locality.FileProvider`.
 - Create provisioning profiles for the containing app and File Provider
-  extension with `group.ai.codeflash.locality`.
+  extension with `C484HB7Q6S.group.ai.codeflash.locality`.
 - Run the manual workflow with validation enabled.
 - Run the manual workflow with upload enabled when validation passes.
 - Complete TestFlight/App Review metadata in App Store Connect.
