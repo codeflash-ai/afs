@@ -1,9 +1,13 @@
 use loc_cli::connect::{
-    BrokerOAuthConnectOptions, ConnectOptions, DEFAULT_NOTION_OAUTH_PROFILE_ID,
-    DEFAULT_NOTION_PROFILE_ID, NotionConnectionProbe, NotionConnectionProbeResult,
-    NotionOAuthBrokerExchange, NotionOAuthExchange, OAuthConnectOptions, run_connect_notion,
+    BrokerOAuthConnectOptions, ConnectOptions, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
+    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID,
+    GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange, NotionConnectionProbe,
+    NotionConnectionProbeResult, NotionOAuthBrokerExchange, NotionOAuthExchange,
+    OAuthConnectOptions, run_connect_google_docs_broker_oauth, run_connect_notion,
     run_connect_notion_broker_oauth, run_connect_notion_oauth, run_disconnect, run_profiles,
 };
+use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
+use locality_google_docs::{GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential};
 use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthCodeExchange, NotionOAuthToken,
     StoredNotionCredential,
@@ -176,6 +180,54 @@ fn connect_notion_broker_oauth_stores_refresh_handle_without_client_secret() {
 }
 
 #[test]
+fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = FakeGoogleDocsBrokerOAuthExchange;
+
+    let report = run_connect_google_docs_broker_oauth(
+        &mut store,
+        &credentials,
+        GoogleDocsBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("docs-work")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect google docs oauth");
+
+    assert_eq!(report.connection_id, "docs-work");
+    assert_eq!(report.profile_id, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID);
+    assert_eq!(report.connector, "google-docs");
+    assert_eq!(report.auth_kind, "oauth");
+    assert_eq!(report.account_label.as_deref(), Some("user@example.com"));
+
+    let secret = credentials
+        .get("connection:docs-work")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGoogleDocsCredential>(&secret).expect("stored oauth");
+    assert_eq!(
+        stored.refresh_token_handle.as_deref(),
+        Some("opaque-refresh-handle")
+    );
+    assert_eq!(
+        stored.oauth_broker_url.as_deref(),
+        Some("https://auth.example.test")
+    );
+
+    let json = serde_json::to_string(&report).expect("json");
+    assert!(!json.contains("oauth-access-token"));
+    assert!(!json.contains("opaque-refresh-handle"));
+    assert!(!json.contains("client-secret"));
+    assert!(!json.contains("secret_ref"));
+}
+
+#[test]
 fn profiles_list_auth_configs_without_secrets() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -305,6 +357,39 @@ impl NotionOAuthBrokerExchange for FakeBrokerOAuthExchange {
             workspace_icon: None,
             owner: None,
             duplicated_template_id: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FakeGoogleDocsBrokerOAuthExchange;
+
+impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "google-docs");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/google-docs/callback"
+        );
+        Ok(OAuthBrokerToken {
+            access_token: "oauth-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(3600),
+            refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("google-drive".to_string()),
+            workspace_name: Some("Google Drive".to_string()),
+            scopes: GOOGLE_DOCS_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
         })
     }
 }
