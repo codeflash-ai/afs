@@ -13,10 +13,10 @@ only performs the confidential token exchange and refresh calls.
 ```text
 loc CLI -> broker /start
 loc CLI <- authorization_url, state, signed session
-loc CLI -> browser -> Notion OAuth consent
-Notion -> localhost callback on the user's machine
+loc CLI -> browser -> provider OAuth consent
+provider -> localhost callback on the user's machine
 loc CLI -> broker /exchange with code, state, session, redirect_uri
-broker -> Notion token endpoint with client_secret
+broker -> provider token endpoint with client_secret
 broker -> loc CLI with access token and refresh handle
 ```
 
@@ -24,7 +24,7 @@ Refresh is similarly narrow:
 
 ```text
 loc CLI -> broker /refresh with refresh_token_handle
-broker -> Notion token endpoint with client_secret
+broker -> provider token endpoint with client_secret
 broker -> loc CLI with new access token and new refresh handle
 ```
 
@@ -83,6 +83,57 @@ Request:
 }
 ```
 
+### `POST /v1/oauth/google-docs/start`
+
+Request:
+
+```json
+{
+  "redirect_uri": "http://localhost:8757/oauth/google-docs/callback"
+}
+```
+
+Response:
+
+```json
+{
+  "connector": "google-docs",
+  "client_id": "public-client-id",
+  "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "redirect_uri": "http://localhost:8757/oauth/google-docs/callback",
+  "session": "signed-session",
+  "state": "opaque-state",
+  "expires_in": 600
+}
+```
+
+### `POST /v1/oauth/google-docs/exchange`
+
+Request:
+
+```json
+{
+  "session": "signed-session",
+  "state": "opaque-state",
+  "code": "provider-authorization-code",
+  "redirect_uri": "http://localhost:8757/oauth/google-docs/callback"
+}
+```
+
+Response includes the Google OAuth access token, granted scopes, optional ID
+token, and either `refresh_token_handle` or `refresh_token`, depending on
+`LOCALITY_TOKEN_MODE`.
+
+### `POST /v1/oauth/google-docs/refresh`
+
+Request:
+
+```json
+{
+  "refresh_token_handle": "locrh_v1..."
+}
+```
+
 ## Local Development
 
 ```sh
@@ -103,6 +154,8 @@ npm run check
 - `LOCALITY_REFRESH_HANDLE_KEY`: encrypts opaque refresh handles in `handle` mode.
 - `LOCALITY_NOTION_CLIENT_ID`: Notion OAuth client ID.
 - `LOCALITY_NOTION_CLIENT_SECRET`: Notion OAuth client secret.
+- `LOCALITY_GOOGLE_DOCS_CLIENT_ID`: Google OAuth client ID.
+- `LOCALITY_GOOGLE_DOCS_CLIENT_SECRET`: Google OAuth client secret.
 
 ## Deployment
 

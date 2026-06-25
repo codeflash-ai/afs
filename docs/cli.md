@@ -5,6 +5,7 @@ The `loc` command is the single supported control surface for users and coding a
 ## Commands
 
 - `loc connect notion [--name <id>] [--token-stdin|--no-browser|--direct-oauth] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
+- `loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
 - `loc connections [--json]`
 - `loc profiles [--json]`
 - `loc connection show <id> [--json]`
@@ -62,6 +63,8 @@ JSON output never includes OAuth tokens, refresh tokens, client secrets, PATs, o
 Connections now point at connector profiles. A profile is Locality's local auth-config record: connector, auth kind, scopes, enabled action classes, connector version, status, and capabilities. OAuth connections use `notion-oauth-default`; explicit PAT connections use `notion-token-default`.
 
 The default connection ID is `notion-default` when no Notion connection exists. If a Notion connection already exists, pass `--name <id>` to avoid overwriting by accident.
+
+`loc connect google-docs [--name <id>]` uses the same Locality OAuth broker flow for Google Docs and Drive. The default broker is `https://loc-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default callback is `http://localhost:8757/oauth/google-docs/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI`. The Google OAuth client must allow that callback and the broker must be configured with Google Docs and Drive scopes.
 
 `loc connections` and `loc connection show <id>` list connected-account metadata only, including the profile ID but never credentials. `loc profiles` lists connector auth profiles and contains no account secrets. `loc disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
 

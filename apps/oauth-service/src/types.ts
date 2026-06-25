@@ -8,9 +8,14 @@ export interface BrokerEnv {
   LOCALITY_NOTION_AUTH_BASE_URL?: string;
   LOCALITY_NOTION_API_BASE_URL?: string;
   LOCALITY_NOTION_VERSION?: string;
+  LOCALITY_GOOGLE_DOCS_CLIENT_ID?: string;
+  LOCALITY_GOOGLE_DOCS_CLIENT_SECRET?: string;
+  LOCALITY_GOOGLE_DOCS_REDIRECT_URIS?: string;
+  LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL?: string;
+  LOCALITY_GOOGLE_DOCS_API_BASE_URL?: string;
 }
 
-export type ConnectorId = "notion";
+export type ConnectorId = "notion" | "google-docs";
 
 export interface ApiErrorBody {
   error: {

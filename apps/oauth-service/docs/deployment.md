@@ -14,6 +14,8 @@ wrangler secret put LOCALITY_BROKER_SESSION_SECRET
 wrangler secret put LOCALITY_REFRESH_HANDLE_KEY
 wrangler secret put LOCALITY_NOTION_CLIENT_ID
 wrangler secret put LOCALITY_NOTION_CLIENT_SECRET
+wrangler secret put LOCALITY_GOOGLE_DOCS_CLIENT_ID
+wrangler secret put LOCALITY_GOOGLE_DOCS_CLIENT_SECRET
 wrangler deploy
 ```
 
@@ -23,6 +25,14 @@ Locality:
 ```text
 http://localhost:8757/oauth/notion/callback
 http://127.0.0.1:8757/oauth/notion/callback
+```
+
+Configure the Google OAuth client with the exact localhost callback used by
+Locality:
+
+```text
+http://localhost:8757/oauth/google-docs/callback
+http://127.0.0.1:8757/oauth/google-docs/callback
 ```
 
 Use a stable production URL such as:

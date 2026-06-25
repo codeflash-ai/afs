@@ -1,10 +1,16 @@
 import { Hono } from "hono";
 import { badRequest, configError, HttpError } from "./http/errors";
+import {
+  exchangeGoogleDocsCode,
+  googleDocsAuthorizeUrl,
+  refreshGoogleDocsToken,
+  type GoogleDocsTokenResponse
+} from "./oauth/google-docs";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
-import { validateNotionRedirectUri } from "./security/redirects";
+import { validateGoogleDocsRedirectUri, validateNotionRedirectUri } from "./security/redirects";
 import { nowSeconds, signSession, verifySession } from "./security/session";
-import type { ApiErrorBody, BrokerEnv } from "./types";
+import type { ApiErrorBody, BrokerEnv, ConnectorId } from "./types";
 
 const SESSION_TTL_SECONDS = 10 * 60;
 const OPERATIONAL_SECRET_MIN_LENGTH = 32;
@@ -27,7 +33,7 @@ interface RefreshRequest {
 
 interface RefreshHandlePayload {
   v: 1;
-  connector: "notion";
+  connector: ConnectorId;
   refresh_token: string;
   issued_at: number;
 }
@@ -42,6 +48,11 @@ app.get("/.well-known/loc-auth-broker", (c) =>
     version: 1,
     connectors: {
       notion: {
+        oauth: "brokered_confidential",
+        session_ttl_seconds: SESSION_TTL_SECONDS,
+        refresh_token_modes: [tokenMode(c.env)]
+      },
+      "google-docs": {
         oauth: "brokered_confidential",
         session_ttl_seconds: SESSION_TTL_SECONDS,
         refresh_token_modes: [tokenMode(c.env)]
@@ -100,9 +111,64 @@ app.post("/v1/oauth/notion/exchange", async (c) => {
 
 app.post("/v1/oauth/notion/refresh", async (c) => {
   const body = await requiredJson<RefreshRequest>(c.req.raw);
-  const refreshToken = await resolveRefreshToken(c.env, body);
+  const refreshToken = await resolveRefreshToken(c.env, "notion", body);
   const token = await refreshNotionToken(c.env, refreshToken);
   return c.json(await shapeNotionTokenResponse(c.env, token));
+});
+
+app.post("/v1/oauth/google-docs/start", async (c) => {
+  const body = await optionalJson<StartRequest>(c.req.raw);
+  const redirectUri = validateGoogleDocsRedirectUri(
+    c.env,
+    body.redirect_uri ?? "http://localhost:8757/oauth/google-docs/callback"
+  );
+  const now = nowSeconds();
+  const state = randomBase64Url();
+  const session = await signSession(
+    {
+      v: 1,
+      connector: "google-docs",
+      state,
+      redirect_uri: redirectUri,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+      nonce: randomBase64Url()
+    },
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  return c.json({
+    connector: "google-docs",
+    client_id: c.env.LOCALITY_GOOGLE_DOCS_CLIENT_ID,
+    authorization_url: googleDocsAuthorizeUrl(c.env, redirectUri, state),
+    redirect_uri: redirectUri,
+    session,
+    state,
+    expires_in: SESSION_TTL_SECONDS
+  });
+});
+
+app.post("/v1/oauth/google-docs/exchange", async (c) => {
+  const body = await requiredJson<ExchangeRequest>(c.req.raw);
+  const session = requireString(body.session, "session");
+  const state = requireString(body.state, "state");
+  const code = requireString(body.code, "code");
+  const redirectUri = validateGoogleDocsRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const payload = await verifySession(
+    session,
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  if (payload.connector !== "google-docs" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+    throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
+  }
+  const token = await exchangeGoogleDocsCode(c.env, code, redirectUri);
+  return c.json(await shapeGoogleDocsTokenResponse(c.env, token));
+});
+
+app.post("/v1/oauth/google-docs/refresh", async (c) => {
+  const body = await requiredJson<RefreshRequest>(c.req.raw);
+  const refreshToken = await resolveRefreshToken(c.env, "google-docs", body);
+  const token = await refreshGoogleDocsToken(c.env, refreshToken);
+  return c.json(await shapeGoogleDocsTokenResponse(c.env, token));
 });
 
 app.onError((error, c) => {
@@ -117,7 +183,7 @@ app.onError((error, c) => {
 });
 
 async function shapeNotionTokenResponse(env: BrokerEnv, token: NotionTokenResponse) {
-  const refresh = await shapeRefreshToken(env, token.refresh_token);
+  const refresh = await shapeRefreshToken(env, "notion", token.refresh_token);
   return {
     connector: "notion",
     access_token: token.access_token,
@@ -133,7 +199,20 @@ async function shapeNotionTokenResponse(env: BrokerEnv, token: NotionTokenRespon
   };
 }
 
-async function shapeRefreshToken(env: BrokerEnv, refreshToken: string | undefined) {
+async function shapeGoogleDocsTokenResponse(env: BrokerEnv, token: GoogleDocsTokenResponse) {
+  const refresh = await shapeRefreshToken(env, "google-docs", token.refresh_token);
+  return {
+    connector: "google-docs",
+    access_token: token.access_token,
+    token_type: token.token_type,
+    expires_in: token.expires_in,
+    scope: token.scope,
+    id_token: token.id_token,
+    ...refresh
+  };
+}
+
+async function shapeRefreshToken(env: BrokerEnv, connector: ConnectorId, refreshToken: string | undefined) {
   if (!refreshToken) {
     return {};
   }
@@ -147,7 +226,7 @@ async function shapeRefreshToken(env: BrokerEnv, refreshToken: string | undefine
   const handle = await encryptJsonHandle(
     {
       v: 1,
-      connector: "notion",
+      connector,
       refresh_token: refreshToken,
       issued_at: nowSeconds()
     } satisfies RefreshHandlePayload,
@@ -159,14 +238,14 @@ async function shapeRefreshToken(env: BrokerEnv, refreshToken: string | undefine
   };
 }
 
-async function resolveRefreshToken(env: BrokerEnv, body: RefreshRequest): Promise<string> {
+async function resolveRefreshToken(env: BrokerEnv, connector: ConnectorId, body: RefreshRequest): Promise<string> {
   if (body.refresh_token_handle) {
     try {
       const payload = await decryptJsonHandle<RefreshHandlePayload>(
         body.refresh_token_handle,
         requireOperationalSecret(env.LOCALITY_REFRESH_HANDLE_KEY, "LOCALITY_REFRESH_HANDLE_KEY")
       );
-      if (payload.v !== 1 || payload.connector !== "notion") {
+      if (payload.v !== 1 || payload.connector !== connector) {
         throw new Error("invalid refresh handle payload");
       }
       return payload.refresh_token;
