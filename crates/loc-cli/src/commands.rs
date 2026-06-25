@@ -8,10 +8,15 @@ use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use locality_connector::ConnectorUndoApplier;
+use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::LocalityError;
 use locality_core::journal::PushId;
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::path_projection::{page_document_path, page_listing_parent_path};
+use locality_google_docs::{
+    DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
+    GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
+};
 use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, HttpNotionOAuthClient,
     NotionOAuthBrokerStart,
@@ -34,9 +39,10 @@ use serde_json::Value;
 
 use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
-    ConnectionsReport, DisconnectReport, HttpNotionConnectionProbe, OAuthConnectOptions,
-    ProfilesReport, run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
-    run_connection_show, run_connections, run_disconnect, run_profiles,
+    ConnectionsReport, DisconnectReport, GoogleDocsBrokerOAuthConnectOptions,
+    HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport,
+    run_connect_google_docs_broker_oauth, run_connect_notion, run_connect_notion_broker_oauth,
+    run_connect_notion_oauth, run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_source_for_mount_id, resolve_source_for_path,
@@ -170,6 +176,8 @@ enum LocalityCommand {
 enum ConnectCommand {
     #[command(about = "Connect a Notion workspace")]
     Notion(ConnectNotionArgs),
+    #[command(name = "google-docs", about = "Connect Google Docs and Drive")]
+    GoogleDocs(ConnectGoogleDocsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -189,6 +197,26 @@ struct ConnectNotionArgs {
         help = "Use direct Notion OAuth environment credentials instead of the broker."
     )]
     direct_oauth: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectGoogleDocsArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to google-docs-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
     #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
     broker_url: Option<String>,
     #[arg(
@@ -621,6 +649,21 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::GoogleDocs(options) => {
+                    args.push("google-docs".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
             }
         }
         LocalityCommand::Connections => args.push("connections".to_string()),
@@ -884,13 +927,17 @@ fn doctor(json: bool) -> i32 {
 }
 
 fn connect(args: &[String], json: bool) -> i32 {
-    if first_positional(args) != Some("notion") {
+    let connector = first_positional(args);
+    if connector == Some(GOOGLE_DOCS_CONNECTOR_ID) {
+        return connect_google_docs(args, json);
+    }
+    if connector != Some("notion") {
         return command_error(
             json,
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect notion [--name <id>] [--token-stdin|--no-browser|--direct-oauth] [--broker-url <url>] [--redirect-uri <uri>] [--json]",
+                "usage: loc connect <notion|google-docs> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1023,6 +1070,77 @@ fn connect(args: &[String], json: bool) -> i32 {
     };
     let exchange = HttpNotionOAuthClient::new();
     match run_connect_notion_oauth(&mut store, credentials.as_ref(), options, &exchange) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_google_docs(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let broker_config = match google_docs_oauth_broker_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let broker = HttpGoogleDocsOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let start = match broker.start(&OAuthBrokerStart {
+        connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
+        redirect_uri: broker_config.redirect_uri,
+    }) {
+        Ok(start) => start,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "connect",
+                    "oauth_broker_start_failed",
+                    format!("Google Docs OAuth broker start failed: {error}"),
+                )
+                .with_suggested_command("loc connect google-docs"),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let authorization = match run_local_oauth_authorization(
+        "Google Docs",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        has_flag(args, "--no-browser"),
+        json,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return command_error(json, google_docs_local_oauth_command_error(error), EXIT_INTERNAL);
+        }
+    };
+    let options = GoogleDocsBrokerOAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        broker_url: broker_config.broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+    match run_connect_google_docs_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -3873,6 +3991,12 @@ struct NotionOAuthBrokerCliConfig {
     redirect_uri: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GoogleDocsOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
 fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandError> {
     let client_id = env_first(&["LOCALITY_NOTION_OAUTH_CLIENT_ID", "NOTION_OAUTH_CLIENT_ID"])
         .ok_or_else(|| missing_oauth_config("LOCALITY_NOTION_OAUTH_CLIENT_ID"))?;
@@ -3934,6 +4058,34 @@ fn notion_oauth_broker_config(args: &[String]) -> Result<NotionOAuthBrokerCliCon
     })
 }
 
+fn google_docs_oauth_broker_config(
+    args: &[String],
+) -> Result<GoogleDocsOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| {
+            env_first(&[
+                "LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL",
+                "LOCALITY_AUTH_BROKER_URL",
+            ])
+        })
+        .unwrap_or_else(|| DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI.to_string());
+
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
+            .with_suggested_command("loc connect google-docs")
+    })?;
+
+    Ok(GoogleDocsOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
 fn missing_oauth_config(name: &str) -> CommandError {
     CommandError::new(
         "connect",
@@ -3973,6 +4125,15 @@ fn local_oauth_command_error(error: LocalOAuthError) -> CommandError {
     let command_error = CommandError::new("connect", error.code, error.message);
     if command_error.code == "invalid_redirect_uri" {
         command_error.with_suggested_command("loc connect notion --token-stdin")
+    } else {
+        command_error
+    }
+}
+
+fn google_docs_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("loc connect google-docs")
     } else {
         command_error
     }
@@ -4992,14 +5153,14 @@ mod tests {
     use crate::push::PushReport;
     use crate::search::{SearchOptions, SearchReport};
 
-    use super::{
-        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
-        absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
-        legacy_args_for_command, notion_oauth_broker_config, projection_mode_for_target,
-        projection_usage_options_for_target, prompt_for_push_confirmation,
-        pull_direct_fallback_error, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        validate_virtual_projection_registration,
+	    use super::{
+	        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
+	        absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
+	        google_docs_oauth_broker_config, legacy_args_for_command, notion_oauth_broker_config,
+	        projection_mode_for_target, projection_usage_options_for_target, prompt_for_push_confirmation,
+	        pull_direct_fallback_error, should_prompt_for_push_confirmation,
+	        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+	        validate_virtual_projection_registration,
     };
 
     #[test]
@@ -5011,7 +5172,13 @@ mod tests {
             ),
             (
                 vec!["connect", "--help"],
-                vec!["Usage: loc connect", "Commands:", "notion", "--json"],
+                vec![
+                    "Usage: loc connect",
+                    "Commands:",
+                    "notion",
+                    "google-docs",
+                    "--json",
+                ],
             ),
             (
                 vec!["connect", "notion", "--help"],
@@ -5020,6 +5187,15 @@ mod tests {
                     "Connect a Notion workspace",
                     "--token-stdin",
                     "--direct-oauth",
+                ],
+            ),
+            (
+                vec!["connect", "google-docs", "--help"],
+                vec![
+                    "Usage: loc connect google-docs",
+                    "Connect Google Docs and Drive",
+                    "--broker-url",
+                    "--redirect-uri",
                 ],
             ),
             (
@@ -5318,6 +5494,32 @@ mod tests {
                 "/tmp/loc-state",
                 "--include-env",
                 "NOTION_TOKEN"
+            ]
+        );
+
+        let cli = parse_cli([
+            "connect",
+            "google-docs",
+            "--name",
+            "docs-work",
+            "--no-browser",
+            "--broker-url",
+            "https://auth.example.test",
+            "--redirect-uri",
+            "http://localhost:8757/oauth/google-docs/callback",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "connect",
+                "google-docs",
+                "--name",
+                "docs-work",
+                "--no-browser",
+                "--broker-url",
+                "https://auth.example.test",
+                "--redirect-uri",
+                "http://localhost:8757/oauth/google-docs/callback"
             ]
         );
 
@@ -5768,6 +5970,25 @@ mod tests {
         assert_eq!(
             config.redirect_uri,
             "http://localhost:8757/oauth/notion/callback"
+        );
+    }
+
+    #[test]
+    fn google_docs_oauth_broker_config_accepts_explicit_broker_url() {
+        let args = vec![
+            "google-docs".to_string(),
+            "--broker-url".to_string(),
+            "https://auth.example.test".to_string(),
+            "--redirect-uri".to_string(),
+            "http://localhost:8757/oauth/google-docs/callback".to_string(),
+        ];
+
+        let config = google_docs_oauth_broker_config(&args).expect("broker config");
+
+        assert_eq!(config.broker_url, "https://auth.example.test");
+        assert_eq!(
+            config.redirect_uri,
+            "http://localhost:8757/oauth/google-docs/callback"
         );
     }
 
