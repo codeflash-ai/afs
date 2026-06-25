@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -424,6 +425,50 @@ fn diff_plans_new_database_row_page_document_as_create_entity() {
         }
         operation => panic!("unexpected operation {operation:?}"),
     }
+}
+
+#[test]
+fn diff_plain_text_summary_includes_entity_creates() {
+    let fixture = DiffFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite");
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    fixture.write_tasks_schema();
+    let path = fixture.write_raw(
+        "Tasks/new-task.md",
+        "---\ntitle: New task\nStatus: Todo\n---\n# Notes\n\nCreated locally.\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .arg("diff")
+        .arg(&path)
+        .output()
+        .expect("run loc diff");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 entity created"), "{stdout}");
 }
 
 #[test]

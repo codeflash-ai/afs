@@ -16,7 +16,7 @@ use locality_connector::{
 use locality_core::canonical::ParsedCanonicalDocument;
 use locality_core::freshness::RemoteObservation;
 use locality_core::hydration::HydrationRequest;
-use locality_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
+use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId, TreeEntry};
 use locality_core::planner::PushOperationKind;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
@@ -95,6 +95,7 @@ pub struct SourceDescriptor {
     auth_env_var: Option<&'static str>,
     supports_oauth: bool,
     mount_guidance: Cow<'static, str>,
+    source_root_create_parent_kind: Option<EntityKind>,
 }
 
 impl SourceDescriptor {
@@ -124,6 +125,10 @@ impl SourceDescriptor {
 
     pub fn mount_guidance(&self) -> &str {
         &self.mount_guidance
+    }
+
+    pub fn source_root_create_parent_kind(&self) -> Option<EntityKind> {
+        self.source_root_create_parent_kind.clone()
     }
 }
 
@@ -159,6 +164,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         auth_env_var: Some(DEFAULT_NOTION_TOKEN_ENV),
         supports_oauth: true,
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
+        source_root_create_parent_kind: None,
     }
 }
 
@@ -170,7 +176,8 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         connect_command: Some(Cow::Borrowed("loc connect google-docs")),
         auth_env_var: None,
         supports_oauth: true,
-        mount_guidance: Cow::Owned(generic_mount_guidance("Google Docs")),
+        mount_guidance: Cow::Owned(google_docs_mount_guidance()),
+        source_root_create_parent_kind: Some(EntityKind::Directory),
     }
 }
 
@@ -200,6 +207,7 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         auth_env_var: None,
         supports_oauth: false,
         mount_guidance: Cow::Owned(generic_mount_guidance(connector)),
+        source_root_create_parent_kind: None,
     }
 }
 
@@ -224,6 +232,17 @@ Locality projects {source} as local Markdown. Browse directories normally; onlin
 - When Live Mode pauses for review, conflict, remote drift, or a large/destructive plan, use `loc status` and `loc diff` before recovery.\n\
 - Do not edit `AGENTS.md`, `CLAUDE.md`, `_schema.yaml`, Locality identity frontmatter, or `::loc{{...}}` directives unless explicitly asked.\n\
 - If a file has conflict markers, resolve the Markdown to the intended final content, remove every marker line, then rerun `loc diff` and `loc push`.\n"
+    )
+}
+
+fn google_docs_mount_guidance() -> String {
+    format!(
+        "{}\n\
+Google Docs facts:\n\
+- This mount uses Google Docs document access plus Google Drive `drive.file` and Drive metadata access.\n\
+- Pull enumerates Google Docs and Drive folders under the configured workspace folder, including Docs manually added inside the workspace folder.\n\
+- Non-Google-Docs Drive files are ignored by this connector in V1.\n",
+        generic_mount_guidance("Google Docs")
     )
 }
 

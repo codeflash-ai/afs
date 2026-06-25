@@ -1290,9 +1290,19 @@ fn create_parent_remote_id(
         }
         return Ok(RemoteId::new(remote_id));
     }
-    if parent_identifier == ROOT_CONTAINER_IDENTIFIER
-        || parent_identifier == source_root_identifier(&mount.connector)
-        || parent_identifier.starts_with(PATH_PREFIX)
+    if parent_identifier == source_root_identifier(&mount.connector) {
+        if source_descriptor(&mount.connector)
+            .source_root_create_parent_kind()
+            .is_some()
+            && let Some(remote_root_id) = &mount.remote_root_id
+        {
+            return Ok(remote_root_id.clone());
+        }
+        return Err(LocalityError::Unsupported(
+            "new virtual filesystem files must be created inside a page or database directory",
+        ));
+    }
+    if parent_identifier == ROOT_CONTAINER_IDENTIFIER || parent_identifier.starts_with(PATH_PREFIX)
     {
         return Err(LocalityError::Unsupported(
             "new virtual filesystem files must be created inside a page or database directory",
@@ -3382,6 +3392,50 @@ mod tests {
                 .expect("list mutations")
                 .len(),
             1
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn create_directory_under_google_docs_source_root_uses_workspace_folder_parent() {
+        let mount_id = MountId::new("google-docs-main");
+        let state_root = temp_root("loc-virtual-fs-google-docs-root-create-dir");
+        let content_root = state_root.join("content/google-docs-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "google-docs", "/tmp/loc/google-docs")
+                    .with_remote_root_id(RemoteId::new("workspace-folder"))
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+
+        let created = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &source_root_identifier("google-docs"),
+            "Scratch Hydration",
+        )
+        .expect("create google docs directory under source root");
+
+        assert!(created.identifier.starts_with("children:local:"));
+        assert_eq!(created.item.filename, "Scratch Hydration");
+        assert_eq!(created.item.path, "Scratch Hydration");
+        assert_eq!(
+            std::fs::read(content_root.join("Scratch Hydration/page.md"))
+                .expect("read pending page cache"),
+            b""
+        );
+        let mutation = store
+            .list_virtual_mutations(&mount_id)
+            .expect("list mutations")
+            .pop()
+            .expect("pending create");
+        assert_eq!(
+            mutation.parent_remote_id.as_ref().map(|id| id.as_str()),
+            Some("workspace-folder")
         );
 
         let _ = std::fs::remove_dir_all(state_root);

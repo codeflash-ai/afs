@@ -632,6 +632,71 @@ fn status_reports_remote_update_available_for_clean_file() {
 }
 
 #[test]
+fn status_treats_drive_only_observation_as_same_google_docs_version() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("doc-1"),
+                EntityKind::Page,
+                "Google Doc",
+                "google-doc/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_remote_edited_at("drive:5:2026-06-25T10:18:24.085Z|docs:rev-1"),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow("doc-1", "# Google Doc\n\nSame body."),
+        )
+        .expect("save shadow");
+    fixture.write_page("google-doc/page.md", "doc-1", "# Google Doc\n\nSame body.");
+    store
+        .save_remote_observation(
+            RemoteObservationRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("doc-1"),
+                EntityKind::Page,
+                "Google Doc",
+                "google-doc/page.md",
+                "unix_ms:2",
+            )
+            .with_remote_version(RemoteVersion::new("drive:5:2026-06-25T10:18:24.085Z")),
+        )
+        .expect("save remote observation");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("doc-1"),
+                FreshnessTier::Warm,
+            )
+            .checked_at("unix_ms:2"),
+        )
+        .expect("save freshness state");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.join("google-doc/page.md")),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean, "{report:#?}");
+    assert_eq!(report.summary.remote_update_available, 0);
+    assert_eq!(
+        entry_sync_state(&report, "google-doc/page.md"),
+        StatusSyncState::AllSynced
+    );
+}
+
+#[test]
 fn status_reports_review_needed_when_local_and_remote_changed() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();

@@ -235,8 +235,13 @@ pub fn local_redirect(uri: &str) -> Result<LocalRedirect, LocalOAuthError> {
             "OAuth redirect URI has an invalid port",
         )
     })?;
+    let bind_host = if host == "localhost" {
+        "127.0.0.1"
+    } else {
+        host
+    };
     Ok(LocalRedirect {
-        bind_addr: format!("{host}:{port}"),
+        bind_addr: format!("{bind_host}:{port}"),
         callback_path,
     })
 }
@@ -272,16 +277,16 @@ pub fn random_state() -> String {
 }
 
 fn open_browser(url: &str) -> io::Result<()> {
-    let mut command = browser_command(url).into_command();
+    launch_browser_command(browser_command(url))
+}
 
-    let status = command.status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "browser command exited with {status}"
-        )))
-    }
+fn launch_browser_command(spec: BrowserCommandSpec) -> io::Result<()> {
+    let mut command = spec.into_command();
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,8 +369,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::browser_command;
     use super::{
-        LocalOAuthAuthorization, local_redirect, parse_oauth_callback, retryable_callback_error,
-        wait_for_oauth_callback,
+        BrowserCommandSpec, LocalOAuthAuthorization, launch_browser_command, local_redirect,
+        parse_oauth_callback, retryable_callback_error, wait_for_oauth_callback,
     };
 
     #[cfg(target_os = "windows")]
@@ -380,6 +385,20 @@ mod tests {
             command.args,
             vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_launch_does_not_wait_for_browser_process_to_exit() {
+        let start = std::time::Instant::now();
+
+        launch_browser_command(BrowserCommandSpec {
+            program: "sh",
+            args: vec!["-c".to_string(), "sleep 2".to_string()],
+        })
+        .expect("launch browser command");
+
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[test]
@@ -446,6 +465,15 @@ mod tests {
             .expect_err("https callback rejected");
 
         assert_eq!(error.code, "invalid_redirect_uri");
+    }
+
+    #[test]
+    fn localhost_redirect_binds_ipv4_loopback() {
+        let redirect = local_redirect("http://localhost:8757/oauth/google-docs/callback")
+            .expect("localhost redirect");
+
+        assert_eq!(redirect.bind_addr, "127.0.0.1:8757");
+        assert_eq!(redirect.callback_path, "/oauth/google-docs/callback");
     }
 
     fn send_request(addr: SocketAddr, request: &str) -> String {

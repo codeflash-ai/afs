@@ -60,7 +60,9 @@ use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource, write_parent_database_schema_cache};
 use crate::media::{render_document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use crate::shadow_match::shadows_match;
-use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
+use crate::source::{
+    LocalSourceValidator, SourcePushValidator, SourceValidationContext, source_descriptor,
+};
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
 pub fn execute_push_job<S, Source>(
@@ -1476,14 +1478,7 @@ where
             pending.local_id
         )))
     })?;
-    let parent = store
-        .get_entity(&mount.mount_id, &parent_id)
-        .map_err(PushPrepareError::Store)?
-        .ok_or_else(|| StoreError::EntityMissing {
-            mount_id: mount.mount_id.clone(),
-            remote_id: parent_id.clone(),
-        })
-        .map_err(PushPrepareError::Store)?;
+    let parent = pending_create_parent_entity(store, &mount, &parent_id)?;
     let read_path = pending_create_read_path(&mount, &pending, state_root, &absolute_path)?;
     let contents = read_to_string(&read_path)?;
     if let Some(line) = unresolved_conflict_marker_line(&contents) {
@@ -1537,6 +1532,40 @@ where
         parsed,
         validator,
     )
+}
+
+fn pending_create_parent_entity<S>(
+    store: &S,
+    mount: &MountConfig,
+    parent_id: &RemoteId,
+) -> Result<EntityRecord, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    if let Some(parent) = store
+        .get_entity(&mount.mount_id, parent_id)
+        .map_err(PushPrepareError::Store)?
+    {
+        return Ok(parent);
+    }
+
+    if mount.remote_root_id.as_ref() == Some(parent_id) {
+        let descriptor = source_descriptor(&mount.connector);
+        if let Some(kind) = descriptor.source_root_create_parent_kind() {
+            return Ok(EntityRecord::new(
+                mount.mount_id.clone(),
+                parent_id.clone(),
+                kind,
+                descriptor.display_name(),
+                PathBuf::new(),
+            ));
+        }
+    }
+
+    Err(PushPrepareError::Store(StoreError::EntityMissing {
+        mount_id: mount.mount_id.clone(),
+        remote_id: parent_id.clone(),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]

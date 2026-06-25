@@ -906,6 +906,59 @@ fn prepare_push_prefers_content_cache_for_linux_fuse_pending_create() {
 }
 
 #[test]
+fn prepare_push_plans_virtual_create_under_mount_remote_root() {
+    let fixture = PrepareFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(
+                fixture.mount_id.clone(),
+                "google-docs",
+                fixture.root.clone(),
+            )
+            .with_remote_root_id(RemoteId::new("workspace-folder"))
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    let cache_path = fixture.write_virtual_page(
+        "Scratch Hydration/page.md",
+        "---\ntitle: Scratch Hydration\n---\nCreated through Locality.\n",
+    );
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:scratch",
+            Some(RemoteId::new("workspace-folder")),
+            "Scratch Hydration/page.md",
+            cache_path,
+        ))
+        .expect("save mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Scratch Hydration/page.md")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare root create");
+
+    assert_eq!(prepared.entity.remote_id, RemoteId::new("workspace-folder"));
+    assert_eq!(prepared.entity.kind, EntityKind::Directory);
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("workspace-folder"),
+            parent_kind: Some(EntityKind::Directory),
+            title: "Scratch Hydration".to_string(),
+            properties: BTreeMap::new(),
+            body: "Created through Locality.\n".to_string(),
+            source_path: PathBuf::from("Scratch Hydration/page.md"),
+        }]
+    );
+}
+
+#[test]
 fn prepare_push_uses_projected_file_when_pending_create_cache_has_not_settled() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.virtual_store("fake");

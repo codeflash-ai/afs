@@ -4085,13 +4085,28 @@ fn print_diff_report_fields(
     };
 
     println!(
-        "{} blocks updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
+        "{} block{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
         plan.summary.blocks_updated,
+        plural(plan.summary.blocks_updated),
         plan.summary.blocks_replaced,
         plan.summary.media_updated,
         plan.summary.blocks_created,
+        plural(plan.summary.blocks_created),
+        plan.summary.entities_created,
+        if plan.summary.entities_created == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         plan.summary.blocks_moved,
-        plan.summary.blocks_archived
+        plan.summary.blocks_archived,
+        plural(plan.summary.blocks_archived),
+        plan.summary.entities_archived,
+        if plan.summary.entities_archived == 1 {
+            "y"
+        } else {
+            "ies"
+        }
     );
 }
 

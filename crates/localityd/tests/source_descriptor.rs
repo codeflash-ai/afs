@@ -46,6 +46,12 @@ fn google_docs_descriptor_comes_from_registry() {
             .mount_guidance()
             .contains("# Locality Google Docs Mount")
     );
+    assert!(descriptor.mount_guidance().contains("Drive metadata"));
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Docs manually added inside the workspace folder")
+    );
 }
 
 #[test]

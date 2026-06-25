@@ -677,9 +677,21 @@ fn remote_tree_version_differs(
             .and_then(|observation| observation.remote_version.as_ref())
             .map(|remote_version| remote_version.as_str()),
     ) {
-        (Some(synced_tree), Some(remote_tree)) => synced_tree != remote_tree,
+        (Some(synced_tree), Some(remote_tree)) => {
+            !remote_versions_equivalent(synced_tree, remote_tree)
+        }
         _ => false,
     }
+}
+
+fn remote_versions_equivalent(synced_tree: &str, remote_tree: &str) -> bool {
+    synced_tree == remote_tree
+        || synced_tree
+            .split_once('|')
+            .is_some_and(|(synced_drive, _)| synced_drive == remote_tree)
+        || remote_tree
+            .split_once('|')
+            .is_some_and(|(remote_drive, _)| remote_drive == synced_tree)
 }
 
 fn freshness_check_pending(

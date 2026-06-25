@@ -21,6 +21,7 @@ pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = &[
     "profile",
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata",
 ];
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
@@ -200,9 +201,12 @@ mod tests {
     };
 
     #[test]
-    fn oauth_scopes_include_google_docs_and_drive_file_access() {
+    fn oauth_scopes_include_google_docs_and_workspace_metadata_access() {
         assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/documents"));
         assert!(!GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive"));
+        assert!(
+            GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.metadata")
+        );
         assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
     }
 

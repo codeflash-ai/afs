@@ -312,8 +312,11 @@ impl Connector for GoogleDocsConnector {
 
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
         for precondition in request.remote_preconditions {
+            let Some(expected) = &precondition.remote_edited_at else {
+                continue;
+            };
             let current = self.remote_version(&precondition.remote_id)?;
-            if precondition.remote_edited_at.as_deref() != Some(current.as_str()) {
+            if expected != current.as_str() {
                 return Err(LocalityError::Conflict(
                     locality_core::conflict::ConflictSummary {
                         remote_id: precondition.remote_id.clone(),
@@ -599,7 +602,7 @@ fn apply_plan(
                     let document = docs
                         .get_document(created.id.as_str())
                         .unwrap_or_else(|_| empty_document(created.id.as_str(), title));
-                    docs.batch_update_document(
+                    if let Err(error) = docs.batch_update_document(
                         created.id.as_str(),
                         BatchUpdateDocumentRequest {
                             requests: vec![DocsRequest::InsertText {
@@ -610,7 +613,11 @@ fn apply_plan(
                             }],
                             write_control: write_control(&document),
                         },
-                    )?;
+                    ) {
+                        let _ =
+                            drive.update_file(created.id.as_str(), DriveUpdateFileRequest::trash());
+                        return Err(error);
+                    }
                 }
                 let entity_id = RemoteId::new(created.id);
                 changed.insert(entity_id.clone());
@@ -809,6 +816,8 @@ fn looks_like_google_drive_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use locality_connector::{
@@ -1019,6 +1028,94 @@ mod tests {
     }
 
     #[test]
+    fn concurrency_skips_preconditions_without_synced_remote_version() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(folder("workspace", "Locality", "root")));
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive,
+            Arc::new(FakeDocs::default()),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                title: "Scratch Hydration".to_string(),
+                properties: BTreeMap::new(),
+                body: "Created locally.\n".to_string(),
+                source_path: PathBuf::from("scratch-hydration/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("workspace"),
+            remote_edited_at: None,
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("concurrency");
+    }
+
+    #[test]
+    fn apply_trashes_created_doc_when_body_insert_fails() {
+        let drive = Arc::new(FakeDrive::default());
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            Arc::new(FakeDocs::default()),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                title: "Scratch Hydration".to_string(),
+                properties: BTreeMap::new(),
+                body: "Created locally.\n".to_string(),
+                source_path: PathBuf::from("scratch-hydration/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+
+        let error = connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect_err("apply should fail");
+
+        assert!(
+            matches!(error, locality_core::LocalityError::RemoteNotFound(_)),
+            "{error:?}"
+        );
+        let update = drive
+            .last_update
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("rollback trash");
+        assert_eq!(update.0, "created-doc");
+        assert_eq!(update.1.trashed, Some(true));
+    }
+
+    #[test]
     fn resolve_workspace_folder_reuses_matching_named_folder() {
         let drive = Arc::new(FakeDrive::default().with_workspace_folders(
             "Locality Workspace",
@@ -1151,7 +1248,7 @@ mod tests {
         ) -> locality_core::LocalityResult<DriveFile> {
             *self.last_created.lock().unwrap() = Some(request.clone());
             if request.mime_type == crate::drive_dto::DRIVE_FOLDER_MIME_TYPE {
-                return Ok(folder(
+                let created = folder(
                     "created-folder",
                     &request.name,
                     request
@@ -1159,9 +1256,14 @@ mod tests {
                         .first()
                         .map(String::as_str)
                         .unwrap_or("root"),
-                ));
+                );
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(created.id.clone(), created.clone());
+                return Ok(created);
             }
-            Ok(doc_file(
+            let created = doc_file(
                 "created-doc",
                 &request.name,
                 request
@@ -1169,7 +1271,12 @@ mod tests {
                     .first()
                     .map(String::as_str)
                     .unwrap_or("workspace"),
-            ))
+            );
+            self.files
+                .lock()
+                .unwrap()
+                .insert(created.id.clone(), created.clone());
+            Ok(created)
         }
 
         fn update_file(
