@@ -641,7 +641,7 @@ fn macos_provider_status(mount: &MountConfig, findings: &mut Vec<DoctorFinding>)
         );
         match file_provider::run_macos_file_provider_helper("list", Vec::new()) {
             Ok(report) => {
-                let registered_domain_id = report
+                let registered_domain = report
                     .helper_report
                     .get("domains")
                     .and_then(Value::as_array)
@@ -652,28 +652,43 @@ fn macos_provider_status(mount: &MountConfig, findings: &mut Vec<DoctorFinding>)
                                 || identifier
                                     == localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID
                             {
-                                Some(identifier.to_string())
+                                Some(domain.clone())
                             } else {
                                 None
                             }
                         })
                     });
-                let registered = Some(registered_domain_id.is_some());
+                let registered = Some(registered_domain.is_some());
+                let user_enabled = registered_domain
+                    .as_ref()
+                    .and_then(|domain| domain.get("userEnabled"))
+                    .and_then(Value::as_bool);
                 provider.registered = registered;
-                provider.state = if registered == Some(true) {
+                provider.state = if registered == Some(true) && user_enabled == Some(false) {
+                    "disabled".to_string()
+                } else if registered == Some(true) {
                     "registered".to_string()
                 } else {
                     "unregistered".to_string()
                 };
-                provider.message = report
-                    .helper_report
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("macOS File Provider status inspected.")
-                    .to_string();
+                provider.message = if provider.state == "disabled" {
+                    "The Locality File Provider is registered but not enabled in macOS.".to_string()
+                } else {
+                    report
+                        .helper_report
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("macOS File Provider status inspected.")
+                        .to_string()
+                };
                 provider.details = report.helper_report;
-                if let Some(identifier) = registered_domain_id {
-                    provider.details["registered_domain_id"] = Value::String(identifier);
+                if let Some(identifier) = registered_domain
+                    .as_ref()
+                    .and_then(|domain| domain.get("identifier"))
+                    .and_then(Value::as_str)
+                {
+                    provider.details["registered_domain_id"] =
+                        Value::String(identifier.to_string());
                 }
             }
             Err(error) => {
@@ -868,6 +883,17 @@ fn add_provider_findings(
             ),
             &mount.mount_id.0,
             Some(format!("{start_command} {}", mount.mount_id.0)),
+        ));
+    } else if provider.state == "disabled" {
+        findings.push(DoctorFinding::mount(
+            DoctorSeverity::Error,
+            "provider_disabled",
+            format!(
+                "Provider for mount `{}` is registered but disabled in macOS. Enable Locality in Finder or System Settings, then retry.",
+                mount.mount_id.0
+            ),
+            &mount.mount_id.0,
+            None,
         ));
     }
     if provider

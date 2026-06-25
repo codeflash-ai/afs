@@ -56,12 +56,13 @@ impl FileProviderHelperError {
     pub fn message(&self) -> String {
         match self {
             Self::Missing => {
-                "locality-file-providerctl was not found; build or install platform/macos/LocalityFileProvider first"
+                "locality-file-providerctl was not found; install Locality.app, or from a source checkout run `make install-macos-file-provider`"
                     .to_string()
             }
             Self::Failed(message) if macos_file_provider_application_unavailable(message) => {
+                let message = message.trim_end_matches('.');
                 format!(
-                    "{message}. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `platform/macos/LocalityFileProvider/scripts/install-dev-bundle.sh`, then reopen Locality and enable the File Provider if macOS asks."
+                    "{message}. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `make install-macos-file-provider`, then reopen Locality and enable the File Provider if macOS asks."
                 )
             }
             Self::Failed(message) => message.clone(),
@@ -1427,8 +1428,9 @@ mod tests {
         )
         .message();
 
-        assert!(message.contains("install-dev-bundle.sh"));
+        assert!(message.contains("make install-macos-file-provider"));
         assert!(message.contains("enable the File Provider"));
+        assert!(!message.contains("right now.."));
     }
 
     #[test]

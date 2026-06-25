@@ -6100,11 +6100,11 @@ mod tests {
     }
 
     #[test]
-    fn local_redirect_defaults_to_localhost_callback_uri() {
+    fn local_redirect_defaults_to_loopback_callback_uri() {
         let redirect =
             local_redirect("http://localhost:8757/oauth/notion/callback").expect("redirect");
 
-        assert_eq!(redirect.bind_addr, "localhost:8757");
+        assert_eq!(redirect.bind_addr, "127.0.0.1:8757");
         assert_eq!(redirect.callback_path, "/oauth/notion/callback");
     }
 

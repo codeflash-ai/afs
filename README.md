@@ -71,6 +71,7 @@ Common targets:
 | `make dev-desktop` | Starts the desktop Vite dev server at `http://127.0.0.1:1420/`. |
 | `make dev-tauri` | Builds fresh debug desktop sidecars, then starts the Tauri desktop app in development mode. |
 | `make build-tauri` | Builds the packaged Tauri desktop app. |
+| `make install-macos-file-provider` | Installs/registers the local macOS File Provider development bundle. |
 | `make run-cli ARGS='status --json'` | Runs the `loc` CLI with custom arguments. |
 | `make clean` | Removes Rust and desktop build outputs. |
 
