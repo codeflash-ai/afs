@@ -215,7 +215,7 @@ fn paragraph_text(
 }
 
 fn render_text_run(content: &str, style: &TextStyle) -> String {
-    let mut rendered = trim_docs_newline(content).to_string();
+    let mut rendered = normalize_docs_text(trim_docs_newline(content));
     if rendered.is_empty() {
         return rendered;
     }
@@ -235,6 +235,10 @@ fn render_text_run(content: &str, style: &TextStyle) -> String {
         rendered = format!("[{rendered}]({url})");
     }
     rendered
+}
+
+fn normalize_docs_text(value: &str) -> String {
+    value.replace('\u{000b}', "\n")
 }
 
 fn render_table(document: &GoogleDocument, table: &Table) -> String {
@@ -623,6 +627,41 @@ mod tests {
         assert_eq!(
             rendered.shadow.blocks[0].native_kind.as_deref(),
             Some("google_docs_inline_object")
+        );
+    }
+
+    #[test]
+    fn google_docs_soft_line_breaks_render_as_markdown_newlines() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Pet Resume"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Pet Resume",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 56, "paragraph": {
+                            "elements": [
+                                { "textRun": { "content": "Age:", "textStyle": { "bold": true } } },
+                                { "textRun": { "content": " 4 years\u{000b}" } },
+                                { "textRun": { "content": "Sex:", "textStyle": { "bold": true } } },
+                                { "textRun": { "content": "Male\u{000b}" } },
+                                { "textRun": { "content": "Breed:", "textStyle": { "bold": true } } },
+                                { "textRun": { "content": " Mutt\n" } }
+                            ]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert!(!rendered.document.body.contains('\u{000b}'));
+        assert_eq!(
+            rendered.document.body,
+            "**Age:** 4 years\n**Sex:**Male\n**Breed:** Mutt\n"
         );
     }
 
