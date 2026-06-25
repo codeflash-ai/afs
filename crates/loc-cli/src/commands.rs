@@ -4296,7 +4296,7 @@ fn command_error(json: bool, error: CommandError, exit_code: i32) -> i32 {
 
 fn connect_command_error(command: &'static str, json: bool, error: ConnectError) -> i32 {
     let exit_code = match &error {
-        ConnectError::ConnectionNameRequired => EXIT_USAGE,
+        ConnectError::ConnectionNameRequired(_) => EXIT_USAGE,
         ConnectError::ConnectionProbeFailed(_)
         | ConnectError::OAuthExchangeFailed(_)
         | ConnectError::CredentialEncode(_)
