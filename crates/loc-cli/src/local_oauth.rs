@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +300,10 @@ impl BrowserCommandSpec {
         let mut command = ProcessCommand::new(self.program);
         command.args(self.args);
         command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
     }
 }
 
@@ -399,6 +403,50 @@ mod tests {
         .expect("launch browser command");
 
         assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_launch_suppresses_child_stdio() {
+        let output = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("local_oauth::tests::browser_launch_stdio_helper")
+            .arg("--nocapture")
+            .env("LOCALITY_BROWSER_STDIO_HELPER", "1")
+            .output()
+            .expect("run stdio helper");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stdout.contains("browser stdout"),
+            "browser stdout leaked into CLI stdout: {stdout}"
+        );
+        assert!(
+            !stderr.contains("browser stderr"),
+            "browser stderr leaked into CLI stderr: {stderr}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn browser_launch_stdio_helper() {
+        if std::env::var("LOCALITY_BROWSER_STDIO_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+
+        launch_browser_command(BrowserCommandSpec {
+            program: "sh",
+            args: vec![
+                "-c".to_string(),
+                "printf 'browser stdout'; printf 'browser stderr' >&2".to_string(),
+            ],
+        })
+        .expect("launch browser command");
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     #[test]
