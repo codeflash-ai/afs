@@ -80,7 +80,8 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
     return LocalityEnumerator(
       client: client,
       mountId: resolved.mountId,
-      containerIdentifier: resolved.daemonIdentifier
+      containerIdentifier: resolved.daemonIdentifier,
+      namespaceMountId: isSharedDomain ? resolved.mountId : nil
     )
   }
 

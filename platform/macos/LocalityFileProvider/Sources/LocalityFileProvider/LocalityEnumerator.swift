@@ -6,12 +6,19 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
     private let mountId: String?
     private let containerIdentifier: String?
     private let domainId: String?
+    private let namespaceMountId: String?
 
-    init(client: LocalityDaemonClient, mountId: String, containerIdentifier: String) {
+    init(
+        client: LocalityDaemonClient,
+        mountId: String,
+        containerIdentifier: String,
+        namespaceMountId: String? = nil
+    ) {
         self.client = client
         self.mountId = mountId
         self.containerIdentifier = containerIdentifier
         self.domainId = nil
+        self.namespaceMountId = namespaceMountId
         super.init()
     }
 
@@ -20,6 +27,7 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         self.mountId = nil
         self.containerIdentifier = nil
         self.domainId = domainId
+        self.namespaceMountId = nil
         super.init()
     }
 
@@ -28,6 +36,7 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         self.mountId = nil
         self.containerIdentifier = nil
         self.domainId = nil
+        self.namespaceMountId = nil
         super.init()
     }
 
@@ -55,7 +64,10 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
                     mountId: mountId,
                     containerIdentifier: containerIdentifier
                 )
-                items = response.children.map(LocalityFileProviderItem.init(metadata:))
+                items = response.children.map { child in
+                    let metadata = namespaceMountId.map { child.namespaced(for: $0) } ?? child
+                    return LocalityFileProviderItem(metadata: metadata)
+                }
             } else {
                 items = []
             }
