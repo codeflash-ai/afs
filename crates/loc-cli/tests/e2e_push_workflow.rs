@@ -9,7 +9,7 @@ use loc_cli::diff::run_diff;
 use loc_cli::history::{LogOptions, run_log, run_undo_with_applier};
 use loc_cli::inspect::{InspectOptions, run_inspect};
 use loc_cli::mount::{MountOptions, run_mount};
-use loc_cli::pull::run_pull;
+use loc_cli::pull::{run_pull, run_pull_with_state_root};
 use loc_cli::push::{PushOptions, run_push_with_daemon, run_push_with_daemon_at_state_root};
 use loc_cli::search::{SearchOptions, run_search};
 use loc_cli::status::{StatusOptions, run_status};
@@ -2117,6 +2117,91 @@ fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
     )
     .expect("clean status after conflict resolution push");
     assert!(clean_status.clean, "{clean_status:#?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_macos_file_provider_dirty_pull_conflict_materializes_visible_markers() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let base = "File Provider conflict base body before local and remote edits.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live macOS conflict {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::MacosFileProvider,
+        },
+    )
+    .expect("mount live macos file provider page");
+    run_pull_with_state_root(
+        &mut store,
+        &connector,
+        &fixture.root,
+        Some(&fixture.state_root),
+    )
+    .expect("pull live page into daemon cache");
+
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(scratch.id.clone()))
+        .expect("get live scratch entity")
+        .expect("live scratch entity");
+    let cache_path = fixture.content_root().join(&entity.path);
+    let visible_path = fixture.root.join(&entity.path);
+    fs::create_dir_all(visible_path.parent().expect("visible parent"))
+        .expect("create visible parent");
+    fs::copy(&cache_path, &visible_path).expect("seed visible File Provider replica");
+    let original = fs::read_to_string(&visible_path).expect("read visible replica");
+    let local_marker = format!("Local visible conflict edit {}", unique_suffix());
+    let remote_marker = format!("Remote conflict edit {}", unique_suffix());
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(&visible_path, original.replace(base, &local_marker))
+        .expect("write missed visible local edit");
+
+    std::thread::sleep(Duration::from_millis(1200));
+    let paragraph_id = first_live_child_block_id(&cleanup.api, &scratch.id);
+    update_remote_paragraph(&cleanup.api, &paragraph_id, &remote_marker);
+
+    let pull = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        &visible_path,
+        Some(&fixture.state_root),
+    )
+    .expect("pull conflicted visible page");
+    assert!(!pull.ok, "{pull:#?}");
+    assert_eq!(pull.hydrated, 0, "{pull:#?}");
+    assert_eq!(pull.skipped_dirty, 1, "{pull:#?}");
+    assert_eq!(pull.conflicts.len(), 1, "{pull:#?}");
+
+    let visible = fs::read_to_string(&visible_path).expect("read visible conflicted page");
+    assert!(visible.contains(&local_marker), "{visible}");
+    assert!(visible.contains(&remote_marker), "{visible}");
+    assert!(visible.contains(CONFLICT_LOCAL_MARKER), "{visible}");
+    assert!(visible.contains(CONFLICT_SEPARATOR_MARKER), "{visible}");
+    assert!(visible.contains(CONFLICT_REMOTE_MARKER), "{visible}");
+    assert!(has_unresolved_conflict_markers(&visible), "{visible}");
+    let cached = fs::read_to_string(&cache_path).expect("read daemon conflict cache");
+    assert_eq!(visible, cached);
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(scratch.id))
+        .expect("get conflicted entity")
+        .expect("conflicted entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
 }
 
 #[test]

@@ -5,6 +5,7 @@
 //! generic API instead of growing platform-specific daemon semantics.
 
 use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use locality_core::conflict::has_unresolved_conflict_markers;
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
@@ -695,6 +696,13 @@ fn refresh_projection_candidate_if_clean(
 
     if projection_contents == cache_contents {
         return Ok(ProjectionRefreshOutcome::Unchanged);
+    }
+
+    if entity.hydration == HydrationState::Conflicted
+        && std::str::from_utf8(&cache_contents).is_ok_and(has_unresolved_conflict_markers)
+    {
+        write_binary_atomic(&projection_path, &cache_contents).map_err(LocalityError::from)?;
+        return Ok(ProjectionRefreshOutcome::Refreshed);
     }
 
     let can_refresh_stale_replica = previous_shadow.is_none()

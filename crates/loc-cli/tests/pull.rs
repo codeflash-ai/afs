@@ -368,6 +368,72 @@ fn pull_macos_file_provider_refreshes_clean_visible_replica_after_conflict_pull(
 
 #[cfg(target_os = "macos")]
 #[test]
+fn pull_macos_file_provider_writes_conflict_markers_to_missed_visible_edit() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("loc-cli-pull-macos-visible-conflict-state");
+    let mount_root = fixture.root.join("notion");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_root)
+                .with_remote_root_id(fixture.root_page_id.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save macos file provider mount");
+    run_pull_with_state_root(
+        &mut store,
+        &fixture.connector("Roadmap"),
+        &mount_root,
+        Some(&state_root),
+    )
+    .expect("initial pull");
+
+    let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
+        .join("roadmap")
+        .join("page.md");
+    let visible_path = mount_root.join("roadmap").join("page.md");
+    fs::create_dir_all(visible_path.parent().expect("visible parent"))
+        .expect("create visible parent");
+    fs::copy(&content_path, &visible_path).expect("seed visible replica");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(
+        &visible_path,
+        "---\nloc:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal visible edit.\n",
+    )
+    .expect("missed visible edit");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z"),
+        &visible_path,
+        Some(&state_root),
+    )
+    .expect("pull visible file");
+
+    assert!(!report.ok);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.skipped_dirty, 1);
+    assert_eq!(report.conflicts.len(), 1);
+    let cached = fs::read_to_string(&content_path).expect("read daemon cache");
+    assert!(cached.contains("Local visible edit."));
+    assert!(cached.contains("Remote body."));
+    assert!(cached.contains(CONFLICT_LOCAL_MARKER));
+    assert!(cached.contains(CONFLICT_SEPARATOR_MARKER));
+    assert!(cached.contains(CONFLICT_REMOTE_MARKER));
+    assert!(has_unresolved_conflict_markers(&cached));
+    let visible = fs::read_to_string(&visible_path).expect("read visible replica");
+    assert_eq!(visible, cached);
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get root entity")
+        .expect("root entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn pull_macos_file_provider_preserves_older_visible_replica_after_cache_fast_forward() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-macos-stale-visible-state");
