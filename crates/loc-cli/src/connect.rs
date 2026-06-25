@@ -795,7 +795,7 @@ where
         .list_connections()
         .map_err(ConnectError::Store)?
         .into_iter()
-        .filter(|connection| connection.connector == connector)
+        .filter(|connection| connection.connector == connector && connection.status == "active")
         .count();
     if connection_count == 0 {
         Ok(ConnectionId::new(default_id))

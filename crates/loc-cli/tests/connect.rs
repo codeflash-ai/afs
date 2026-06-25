@@ -228,6 +228,61 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
+fn connect_google_docs_reuses_default_id_when_previous_default_is_revoked() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = FakeGoogleDocsBrokerOAuthExchange;
+
+    run_connect_google_docs_broker_oauth(
+        &mut store,
+        &credentials,
+        GoogleDocsBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("google-docs-default")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("initial connect");
+    run_disconnect(
+        &mut store,
+        &credentials,
+        ConnectionId::new("google-docs-default"),
+    )
+    .expect("disconnect");
+
+    let report = run_connect_google_docs_broker_oauth(
+        &mut store,
+        &credentials,
+        GoogleDocsBrokerOAuthConnectOptions {
+            connection_id: None,
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("reconnect default");
+
+    assert_eq!(report.connection_id, "google-docs-default");
+    assert_eq!(
+        store
+            .get_connection(&ConnectionId::new("google-docs-default"))
+            .expect("get connection")
+            .expect("connection")
+            .status,
+        "active"
+    );
+}
+
+#[test]
 fn profiles_list_auth_configs_without_secrets() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
