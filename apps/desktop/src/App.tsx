@@ -334,19 +334,19 @@ function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallRepor
       {
         agent: "Claude Code / Claude Desktop / Claude Cowork",
         status: "installed",
-        path: "~/.claude/skills/loc/SKILL.md",
+        path: "~/.claude/skills/locality/SKILL.md",
         detail: "Installed the Locality skill for Claude local agents.",
       },
       {
         agent: "Codex",
         status: "installed",
-        path: "~/.codex/skills/loc/SKILL.md",
+        path: "~/.codex/skills/locality/SKILL.md",
         detail: "Installed the Locality skill for Codex.",
       },
       {
         agent: "Warp",
         status: "installed",
-        path: "~/.agents/skills/loc/SKILL.md",
+        path: "~/.agents/skills/locality/SKILL.md",
         detail: "Installed the Locality skill for Warp.",
       },
     ],

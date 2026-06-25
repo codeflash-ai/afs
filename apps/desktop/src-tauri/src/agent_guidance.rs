@@ -11,6 +11,7 @@ const MANAGED_START: &str = "<!-- LOCALITY_AGENT_GUIDANCE_START -->";
 const MANAGED_END: &str = "<!-- LOCALITY_AGENT_GUIDANCE_END -->";
 const DEFAULT_NOTION_MOUNT: &str = "~/Library/CloudStorage/Locality/notion";
 const MCP_SERVER_NAME: &str = "loc";
+const SKILL_DIR_NAME: &str = "locality";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,28 +157,28 @@ fn agent_target_specs(home: &Path) -> Vec<AgentTargetSpec> {
     vec![
         AgentTargetSpec {
             agent: "Claude Code / Claude Desktop / Claude Cowork",
-            path: home.join(".claude/skills/loc/SKILL.md"),
+            path: skill_path(home, ".claude/skills"),
             kind: InstallKind::Skill,
             detected: claude_detected,
             detail: "Installed the Locality skill for Claude local agents.",
         },
         AgentTargetSpec {
             agent: "Codex",
-            path: home.join(".codex/skills/loc/SKILL.md"),
+            path: skill_path(home, ".codex/skills"),
             kind: InstallKind::Skill,
             detected: codex_detected,
             detail: "Installed the Locality skill for Codex.",
         },
         AgentTargetSpec {
             agent: "Warp",
-            path: home.join(".agents/skills/loc/SKILL.md"),
+            path: skill_path(home, ".agents/skills"),
             kind: InstallKind::Skill,
             detected: warp_detected,
             detail: "Installed the Locality skill for Warp and Oz skills discovery.",
         },
         AgentTargetSpec {
             agent: "OpenCode",
-            path: home.join(".agents/skills/loc/SKILL.md"),
+            path: skill_path(home, ".agents/skills"),
             kind: InstallKind::Skill,
             detected: opencode_detected,
             detail: "Installed the Locality skill for OpenCode's shared skill discovery.",
@@ -290,6 +291,10 @@ fn install_target(spec: &AgentTargetSpec, mount_path: &str) -> AgentGuidanceTarg
     }
 }
 
+fn skill_path(home: &Path, skills_root: &str) -> PathBuf {
+    home.join(skills_root).join(SKILL_DIR_NAME).join("SKILL.md")
+}
+
 fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget {
     let result = match spec.kind {
         McpInstallKind::ClaudeDesktopJson => install_claude_desktop_mcp_config(&spec.path),
@@ -319,7 +324,7 @@ fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget 
 fn skill_markdown(mount_path: &str) -> String {
     format!(
         r#"---
-name: loc
+name: locality
 description: Use Locality when the user wants to find, read, or edit Notion/company docs through local filesystem files.
 ---
 
@@ -777,7 +782,7 @@ mod tests {
     fn skill_mentions_mount_and_review_workflow() {
         let skill = skill_markdown("~/Library/CloudStorage/Locality/notion");
 
-        assert!(skill.contains("name: loc"));
+        assert!(skill.contains("name: locality"));
         assert!(skill.contains("~/Library/CloudStorage/Locality/notion"));
         assert!(skill.contains("pending for Locality review"));
         assert!(skill.contains("If desktop Live Mode is on"));
@@ -813,6 +818,25 @@ mod tests {
     #[test]
     fn normalized_mount_preserves_root_path() {
         assert_eq!(normalized_mount_path(Some("/")), "/");
+    }
+
+    #[test]
+    fn install_target_writes_locality_skill_name() {
+        let temp = temp_root("locality-agent-guidance-skill-name");
+        let spec = AgentTargetSpec {
+            agent: "Codex",
+            path: temp.join(".codex/skills/locality/SKILL.md"),
+            kind: InstallKind::Skill,
+            detected: true,
+            detail: "Installed the Locality skill for Codex.",
+        };
+        let target = install_target(&spec, "~/Library/CloudStorage/Locality/notion");
+        let skill = fs::read_to_string(temp.join(".codex/skills/locality/SKILL.md"))
+            .expect("read locality skill");
+
+        assert_eq!(target.status, "installed");
+        assert!(skill.contains("name: locality"));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

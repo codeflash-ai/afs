@@ -6,19 +6,21 @@ Locality installs a small agent guidance pack during desktop onboarding so local
 
 | Agent | Install target | Status |
 | --- | --- | --- |
-| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/loc/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present | Automatic when Claude is detected. |
-| Codex | `~/.codex/skills/loc/SKILL.md` and `~/.codex/config.toml` | Automatic when Codex is detected. |
-| Warp | `~/.agents/skills/loc/SKILL.md` | Automatic when Warp is detected. Warp also reads project rules such as `AGENTS.md` and `WARP.md`; Locality keeps connector-local `AGENTS.md` under `/Locality/notion`. |
-| OpenCode | `~/.agents/skills/loc/SKILL.md` | Automatic when OpenCode is detected. |
+| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/locality/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present | Automatic when Claude is detected. |
+| Codex | `~/.codex/skills/locality/SKILL.md` and `~/.codex/config.toml` | Automatic when Codex is detected. |
+| Warp | `~/.agents/skills/locality/SKILL.md` | Automatic when Warp is detected. Warp also reads project rules such as `AGENTS.md` and `WARP.md`; Locality keeps connector-local `AGENTS.md` under `/Locality/notion`. |
+| OpenCode | `~/.agents/skills/locality/SKILL.md` | Automatic when OpenCode is detected. |
 | Gemini CLI | `~/.gemini/GEMINI.md` | Automatic managed section when Gemini is detected. |
 | Cline / Roo Code / Cursor / Windsurf / Zed | `~/.agents/AGENTS.md` plus `/Locality/notion/AGENTS.md`; Cursor and Windsurf also get global MCP config when present | Automatic fallback when one of these agents is detected. |
 | GitHub Copilot CLI | `~/.copilot/copilot-instructions.md`; Copilot MCP config when present | Automatic managed section when Copilot-capable local tooling is detected. |
 
 Locality does not edit opaque app databases. It only updates documented, file-backed
-agent instruction or MCP config files, and rewrites its own `loc` entry
-idempotently. If an agent only supports UI-managed global rules, Locality relies on
-the shared `AGENTS.md` fallback and the connector-local guidance in the mounted
-folder.
+agent instruction or MCP config files. Skill installs use the `locality` skill
+name, and MCP config installs rewrite the `loc` server entry idempotently. If an
+agent only supports UI-managed global rules, Locality relies on the shared
+`AGENTS.md` fallback and the connector-local guidance in the mounted folder.
+
+The `loc` name is reserved for the CLI and MCP server entry.
 
 ## Installed Skill Behavior
 
