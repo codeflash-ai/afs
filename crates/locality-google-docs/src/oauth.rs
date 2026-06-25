@@ -119,10 +119,7 @@ impl HttpGoogleDocsOAuthBrokerClient {
         }
     }
 
-    pub fn start(
-        &self,
-        request: &OAuthBrokerStart,
-    ) -> LocalityResult<OAuthBrokerStartResponse> {
+    pub fn start(&self, request: &OAuthBrokerStart) -> LocalityResult<OAuthBrokerStartResponse> {
         self.post_json("/v1/oauth/google-docs/start", request)
     }
 
@@ -133,10 +130,7 @@ impl HttpGoogleDocsOAuthBrokerClient {
         self.post_json("/v1/oauth/google-docs/exchange", request)
     }
 
-    pub fn refresh_token(
-        &self,
-        request: &OAuthBrokerRefresh,
-    ) -> LocalityResult<OAuthBrokerToken> {
+    pub fn refresh_token(&self, request: &OAuthBrokerRefresh) -> LocalityResult<OAuthBrokerToken> {
         self.post_json("/v1/oauth/google-docs/refresh", request)
     }
 

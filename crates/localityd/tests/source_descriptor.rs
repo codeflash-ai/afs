@@ -25,7 +25,10 @@ fn google_docs_descriptor_comes_from_registry() {
     assert_eq!(descriptor.id(), "google-docs");
     assert_eq!(descriptor.display_name(), "Google Docs");
     assert_eq!(descriptor.default_mount_id(), "google-docs-main");
-    assert_eq!(descriptor.connect_command(), Some("loc connect google-docs"));
+    assert_eq!(
+        descriptor.connect_command(),
+        Some("loc connect google-docs")
+    );
     assert_eq!(descriptor.auth_env_var(), None);
     assert!(descriptor.supports_oauth());
     assert!(

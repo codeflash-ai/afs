@@ -210,8 +210,7 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
     let secret = credentials
         .get("connection:docs-work")
         .expect("credential saved");
-    let stored =
-        serde_json::from_str::<StoredGoogleDocsCredential>(&secret).expect("stored oauth");
+    let stored = serde_json::from_str::<StoredGoogleDocsCredential>(&secret).expect("stored oauth");
     assert_eq!(
         stored.refresh_token_handle.as_deref(),
         Some("opaque-refresh-handle")

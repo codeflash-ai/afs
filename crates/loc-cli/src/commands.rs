@@ -1128,7 +1128,11 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
     ) {
         Ok(authorization) => authorization,
         Err(error) => {
-            return command_error(json, google_docs_local_oauth_command_error(error), EXIT_INTERNAL);
+            return command_error(
+                json,
+                google_docs_local_oauth_command_error(error),
+                EXIT_INTERNAL,
+            );
         }
     };
     let options = GoogleDocsBrokerOAuthConnectOptions {
@@ -5153,14 +5157,14 @@ mod tests {
     use crate::push::PushReport;
     use crate::search::{SearchOptions, SearchReport};
 
-	    use super::{
-	        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
-	        absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
-	        google_docs_oauth_broker_config, legacy_args_for_command, notion_oauth_broker_config,
-	        projection_mode_for_target, projection_usage_options_for_target, prompt_for_push_confirmation,
-	        pull_direct_fallback_error, should_prompt_for_push_confirmation,
-	        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-	        validate_virtual_projection_registration,
+    use super::{
+        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
+        absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
+        google_docs_oauth_broker_config, legacy_args_for_command, notion_oauth_broker_config,
+        projection_mode_for_target, projection_usage_options_for_target,
+        prompt_for_push_confirmation, pull_direct_fallback_error,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
     };
 
     #[test]
