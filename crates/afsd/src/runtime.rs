@@ -1783,7 +1783,7 @@ impl RuntimeState {
         request: &HydrationRequest,
         previous_shadow: Option<&ShadowDocument>,
     ) {
-        if std::env::consts::OS != "macos" || request.reason != HydrationReason::RemoteFastForward {
+        if request.reason != HydrationReason::RemoteFastForward {
             return;
         }
         let Some(previous_shadow) = previous_shadow else {
@@ -1794,12 +1794,12 @@ impl RuntimeState {
             Ok(store) => store,
             Err(error) => {
                 eprintln!(
-                    "afsd failed to open state for macOS File Provider refresh after remote fast-forward: {error}"
+                    "afsd failed to open state for visible projection refresh after remote fast-forward: {error}"
                 );
                 return;
             }
         };
-        if let Err(error) = file_provider::refresh_macos_file_provider_entity_projection_if_clean(
+        if let Err(error) = file_provider::refresh_visible_entity_projection_if_clean(
             &store,
             &self.config.state_root,
             &request.mount_id,
@@ -1807,7 +1807,7 @@ impl RuntimeState {
             previous_shadow,
         ) {
             eprintln!(
-                "afsd failed to refresh macOS File Provider replica after remote fast-forward for `{}`: {error}",
+                "afsd failed to refresh visible projection after remote fast-forward for `{}`: {error}",
                 request.path.display()
             );
         }

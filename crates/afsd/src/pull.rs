@@ -93,8 +93,7 @@ where
     let mount = mount.clone();
     let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
-    let refresh_bases =
-        prepare_macos_file_provider_projection_pull(store, state_root, &mount, &target_path)?;
+    let refresh_bases = prepare_visible_projection_pull(store, state_root, &mount, &target_path)?;
 
     let report = if should_pull_mount_root(&mount, &relative_path, &target_path) {
         pull_mount_root(store, &source, &mount, target_path.clone(), state_root)
@@ -118,7 +117,7 @@ where
         )
     }?;
 
-    refresh_macos_file_provider_projection_after_pull(
+    refresh_visible_projection_after_pull(
         store,
         state_root,
         &target_path,
@@ -128,7 +127,7 @@ where
     Ok(report)
 }
 
-fn prepare_macos_file_provider_projection_pull<S>(
+fn prepare_visible_projection_pull<S>(
     store: &mut S,
     state_root: Option<&Path>,
     mount: &MountConfig,
@@ -144,25 +143,23 @@ where
     let Some(state_root) = state_root else {
         return Ok(Vec::new());
     };
-    if mount.projection != afs_store::ProjectionMode::MacosFileProvider {
+    if !matches!(
+        mount.projection,
+        afs_store::ProjectionMode::MacosFileProvider | afs_store::ProjectionMode::WindowsCloudFiles
+    ) {
         return Ok(Vec::new());
     }
 
-    let refresh_bases =
-        file_provider::macos_file_provider_projection_refresh_bases(store, Some(target_path))
-            .map_err(PullError::Projection)?;
-    if !refresh_bases.is_empty() {
-        file_provider::reconcile_newer_macos_file_provider_projection(
-            store,
-            state_root,
-            Some(target_path),
-        )
+    let refresh_bases = file_provider::visible_projection_refresh_bases(store, Some(target_path))
         .map_err(PullError::Projection)?;
+    if !refresh_bases.is_empty() {
+        file_provider::reconcile_newer_visible_projection(store, state_root, Some(target_path))
+            .map_err(PullError::Projection)?;
     }
     Ok(refresh_bases)
 }
 
-fn refresh_macos_file_provider_projection_after_pull<S>(
+fn refresh_visible_projection_after_pull<S>(
     store: &S,
     state_root: Option<&Path>,
     target_path: &Path,
@@ -179,14 +176,9 @@ where
         return Ok(());
     };
 
-    file_provider::refresh_macos_file_provider_projection(
-        store,
-        state_root,
-        Some(target_path),
-        refresh_bases,
-    )
-    .map(|_| ())
-    .map_err(PullError::Projection)
+    file_provider::refresh_visible_projection(store, state_root, Some(target_path), refresh_bases)
+        .map(|_| ())
+        .map_err(PullError::Projection)
 }
 
 fn pull_mount_root<S, Source>(
@@ -1260,9 +1252,7 @@ impl PullError {
             Self::MountNotFound(path) => {
                 format!("no AgentFS mount contains `{}`", path.display())
             }
-            Self::Projection(error) => {
-                format!("macOS File Provider projection refresh failed: {error}")
-            }
+            Self::Projection(error) => format!("visible projection refresh failed: {error}"),
             Self::ReadFile { path, message } => {
                 format!("failed to read `{}`: {message}", path.display())
             }

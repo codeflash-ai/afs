@@ -4909,9 +4909,9 @@ fn reconcile_desktop_projection_changes(
     state_root: &Path,
     target: Option<&Path>,
 ) -> Result<(), String> {
-    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    daemon_file_provider::reconcile_visible_projection(store, state_root, target)
         .map(|_| ())
-        .map_err(|error| format!("Could not reconcile macOS File Provider changes: {error}"))
+        .map_err(|error| format!("Could not reconcile visible projection changes: {error}"))
 }
 
 fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {

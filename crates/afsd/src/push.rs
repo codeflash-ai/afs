@@ -97,11 +97,7 @@ where
 {
     let validator = LocalSourceValidator;
     if let Some(state_root) = state_root {
-        file_provider::reconcile_macos_file_provider_projection(
-            store,
-            state_root,
-            Some(&job.target_path),
-        )?;
+        file_provider::reconcile_visible_projection(store, state_root, Some(&job.target_path))?;
     }
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     execute_prepared_push(store, source, prepared, state_root)
@@ -130,11 +126,7 @@ where
 
     let validator = LocalSourceValidator;
     if let Some(state_root) = state_root {
-        file_provider::reconcile_macos_file_provider_projection(
-            store,
-            state_root,
-            Some(&job.target_path),
-        )?;
+        file_provider::reconcile_visible_projection(store, state_root, Some(&job.target_path))?;
     }
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     let relative_path = auto_save_relative_path(&prepared);

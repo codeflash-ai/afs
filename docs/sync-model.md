@@ -407,12 +407,13 @@ Current implementation:
   executor skips without fetching remote content or inserting conflict markers.
 - Successful hydration clears the entity's pending remote hint so status returns
   to `all_synced` once the local shadow and remote version agree.
-- On macOS File Provider mounts, successful `remote_fast_forward` hydration also
-  refreshes already-materialized visible CloudStorage replicas that still match
-  the previous Synced Tree shadow. Visible files that have diverged are skipped
-  so a missed File Provider write is not overwritten. This does not add full
-  workspace polling for virtual mounts; the remote change must still be observed
-  by freshness jobs, scheduled enumeration, or an explicit user action first.
+- On virtual projections with a visible local replica, currently macOS File
+  Provider and Windows Cloud Files, successful `remote_fast_forward` hydration
+  also refreshes already-materialized visible replicas that still match the
+  previous Synced Tree shadow. Visible files that have diverged are skipped so a
+  missed provider write is not overwritten. This does not add full workspace
+  polling for virtual mounts; the remote change must still be observed by
+  freshness jobs, scheduled enumeration, or an explicit user action first.
 
 ### Stage 8: Remote Change Explanation
 
