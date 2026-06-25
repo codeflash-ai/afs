@@ -10,6 +10,8 @@ CHANNEL="${PUBLISH_CHANNEL:-beta}"
 DATE_STAMP="${PUBLISH_DATE:-$(date +%Y%m%d)}"
 NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-${NOTARY_KEYCHAIN_PROFILE:-loc-notary}}"
 UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/locality/releases/latest/download/latest-macos.json}"
+HOST_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityDeveloperId.entitlements"
+HOST_APP_GROUP="C484HB7Q6S.group.ai.codeflash.locality"
 
 log() {
   printf 'publish: %s\n' "$*"
@@ -127,20 +129,24 @@ updater_enabled() {
 
 build_config_json() {
   local signing_identity="$1"
-  local escaped_identity
+  local escaped_identity escaped_entitlements
   escaped_identity="$(json_escape "${signing_identity}")"
+  escaped_entitlements="$(json_escape "${HOST_ENTITLEMENTS}")"
 
   if updater_enabled; then
     [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] \
       || fail "TAURI_UPDATER_PUBKEY is set but TAURI_SIGNING_PRIVATE_KEY is missing"
-    printf '{"bundle":{"createUpdaterArtifacts":true,"macOS":{"signingIdentity":"%s"}},"plugins":{"updater":{"pubkey":"%s","endpoints":["%s"]}}}' \
+    printf '{"bundle":{"createUpdaterArtifacts":true,"macOS":{"signingIdentity":"%s","entitlements":"%s"}},"plugins":{"updater":{"pubkey":"%s","endpoints":["%s"]}}}' \
       "${escaped_identity}" \
+      "${escaped_entitlements}" \
       "$(json_escape "${TAURI_UPDATER_PUBKEY}")" \
       "$(json_escape "${UPDATER_ENDPOINT}")"
     return 0
   fi
 
-  printf '{"bundle":{"macOS":{"signingIdentity":"%s"}}}' "${escaped_identity}"
+  printf '{"bundle":{"macOS":{"signingIdentity":"%s","entitlements":"%s"}}}' \
+    "${escaped_identity}" \
+    "${escaped_entitlements}"
 }
 
 latest_updater_archive() {
@@ -166,6 +172,16 @@ copy_updater_artifacts() {
   cp "${archive}.sig" "${final_archive}.sig"
   printf '\nPublished updater archive: %s\n' "${final_archive}"
   printf 'Published updater signature: %s.sig\n' "${final_archive}"
+}
+
+assert_app_group_entitlement() {
+  local path="$1"
+  local entitlements
+  entitlements="$(codesign -d --entitlements - "${path}" 2>/dev/null || true)"
+  [[ "${entitlements}" == *"com.apple.security.application-groups"* ]] \
+    || fail "${path} is missing com.apple.security.application-groups entitlement"
+  [[ "${entitlements}" == *"${HOST_APP_GROUP}"* ]] \
+    || fail "${path} is missing ${HOST_APP_GROUP} entitlement"
 }
 
 verify_signed_app_in_dmg() (
@@ -200,6 +216,10 @@ verify_signed_app_in_dmg() (
       || fail "${PRODUCT_NAME}.app is not signed with a Developer ID Application identity"
     [[ "${appex_signature}" == *"Developer ID Application"* ]] \
       || fail "LocalityFileProvider.appex is not signed with a Developer ID Application identity"
+    assert_app_group_entitlement "${app}"
+    assert_app_group_entitlement "${app}/Contents/MacOS/loc"
+    assert_app_group_entitlement "${app}/Contents/MacOS/localityd"
+    assert_app_group_entitlement "${app}/Contents/MacOS/locality-file-providerctl"
   fi
   grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/localityd"
   smoke_test_desktop_app "${app}"
