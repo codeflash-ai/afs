@@ -7,7 +7,6 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_connector::{Connector, EnumerateRequest};
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::hydration::{
@@ -16,7 +15,6 @@ use afs_core::hydration::{
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use afs_core::path_projection::{is_page_document_path, page_container_path};
 use afs_core::{AfsError, AfsResult};
-use afs_notion::NotionConnector;
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository, MountConfig,
     RemoteObservationRecord, RemoteObservationRepository,
@@ -280,28 +278,6 @@ fn observation_timestamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => format!("unix_ms:{}", duration.as_millis()),
         Err(_) => "unix_ms:0".to_string(),
-    }
-}
-
-impl ScheduledPullSource for NotionConnector {
-    fn enumerate_mount(&self, mount: &MountConfig) -> AfsResult<Vec<TreeEntry>> {
-        let connector = match &mount.remote_root_id {
-            Some(root_page_id) => self.with_root_page_id(root_page_id.clone()),
-            None => self.clone(),
-        };
-
-        connector.enumerate(EnumerateRequest {
-            mount_id: mount.mount_id.clone(),
-            cursor: None,
-        })
-    }
-
-    fn database_schema_yaml(
-        &self,
-        _mount: &MountConfig,
-        remote_id: &RemoteId,
-    ) -> AfsResult<Option<String>> {
-        self.database_schema_yaml(remote_id).map(Some)
     }
 }
 

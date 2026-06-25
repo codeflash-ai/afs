@@ -12,6 +12,13 @@ A connector implements seven responsibilities and leaves caching, journaling, va
 
 First-party connectors compile in as Rust crates. A future third-party connector ABI should be possible if this trait remains narrow, explicit, and host-mediated.
 
+First-party connectors are exposed through the daemon source registry. The
+registry is the single runtime list of connectors supported by the current
+build, and it owns the descriptor metadata consumed by CLI flows such as mount
+guidance, default mount IDs, auth hints, and display names. Descriptor lookup
+may return generic guidance for an unknown connector string, but remote I/O must
+still fail unless that connector has a registered runtime resolver.
+
 Connectors are resolved through a profile/account boundary before any API call.
 A connector profile is the local auth-config record: auth kind, scopes, enabled
 action classes, connector version, status, and capabilities. A connected account

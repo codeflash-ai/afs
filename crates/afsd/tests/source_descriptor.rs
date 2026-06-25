@@ -1,5 +1,9 @@
+use afs_core::model::MountId;
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
-use afsd::source::{source_descriptor, source_display_name};
+use afs_store::{InMemoryCredentialStore, InMemoryStateStore, MountConfig};
+use afsd::source::{
+    resolve_source_for_mount, source_descriptor, source_display_name, supported_source_connectors,
+};
 
 #[test]
 fn notion_descriptor_exposes_cli_and_mount_metadata() {
@@ -37,4 +41,24 @@ fn source_display_name_uses_descriptor_registry() {
     assert_eq!(source_display_name("notion"), "Notion");
     assert_eq!(source_display_name("linear"), "Linear");
     assert_eq!(source_display_name("custom"), "custom");
+}
+
+#[test]
+fn supported_source_connectors_lists_runtime_registered_connectors() {
+    assert_eq!(supported_source_connectors(), vec!["notion"]);
+}
+
+#[test]
+fn resolving_unregistered_connector_reports_unsupported_connector() {
+    let store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let mount = MountConfig::new(MountId::new("custom-main"), "custom", "/tmp/afs/custom");
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount).expect_err("unsupported");
+
+    assert_eq!(error.code(), "unsupported_connector");
+    assert_eq!(
+        error.message(),
+        "connector `custom` is not supported by this build"
+    );
 }

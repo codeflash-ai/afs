@@ -1,9 +1,8 @@
 //! Source adapter boundary.
 //!
 //! Daemon orchestration should talk to source capabilities, not directly to a
-//! provider crate. This module is the first local registry: it still resolves
-//! only Notion, but keeps Notion-specific validation and schema lookup behind a
-//! daemon-facing adapter trait.
+//! provider crate. This module owns the first-party source registry and keeps
+//! provider-specific behavior behind daemon-facing adapter traits.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,10 +16,10 @@ use afs_connector::{
 use afs_core::canonical::ParsedCanonicalDocument;
 use afs_core::freshness::RemoteObservation;
 use afs_core::hydration::HydrationRequest;
-use afs_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId, TreeEntry};
+use afs_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
 use afs_core::planner::PushOperationKind;
 use afs_core::shadow::ShadowDocument;
-use afs_core::validation::{ValidationIssue, ValidationReport};
+use afs_core::validation::ValidationReport;
 use afs_core::{AfsError, AfsResult};
 use afs_notion::NotionConnector;
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
@@ -33,7 +32,6 @@ use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::notion::{ConnectorResolveError, resolve_notion_connector_for_mount};
 use crate::reconcile::ScheduledPullSource;
-use crate::virtual_fs::virtual_fs_content_root;
 
 const NOTION_AGENT_GUIDANCE: &str = include_str!("../../../templates/mount/AGENTS.md");
 
@@ -41,6 +39,35 @@ const NOTION_AGENT_GUIDANCE: &str = include_str!("../../../templates/mount/AGENT
 pub enum ResolvedSource {
     Notion(NotionConnector),
 }
+
+pub trait SourceResolverStore: ConnectionRepository + ConnectorProfileRepository {}
+
+impl<T> SourceResolverStore for T where T: ConnectionRepository + ConnectorProfileRepository + ?Sized
+{}
+
+type SourceResolver = fn(
+    &dyn SourceResolverStore,
+    &dyn CredentialStore,
+    &MountConfig,
+) -> Result<ResolvedSource, ConnectorResolveError>;
+type SourceValidationFn = fn(SourceValidationContext<'_>) -> AfsResult<ValidationReport>;
+
+#[derive(Clone, Copy)]
+struct SourceRegistration {
+    id: &'static str,
+    descriptor: fn() -> SourceDescriptor,
+    resolve: SourceResolver,
+    validate_changed_frontmatter: SourceValidationFn,
+    validate_create_frontmatter: SourceValidationFn,
+}
+
+const SOURCE_REGISTRY: &[SourceRegistration] = &[SourceRegistration {
+    id: "notion",
+    descriptor: notion_source_descriptor,
+    resolve: resolve_notion_source,
+    validate_changed_frontmatter: crate::notion::validate_notion_changed_frontmatter,
+    validate_create_frontmatter: crate::notion::validate_notion_create_frontmatter,
+}];
 
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedSourceSet {
@@ -89,22 +116,46 @@ impl SourceDescriptor {
 }
 
 pub fn source_descriptor(connector: &str) -> SourceDescriptor {
-    match connector {
-        "notion" => SourceDescriptor {
-            id: Cow::Borrowed("notion"),
-            display_name: Cow::Borrowed("Notion"),
-            default_mount_id: Cow::Borrowed("notion-main"),
-            connect_command: Some(Cow::Borrowed("afs connect notion")),
-            auth_env_var: Some(DEFAULT_NOTION_TOKEN_ENV),
-            supports_oauth: true,
-            mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
-        },
-        source => generic_source_descriptor(source),
-    }
+    source_registration(connector)
+        .map(|registration| (registration.descriptor)())
+        .unwrap_or_else(|| generic_source_descriptor(connector))
 }
 
 pub fn source_display_name(connector: &str) -> String {
     source_descriptor(connector).display_name().to_string()
+}
+
+pub fn supported_source_connectors() -> Vec<&'static str> {
+    SOURCE_REGISTRY
+        .iter()
+        .map(|registration| registration.id)
+        .collect()
+}
+
+fn source_registration(connector: &str) -> Option<&'static SourceRegistration> {
+    SOURCE_REGISTRY
+        .iter()
+        .find(|registration| registration.id == connector)
+}
+
+fn notion_source_descriptor() -> SourceDescriptor {
+    SourceDescriptor {
+        id: Cow::Borrowed("notion"),
+        display_name: Cow::Borrowed("Notion"),
+        default_mount_id: Cow::Borrowed("notion-main"),
+        connect_command: Some(Cow::Borrowed("afs connect notion")),
+        auth_env_var: Some(DEFAULT_NOTION_TOKEN_ENV),
+        supports_oauth: true,
+        mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
+    }
+}
+
+fn resolve_notion_source(
+    store: &dyn SourceResolverStore,
+    credentials: &dyn CredentialStore,
+    mount: &MountConfig,
+) -> Result<ResolvedSource, ConnectorResolveError> {
+    resolve_notion_connector_for_mount(store, credentials, mount).map(ResolvedSource::Notion)
 }
 
 fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
@@ -183,13 +234,9 @@ pub fn resolve_source_for_mount<S>(
 where
     S: ConnectionRepository + ConnectorProfileRepository,
 {
-    match mount.connector.as_str() {
-        "notion" => resolve_notion_connector_for_mount(store, credentials, mount)
-            .map(ResolvedSource::Notion),
-        connector => Err(ConnectorResolveError::UnsupportedConnector(
-            connector.to_string(),
-        )),
-    }
+    let registration = source_registration(&mount.connector)
+        .ok_or_else(|| ConnectorResolveError::UnsupportedConnector(mount.connector.clone()))?;
+    (registration.resolve)(store, credentials, mount)
 }
 
 impl ResolvedSourceSet {
@@ -345,39 +392,6 @@ pub struct SourceValidationContext<'a> {
     pub shadow: Option<&'a ShadowDocument>,
 }
 
-impl SourcePushValidator for NotionConnector {
-    fn validate_changed_frontmatter(
-        &self,
-        context: SourceValidationContext<'_>,
-    ) -> AfsResult<ValidationReport> {
-        validate_notion_changed_frontmatter(context)
-    }
-
-    fn validate_create_frontmatter(
-        &self,
-        context: SourceValidationContext<'_>,
-    ) -> AfsResult<ValidationReport> {
-        validate_notion_create_frontmatter(context)
-    }
-}
-
-impl SourceAdapter for NotionConnector {
-    fn scoped_to_mount(&self, mount: &MountConfig) -> Self
-    where
-        Self: Sized + Clone,
-    {
-        mount
-            .remote_root_id
-            .as_ref()
-            .map(|root_page_id| self.with_root_page_id(root_page_id.clone()))
-            .unwrap_or_else(|| self.clone())
-    }
-
-    fn database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<Option<String>> {
-        self.database_schema_yaml(database_id).map(Some)
-    }
-}
-
 impl SourcePushValidator for ResolvedSource {
     fn validate_changed_frontmatter(
         &self,
@@ -457,131 +471,19 @@ impl SourcePushValidator for LocalSourceValidator {
         &self,
         context: SourceValidationContext<'_>,
     ) -> AfsResult<ValidationReport> {
-        if context.mount.connector == "notion" {
-            return validate_notion_changed_frontmatter(context);
-        }
-        Ok(ValidationReport::clean())
+        source_registration(&context.mount.connector)
+            .map(|registration| (registration.validate_changed_frontmatter)(context))
+            .unwrap_or_else(|| Ok(ValidationReport::clean()))
     }
 
     fn validate_create_frontmatter(
         &self,
         context: SourceValidationContext<'_>,
     ) -> AfsResult<ValidationReport> {
-        if context.mount.connector == "notion" {
-            return validate_notion_create_frontmatter(context);
-        }
-        Ok(ValidationReport::clean())
+        source_registration(&context.mount.connector)
+            .map(|registration| (registration.validate_create_frontmatter)(context))
+            .unwrap_or_else(|| Ok(ValidationReport::clean()))
     }
-}
-
-fn validate_notion_changed_frontmatter(
-    context: SourceValidationContext<'_>,
-) -> AfsResult<ValidationReport> {
-    if context.mount.read_only {
-        return Ok(ValidationReport::clean());
-    }
-    let Some(parent) = context
-        .parent
-        .filter(|entity| entity.kind == EntityKind::Database)
-    else {
-        return Ok(ValidationReport::clean());
-    };
-    let Some(shadow) = context.shadow else {
-        return Ok(ValidationReport::clean());
-    };
-
-    Ok(
-        match notion_schema_yaml_or_issue(
-            context.state_root,
-            context.mount,
-            parent,
-            context.relative_path,
-        ) {
-            Ok(schema) => afs_notion::schema::validate_changed_row_frontmatter(
-                &schema,
-                shadow,
-                context.parsed,
-                context.relative_path,
-            ),
-            Err(report) => report,
-        },
-    )
-}
-
-fn validate_notion_create_frontmatter(
-    context: SourceValidationContext<'_>,
-) -> AfsResult<ValidationReport> {
-    if context.mount.read_only {
-        return Ok(ValidationReport::clean());
-    }
-    let Some(parent) = context
-        .parent
-        .filter(|entity| entity.kind == EntityKind::Database)
-    else {
-        return Ok(ValidationReport::clean());
-    };
-
-    Ok(
-        match notion_schema_yaml_or_issue(
-            context.state_root,
-            context.mount,
-            parent,
-            context.relative_path,
-        ) {
-            Ok(schema) => afs_notion::schema::validate_create_row_frontmatter(
-                &schema,
-                context.parsed,
-                context.relative_path,
-            ),
-            Err(report) => report,
-        },
-    )
-}
-
-fn notion_schema_yaml_or_issue(
-    state_root: Option<&Path>,
-    mount: &MountConfig,
-    database: &EntityRecord,
-    relative_path: &Path,
-) -> Result<String, ValidationReport> {
-    let schema_path = schema_path(state_root, mount, database);
-    match std::fs::read_to_string(&schema_path) {
-        Ok(schema) => Ok(schema),
-        Err(error) => {
-            let code = if error.kind() == std::io::ErrorKind::NotFound {
-                "notion_schema_missing"
-            } else {
-                "notion_schema_unreadable"
-            };
-            let mut report = ValidationReport::clean();
-            report.push(ValidationIssue::new(
-                code,
-                relative_path,
-                Some(1),
-                format!(
-                    "Notion database row writes require readable schema file `{}`",
-                    schema_path.display()
-                ),
-                Some(
-                    "run `afs pull` on the database directory to regenerate `_schema.yaml`"
-                        .to_string(),
-                ),
-            ));
-            Err(report)
-        }
-    }
-}
-
-fn schema_path(state_root: Option<&Path>, mount: &MountConfig, database: &EntityRecord) -> PathBuf {
-    if mount.projection.uses_virtual_filesystem() {
-        return state_root
-            .map(|root| virtual_fs_content_root(root, &mount.mount_id))
-            .unwrap_or_else(|| mount.root.clone())
-            .join(&database.path)
-            .join("_schema.yaml");
-    }
-
-    mount.root.join(&database.path).join("_schema.yaml")
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {

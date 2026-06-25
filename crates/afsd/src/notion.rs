@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_connector::{Connector, FetchRequest};
-use afs_core::model::{MountId, RemoteId};
+use afs_connector::{Connector, EnumerateRequest, FetchRequest};
+use afs_core::model::{EntityKind, MountId, RemoteId, TreeEntry};
+use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use afs_notion::dto::NotionPageBundle;
@@ -16,10 +17,12 @@ use afs_notion::oauth::{
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
-    CredentialStore, MountConfig, MountRepository,
+    CredentialStore, EntityRecord, MountConfig, MountRepository,
 };
 
 use crate::hydration::{HydratedAsset, HydratedAssetMedia, HydratedEntity, HydrationSource};
+use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
+use crate::virtual_fs::virtual_fs_content_root;
 
 static ENV_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -142,7 +145,7 @@ pub fn resolve_notion_connector_for_mount<S>(
     mount: &MountConfig,
 ) -> Result<NotionConnector, ConnectorResolveError>
 where
-    S: ConnectionRepository + ConnectorProfileRepository,
+    S: ConnectionRepository + ConnectorProfileRepository + ?Sized,
 {
     if mount.connector != "notion" {
         return Err(ConnectorResolveError::UnsupportedConnector(
@@ -342,7 +345,7 @@ fn timestamp_secs() -> u64 {
 
 fn active_notion_connections<S>(store: &S) -> Result<Vec<ConnectionRecord>, ConnectorResolveError>
 where
-    S: ConnectionRepository,
+    S: ConnectionRepository + ?Sized,
 {
     let connections = store
         .list_connections()
@@ -358,7 +361,7 @@ fn validate_connection_profile<S>(
     connection: &ConnectionRecord,
 ) -> Result<(), ConnectorResolveError>
 where
-    S: ConnectorProfileRepository,
+    S: ConnectorProfileRepository + ?Sized,
 {
     let Some(profile_id) = &connection.profile_id else {
         return Ok(());
@@ -405,6 +408,149 @@ fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a
         .iter()
         .filter(|mount| path.starts_with(&mount.root))
         .max_by_key(|mount| mount.root.components().count())
+}
+
+impl SourcePushValidator for NotionConnector {
+    fn validate_changed_frontmatter(
+        &self,
+        context: SourceValidationContext<'_>,
+    ) -> AfsResult<ValidationReport> {
+        validate_notion_changed_frontmatter(context)
+    }
+
+    fn validate_create_frontmatter(
+        &self,
+        context: SourceValidationContext<'_>,
+    ) -> AfsResult<ValidationReport> {
+        validate_notion_create_frontmatter(context)
+    }
+}
+
+impl SourceAdapter for NotionConnector {
+    fn scoped_to_mount(&self, mount: &MountConfig) -> Self
+    where
+        Self: Sized + Clone,
+    {
+        mount
+            .remote_root_id
+            .as_ref()
+            .map(|root_page_id| self.with_root_page_id(root_page_id.clone()))
+            .unwrap_or_else(|| self.clone())
+    }
+
+    fn database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<Option<String>> {
+        self.database_schema_yaml(database_id).map(Some)
+    }
+}
+
+pub(crate) fn validate_notion_changed_frontmatter(
+    context: SourceValidationContext<'_>,
+) -> AfsResult<ValidationReport> {
+    if context.mount.read_only {
+        return Ok(ValidationReport::clean());
+    }
+    let Some(parent) = context
+        .parent
+        .filter(|entity| entity.kind == EntityKind::Database)
+    else {
+        return Ok(ValidationReport::clean());
+    };
+    let Some(shadow) = context.shadow else {
+        return Ok(ValidationReport::clean());
+    };
+
+    Ok(
+        match notion_schema_yaml_or_issue(
+            context.state_root,
+            context.mount,
+            parent,
+            context.relative_path,
+        ) {
+            Ok(schema) => afs_notion::schema::validate_changed_row_frontmatter(
+                &schema,
+                shadow,
+                context.parsed,
+                context.relative_path,
+            ),
+            Err(report) => report,
+        },
+    )
+}
+
+pub(crate) fn validate_notion_create_frontmatter(
+    context: SourceValidationContext<'_>,
+) -> AfsResult<ValidationReport> {
+    if context.mount.read_only {
+        return Ok(ValidationReport::clean());
+    }
+    let Some(parent) = context
+        .parent
+        .filter(|entity| entity.kind == EntityKind::Database)
+    else {
+        return Ok(ValidationReport::clean());
+    };
+
+    Ok(
+        match notion_schema_yaml_or_issue(
+            context.state_root,
+            context.mount,
+            parent,
+            context.relative_path,
+        ) {
+            Ok(schema) => afs_notion::schema::validate_create_row_frontmatter(
+                &schema,
+                context.parsed,
+                context.relative_path,
+            ),
+            Err(report) => report,
+        },
+    )
+}
+
+fn notion_schema_yaml_or_issue(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    database: &EntityRecord,
+    relative_path: &Path,
+) -> Result<String, ValidationReport> {
+    let schema_path = schema_path(state_root, mount, database);
+    match std::fs::read_to_string(&schema_path) {
+        Ok(schema) => Ok(schema),
+        Err(error) => {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                "notion_schema_missing"
+            } else {
+                "notion_schema_unreadable"
+            };
+            let mut report = ValidationReport::clean();
+            report.push(ValidationIssue::new(
+                code,
+                relative_path,
+                Some(1),
+                format!(
+                    "Notion database row writes require readable schema file `{}`",
+                    schema_path.display()
+                ),
+                Some(
+                    "run `afs pull` on the database directory to regenerate `_schema.yaml`"
+                        .to_string(),
+                ),
+            ));
+            Err(report)
+        }
+    }
+}
+
+fn schema_path(state_root: Option<&Path>, mount: &MountConfig, database: &EntityRecord) -> PathBuf {
+    if mount.projection.uses_virtual_filesystem() {
+        return state_root
+            .map(|root| virtual_fs_content_root(root, &mount.mount_id))
+            .unwrap_or_else(|| mount.root.clone())
+            .join(&database.path)
+            .join("_schema.yaml");
+    }
+
+    mount.root.join(&database.path).join("_schema.yaml")
 }
 
 impl HydrationSource for NotionConnector {
@@ -456,5 +602,27 @@ impl HydrationSource for NotionConnector {
 
     fn fetch_database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<Option<String>> {
         self.database_schema_yaml(database_id).map(Some)
+    }
+}
+
+impl crate::reconcile::ScheduledPullSource for NotionConnector {
+    fn enumerate_mount(&self, mount: &MountConfig) -> AfsResult<Vec<TreeEntry>> {
+        let connector = match &mount.remote_root_id {
+            Some(root_page_id) => self.with_root_page_id(root_page_id.clone()),
+            None => self.clone(),
+        };
+
+        connector.enumerate(EnumerateRequest {
+            mount_id: mount.mount_id.clone(),
+            cursor: None,
+        })
+    }
+
+    fn database_schema_yaml(
+        &self,
+        _mount: &MountConfig,
+        remote_id: &RemoteId,
+    ) -> AfsResult<Option<String>> {
+        self.database_schema_yaml(remote_id).map(Some)
     }
 }
