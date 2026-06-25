@@ -31,6 +31,7 @@ struct LocalityFileProviderCtl {
 private enum Command {
   case register(mountId: String, displayName: String)
   case open(mountId: String)
+  case url(mountId: String)
   case signal(mountId: String, identifier: String)
   case unregister(mountId: String)
   case list
@@ -40,7 +41,7 @@ private enum Command {
     let args = arguments.filter { $0 != "--json" }
     guard let action = args.first else {
       throw UsageError(
-        "usage: locality-file-providerctl register|open|unregister|list|reset [options]")
+        "usage: locality-file-providerctl register|open|url|unregister|list|reset [options]")
     }
 
     switch action {
@@ -53,6 +54,10 @@ private enum Command {
       let mountId = try requiredValue(args, "--mount-id")
       try validateDomainIdentifier(mountId)
       return .open(mountId: mountId)
+    case "url":
+      let mountId = try requiredValue(args, "--mount-id")
+      try validateDomainIdentifier(mountId)
+      return .url(mountId: mountId)
     case "signal":
       let mountId = try requiredValue(args, "--mount-id")
       let identifier = value(args, "--identifier") ?? "root"
@@ -143,6 +148,24 @@ private enum Command {
       return FileProviderCtlReport(
         ok: true,
         action: "open",
+        domain: DomainReport(domain),
+        domains: nil,
+        url: url.path,
+        message: "resolved \(mountId)"
+      )
+    case .url(let mountId):
+      guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
+        throw UsageError("File Provider domain \(mountId) is not registered")
+      }
+      guard domain.userEnabled else {
+        throw UsageError(
+          "The Locality File Provider is registered but not enabled. Enable Locality in Finder or System Settings, then try again."
+        )
+      }
+      let url = try userVisibleDomainURL(for: domain)
+      return FileProviderCtlReport(
+        ok: true,
+        action: "url",
         domain: DomainReport(domain),
         domains: nil,
         url: url.path,

@@ -73,6 +73,8 @@ pub struct MountConfig {
     pub connection_id: Option<ConnectionId>,
     pub read_only: bool,
     pub projection: ProjectionMode,
+    #[serde(default)]
+    pub hydrate_all_files: bool,
 }
 
 impl MountConfig {
@@ -85,6 +87,7 @@ impl MountConfig {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            hydrate_all_files: false,
         }
     }
 
@@ -105,6 +108,11 @@ impl MountConfig {
 
     pub fn projection(mut self, projection: ProjectionMode) -> Self {
         self.projection = projection;
+        self
+    }
+
+    pub fn hydrate_all_files(mut self, hydrate_all_files: bool) -> Self {
+        self.hydrate_all_files = hydrate_all_files;
         self
     }
 }

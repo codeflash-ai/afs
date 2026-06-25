@@ -158,6 +158,7 @@ struct MountSummary {
     access_scope: String,
     projection: String,
     read_only: bool,
+    hydrate_all_files: bool,
     status: String,
     provider: Option<ProviderRuntimeSummary>,
 }
@@ -176,8 +177,12 @@ struct ProviderRuntimeSummary {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSettings {
+    #[serde(default = "default_true")]
     launch_at_login: bool,
+    #[serde(default = "default_true")]
     show_menu_bar: bool,
+    #[serde(default)]
+    hydrate_all_notion_files: bool,
 }
 
 impl Default for DesktopSettings {
@@ -185,8 +190,13 @@ impl Default for DesktopSettings {
         Self {
             launch_at_login: true,
             show_menu_bar: true,
+            hydrate_all_notion_files: false,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Serialize)]
@@ -1348,6 +1358,21 @@ async fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> Ac
             }
         }
         "show_menu_bar" => set_menu_bar_visible(&app, change.enabled).unwrap_or_else(action_error),
+        "hydrate_all_notion_files" => {
+            match tauri::async_runtime::spawn_blocking(move || {
+                set_hydrate_all_notion_files(change.enabled)
+            })
+            .await
+            .map_err(|error| format!("Desktop setting worker failed: {error}"))
+            .and_then(|result| result)
+            {
+                Ok(report) => {
+                    refresh_desktop_surfaces(&app);
+                    report
+                }
+                Err(message) => action_error(message),
+            }
+        }
         _ => ActionReport {
             ok: false,
             message: format!("Unknown desktop setting `{}`.", change.key),
@@ -1432,6 +1457,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             access_scope: "State load failed".to_string(),
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
+            hydrate_all_files: false,
             status: "error".to_string(),
             provider: None,
         },
@@ -1518,6 +1544,7 @@ fn mount_summary(
             access_scope: "No mounted Notion access yet".to_string(),
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
+            hydrate_all_files: false,
             status: "not_mounted".to_string(),
             provider: None,
         };
@@ -1541,6 +1568,7 @@ fn mount_summary(
         access_scope: notion_access_scope_label(store, mount),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
+        hydrate_all_files: mount.hydrate_all_files,
         status: mount_status.to_string(),
         provider,
     }
@@ -2486,6 +2514,7 @@ fn desktop_settings() -> DesktopSettings {
     DesktopSettings {
         launch_at_login: cached_launch_at_login_enabled(persisted.launch_at_login),
         show_menu_bar: persisted.show_menu_bar,
+        hydrate_all_notion_files: persisted.hydrate_all_notion_files,
     }
 }
 
@@ -2556,6 +2585,205 @@ fn set_menu_bar_visible(app: &AppHandle, visible: bool) -> Result<ActionReport, 
             "Locality is hidden from the menu bar.".to_string()
         },
     })
+}
+
+fn set_hydrate_all_notion_files(enabled: bool) -> Result<ActionReport, String> {
+    let state_root = default_state_root();
+    let mut settings = load_desktop_settings().unwrap_or_default();
+    settings.hydrate_all_notion_files = enabled;
+    save_desktop_settings(&settings)?;
+
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?;
+    let Some(mut mount) = choose_mount(&mounts) else {
+        return Ok(ActionReport {
+            ok: true,
+            message: if enabled {
+                "All Notion files will hydrate after you mount a workspace.".to_string()
+            } else {
+                "New Notion files will stay online-only until opened.".to_string()
+            },
+        });
+    };
+    if mount.connector != "notion" {
+        return Ok(ActionReport {
+            ok: true,
+            message: if enabled {
+                "All Notion files will hydrate after you mount a Notion workspace.".to_string()
+            } else {
+                "New Notion files will stay online-only until opened.".to_string()
+            },
+        });
+    }
+
+    mount.hydrate_all_files = enabled;
+    store
+        .save_mount(mount.clone())
+        .map_err(|error| format!("Could not update mount settings: {error}"))?;
+
+    if enabled {
+        let _ = ensure_daemon_running(&state_root);
+    }
+    let _ = reload_daemon_mounts(&state_root);
+
+    let preparation = if enabled {
+        prepare_existing_notion_files_for_preview(&mut store, &state_root, &mount)
+    } else {
+        PreviewPreparationReport::default()
+    };
+
+    Ok(ActionReport {
+        ok: true,
+        message: if enabled {
+            preview_preparation_message(&preparation)
+        } else {
+            "New Notion files will stay online-only until opened.".to_string()
+        },
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PreviewPreparationReport {
+    prepared: usize,
+    failed: usize,
+    first_error: Option<String>,
+}
+
+fn preview_preparation_message(report: &PreviewPreparationReport) -> String {
+    if report.failed == 0 {
+        return format!(
+            "All Notion files will be ready for Finder preview. Prepared {} existing file{}.",
+            report.prepared,
+            if report.prepared == 1 { "" } else { "s" }
+        );
+    }
+
+    format!(
+        "All Notion files will be ready for Finder preview. Prepared {} existing file{}; {} failed{}.",
+        report.prepared,
+        if report.prepared == 1 { "" } else { "s" },
+        report.failed,
+        report
+            .first_error
+            .as_ref()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    )
+}
+
+fn prepare_existing_notion_files_for_preview(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    mount: &MountConfig,
+) -> PreviewPreparationReport {
+    let entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(|error| format!("Could not list Notion files: {error}"));
+    let entities = match entities {
+        Ok(entities) => entities,
+        Err(error) => {
+            return PreviewPreparationReport {
+                prepared: 0,
+                failed: 1,
+                first_error: Some(error),
+            };
+        }
+    };
+    let credentials = open_credential_store(state_root);
+    let connector = match resolve_source_for_mount_id(store, credentials.as_ref(), &mount.mount_id)
+    {
+        Ok(connector) => connector,
+        Err(error) => {
+            return PreviewPreparationReport {
+                prepared: 0,
+                failed: entities
+                    .iter()
+                    .filter(|entity| entity.kind == EntityKind::Page)
+                    .count(),
+                first_error: Some(error.message()),
+            };
+        }
+    };
+    let mut report = PreviewPreparationReport::default();
+
+    for entity in entities {
+        if entity.kind != EntityKind::Page {
+            continue;
+        }
+
+        match prepare_entity_for_preview(store, &connector, state_root, mount, &entity) {
+            Ok(()) => report.prepared += 1,
+            Err(error) => {
+                report.failed += 1;
+                if report.first_error.is_none() {
+                    report.first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    report
+}
+
+fn prepare_entity_for_preview(
+    store: &mut SqliteStateStore,
+    connector: &dyn HydrationSource,
+    state_root: &Path,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+) -> Result<(), String> {
+    if mount.projection.uses_virtual_filesystem() {
+        let content_root = virtual_fs_content_root(state_root, &mount.mount_id);
+        materialize_virtual_fs_item_with_content_root(
+            store,
+            connector,
+            &content_root,
+            &mount.mount_id,
+            &entity.remote_id.0,
+        )
+        .map_err(|error| format!("Could not hydrate `{}`: {error}", entity.title))?;
+    } else if !matches!(entity.hydration, HydrationState::Hydrated) {
+        let request = HydrationRequest::new(
+            mount.mount_id.clone(),
+            entity.remote_id.clone(),
+            mount.root.join(&entity.path),
+            HydrationState::Hydrated,
+            HydrationReason::Policy,
+        );
+        HydrationExecutor::new(store, connector)
+            .hydrate_request(request)
+            .map_err(|error| format!("Could not hydrate `{}`: {error}", entity.title))?;
+    }
+
+    materialize_visible_preview_file(state_root, mount, entity)
+}
+
+#[cfg(target_os = "macos")]
+fn materialize_visible_preview_file(
+    state_root: &Path,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+) -> Result<(), String> {
+    if mount.projection != ProjectionMode::MacosFileProvider {
+        return Ok(());
+    }
+
+    let visible_path = mount.root.join(&entity.path);
+    let content_path = virtual_fs_content_path(state_root, &mount.mount_id, &entity.path)
+        .map_err(|error| format!("Could not resolve materialized cache: {error}"))?;
+    write_visible_file_from_cache_for_reveal(&content_path, &visible_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn materialize_visible_preview_file(
+    _state_root: &Path,
+    _mount: &MountConfig,
+    _entity: &EntityRecord,
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
@@ -3796,12 +4024,15 @@ fn write_visible_file_from_cache_for_reveal(
 ) -> Result<(), String> {
     if visible_path.exists() {
         if visible_path.is_file() {
-            return Ok(());
+            if !is_macos_dataless_file(visible_path) {
+                return Ok(());
+            }
+        } else {
+            return Err(format!(
+                "Could not reveal `{}` because a non-file item already exists there.",
+                visible_path.display()
+            ));
         }
-        return Err(format!(
-            "Could not reveal `{}` because a non-file item already exists there.",
-            visible_path.display()
-        ));
     }
 
     let contents = fs::read(cache_path).map_err(|error| {
@@ -3836,6 +4067,17 @@ fn write_visible_file_from_cache_for_reveal(
             visible_path.display()
         )
     })
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_dataless_file(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+
+    const SF_DATALESS: u32 = 0x40000000;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.st_flags() & SF_DATALESS != 0)
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -3932,6 +4174,7 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
         .get_mount(&MountId::new(mount_report.mount_id.clone()))
         .map_err(|error| format!("Could not reload created mount: {error}"))?
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
+    let mount = apply_desktop_hydration_preference(&mut store, mount)?;
 
     if mount.projection.uses_virtual_filesystem() {
         activate_virtual_projection_mount(&state_root, &mount, false)?;
@@ -3942,6 +4185,21 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
         absolute_display_path(&mount_access_root(&mount)),
         projection_label(&mount.projection)
     ))
+}
+
+fn apply_desktop_hydration_preference(
+    store: &mut SqliteStateStore,
+    mut mount: MountConfig,
+) -> Result<MountConfig, String> {
+    let settings = load_desktop_settings().unwrap_or_default();
+    if mount.connector == "notion" && mount.hydrate_all_files != settings.hydrate_all_notion_files {
+        mount.hydrate_all_files = settings.hydrate_all_notion_files;
+        store
+            .save_mount(mount.clone())
+            .map_err(|error| format!("Could not apply hydration setting to mount: {error}"))?;
+    }
+
+    Ok(mount)
 }
 
 fn preferred_notion_connection_id(
@@ -6764,6 +7022,39 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preview_preparation_materializes_visible_file_from_content_cache() {
+        let temp = TestTempDir::new("preview-cache");
+        let state_root = temp.path().join("state");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("CloudStorage/Locality/notion"),
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+        let entity = EntityRecord::new(
+            mount.mount_id.clone(),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Page",
+            "Page/page.md",
+        )
+        .with_hydration(HydrationState::Hydrated);
+        let cache = super::virtual_fs_content_path(&state_root, &mount.mount_id, &entity.path)
+            .expect("content path");
+        fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
+        fs::write(&cache, "# Page\n\nCached body").expect("write cache");
+
+        super::materialize_visible_preview_file(&state_root, &mount, &entity)
+            .expect("materialize preview");
+
+        assert_eq!(
+            fs::read_to_string(mount.root.join("Page/page.md")).expect("read visible"),
+            "# Page\n\nCached body"
+        );
+    }
+
     #[test]
     fn missing_non_macos_virtual_reveal_opens_projection_root() {
         let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
@@ -7945,12 +8236,14 @@ fn sample_snapshot() -> DesktopSnapshot {
             access_scope: "Initial Idea".to_string(),
             projection: "macOS File Provider".to_string(),
             read_only: false,
+            hydrate_all_files: false,
             status: "ready".to_string(),
             provider: None,
         },
         settings: DesktopSettings {
             launch_at_login: true,
             show_menu_bar: true,
+            hydrate_all_notion_files: false,
         },
         pending_changes: sample_pending_changes(),
         activity: vec![

@@ -14,6 +14,8 @@ use locality_store::{
     ProjectionMode, ShadowRepository, StoreError, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::os::macos::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -686,10 +688,31 @@ fn refresh_projection_candidate_if_clean(
     projection_path: PathBuf,
     previous_shadow: Option<&ShadowDocument>,
 ) -> LocalityResult<ProjectionRefreshOutcome> {
+    refresh_projection_candidate_if_clean_with_dataless_detector(
+        entity,
+        content_root,
+        projection_path,
+        previous_shadow,
+        is_macos_dataless_file,
+    )
+}
+
+fn refresh_projection_candidate_if_clean_with_dataless_detector(
+    entity: &EntityRecord,
+    content_root: &Path,
+    projection_path: PathBuf,
+    previous_shadow: Option<&ShadowDocument>,
+    is_dataless_file: impl Fn(&Path) -> bool,
+) -> LocalityResult<ProjectionRefreshOutcome> {
     let content_path = content_cache_path(content_root, &entity.path)?;
     let Ok(cache_contents) = std::fs::read(&content_path) else {
         return Ok(ProjectionRefreshOutcome::MissingCache);
     };
+    if is_dataless_file(&projection_path) {
+        write_binary_atomic(&projection_path, &cache_contents).map_err(LocalityError::from)?;
+        return Ok(ProjectionRefreshOutcome::Refreshed);
+    }
+
     let Ok(projection_contents) = std::fs::read(&projection_path) else {
         return Ok(ProjectionRefreshOutcome::MissingProjection);
     };
@@ -752,6 +775,20 @@ fn projection_contents_match_shadow(contents: &[u8], shadow: &ShadowDocument) ->
         .ok()
         .and_then(|contents| parse_canonical_markdown(contents).ok())
         .is_some_and(|parsed| parsed_matches_shadow(&parsed, shadow))
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_dataless_file(path: &Path) -> bool {
+    const SF_DATALESS: u32 = 0x40000000;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.st_flags() & SF_DATALESS != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_dataless_file(_path: &Path) -> bool {
+    false
 }
 
 fn projection_needs_read(projection_path: &Path, content_path: &Path, force_read: bool) -> bool {
@@ -1376,6 +1413,34 @@ mod tests {
         let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
         assert!(visible.contains("Local visible edit."));
         assert!(!visible.contains("Pulled remote body."));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refresh_macos_projection_replaces_dataless_visible_replica_without_reading_it() {
+        let fixture = ProjectionFixture::new("refresh-dataless-visible");
+        let refresh_bases = fixture.refresh_bases();
+        fixture.write_projection_without_identity("Local visible edit.\n");
+        fixture.write_cache("Pulled remote body.\n");
+        let store = fixture.store();
+        let entity = store
+            .get_entity(&fixture.mount_id, &fixture.remote_id)
+            .expect("read entity")
+            .expect("entity");
+
+        let outcome = refresh_projection_candidate_if_clean_with_dataless_detector(
+            &entity,
+            &virtual_fs::virtual_fs_content_root(&fixture.state_root, &fixture.mount_id),
+            fixture.projection_path(),
+            Some(&refresh_bases[0].previous_shadow),
+            |_| true,
+        )
+        .expect("refresh projection");
+
+        assert_eq!(outcome, ProjectionRefreshOutcome::Refreshed);
+        let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
+        assert!(visible.contains("Pulled remote body."));
+        assert!(!visible.contains("Local visible edit."));
     }
 
     #[cfg(target_os = "macos")]

@@ -1897,6 +1897,7 @@ fn mount_remote_root_id(
                 connection_id: connection_id.clone(),
                 read_only,
                 projection: projection.clone(),
+                hydrate_all_files: false,
             };
             let credentials = open_credential_store(state_root);
             let connector =

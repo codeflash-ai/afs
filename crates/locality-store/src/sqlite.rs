@@ -40,7 +40,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
@@ -189,7 +189,7 @@ impl MountRepository for SqliteStateStore {
         let transaction = connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, hydrate_all_files
                  FROM mounts
                  WHERE mount_id = ?1",
                 params![&mount.mount_id.0],
@@ -202,6 +202,7 @@ impl MountRepository for SqliteStateStore {
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
@@ -216,15 +217,16 @@ impl MountRepository for SqliteStateStore {
         }
 
         transaction.execute(
-            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, hydrate_all_files)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(mount_id) DO UPDATE SET
                 connector = excluded.connector,
                 root = excluded.root,
                 remote_root_id = excluded.remote_root_id,
                 read_only = excluded.read_only,
                 projection_json = excluded.projection_json,
-                connection_id = excluded.connection_id",
+                connection_id = excluded.connection_id,
+                hydrate_all_files = excluded.hydrate_all_files",
             params![
                 &mount.mount_id.0,
                 &mount.connector,
@@ -233,6 +235,7 @@ impl MountRepository for SqliteStateStore {
                 bool_to_int(mount.read_only),
                 to_json(&mount.projection)?,
                 mount.connection_id.as_ref().map(|connection_id| connection_id.0.as_str()),
+                bool_to_int(mount.hydrate_all_files),
             ],
         )?;
         transaction.commit()?;
@@ -243,7 +246,7 @@ impl MountRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, hydrate_all_files
                  FROM mounts
                  WHERE mount_id = ?1",
                 params![mount_id.0],
@@ -256,6 +259,7 @@ impl MountRepository for SqliteStateStore {
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
@@ -267,7 +271,7 @@ impl MountRepository for SqliteStateStore {
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, hydrate_all_files
              FROM mounts
              ORDER BY mount_id",
         )?;
@@ -280,6 +284,7 @@ impl MountRepository for SqliteStateStore {
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
 
@@ -1325,6 +1330,7 @@ type MountRow = (
     i64,
     String,
     Option<String>,
+    i64,
 );
 type ConnectionRow = (
     String,
@@ -1442,7 +1448,8 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             remote_root_id TEXT,
             read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
             projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
-            connection_id TEXT
+            connection_id TEXT,
+            hydrate_all_files INTEGER NOT NULL DEFAULT 0 CHECK (hydrate_all_files IN (0, 1))
         );
 
         CREATE TABLE IF NOT EXISTS connections (
@@ -1776,6 +1783,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 15 && !column_exists(connection, "mounts", "hydrate_all_files")? {
+        connection.execute_batch(
+            "ALTER TABLE mounts
+             ADD COLUMN hydrate_all_files INTEGER NOT NULL DEFAULT 0 CHECK (hydrate_all_files IN (0, 1));",
+        )?;
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         seed_current_state_components(connection)?;
@@ -1794,6 +1808,7 @@ fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
         read_only: row.4 != 0,
         projection: from_json::<ProjectionMode>(&row.5)?,
         connection_id: row.6.map(ConnectionId),
+        hydrate_all_files: row.7 != 0,
     })
 }
 

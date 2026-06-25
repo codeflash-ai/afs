@@ -20,7 +20,8 @@ fn mount_config_round_trips_with_read_only_flag() {
     let mut store = InMemoryStateStore::new();
     let mount = MountConfig::new(mount_id(), "notion", "/Users/saurabh/loc/notion")
         .with_remote_root_id(RemoteId::new("root-page"))
-        .read_only(true);
+        .read_only(true)
+        .hydrate_all_files(true);
 
     store.save_mount(mount.clone()).expect("save mount");
 

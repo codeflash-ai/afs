@@ -38,6 +38,9 @@ setup flow.
   buttons. Use one primary action and secondary links only when needed.
 - Do not block on full initial sync: setup should become useful quickly, with
   specific pages prepared on demand when the user locates them.
+- Full-content hydration is opt-in. The app can expose a setting to hydrate all
+  currently indexed Notion page files, but the default should remain online-only
+  so large workspaces do not materialize every page body during onboarding.
 - Hide sync internals: users should not need to reason about hydration queues,
   polling, or last-sync timestamps.
 - Safe by default: local edits are staged as pending changes until the user or

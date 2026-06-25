@@ -367,6 +367,11 @@ already hydrated pages with changed Remote Tree versions are queued for refresh.
 Project- or mount-specific strategies can dispatch on `MountConfig` without
 changing the reconciliation mechanics.
 
+Mounts can opt into `hydrate_all_files` for users who want Notion pages fully
+materialized instead of online-only. When enabled, scheduled reconciliation queues
+policy hydration for unhydrated page entities while still leaving hydrated, dirty,
+and conflicted files to their normal refresh and review paths.
+
 For hydrated, dirty, or conflicted entities, enumeration preserves the Synced
 Tree remote version until hydration writes a new shadow. That version is the
 push precondition for the current Local Tree file, so it must advance with the

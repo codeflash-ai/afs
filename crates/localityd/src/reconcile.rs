@@ -97,6 +97,10 @@ impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
             return policy_hydration();
         }
 
+        if request.mount.hydrate_all_files && should_hydrate_all_files_candidate(request.existing) {
+            return policy_hydration();
+        }
+
         if request
             .existing
             .is_some_and(|existing| should_refresh_hydrated_entity(existing, request.entry))
@@ -430,6 +434,15 @@ fn policy_hydration() -> EntityFetchPlan {
     EntityFetchPlan {
         queue_hydration: Some(HydrationReason::Policy),
     }
+}
+
+fn should_hydrate_all_files_candidate(existing: Option<&EntityRecord>) -> bool {
+    existing.is_none_or(|existing| {
+        matches!(
+            existing.hydration,
+            HydrationState::Virtual | HydrationState::Stub
+        )
+    })
 }
 
 fn remote_fast_forward_hydration() -> EntityFetchPlan {

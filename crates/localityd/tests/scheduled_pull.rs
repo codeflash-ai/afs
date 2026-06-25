@@ -116,6 +116,50 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
 }
 
 #[test]
+fn scheduled_pull_hydrates_all_pages_when_mount_option_is_enabled() {
+    let root = temp_root("scheduled-pull-hydrate-all");
+    let mount_id = MountId::new("notion-main");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root).hydrate_all_files(true);
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            page_entry(
+                &mount_id,
+                "page-a",
+                "A",
+                "A/page.md",
+                "2026-06-10T00:00:00Z",
+            ),
+            page_entry(
+                &mount_id,
+                "page-b",
+                "B",
+                "B/page.md",
+                "2026-06-10T00:00:00Z",
+            ),
+        ],
+    );
+    let mut supervisor = supervisor_with_mounts([mount]);
+
+    supervisor.start().expect("start supervisor");
+    let report = supervisor
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
+        .expect("scheduled pull");
+
+    assert_eq!(report.queued_hydrations, 2);
+    let first = supervisor
+        .hydration()
+        .peek_ready()
+        .expect("first hydration request");
+    assert_eq!(first.reason, HydrationReason::Policy);
+}
+
+#[test]
 fn scheduled_pull_macos_file_provider_keeps_unhydrated_pages_online_only() {
     assert_virtual_projection_keeps_unhydrated_pages_online_only(
         ProjectionMode::MacosFileProvider,

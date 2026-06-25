@@ -59,12 +59,14 @@ type DesktopSnapshot = {
     accessScope: string;
     projection: string;
     readOnly: boolean;
+    hydrateAllFiles: boolean;
     status: string;
     provider?: ProviderRuntimeSummary | null;
   };
   settings: {
     launchAtLogin: boolean;
     showMenuBar: boolean;
+    hydrateAllNotionFiles: boolean;
   };
   pendingChanges: PendingChange[];
   activity: ActivityItem[];
@@ -189,12 +191,14 @@ const sampleSnapshot: DesktopSnapshot = {
     accessScope: "Initial Idea",
     projection: "macOS File Provider",
     readOnly: false,
+    hydrateAllFiles: false,
     status: "ready",
     provider: null,
   },
   settings: {
     launchAtLogin: true,
     showMenuBar: true,
+    hydrateAllNotionFiles: false,
   },
   pendingChanges: [
     {
@@ -2204,6 +2208,7 @@ function SettingsView({
   const [resettingState, setResettingState] = useState(false);
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
+  const [hydrateAllFiles, setHydrateAllFiles] = useState(snapshot.settings.hydrateAllNotionFiles);
   const daemonStopped = snapshot.health.state === "stopped";
   const runtimeStopped = snapshot.health.state === "runtime_stopped";
   const runtimeNeedsRepair = daemonStopped || runtimeStopped;
@@ -2218,6 +2223,10 @@ function SettingsView({
   useEffect(() => {
     setLocalSettings(snapshot.settings);
   }, [snapshot.settings.launchAtLogin, snapshot.settings.showMenuBar]);
+
+  useEffect(() => {
+    setHydrateAllFiles(snapshot.settings.hydrateAllNotionFiles);
+  }, [snapshot.settings.hydrateAllNotionFiles]);
 
   async function repairRuntime() {
     if (!runtimeNeedsRepair) {
@@ -2257,15 +2266,19 @@ function SettingsView({
     setDiagnosticMessage(report.message);
   }
 
-  async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar", enabled: boolean) {
+  async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar" | "hydrate_all_notion_files", enabled: boolean) {
     setBusySetting(key);
     setSettingsMessage("");
     const previous = localSettings;
+    const previousHydrateAllFiles = hydrateAllFiles;
     setLocalSettings({
       ...localSettings,
       launchAtLogin: key === "launch_at_login" ? enabled : localSettings.launchAtLogin,
       showMenuBar: key === "show_menu_bar" ? enabled : localSettings.showMenuBar,
     });
+    if (key === "hydrate_all_notion_files") {
+      setHydrateAllFiles(enabled);
+    }
     try {
       const report = await callCommand<ActionReport>(
         "set_desktop_setting",
@@ -2274,11 +2287,13 @@ function SettingsView({
       );
       if (!report.ok) {
         setLocalSettings(previous);
+        setHydrateAllFiles(previousHydrateAllFiles);
       }
       setSettingsMessage(report.message);
       await onRefresh().catch(() => undefined);
     } catch (error) {
       setLocalSettings(previous);
+      setHydrateAllFiles(previousHydrateAllFiles);
       setSettingsMessage(errorMessage(error));
     } finally {
       setBusySetting("");
@@ -2365,6 +2380,12 @@ function SettingsView({
           <SettingRow title="Local edits" value="Pending until reviewed" />
           <SettingRow title="Push confirmation" value="Require for large changes" />
           <SettingRow title="Default new mount mode" value="Edit enabled" />
+          <ToggleRow
+            title="Hydrate all Notion files"
+            enabled={hydrateAllFiles}
+            busy={busySetting === "hydrate_all_notion_files"}
+            onToggle={(enabled) => void updateDesktopSetting("hydrate_all_notion_files", enabled)}
+          />
         </div>
 
         <div className="panel">

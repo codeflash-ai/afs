@@ -1021,7 +1021,7 @@ fn resolve_macos_file_provider_domain(
     mount_id: &str,
 ) -> Result<(FileProviderHelperReport, PathBuf), FileProviderHelperError> {
     let report = run_macos_file_provider_helper(
-        "open",
+        "url",
         vec!["--mount-id".to_string(), mount_id.to_string()],
     )?;
     let url = report
