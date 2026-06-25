@@ -660,3 +660,17 @@ Run:
 git add docs/superpowers/plans/2026-06-25-google-docs-connector-foundation.md
 git commit -m "Track Google Docs foundation plan progress"
 ```
+
+## Next implementation slices
+
+This foundation slice intentionally stops at broker-backed connection setup,
+credential persistence, and descriptor registration. It does not implement:
+
+- `loc mount google-docs` command parsing or mount configuration.
+- Drive API tree enumeration and folder/document projection.
+- Google Docs `documents.get` fetch and canonical Markdown rendering.
+- Markdown parse and Google Docs `documents.batchUpdate` write planning.
+- Drive file create, rename, move, trash/delete, or post-push reconciliation.
+
+Those should be implemented as separate plan slices so each one has focused
+tests and can keep Notion behavior unchanged.
