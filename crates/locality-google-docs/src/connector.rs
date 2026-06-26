@@ -829,6 +829,7 @@ struct DocsParagraphIndentRange {
     end: usize,
     indent_start: Option<serde_json::Value>,
     indent_first_line: Option<serde_json::Value>,
+    indent_end: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1114,6 +1115,9 @@ fn paragraph_indent_request(location_index: usize, range: DocsParagraphIndentRan
     if range.indent_first_line.is_some() {
         fields.push("indentFirstLine");
     }
+    if range.indent_end.is_some() {
+        fields.push("indentEnd");
+    }
     DocsRequest::UpdateParagraphStyle {
         update_paragraph_style: UpdateParagraphStyleRequest {
             range: Range {
@@ -1123,6 +1127,7 @@ fn paragraph_indent_request(location_index: usize, range: DocsParagraphIndentRan
             paragraph_style: ParagraphStylePatch {
                 indent_start: range.indent_start,
                 indent_first_line: range.indent_first_line,
+                indent_end: range.indent_end,
                 ..ParagraphStylePatch::default()
             },
             fields: fields.join(","),
@@ -1575,6 +1580,7 @@ fn preserved_paragraph_indents(
                 end,
                 indent_start: range.indent_start,
                 indent_first_line: range.indent_first_line,
+                indent_end: range.indent_end,
             })
         })
         .collect()
@@ -1693,7 +1699,10 @@ fn source_text_paragraph_indent_ranges(
         let Some(style) = paragraph.paragraph_style.as_ref() else {
             continue;
         };
-        if style.indent_start.is_none() && style.indent_first_line.is_none() {
+        if style.indent_start.is_none()
+            && style.indent_first_line.is_none()
+            && style.indent_end.is_none()
+        {
             continue;
         }
         ranges.push(DocsParagraphIndentRange {
@@ -1701,6 +1710,7 @@ fn source_text_paragraph_indent_ranges(
             end: range_end,
             indent_start: style.indent_start.clone(),
             indent_first_line: style.indent_first_line.clone(),
+            indent_end: style.indent_end.clone(),
         });
     }
     (source_text, ranges)
@@ -4722,6 +4732,88 @@ mod tests {
                     && value["updateParagraphStyle"]["fields"] == "indentStart,indentFirstLine"
             }),
             "source paragraph indentation should be restored after editing the block: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_end_indentation_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "End indent", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "End indent",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 17,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "indentEnd": {
+                                        "magnitude": 42,
+                                        "unit": "PT"
+                                    }
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 17,
+                                    "textRun": {
+                                        "content": "End indent line\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("end indented document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:17"),
+                content: "End indent phrase".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 18
+                    && value["updateParagraphStyle"]["paragraphStyle"]["indentEnd"]["magnitude"]
+                        == 42
+                    && value["updateParagraphStyle"]["fields"] == "indentEnd"
+            }),
+            "source paragraph end indentation should be restored after editing the block: {serialized:#?}"
         );
     }
 

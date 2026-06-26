@@ -65,6 +65,8 @@ pub struct ParagraphStyle {
     #[serde(default)]
     pub indent_first_line: Option<serde_json::Value>,
     #[serde(default)]
+    pub indent_end: Option<serde_json::Value>,
+    #[serde(default)]
     pub line_spacing: Option<serde_json::Value>,
     #[serde(default)]
     pub space_above: Option<serde_json::Value>,
@@ -309,6 +311,8 @@ pub struct ParagraphStylePatch {
     pub indent_start: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indent_first_line: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indent_end: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_spacing: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
