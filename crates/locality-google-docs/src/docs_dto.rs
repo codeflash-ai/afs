@@ -223,6 +223,10 @@ pub enum DocsRequest {
         #[serde(rename = "deleteContentRange")]
         delete_content_range: DeleteContentRangeRequest,
     },
+    DeleteParagraphBullets {
+        #[serde(rename = "deleteParagraphBullets")]
+        delete_paragraph_bullets: DeleteParagraphBulletsRequest,
+    },
     InsertText {
         #[serde(rename = "insertText")]
         insert_text: InsertTextRequest,
@@ -235,6 +239,11 @@ pub enum DocsRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteContentRangeRequest {
+    pub range: Range,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteParagraphBulletsRequest {
     pub range: Range,
 }
 

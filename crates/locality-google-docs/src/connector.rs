@@ -16,9 +16,9 @@ use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
 use crate::docs_dto::{
-    BatchUpdateDocumentRequest, DeleteContentRangeRequest, DocsRequest, GoogleDocument,
-    InsertTextRequest, Link, Location, Range, TextStyle, TextStylePatch, UpdateTextStyleRequest,
-    WriteControl,
+    BatchUpdateDocumentRequest, DeleteContentRangeRequest, DeleteParagraphBulletsRequest,
+    DocsRequest, GoogleDocument, InsertTextRequest, Link, Location, Range, TextStyle,
+    TextStylePatch, UpdateTextStyleRequest, WriteControl,
 };
 use crate::drive_dto::{
     DRIVE_FOLDER_MIME_TYPE, DRIVE_GOOGLE_DOC_MIME_TYPE, DriveCreateFileRequest, DriveFile,
@@ -678,6 +678,7 @@ fn write_control(document: &GoogleDocument) -> Option<WriteControl> {
 struct DocsText {
     text: String,
     style_ranges: Vec<DocsTextStyleRange>,
+    list_block: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -727,6 +728,12 @@ fn docs_text_requests_from_parsed(
             location_index,
             location_index + inserted_len,
         ));
+        if !docs_text.list_block {
+            requests.push(delete_paragraph_bullets_request(
+                location_index,
+                location_index + inserted_len,
+            ));
+        }
     }
     requests.extend(
         docs_text
@@ -759,6 +766,17 @@ fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest
                 link: None,
             },
             fields: "bold,italic,underline,strikethrough,foregroundColor,link".to_string(),
+        },
+    }
+}
+
+fn delete_paragraph_bullets_request(start_index: usize, end_index: usize) -> DocsRequest {
+    DocsRequest::DeleteParagraphBullets {
+        delete_paragraph_bullets: DeleteParagraphBulletsRequest {
+            range: Range {
+                start_index,
+                end_index,
+            },
         },
     }
 }
@@ -858,7 +876,10 @@ fn docs_text(content: &str) -> DocsText {
 }
 
 fn parse_docs_markdown_inline(content: &str) -> DocsText {
-    let mut parsed = DocsText::default();
+    let mut parsed = DocsText {
+        list_block: starts_with_markdown_list_marker(content),
+        ..DocsText::default()
+    };
     let mut index = 0;
     while index < content.len() {
         if let Some(next) = parse_markdown_span(content, index, &mut parsed) {
@@ -874,6 +895,17 @@ fn parse_docs_markdown_inline(content: &str) -> DocsText {
         index += ch.len_utf8();
     }
     parsed
+}
+
+fn starts_with_markdown_list_marker(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    let Some((digits, _rest)) = trimmed.split_once(". ") else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn parse_markdown_span(content: &str, index: usize, parsed: &mut DocsText) -> Option<usize> {
@@ -1425,13 +1457,13 @@ mod tests {
         assert_eq!(update_text_style.range.start_index, 1);
         assert_eq!(update_text_style.range.end_index, 32);
         assert_eq!(update_text_style.text_style.bold, Some(false));
-        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[3] else {
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[4] else {
             panic!("expected age style request");
         };
         assert_eq!(update_text_style.range.start_index, 1);
         assert_eq!(update_text_style.range.end_index, 5);
         assert_eq!(update_text_style.text_style.bold, Some(true));
-        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[4] else {
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[5] else {
             panic!("expected weight style request");
         };
         assert_eq!(update_text_style.range.start_index, 14);
@@ -1485,7 +1517,7 @@ mod tests {
             "Styled: Bold Italic Under Strike Link Plain edited\n"
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[3]).expect("bold style json"),
+            serde_json::to_value(&batch.requests[4]).expect("bold style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 9, "endIndex": 13 },
@@ -1495,7 +1527,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[4]).expect("italic style json"),
+            serde_json::to_value(&batch.requests[5]).expect("italic style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 14, "endIndex": 20 },
@@ -1505,7 +1537,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[5]).expect("underline style json"),
+            serde_json::to_value(&batch.requests[6]).expect("underline style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 21, "endIndex": 26 },
@@ -1515,7 +1547,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[6]).expect("strike style json"),
+            serde_json::to_value(&batch.requests[7]).expect("strike style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 27, "endIndex": 33 },
@@ -1525,7 +1557,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[7]).expect("link underline style json"),
+            serde_json::to_value(&batch.requests[8]).expect("link underline style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 34, "endIndex": 38 },
@@ -1535,7 +1567,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[8]).expect("link style json"),
+            serde_json::to_value(&batch.requests[9]).expect("link style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 34, "endIndex": 38 },
@@ -1624,7 +1656,7 @@ mod tests {
             .unwrap()
             .clone()
             .expect("batch update");
-        assert_eq!(batch.requests.len(), 4);
+        assert_eq!(batch.requests.len(), 5);
         assert_eq!(
             serde_json::to_value(&batch.requests[2]).expect("style reset json"),
             serde_json::json!({
@@ -1641,7 +1673,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[3]).expect("age style json"),
+            serde_json::to_value(&batch.requests[4]).expect("age style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 1, "endIndex": 4 },
@@ -1659,6 +1691,93 @@ mod tests {
                     "fields": "bold,foregroundColor"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn apply_clears_inherited_bullets_for_non_list_block_updates() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "List Doc", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "List Doc",
+                    "revisionId": "rev-1",
+                    "lists": {
+                        "list-1": {
+                            "listProperties": {
+                                "nestingLevels": [{ "glyphType": "DECIMAL" }]
+                            }
+                        }
+                    },
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 12,
+                                "paragraph": {
+                                    "elements": [{
+                                        "startIndex": 1,
+                                        "endIndex": 12,
+                                        "textRun": { "content": "Intro line\n" }
+                                    }]
+                                }
+                            },
+                            {
+                                "startIndex": 12,
+                                "endIndex": 22,
+                                "paragraph": {
+                                    "bullet": { "listId": "list-1", "nestingLevel": 0 },
+                                    "elements": [{
+                                        "startIndex": 12,
+                                        "endIndex": 22,
+                                        "textRun": { "content": "List item\n" }
+                                    }]
+                                }
+                            }
+                        ]
+                    }
+                }))
+                .expect("list document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:12"),
+                content: "Intro edited".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .get("deleteParagraphBullets")
+                    .is_some()
+            }),
+            "expected non-list block updates to clear inherited list bullets"
         );
     }
 
