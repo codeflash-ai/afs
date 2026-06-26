@@ -854,15 +854,15 @@ fn docs_text_requests_from_parsed(
     }
     requests.extend(
         docs_text
-            .style_ranges
-            .into_iter()
-            .map(|range| text_style_request(location_index, range, style_source)),
-    );
-    requests.extend(
-        docs_text
             .paragraph_styles
             .into_iter()
             .map(|range| paragraph_style_request(location_index, range)),
+    );
+    requests.extend(
+        docs_text
+            .style_ranges
+            .into_iter()
+            .map(|range| text_style_request(location_index, range, style_source)),
     );
     requests.extend(
         merge_adjacent_bullet_ranges(docs_text.bullet_ranges)
@@ -1944,13 +1944,28 @@ mod tests {
         assert_eq!(update_text_style.range.start_index, 1);
         assert_eq!(update_text_style.range.end_index, 32);
         assert_eq!(update_text_style.text_style.bold, Some(false));
-        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[4] else {
+        let DocsRequest::UpdateParagraphStyle {
+            update_paragraph_style,
+        } = &batch.requests[4]
+        else {
+            panic!("expected paragraph style request");
+        };
+        assert_eq!(update_paragraph_style.range.start_index, 1);
+        assert_eq!(update_paragraph_style.range.end_index, 32);
+        assert_eq!(
+            update_paragraph_style
+                .paragraph_style
+                .named_style_type
+                .as_deref(),
+            Some("NORMAL_TEXT")
+        );
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[5] else {
             panic!("expected age style request");
         };
         assert_eq!(update_text_style.range.start_index, 1);
         assert_eq!(update_text_style.range.end_index, 5);
         assert_eq!(update_text_style.text_style.bold, Some(true));
-        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[5] else {
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[6] else {
             panic!("expected weight style request");
         };
         assert_eq!(update_text_style.range.start_index, 14);
@@ -2152,7 +2167,19 @@ mod tests {
             "Styled: Bold Italic Under Strike Link Plain edited"
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[4]).expect("bold style json"),
+            serde_json::to_value(&batch.requests[4]).expect("paragraph style json"),
+            serde_json::json!({
+                "updateParagraphStyle": {
+                    "range": { "startIndex": 1, "endIndex": 51 },
+                    "paragraphStyle": {
+                        "namedStyleType": "NORMAL_TEXT"
+                    },
+                    "fields": "namedStyleType"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[5]).expect("bold style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 9, "endIndex": 13 },
@@ -2162,7 +2189,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[5]).expect("italic style json"),
+            serde_json::to_value(&batch.requests[6]).expect("italic style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 14, "endIndex": 20 },
@@ -2172,7 +2199,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[6]).expect("underline style json"),
+            serde_json::to_value(&batch.requests[7]).expect("underline style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 21, "endIndex": 26 },
@@ -2182,7 +2209,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[7]).expect("strike style json"),
+            serde_json::to_value(&batch.requests[8]).expect("strike style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 27, "endIndex": 33 },
@@ -2192,7 +2219,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[8]).expect("link underline style json"),
+            serde_json::to_value(&batch.requests[9]).expect("link underline style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 34, "endIndex": 38 },
@@ -2202,7 +2229,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[9]).expect("link style json"),
+            serde_json::to_value(&batch.requests[10]).expect("link style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 34, "endIndex": 38 },
@@ -2308,7 +2335,19 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(&batch.requests[4]).expect("age style json"),
+            serde_json::to_value(&batch.requests[4]).expect("paragraph style json"),
+            serde_json::json!({
+                "updateParagraphStyle": {
+                    "range": { "startIndex": 1, "endIndex": 13 },
+                    "paragraphStyle": {
+                        "namedStyleType": "NORMAL_TEXT"
+                    },
+                    "fields": "namedStyleType"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[5]).expect("age style json"),
             serde_json::json!({
                 "updateTextStyle": {
                     "range": { "startIndex": 1, "endIndex": 4 },
@@ -2327,17 +2366,98 @@ mod tests {
                 }
             })
         );
-        assert_eq!(
-            serde_json::to_value(&batch.requests[5]).expect("paragraph style json"),
-            serde_json::json!({
-                "updateParagraphStyle": {
-                    "range": { "startIndex": 1, "endIndex": 13 },
-                    "paragraphStyle": {
-                        "namedStyleType": "NORMAL_TEXT"
-                    },
-                    "fields": "namedStyleType"
-                }
+    }
+
+    #[test]
+    fn apply_restores_inline_styles_after_paragraph_style_reset() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Pet Resume",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 14,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 5,
+                                        "textRun": {
+                                            "content": "Age:",
+                                            "textStyle": {
+                                                "bold": true,
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.67058825,
+                                                            "blue": 0.26666668
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 5,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": " 4 years\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:14"),
+                content: "**Age:** 5 years".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
             })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            matches!(
+                batch.requests.last(),
+                Some(DocsRequest::UpdateTextStyle { update_text_style })
+                    if update_text_style.range.start_index == 1
+                        && update_text_style.range.end_index == 5
+                        && update_text_style.text_style.bold == Some(true)
+                        && update_text_style.text_style.foreground_color.is_some()
+                        && update_text_style.fields == "bold,foregroundColor"
+            ),
+            "the inline style restore must be the final style-affecting request: {:#?}",
+            batch.requests
         );
     }
 
