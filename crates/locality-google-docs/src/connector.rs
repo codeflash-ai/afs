@@ -1016,7 +1016,16 @@ fn docs_block_text(content: &str) -> DocsText {
     let trimmed = content.trim_start();
     let (_, block_kind) = markdown_block_content(trimmed);
     if matches!(block_kind, MarkdownBlockKind::Paragraph) {
-        return docs_text(content);
+        let mut parsed = docs_text(content);
+        let end = docs_text_len(&parsed.text);
+        if end > 0 {
+            parsed.paragraph_styles.push(DocsParagraphStyleRange {
+                start: 0,
+                end,
+                named_style_type: "NORMAL_TEXT".to_string(),
+            });
+        }
+        return parsed;
     }
 
     let mut parsed = DocsText::default();
@@ -1940,7 +1949,7 @@ mod tests {
             .unwrap()
             .clone()
             .expect("batch update");
-        assert_eq!(batch.requests.len(), 5);
+        assert_eq!(batch.requests.len(), 6);
         assert_eq!(
             serde_json::to_value(&batch.requests[2]).expect("style reset json"),
             serde_json::json!({
@@ -1973,6 +1982,18 @@ mod tests {
                         }
                     },
                     "fields": "bold,foregroundColor"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[5]).expect("paragraph style json"),
+            serde_json::json!({
+                "updateParagraphStyle": {
+                    "range": { "startIndex": 1, "endIndex": 14 },
+                    "paragraphStyle": {
+                        "namedStyleType": "NORMAL_TEXT"
+                    },
+                    "fields": "namedStyleType"
                 }
             })
         );
@@ -2321,6 +2342,75 @@ mod tests {
                     ))
             }),
             "expected list update to preserve bullet shape without literal marker"
+        );
+    }
+
+    #[test]
+    fn update_block_clears_heading_style_when_markdown_heading_marker_is_removed() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Shape Doc",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 13,
+                                "paragraph": {
+                                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                                    "elements": [{
+                                        "startIndex": 1,
+                                        "endIndex": 13,
+                                        "textRun": { "content": "Old Heading\n" }
+                                    }]
+                                }
+                            }
+                        ]
+                    }
+                }))
+                .expect("heading document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:13"),
+                content: "Plain paragraph now".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("NORMAL_TEXT".to_string()))
+            }),
+            "expected plain Markdown block to clear existing heading style"
         );
     }
 
