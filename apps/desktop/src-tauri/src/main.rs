@@ -2698,7 +2698,7 @@ fn current_desktop_build_id() -> String {
 }
 
 fn current_daemon_build_id() -> String {
-    DaemonBuildInfo::current().build_id
+    expected_daemon_build_info().build_id
 }
 
 fn install_marker_path(state_root: &Path) -> PathBuf {
@@ -4039,7 +4039,7 @@ fn desktop_projection_mode() -> ProjectionMode {
 }
 
 fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
-    let current_build = DaemonBuildInfo::current();
+    let current_build = expected_daemon_build_info();
     match running_daemon_build(state_root) {
         Some(build) if build == current_build => return Ok(()),
         Some(build) => {
@@ -4051,7 +4051,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
                     build.build_id, current_build.build_id
                 ),
             );
-            return restart_daemon_for_current_binary(state_root);
+            return restart_daemon_for_current_binary(state_root, &current_build);
         }
         None if daemon_is_ready(state_root) => {
             desktop_log(
@@ -4059,7 +4059,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
                 "daemon.missing_build_metadata",
                 "detected an older localityd without build metadata; restarting localityd",
             );
-            return restart_daemon_for_current_binary(state_root);
+            return restart_daemon_for_current_binary(state_root, &current_build);
         }
         None => {}
     }
@@ -4077,18 +4077,62 @@ fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
     }
 }
 
-fn restart_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
+fn restart_daemon_for_current_binary(
+    state_root: &Path,
+    expected_build: &DaemonBuildInfo,
+) -> Result<(), String> {
     let _ = run_daemon_control(&daemon_control_args_any_manager("stop", state_root));
     start_daemon_for_current_binary(state_root)?;
     match running_daemon_build(state_root) {
-        Some(build) if build == DaemonBuildInfo::current() => Ok(()),
+        Some(build) if &build == expected_build => Ok(()),
         Some(build) => Err(format!(
             "localityd restarted, but reported build {} instead of {}.",
-            build.build_id,
-            DaemonBuildInfo::current().build_id
+            build.build_id, expected_build.build_id
         )),
         None => Err("localityd restarted, but did not report build metadata.".to_string()),
     }
+}
+
+fn expected_daemon_build_info() -> DaemonBuildInfo {
+    let Some(binary) = bundled_localityd_binary() else {
+        return DaemonBuildInfo::current();
+    };
+    match daemon_build_info_from_binary(&binary) {
+        Ok(build) => build,
+        Err(message) => {
+            desktop_log(
+                "warn",
+                "daemon.bundled_build_probe_failed",
+                format!(
+                    "could not read bundled localityd build metadata from {}: {}; falling back to linked daemon build metadata",
+                    binary.display(),
+                    message
+                ),
+            );
+            DaemonBuildInfo::current()
+        }
+    }
+}
+
+fn daemon_build_info_from_binary(binary: &Path) -> Result<DaemonBuildInfo, String> {
+    let mut command = Command::new(binary);
+    command.arg("--build-info");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("process exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    parse_daemon_build_info_json(&output.stdout)
+}
+
+fn parse_daemon_build_info_json(output: &[u8]) -> Result<DaemonBuildInfo, String> {
+    serde_json::from_slice(output).map_err(|error| error.to_string())
 }
 
 fn daemon_control_args(action: &str, state_root: &Path) -> Vec<String> {
@@ -4783,7 +4827,8 @@ fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
                     error.message
                 ),
             );
-            restart_daemon_for_current_binary(state_root)?;
+            let current_build = expected_daemon_build_info();
+            restart_daemon_for_current_binary(state_root, &current_build)?;
             reload_daemon_mounts_once(state_root).map_err(|retry_error| {
                 format!(
                     "Could not reload localityd mounts after restarting localityd for the current state schema: {}",
@@ -6344,6 +6389,7 @@ mod tests {
         ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
         MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
     };
+    use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
@@ -6360,14 +6406,14 @@ mod tests {
         live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_remote_pull_candidates,
         live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
         live_mode_tick_from_snapshot, load_desktop_activity, mount_has_pending_local_changes,
-        mount_has_unfinished_journals, notion_id_from_url, pending_changes_from_status,
-        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
-        push_action_message, record_current_install_marker, record_desktop_activity,
-        sample_auto_save_status, sample_snapshot, shell_single_quote, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
-        terminal_cli_link_state, tray_icon_image, tray_popover_position, unique_suffix,
-        validate_mount_root, virtual_projection_refresh_signal_identifiers,
-        write_terminal_cli_path_section,
+        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
+        pending_changes_from_status, preserve_mount_pending_local_changes, pull_error_message,
+        pull_report_message, push_action_message, record_current_install_marker,
+        record_desktop_activity, sample_auto_save_status, sample_snapshot, shell_single_quote,
+        should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
+        tray_popover_position, unique_suffix, validate_mount_root,
+        virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -6434,6 +6480,20 @@ mod tests {
         assert!(error.contains("pending changes"));
         assert!(error.contains("engineering-wiki/daily-standup/page.md"));
         assert!(error.contains("engineering-wiki/standups-with-locality/daily-standup/page.md"));
+    }
+
+    #[test]
+    fn daemon_build_info_parser_reads_sidecar_metadata() {
+        let parsed = parse_daemon_build_info_json(br#"{"version":"0.1.3","build_id":"build-123"}"#)
+            .expect("parse build info");
+
+        assert_eq!(
+            parsed,
+            DaemonBuildInfo {
+                version: "0.1.3".to_string(),
+                build_id: "build-123".to_string(),
+            }
+        );
     }
 
     #[test]
