@@ -537,17 +537,27 @@ fn apply_plan(
             | PushOperation::ReplaceBlock { block_id, content } => {
                 let range = GoogleBlockRange::parse(block_id)?;
                 let document = docs.get_document(&range.document_id)?;
+                let final_block = range.end_index == document_end_index(&document);
+                let delete_end_index = if final_block && range.end_index > range.start_index {
+                    range.end_index - 1
+                } else {
+                    range.end_index
+                };
                 let mut requests = vec![DocsRequest::DeleteContentRange {
                     delete_content_range: DeleteContentRangeRequest {
                         range: Range {
                             start_index: range.start_index,
-                            end_index: range.end_index,
+                            end_index: delete_end_index,
                         },
                     },
                 }];
-                requests.extend(docs_block_text_requests_with_style_source(
+                let mut docs_text = docs_block_text(content);
+                if final_block {
+                    strip_trailing_segment_newline(&mut docs_text);
+                }
+                requests.extend(docs_text_requests_from_parsed(
                     range.start_index,
-                    content,
+                    docs_text,
                     Some(DocsTextStyleSource {
                         document: &document,
                         start_index: range.start_index,
@@ -791,14 +801,6 @@ fn docs_document_text_requests(location_index: usize, content: &str) -> Vec<Docs
     docs_text_requests_from_parsed(location_index, docs_document_text(content), None)
 }
 
-fn docs_block_text_requests_with_style_source(
-    location_index: usize,
-    content: &str,
-    style_source: Option<DocsTextStyleSource<'_>>,
-) -> Vec<DocsRequest> {
-    docs_text_requests_from_parsed(location_index, docs_block_text(content), style_source)
-}
-
 fn docs_text_requests_from_parsed(
     location_index: usize,
     docs_text: DocsText,
@@ -1040,6 +1042,39 @@ fn docs_block_text(content: &str) -> DocsText {
         parsed.text.push('\n');
     }
     parsed
+}
+
+fn strip_trailing_segment_newline(docs_text: &mut DocsText) {
+    if !docs_text.text.ends_with('\n') {
+        return;
+    }
+    let old_len = docs_text_len(&docs_text.text);
+    docs_text.text.pop();
+    let new_len = docs_text_len(&docs_text.text);
+    for range in &mut docs_text.style_ranges {
+        if range.end == old_len {
+            range.end = new_len;
+        }
+    }
+    docs_text
+        .style_ranges
+        .retain(|range| range.end > range.start);
+    for range in &mut docs_text.paragraph_styles {
+        if range.end == old_len {
+            range.end = new_len;
+        }
+    }
+    docs_text
+        .paragraph_styles
+        .retain(|range| range.end > range.start);
+    for range in &mut docs_text.bullet_ranges {
+        if range.end == old_len {
+            range.end = new_len;
+        }
+    }
+    docs_text
+        .bullet_ranges
+        .retain(|range| range.end > range.start);
 }
 
 fn parse_docs_markdown_blocks(content: &str) -> DocsText {
@@ -1837,7 +1872,7 @@ mod tests {
         let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
             panic!("expected insert text request");
         };
-        assert_eq!(insert_text.text, format!("{literal}\n"));
+        assert_eq!(insert_text.text, literal);
         assert_eq!(
             batch
                 .requests
@@ -1892,7 +1927,7 @@ mod tests {
         };
         assert_eq!(
             insert_text.text,
-            "Styled: Bold Italic Under Strike Link Plain edited\n"
+            "Styled: Bold Italic Under Strike Link Plain edited"
         );
         assert_eq!(
             serde_json::to_value(&batch.requests[4]).expect("bold style json"),
@@ -2039,7 +2074,7 @@ mod tests {
             serde_json::to_value(&batch.requests[2]).expect("style reset json"),
             serde_json::json!({
                 "updateTextStyle": {
-                    "range": { "startIndex": 1, "endIndex": 14 },
+                    "range": { "startIndex": 1, "endIndex": 13 },
                     "textStyle": {
                         "bold": false,
                         "italic": false,
@@ -2074,7 +2109,7 @@ mod tests {
             serde_json::to_value(&batch.requests[5]).expect("paragraph style json"),
             serde_json::json!({
                 "updateParagraphStyle": {
-                    "range": { "startIndex": 1, "endIndex": 14 },
+                    "range": { "startIndex": 1, "endIndex": 13 },
                     "paragraphStyle": {
                         "namedStyleType": "NORMAL_TEXT"
                     },
@@ -2416,7 +2451,7 @@ mod tests {
         let DocsRequest::InsertText { insert_text } = &list_batch.requests[1] else {
             panic!("expected list insert text request");
         };
-        assert_eq!(insert_text.text, "Bullet alpha edited\n");
+        assert_eq!(insert_text.text, "Bullet alpha edited");
         assert!(
             list_batch.requests.iter().any(|request| {
                 serde_json::to_value(request)
@@ -2497,6 +2532,53 @@ mod tests {
             }),
             "expected plain Markdown block to clear existing heading style"
         );
+    }
+
+    #[test]
+    fn update_final_block_preserves_google_docs_segment_newline() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Final Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Final Doc",
+            "rev-1",
+            "Original\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:10"),
+                content: "Updated".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let delete_range = first_delete_range(&batch);
+        assert_eq!(delete_range.start_index, 1);
+        assert_eq!(delete_range.end_index, 9);
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.text, "Updated");
     }
 
     #[test]
