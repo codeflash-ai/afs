@@ -248,6 +248,29 @@ p {
   line-height: 1.45;
 }
 
+.live-mode-intro {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  max-width: 560px;
+  margin-top: 13px;
+  padding: 10px 11px;
+  border: 1px solid rgba(15, 118, 110, 0.15);
+  border-radius: 10px;
+  background: rgba(236, 253, 245, 0.68);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.42;
+}
+
+.live-mode-intro svg {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  color: #0f766e;
+}
+
 .sync-note {
   display: inline-flex;
   align-items: center;

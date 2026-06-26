@@ -62,6 +62,7 @@ type DesktopSnapshot = {
     status: string;
     provider?: ProviderRuntimeSummary | null;
   };
+  needsOnboarding: boolean;
   settings: {
     launchAtLogin: boolean;
     showMenuBar: boolean;
@@ -192,6 +193,7 @@ const sampleSnapshot: DesktopSnapshot = {
     status: "ready",
     provider: null,
   },
+  needsOnboarding: false,
   settings: {
     launchAtLogin: true,
     showMenuBar: true,
@@ -275,6 +277,7 @@ const loadingSnapshot: DesktopSnapshot = {
     status: "loading",
     provider: null,
   },
+  needsOnboarding: false,
   pendingChanges: [],
   activity: [],
 };
@@ -293,6 +296,7 @@ const snapshotLoadFailed: DesktopSnapshot = {
     ...loadingSnapshot.mount,
     status: "unknown",
   },
+  needsOnboarding: false,
 };
 
 const samplePushPlan: PushPlan = {
@@ -355,6 +359,29 @@ function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallRepor
 
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function routeForcesMainApp(route: string) {
+  return route === "#app";
+}
+
+function routeForcesOnboarding(route: string) {
+  return route === "#onboarding" || route === "#onboarding-ready";
+}
+
+function previewRouteStartsOnboarding(route: string) {
+  return !isTauriRuntime() && (route === "" || route === "#");
+}
+
+function snapshotNeedsOnboarding(snapshot: DesktopSnapshot) {
+  return snapshot.needsOnboarding || connectionMissing(snapshot) || mountMissing(snapshot);
+}
+
+function routeShouldShowOnboarding(route: string, snapshot: DesktopSnapshot) {
+  if (route === "#tray" || routeForcesMainApp(route)) {
+    return false;
+  }
+  return routeForcesOnboarding(route) || previewRouteStartsOnboarding(route) || snapshotNeedsOnboarding(snapshot);
 }
 
 async function callCommand<T>(command: string, args?: Record<string, unknown>, fallback?: T) {
@@ -444,16 +471,19 @@ function useNotionSearchResults(query: string, enabled = true) {
 }
 
 export default function App() {
+  const initialRoute = window.location.hash;
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(() =>
     isTauriRuntime() ? loadingSnapshot : sampleSnapshot,
   );
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
-  const route = window.location.hash;
-  const [showOnboarding, setShowOnboarding] = useState(() => route === "#onboarding-ready");
+  const [route, setRoute] = useState(initialRoute);
+  const [showOnboarding, setShowOnboarding] = useState(() =>
+    routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
+  );
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
-    route === "#onboarding-ready" ? 4 : 1,
+    initialRoute === "#onboarding-ready" ? 4 : 1,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
   const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
@@ -603,17 +633,36 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const handleHashChange = () => setRoute(window.location.hash);
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
+  useEffect(() => {
     if (!snapshotLoaded || route === "#tray") {
       return;
     }
 
     if (route === "#onboarding-ready") {
+      setOnboardingInitialStep(4);
+      setShowOnboarding(true);
+      return;
+    }
+
+    if (routeShouldShowOnboarding(route, snapshot)) {
+      setOnboardingInitialStep(1);
       setShowOnboarding(true);
       return;
     }
 
     setShowOnboarding(false);
-  }, [route, snapshotLoaded]);
+  }, [
+    route,
+    snapshot.connection.status,
+    snapshot.mount.status,
+    snapshot.needsOnboarding,
+    snapshotLoaded,
+  ]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -670,7 +719,10 @@ export default function App() {
     return <TrayPopover snapshot={snapshot} />;
   }
 
-  if (showOnboarding) {
+  const shouldRenderOnboarding =
+    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot));
+
+  if (shouldRenderOnboarding) {
     return (
       <Onboarding
         key={onboardingKey}
@@ -684,6 +736,10 @@ export default function App() {
         }}
       />
     );
+  }
+
+  if (isTauriRuntime() && !snapshotLoaded && !routeForcesMainApp(route)) {
+    return <SetupLoading />;
   }
 
   return (
@@ -704,6 +760,26 @@ export default function App() {
         setShowOnboarding(true);
       }}
     />
+  );
+}
+
+function SetupLoading() {
+  return (
+    <main className="setup-shell">
+      <section className="setup-window">
+        <WindowChrome title="Locality Setup" meta="Checking" />
+        <SetupContent mark={<BrandTile>Locality</BrandTile>}>
+          <div>
+            <div className="sync-note">
+              <Loader2 className="spin" />
+              Checking setup
+            </div>
+            <h1>Checking your Locality setup</h1>
+            <p>Locality is checking your Notion connection and local folder.</p>
+          </div>
+        </SetupContent>
+      </section>
+    </main>
   );
 }
 
@@ -1059,9 +1135,13 @@ function Onboarding({
             <div>
               <h1>Locality is ready</h1>
               <p>
-                Your Notion folder is mounted. Locality will keep syncing the workspace quietly in the
-                background while agents edit local Markdown.
+                Your Notion folder is mounted. Agents can edit local Markdown now, and Locality
+                will keep review controls close when those edits are ready.
               </p>
+            </div>
+            <div className="live-mode-intro">
+              <Zap />
+              <span>Live Mode can watch this folder, sync safe edits, and pause when a change needs review.</span>
             </div>
             <div className="ready-folder">
               <FolderOpen />

@@ -126,6 +126,7 @@ struct DesktopSnapshot {
     health: AppHealth,
     connection: ConnectionSummary,
     mount: MountSummary,
+    needs_onboarding: bool,
     settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
     activity: Vec<ActivityItem>,
@@ -1380,6 +1381,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let journals = store.list_journal().unwrap_or_default();
     let mount = choose_mount(&mounts);
     let connection = choose_connection(&connections, mount.as_ref());
+    let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
     let provider = mount
         .as_ref()
         .and_then(|mount| provider_runtime_summary(&state_root, mount));
@@ -1401,6 +1403,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
         },
         connection: connection_summary(connection.as_ref()),
         mount: mount_summary(Some(&store), mount.as_ref(), connection.as_ref(), provider),
+        needs_onboarding,
         settings: desktop_settings(),
         pending_changes,
         activity: activity_from_journals(&journals, &store, &state_root),
@@ -1435,6 +1438,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             status: "error".to_string(),
             provider: None,
         },
+        needs_onboarding: false,
         settings: desktop_settings(),
         pending_changes: Vec::new(),
         activity: vec![ActivityItem {
@@ -1459,6 +1463,13 @@ fn choose_mount(mounts: &[MountConfig]) -> Option<MountConfig> {
         .find(|mount| mount.connector == "notion")
         .or_else(|| mounts.first())
         .cloned()
+}
+
+fn desktop_needs_onboarding(
+    connection: Option<&ConnectionRecord>,
+    mount: Option<&MountConfig>,
+) -> bool {
+    !matches!(connection, Some(connection) if connection.status == "active") || mount.is_none()
 }
 
 fn choose_connection(
@@ -6353,6 +6364,32 @@ mod tests {
     }
 
     #[test]
+    fn desktop_onboarding_is_required_until_active_connection_and_mount_exist() {
+        let active_connection = test_connection("workspace-1", "Synergy Labs");
+        let mut inactive_connection = active_connection.clone();
+        inactive_connection.status = "revoked".to_string();
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion",
+        );
+
+        assert!(super::desktop_needs_onboarding(None, None));
+        assert!(super::desktop_needs_onboarding(
+            Some(&inactive_connection),
+            Some(&mount),
+        ));
+        assert!(super::desktop_needs_onboarding(
+            Some(&active_connection),
+            None,
+        ));
+        assert!(!super::desktop_needs_onboarding(
+            Some(&active_connection),
+            Some(&mount),
+        ));
+    }
+
+    #[test]
     fn live_mode_tick_noops_without_pending_changes() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
@@ -7948,6 +7985,7 @@ fn sample_snapshot() -> DesktopSnapshot {
             status: "ready".to_string(),
             provider: None,
         },
+        needs_onboarding: false,
         settings: DesktopSettings {
             launch_at_login: true,
             show_menu_bar: true,
