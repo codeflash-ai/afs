@@ -122,6 +122,8 @@ pub struct TextStyle {
     pub background_color: Option<serde_json::Value>,
     #[serde(default)]
     pub baseline_offset: Option<String>,
+    #[serde(default)]
+    pub font_size: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +326,8 @@ pub struct TextStylePatch {
     pub background_color: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_offset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<Link>,
 }
