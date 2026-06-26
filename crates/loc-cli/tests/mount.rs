@@ -226,6 +226,49 @@ fn mount_options_preserve_google_docs_workspace_folder_id_from_resolver() {
     );
 }
 
+#[test]
+fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
+    let fixture = MountFixture::new("loc-cli-duplicate-mount-point");
+    let mut store = InMemoryStateStore::new();
+    let first_root = fixture.root.join("notion-main");
+    let duplicate_root = fixture.root.join("notion-main");
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: first_root,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work-a")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("first mount");
+
+    let error = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-my-company"),
+            connector: "notion".to_string(),
+            root: duplicate_root,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work-b")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect_err("duplicate mount point rejected");
+
+    assert_eq!(error.code(), "mount_point_conflict");
+    assert!(
+        error
+            .message()
+            .contains("already uses mount point `notion-main` under")
+    );
+}
+
 struct MountFixture {
     root: PathBuf,
 }

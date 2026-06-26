@@ -78,6 +78,10 @@ where
     S: MountRepository,
 {
     let root = absolute_path(&options.root)?;
+    if options.projection.uses_virtual_filesystem() {
+        reject_duplicate_virtual_mount_point(store, &options.mount_id, &root, &options.projection)?;
+    }
+
     std::fs::create_dir_all(&root).map_err(|error| MountError::CreateRoot {
         path: root.clone(),
         message: error.to_string(),
@@ -113,11 +117,25 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountError {
-    CreateRoot { path: PathBuf, message: String },
+    CreateRoot {
+        path: PathBuf,
+        message: String,
+    },
     CurrentDir(String),
-    ReadGuidance { path: PathBuf, message: String },
+    MountPointConflict {
+        root: PathBuf,
+        mount_point: String,
+        existing_mount_id: MountId,
+    },
+    ReadGuidance {
+        path: PathBuf,
+        message: String,
+    },
     Store(StoreError),
-    WriteGuidance { path: PathBuf, message: String },
+    WriteGuidance {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl MountError {
@@ -125,6 +143,7 @@ impl MountError {
         match self {
             Self::CreateRoot { .. } => "create_mount_root_failed",
             Self::CurrentDir(_) => "current_dir_failed",
+            Self::MountPointConflict { .. } => "mount_point_conflict",
             Self::ReadGuidance { .. } => "read_mount_guidance_failed",
             Self::Store(_) => "store_error",
             Self::WriteGuidance { .. } => "write_mount_guidance_failed",
@@ -140,6 +159,15 @@ impl MountError {
                 )
             }
             Self::CurrentDir(message) => format!("failed to resolve current directory: {message}"),
+            Self::MountPointConflict {
+                root,
+                mount_point,
+                existing_mount_id,
+            } => format!(
+                "mount `{}` already uses mount point `{mount_point}` under `{}`",
+                existing_mount_id.0,
+                root.display()
+            ),
             Self::ReadGuidance { path, message } => {
                 format!(
                     "failed to read mount guidance `{}`: {message}",
@@ -155,6 +183,41 @@ impl MountError {
             }
         }
     }
+}
+
+fn reject_duplicate_virtual_mount_point<S>(
+    store: &S,
+    mount_id: &MountId,
+    root: &Path,
+    projection: &ProjectionMode,
+) -> Result<(), MountError>
+where
+    S: MountRepository,
+{
+    let proposed =
+        MountConfig::new(mount_id.clone(), "pending", root).projection(projection.clone());
+    let proposed_root = localityd::virtual_fs::virtual_projection_root(&proposed);
+    let proposed_mount_point = localityd::virtual_fs::mount_point_directory_name(&proposed);
+
+    for existing in store.load_mounts().map_err(MountError::Store)? {
+        if existing.mount_id == *mount_id || existing.projection != *projection {
+            continue;
+        }
+        if !existing.projection.uses_virtual_filesystem() {
+            continue;
+        }
+        if localityd::virtual_fs::virtual_projection_root(&existing) == proposed_root
+            && localityd::virtual_fs::mount_point_directory_name(&existing) == proposed_mount_point
+        {
+            return Err(MountError::MountPointConflict {
+                root: proposed_root,
+                mount_point: proposed_mount_point,
+                existing_mount_id: existing.mount_id,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn install_mount_guidance(root: &Path, connector: &str) -> Result<MountGuidanceReport, MountError> {

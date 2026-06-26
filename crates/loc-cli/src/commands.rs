@@ -4696,10 +4696,15 @@ fn daemon_command_error(json: bool, error: DaemonControlError) -> i32 {
 }
 
 fn mount_command_error(json: bool, error: MountError) -> i32 {
+    let exit_code = match &error {
+        MountError::MountPointConflict { .. } => EXIT_USAGE,
+        _ => EXIT_INTERNAL,
+    };
+
     command_error(
         json,
         CommandError::new("mount", error.code(), error.message()),
-        EXIT_INTERNAL,
+        exit_code,
     )
 }
 
