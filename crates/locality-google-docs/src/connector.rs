@@ -11,7 +11,7 @@ use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::journal::JournalApplyEffect;
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{page_container_path, page_document_path};
-use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
+use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
@@ -318,16 +318,22 @@ impl Connector for GoogleDocsConnector {
                 continue;
             };
             let current = self.remote_version(&precondition.remote_id)?;
-            if expected != current.as_str() {
-                return Err(LocalityError::Conflict(
-                    locality_core::conflict::ConflictSummary {
-                        remote_id: precondition.remote_id.clone(),
-                        path: PathBuf::from(precondition.remote_id.as_str()),
-                        remote_path: PathBuf::from(precondition.remote_id.as_str()),
-                        reason: locality_core::conflict::ConflictReason::RemoteMovedDuringPush,
-                    },
-                ));
+            if expected == current.as_str() {
+                continue;
             }
+            if docs_revision_matches(expected, current.as_str())
+                && plan_changes_only_document_body(request.plan, &precondition.remote_id)
+            {
+                continue;
+            }
+            return Err(LocalityError::Conflict(
+                locality_core::conflict::ConflictSummary {
+                    remote_id: precondition.remote_id.clone(),
+                    path: PathBuf::from(precondition.remote_id.as_str()),
+                    remote_path: PathBuf::from(precondition.remote_id.as_str()),
+                    reason: locality_core::conflict::ConflictReason::RemoteMovedDuringPush,
+                },
+            ));
         }
         Ok(())
     }
@@ -339,6 +345,64 @@ impl Connector for GoogleDocsConnector {
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         Err(LocalityError::Unsupported("google docs undo"))
     }
+}
+
+fn docs_revision_matches(expected: &str, current: &str) -> bool {
+    match (
+        docs_revision_from_remote_version(expected),
+        docs_revision_from_remote_version(current),
+    ) {
+        (Some(expected), Some(current)) => expected == current,
+        _ => false,
+    }
+}
+
+fn docs_revision_from_remote_version(version: &str) -> Option<&str> {
+    version
+        .rsplit_once("|docs:")
+        .map(|(_, revision)| revision)
+        .or_else(|| version.strip_prefix("docs:"))
+}
+
+fn plan_changes_only_document_body(plan: &PushPlan, remote_id: &RemoteId) -> bool {
+    let mut body_change = false;
+    for operation in &plan.operations {
+        match operation {
+            PushOperation::UpdateBlock { block_id, .. }
+            | PushOperation::ReplaceBlock { block_id, .. }
+            | PushOperation::ArchiveBlock { block_id } => {
+                if operation_targets_document(block_id, remote_id) {
+                    body_change = true;
+                }
+            }
+            PushOperation::AppendBlock { parent_id, .. } if parent_id == remote_id => {
+                body_change = true;
+            }
+            PushOperation::UpdateMedia { block_id, .. }
+            | PushOperation::MoveBlock { block_id, .. }
+                if operation_targets_document(block_id, remote_id) =>
+            {
+                return false;
+            }
+            PushOperation::UpdateProperties { entity_id, .. }
+            | PushOperation::ArchiveEntity { entity_id }
+                if entity_id == remote_id =>
+            {
+                return false;
+            }
+            PushOperation::CreateEntity { parent_id, .. } if parent_id == remote_id => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    body_change
+}
+
+fn operation_targets_document(block_id: &RemoteId, remote_id: &RemoteId) -> bool {
+    GoogleBlockRange::parse(block_id)
+        .map(|range| range.document_id == remote_id.0)
+        .unwrap_or(false)
 }
 
 impl GoogleDocsConnector {
@@ -1589,6 +1653,44 @@ mod tests {
                 .trashed,
             Some(true)
         );
+    }
+
+    #[test]
+    fn concurrency_allows_drive_only_version_drift_when_docs_revision_matches() {
+        let mut file = doc_file("doc-1", "Launch Brief", "workspace");
+        file.version = Some("8".to_string());
+        let drive = Arc::new(FakeDrive::default().with_file(file));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::AppendBlock {
+                parent_id: RemoteId::new("doc-1"),
+                after: Some(RemoteId::new("doc-1:1:7")),
+                content: "Local body edit".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:append_block:doc-1".to_string())];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1".to_string()),
+        }];
+
+        connector
+            .check_concurrency(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect("drive-only version drift should not block body push");
     }
 
     #[test]
