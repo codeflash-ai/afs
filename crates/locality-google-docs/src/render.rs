@@ -399,7 +399,18 @@ fn render_table(document: &GoogleDocument, table: &Table) -> String {
 }
 
 fn markdown_table_row(cells: &[String]) -> String {
-    format!("| {} |", cells.join(" | "))
+    format!(
+        "| {} |",
+        cells
+            .iter()
+            .map(|cell| markdown_table_cell(cell))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    )
+}
+
+fn markdown_table_cell(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('|', "\\|")
 }
 
 fn heading_level(style: &str) -> Option<usize> {
@@ -712,6 +723,42 @@ mod tests {
         let rendered = render_google_document(&bundle).expect("render");
 
         assert_eq!(rendered.document.body, "  1. Alpha\n\n    1. Roman\n");
+    }
+
+    #[test]
+    fn render_escapes_markdown_table_cell_pipes() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Table Pipes"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Table Pipes",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 48, "table": {
+                            "tableRows": [
+                                { "tableCells": [
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Key\n" } }] } }] },
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Value\n" } }] } }] }
+                                ]},
+                                { "tableCells": [
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Owner | Reviewer\n" } }] } }] },
+                                    { "content": [{ "paragraph": { "elements": [{ "textRun": { "content": "Alex\n" } }] } }] }
+                                ]}
+                            ]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "| Key | Value |\n| --- | --- |\n| Owner \\| Reviewer | Alex |\n"
+        );
     }
 
     #[test]
