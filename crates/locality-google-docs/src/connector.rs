@@ -1410,8 +1410,7 @@ fn parse_link_style(content: &str, index: usize, parsed: &mut DocsText) -> Optio
     let label_close_offset = content[label_start..].find("](")?;
     let label_end = label_start + label_close_offset;
     let url_start = label_end + "](".len();
-    let url_close_offset = content[url_start..].find(')')?;
-    let url_end = url_start + url_close_offset;
+    let url_end = find_unescaped_char(content, url_start, ')')?;
     let start = docs_text_len(&parsed.text);
     append_parsed_inline(
         parsed,
@@ -1423,11 +1422,57 @@ fn parse_link_style(content: &str, index: usize, parsed: &mut DocsText) -> Optio
         start,
         end,
         DocsInlineStyle {
-            link: Some(content[url_start..url_end].to_string()),
+            link: Some(unescape_markdown_link_href(&content[url_start..url_end])),
             ..DocsInlineStyle::default()
         },
     );
     Some(url_end + ')'.len_utf8())
+}
+
+fn find_unescaped_char(content: &str, start: usize, needle: char) -> Option<usize> {
+    let mut index = start;
+    while index < content.len() {
+        let ch = content[index..].chars().next()?;
+        if ch == '\\' {
+            index += ch.len_utf8();
+            if let Some(escaped) = content[index..].chars().next() {
+                index += escaped.len_utf8();
+            }
+            continue;
+        }
+        if ch == needle {
+            return Some(index);
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn unescape_markdown_link_href(href: &str) -> String {
+    let mut unescaped = String::with_capacity(href.len());
+    let mut index = 0;
+    while index < href.len() {
+        let ch = href[index..].chars().next().expect("index inside href");
+        if ch == '\\' {
+            index += ch.len_utf8();
+            if let Some(escaped) = href[index..].chars().next() {
+                if matches!(escaped, '\\' | '(' | ')') {
+                    unescaped.push(escaped);
+                    index += escaped.len_utf8();
+                    continue;
+                }
+                unescaped.push(ch);
+                unescaped.push(escaped);
+                index += escaped.len_utf8();
+                continue;
+            }
+            unescaped.push(ch);
+            continue;
+        }
+        unescaped.push(ch);
+        index += ch.len_utf8();
+    }
+    unescaped
 }
 
 fn append_parsed_inline(parsed: &mut DocsText, inline: &DocsText) {
@@ -2025,6 +2070,34 @@ mod tests {
                 .count(),
             1,
             "escaped literal markers should not emit inline style requests beyond the reset"
+        );
+    }
+
+    #[test]
+    fn apply_decodes_escaped_parentheses_in_markdown_link_hrefs() {
+        let parsed = docs_block_text(
+            "[<u>Reference v2</u>](https://example.test/path\\(abc\\)?q=one\\(two\\)) link",
+        );
+
+        assert_eq!(parsed.text, "Reference v2 link\n");
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0
+                    && range.end == docs_text_len("Reference v2")
+                    && range.style.link.as_deref()
+                        == Some("https://example.test/path(abc)?q=one(two)")
+            }),
+            "expected escaped Markdown href parentheses to decode into one link style: {:#?}",
+            parsed.style_ranges
+        );
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0
+                    && range.end == docs_text_len("Reference v2")
+                    && range.style.underline
+            }),
+            "expected nested underline to remain scoped to the linked label: {:#?}",
+            parsed.style_ranges
         );
     }
 
