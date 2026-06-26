@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -460,6 +460,7 @@ fn apply_plan(
 ) -> LocalityResult<ApplyPlanResult> {
     let mut changed = BTreeSet::new();
     let mut effects = Vec::new();
+    let mut append_offsets: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
     for index in apply_operation_order(&request.plan.operations) {
         let operation = &request.plan.operations[index];
         let operation_id = request
@@ -509,13 +510,20 @@ fn apply_plan(
                 content,
             } => {
                 let document = docs.get_document(parent_id.as_str())?;
-                let index_position = after
+                let base_index = after
                     .as_ref()
                     .and_then(|after| GoogleBlockRange::parse(after).ok())
                     .map(|range| range.end_index)
                     .unwrap_or_else(|| document_end_index(&document));
-                let docs_text = docs_text(content);
-                let new_block_end = index_position + docs_text.text.encode_utf16().count();
+                let append_key = (
+                    parent_id.0.clone(),
+                    after.as_ref().map(|remote_id| remote_id.0.clone()),
+                );
+                let index_position =
+                    base_index + append_offsets.get(&append_key).copied().unwrap_or_default();
+                let docs_text = docs_block_text(content);
+                let inserted_len = docs_text_len(&docs_text.text);
+                let new_block_end = index_position + inserted_len;
                 let requests = docs_text_requests_from_parsed(index_position, docs_text, None);
                 docs.batch_update_document(
                     parent_id.as_str(),
@@ -524,6 +532,7 @@ fn apply_plan(
                         write_control: write_control(&document),
                     },
                 )?;
+                *append_offsets.entry(append_key).or_default() += inserted_len;
                 changed.insert(parent_id.clone());
                 effects.push(JournalApplyEffect::CreatedBlock {
                     operation_id,
@@ -2210,6 +2219,109 @@ mod tests {
                     ))
             }),
             "expected list update to preserve bullet shape without literal marker"
+        );
+    }
+
+    #[test]
+    fn append_block_converts_markdown_heading_and_list_markers_to_docs_shape() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "## Appended Section".to_string(),
+                },
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "- Appended bullet".to_string(),
+                },
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "1. Appended number".to_string(),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:append_block:doc-1".to_string()),
+            PushOperationId("push-1:1:append_block:doc-1".to_string()),
+            PushOperationId("push-1:2:append_block:doc-1".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let heading_batch = &batches[0].1;
+        let DocsRequest::InsertText { insert_text } = &heading_batch.requests[0] else {
+            panic!("expected heading insert text request");
+        };
+        assert_eq!(insert_text.location.index, 7);
+        assert_eq!(insert_text.text, "Appended Section\n");
+        assert!(
+            heading_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_2".to_string()))
+            }),
+            "expected appended heading to use paragraph style without literal marker"
+        );
+
+        let list_batch = &batches[1].1;
+        let DocsRequest::InsertText { insert_text } = &list_batch.requests[0] else {
+            panic!("expected list insert text request");
+        };
+        assert_eq!(insert_text.location.index, 24);
+        assert_eq!(insert_text.text, "Appended bullet\n");
+        assert!(
+            list_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "BULLET_DISC_CIRCLE_SQUARE".to_string(),
+                    ))
+            }),
+            "expected appended list item to use bullet shape without literal marker"
+        );
+
+        let ordered_list_batch = &batches[2].1;
+        let DocsRequest::InsertText { insert_text } = &ordered_list_batch.requests[0] else {
+            panic!("expected ordered list insert text request");
+        };
+        assert_eq!(insert_text.location.index, 40);
+        assert_eq!(insert_text.text, "Appended number\n");
+        assert!(
+            ordered_list_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "NUMBERED_DECIMAL_ALPHA_ROMAN".to_string(),
+                    ))
+            }),
+            "expected appended ordered list item to use numbered shape without literal marker"
         );
     }
 
