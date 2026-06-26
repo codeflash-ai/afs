@@ -817,6 +817,13 @@ struct DocsParagraphStyleRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsParagraphAlignmentRange {
+    start: usize,
+    end: usize,
+    alignment: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DocsBulletRange {
     start: usize,
     end: usize,
@@ -843,6 +850,9 @@ fn docs_text_requests_from_parsed(
     let preserved_baseline_ranges = style_source
         .map(|source| preserved_baseline_ranges(&inserted_text, source, &docs_text.style_ranges))
         .unwrap_or_default();
+    let preserved_paragraph_alignments = style_source
+        .map(|source| preserved_paragraph_alignments(&inserted_text, source))
+        .unwrap_or_default();
     let mut requests = vec![DocsRequest::InsertText {
         insert_text: InsertTextRequest {
             location: Location {
@@ -868,6 +878,11 @@ fn docs_text_requests_from_parsed(
             .paragraph_styles
             .into_iter()
             .map(|range| paragraph_style_request(location_index, range)),
+    );
+    requests.extend(
+        preserved_paragraph_alignments
+            .into_iter()
+            .map(|range| paragraph_alignment_request(location_index, range)),
     );
     requests.extend(
         preserved_color_ranges
@@ -985,8 +1000,28 @@ fn paragraph_style_request(location_index: usize, range: DocsParagraphStyleRange
             },
             paragraph_style: ParagraphStylePatch {
                 named_style_type: Some(range.named_style_type),
+                alignment: None,
             },
             fields: "namedStyleType".to_string(),
+        },
+    }
+}
+
+fn paragraph_alignment_request(
+    location_index: usize,
+    range: DocsParagraphAlignmentRange,
+) -> DocsRequest {
+    DocsRequest::UpdateParagraphStyle {
+        update_paragraph_style: UpdateParagraphStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            paragraph_style: ParagraphStylePatch {
+                named_style_type: None,
+                alignment: Some(range.alignment),
+            },
+            fields: "alignment".to_string(),
         },
     }
 }
@@ -1210,6 +1245,25 @@ fn preserved_baseline_ranges(
         .collect()
 }
 
+fn preserved_paragraph_alignments(
+    new_text: &str,
+    source: DocsTextStyleSource<'_>,
+) -> Vec<DocsParagraphAlignmentRange> {
+    let (source_text, source_ranges) = source_text_paragraph_alignment_ranges(source);
+    source_ranges
+        .into_iter()
+        .filter_map(|range| {
+            let (start, end) =
+                map_source_range_by_context(&source_text, range.start, range.end, new_text)?;
+            Some(DocsParagraphAlignmentRange {
+                start,
+                end,
+                alignment: range.alignment,
+            })
+        })
+        .collect()
+}
+
 fn source_text_color_ranges(
     source: DocsTextStyleSource<'_>,
 ) -> (String, Vec<DocsForegroundColorRange>) {
@@ -1256,6 +1310,59 @@ fn source_text_color_ranges(
                 },
             );
         }
+    }
+    (source_text, ranges)
+}
+
+fn source_text_paragraph_alignment_ranges(
+    source: DocsTextStyleSource<'_>,
+) -> (String, Vec<DocsParagraphAlignmentRange>) {
+    let mut source_text = String::new();
+    let mut ranges = Vec::new();
+    for paragraph in source
+        .document
+        .body
+        .content
+        .iter()
+        .filter_map(|element| element.paragraph.as_ref())
+    {
+        let range_start = docs_text_len(&source_text);
+        for element in &paragraph.elements {
+            let (Some(element_start), Some(element_end), Some(text_run)) = (
+                element.start_index,
+                element.end_index,
+                element.text_run.as_ref(),
+            ) else {
+                continue;
+            };
+            let overlap_start = element_start.max(source.start_index);
+            let overlap_end = element_end.min(source.end_index);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            source_text.push_str(&utf16_slice(
+                &text_run.content,
+                overlap_start - element_start,
+                overlap_end - element_start,
+            ));
+        }
+        let range_end = docs_text_len(&source_text);
+        if range_end <= range_start {
+            continue;
+        }
+        let Some(alignment) = paragraph
+            .paragraph_style
+            .as_ref()
+            .and_then(|style| style.alignment.clone())
+            .filter(|alignment| alignment != "START")
+        else {
+            continue;
+        };
+        ranges.push(DocsParagraphAlignmentRange {
+            start: range_start,
+            end: range_end,
+            alignment,
+        });
     }
     (source_text, ranges)
 }
@@ -3529,6 +3636,84 @@ mod tests {
                     && value["updateTextStyle"]["fields"] == "baselineOffset"
             }),
             "second superscript source style should be restored onto the edited exponent: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_alignment_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Aligned", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Aligned",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 15,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "alignment": "CENTER"
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 15,
+                                    "textRun": {
+                                        "content": "Centered line\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("centered document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:15"),
+                content: "Centered phrase".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 16
+                    && value["updateParagraphStyle"]["paragraphStyle"]["alignment"] == "CENTER"
+                    && value["updateParagraphStyle"]["fields"] == "alignment"
+            }),
+            "source paragraph alignment should be restored after editing the block: {serialized:#?}"
         );
     }
 

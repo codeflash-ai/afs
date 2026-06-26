@@ -58,6 +58,8 @@ pub struct Paragraph {
 pub struct ParagraphStyle {
     #[serde(default)]
     pub named_style_type: Option<String>,
+    #[serde(default)]
+    pub alignment: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +287,8 @@ pub struct UpdateParagraphStyleRequest {
 pub struct ParagraphStylePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub named_style_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
