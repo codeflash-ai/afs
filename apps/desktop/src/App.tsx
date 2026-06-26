@@ -812,6 +812,7 @@ function Onboarding({
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [mountError, setMountError] = useState("");
+  const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
 
@@ -942,29 +943,40 @@ function Onboarding({
   }
 
   async function startMount() {
+    if (mounting) {
+      return;
+    }
+
     setMountError("");
-    const report = await callCommand<ActionReport>(
-      "create_workspace_mount",
-      { path: mountPath },
-      { ok: true, message: "Created demo mount." },
-    );
-    if (!report.ok) {
-      setMountError(report.message);
-      return;
+    setMounting(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "create_workspace_mount",
+        { path: mountPath },
+        { ok: true, message: "Created demo mount." },
+      );
+      if (!report.ok) {
+        setMountError(report.message);
+        return;
+      }
+      const cliReady = await ensureCliAvailable();
+      if (!cliReady) {
+        return;
+      }
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      setMountPathDirty(false);
+      setMountPath(nextSnapshot.mount.localPath);
+      await installAgentGuidance(nextSnapshot.mount.localPath);
+      setStep(4);
+    } catch (error) {
+      setMountError(errorMessage(error));
+    } finally {
+      setMounting(false);
     }
-    const cliReady = await ensureCliAvailable();
-    if (!cliReady) {
-      return;
-    }
-    const nextSnapshot = await callCommand<DesktopSnapshot>(
-      "desktop_snapshot",
-      undefined,
-      sampleSnapshot,
-    );
-    setMountPathDirty(false);
-    setMountPath(nextSnapshot.mount.localPath);
-    await installAgentGuidance(nextSnapshot.mount.localPath);
-    setStep(4);
   }
 
   async function ensureCliAvailable() {
@@ -1103,7 +1115,7 @@ function Onboarding({
         )}
 
         {step === 3 && (
-          <SetupContent mark={<BrandTile variant="folder" />}>
+          <SetupContent mark={<BrandTile variant={mounting ? "progress" : "folder"} />}>
             <div>
               <h1>Where should your Notion files appear?</h1>
               <p>
@@ -1114,17 +1126,18 @@ function Onboarding({
             <div className="path-field">
               <input
                 value={mountPath}
+                disabled={mounting}
                 onChange={(event) => {
                   setMountPathDirty(true);
                   setMountPath(event.target.value);
                 }}
               />
-              <SecondaryButton compact onClick={chooseFolder}>
+              <SecondaryButton compact disabled={mounting} onClick={chooseFolder}>
                 Choose
               </SecondaryButton>
             </div>
-            <PrimaryButton disabled={!mountPath.trim()} onClick={startMount}>
-              Continue
+            <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
+              {mounting ? "Mounting Notion" : "Continue"}
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
             <p className="quiet-note">
