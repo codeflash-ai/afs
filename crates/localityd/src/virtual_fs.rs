@@ -28,6 +28,7 @@ use crate::source::source_descriptor;
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
 pub const SOURCE_ROOT_PREFIX: &str = "source:";
+pub const MOUNT_POINT_PREFIX: &str = "mount:";
 const CHILDREN_PREFIX: &str = "children:";
 const PATH_PREFIX: &str = "path:";
 const LOCAL_PREFIX: &str = "local:";
@@ -65,6 +66,32 @@ pub fn source_root_directory_name(connector: &str) -> String {
     } else {
         normalized
     }
+}
+
+pub fn mount_point_identifier(mount: &MountConfig) -> String {
+    format!("{MOUNT_POINT_PREFIX}{}", mount.mount_id.0)
+}
+
+pub fn mount_point_directory_name(mount: &MountConfig) -> String {
+    mount
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| source_root_directory_name(&mount.mount_id.0))
+}
+
+pub fn virtual_projection_root(mount: &MountConfig) -> PathBuf {
+    mount
+        .root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| mount.root.clone())
+}
+
+pub fn virtual_projection_mount_point(mount: &MountConfig) -> PathBuf {
+    virtual_projection_root(mount).join(mount_point_directory_name(mount))
 }
 
 pub fn virtual_fs_ancestor_container_identifiers<S>(

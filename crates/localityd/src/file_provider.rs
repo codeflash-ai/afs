@@ -21,7 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::hydration::HydrationSource;
 use crate::shadow_match::parsed_matches_shadow;
 use crate::virtual_fs;
-use crate::virtual_fs::{source_root_directory_name, source_root_identifier};
+use crate::virtual_fs::{
+    mount_point_directory_name, source_root_identifier, virtual_projection_mount_point,
+};
 
 pub use crate::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport as FileProviderChildrenReport,
@@ -103,7 +105,7 @@ where
 }
 
 fn shared_domain_source_root_item(mount: &MountConfig) -> FileProviderItem {
-    let filename = source_root_directory_name(&mount.connector);
+    let filename = mount_point_directory_name(mount);
     FileProviderItem {
         identifier: source_root_identifier(&mount.connector),
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
@@ -164,11 +166,7 @@ pub fn mount_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
         mount.projection,
         ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
     ) {
-        roots.push(
-            mount
-                .root
-                .join(source_root_directory_name(&mount.connector)),
-        );
+        roots.push(virtual_projection_mount_point(mount));
     }
 
     #[cfg(target_os = "macos")]
@@ -622,13 +620,13 @@ fn existing_projection_path_entries(
 }
 
 fn source_projection_roots(mount: &MountConfig) -> Vec<PathBuf> {
-    let source_dir = source_root_directory_name(&mount.connector);
+    let mount_point_dir = mount_point_directory_name(mount);
     mount_access_roots(mount)
         .into_iter()
         .filter(|root| {
             root.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name == source_dir.as_str())
+                .is_some_and(|name| name == mount_point_dir.as_str())
         })
         .collect()
 }
@@ -1009,7 +1007,7 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     vec![
         cloud_storage
             .join("Locality")
-            .join(source_root_directory_name(&mount.connector)),
+            .join(mount_point_directory_name(mount)),
     ]
 }
 
@@ -1026,6 +1024,7 @@ fn macos_file_provider_path_is_under_cloud_storage(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtual_fs::virtual_projection_root;
     #[cfg(target_os = "macos")]
     use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
     use locality_core::model::MountId;
@@ -1071,26 +1070,110 @@ mod tests {
     }
 
     #[test]
-    fn linux_fuse_source_directory_is_an_access_root() {
-        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
-            .projection(ProjectionMode::LinuxFuse);
+    fn linux_fuse_mount_point_directory_is_an_access_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
 
-        let matched = match_mount_path(&mount, Path::new("/tmp/Locality/notion/roadmap/page.md"))
-            .expect("path matches source directory");
+        let matched = match_mount_path(
+            &mount,
+            Path::new("/tmp/Locality/notion-main/roadmap/page.md"),
+        )
+        .expect("path matches mount point directory");
 
-        assert_eq!(matched.access_root, PathBuf::from("/tmp/Locality/notion"));
+        assert_eq!(
+            matched.access_root,
+            PathBuf::from("/tmp/Locality/notion-main")
+        );
         assert_eq!(matched.relative_path, PathBuf::from("roadmap/page.md"));
     }
 
     #[test]
-    fn windows_cloud_files_source_directory_is_an_access_root() {
-        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
-            .projection(ProjectionMode::WindowsCloudFiles);
+    fn windows_cloud_files_mount_point_directory_is_an_access_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
 
-        let matched = match_mount_path(&mount, Path::new("/tmp/Locality/notion/roadmap/page.md"))
-            .expect("path matches source directory");
+        let matched = match_mount_path(
+            &mount,
+            Path::new("/tmp/Locality/notion-main/roadmap/page.md"),
+        )
+        .expect("path matches mount point directory");
 
-        assert_eq!(matched.access_root, PathBuf::from("/tmp/Locality/notion"));
+        assert_eq!(
+            matched.access_root,
+            PathBuf::from("/tmp/Locality/notion-main")
+        );
+        assert_eq!(matched.relative_path, PathBuf::from("roadmap/page.md"));
+    }
+
+    #[test]
+    fn mount_point_directory_name_uses_mount_root_basename() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        assert_eq!(mount_point_directory_name(&mount), "notion-main");
+        assert_eq!(
+            virtual_projection_root(&mount),
+            PathBuf::from("/tmp/Locality")
+        );
+        assert_eq!(
+            virtual_projection_mount_point(&mount),
+            PathBuf::from("/tmp/Locality/notion-main")
+        );
+    }
+
+    #[test]
+    fn mount_point_directory_name_falls_back_to_mount_id_for_root_path() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/")
+            .projection(ProjectionMode::LinuxFuse);
+
+        assert_eq!(mount_point_directory_name(&mount), "notion-main");
+        assert_eq!(virtual_projection_root(&mount), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn mount_point_directory_name_preserves_space_sensitive_basenames() {
+        for basename in [" .. ", " . ", " notion-main ", "notion-main "] {
+            let root = PathBuf::from("/tmp/Locality").join(basename);
+            let mount = MountConfig::new(MountId::new("notion-main"), "notion", &root)
+                .projection(ProjectionMode::LinuxFuse);
+
+            assert_eq!(mount_point_directory_name(&mount), basename);
+            assert_eq!(virtual_projection_mount_point(&mount), root);
+            assert!(mount_access_roots(&mount).contains(&root));
+        }
+    }
+
+    #[test]
+    fn virtual_projection_mount_point_is_access_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let matched = match_mount_path(
+            &mount,
+            Path::new("/tmp/Locality/notion-main/roadmap/page.md"),
+        )
+        .expect("path matches mount point");
+
+        assert_eq!(
+            matched.access_root,
+            PathBuf::from("/tmp/Locality/notion-main")
+        );
         assert_eq!(matched.relative_path, PathBuf::from("roadmap/page.md"));
     }
 
@@ -1102,7 +1185,7 @@ mod tests {
                 MountConfig::new(
                     MountId::new("notion-main"),
                     "notion",
-                    "/tmp/Locality/notion",
+                    "/tmp/Locality/notion-main",
                 )
                 .projection(ProjectionMode::MacosFileProvider),
             )
@@ -1112,7 +1195,7 @@ mod tests {
                 MountConfig::new(
                     MountId::new("linear-main"),
                     "linear",
-                    "/tmp/Locality/linear",
+                    "/tmp/Locality/linear-main",
                 )
                 .projection(ProjectionMode::MacosFileProvider),
             )
@@ -1131,15 +1214,51 @@ mod tests {
         assert_eq!(report.domain_id, MACOS_FILE_PROVIDER_DOMAIN_ID);
         assert_eq!(report.children.len(), 2);
         assert_eq!(report.children[0].mount_id, "linear-main");
-        assert_eq!(report.children[0].item.filename, "linear");
+        assert_eq!(report.children[0].item.filename, "linear-main");
         assert_eq!(report.children[0].item.identifier, "source:linear");
         assert_eq!(
             report.children[0].item.parent_identifier.as_deref(),
             Some(ROOT_CONTAINER_IDENTIFIER)
         );
         assert_eq!(report.children[1].mount_id, "notion-main");
-        assert_eq!(report.children[1].item.filename, "notion");
+        assert_eq!(report.children[1].item.filename, "notion-main");
         assert_eq!(report.children[1].item.identifier, "source:notion");
+    }
+
+    #[test]
+    fn shared_macos_file_provider_domain_children_distinguish_same_connector_mount_points() {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    "/tmp/Locality/notion-main",
+                )
+                .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save main notion mount");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-work"),
+                    "notion",
+                    "/tmp/Locality/notion-work",
+                )
+                .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save work notion mount");
+
+        let report =
+            file_provider_domain_children(&store, MACOS_FILE_PROVIDER_DOMAIN_ID).expect("children");
+
+        let filenames = report
+            .children
+            .iter()
+            .map(|child| child.item.filename.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(filenames, vec!["notion-main", "notion-work"]);
     }
 
     #[test]
@@ -1201,18 +1320,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_file_provider_access_roots_include_system_assigned_connector_roots() {
+    fn macos_file_provider_access_roots_include_system_assigned_mount_point_roots() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            "/Users/test/Library/CloudStorage/Locality/notion",
+            "/Users/test/Library/CloudStorage/Locality/notion-main",
         )
         .projection(ProjectionMode::MacosFileProvider);
         let roots = mount_access_roots(&mount);
         let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
 
         assert!(roots.contains(&PathBuf::from(
-            "/Users/test/Library/CloudStorage/Locality/notion"
+            "/Users/test/Library/CloudStorage/Locality/notion-main"
         )));
         assert!(
             roots.contains(
@@ -1220,7 +1339,7 @@ mod tests {
                     .join("Library")
                     .join("CloudStorage")
                     .join("Locality")
-                    .join("notion")
+                    .join("notion-main")
             )
         );
         let matched = match_mount_path(
@@ -1229,10 +1348,10 @@ mod tests {
                 .join("Library")
                 .join("CloudStorage")
                 .join("Locality")
-                .join("notion")
+                .join("notion-main")
                 .join("Page.md"),
         )
-        .expect("canonical connector path matches");
+        .expect("canonical mount point path matches");
         assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
     }
 
