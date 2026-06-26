@@ -525,6 +525,7 @@ fn apply_plan(
     let mut changed = BTreeSet::new();
     let mut effects = Vec::new();
     let mut append_offsets: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
+    let mut inserted_ranges: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     for index in apply_operation_order(&request.plan.operations) {
         let operation = &request.plan.operations[index];
         let operation_id = request
@@ -536,6 +537,12 @@ fn apply_plan(
             PushOperation::UpdateBlock { block_id, content }
             | PushOperation::ReplaceBlock { block_id, content } => {
                 let range = GoogleBlockRange::parse(block_id)?;
+                let range = range.shifted_for_insertions(
+                    inserted_ranges
+                        .get(&range.document_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                );
                 let document = docs.get_document(&range.document_id)?;
                 let final_block = range.end_index == document_end_index(&document);
                 let delete_end_index = if final_block && range.end_index > range.start_index {
@@ -587,8 +594,16 @@ fn apply_plan(
                 let base_index = after
                     .as_ref()
                     .and_then(|after| GoogleBlockRange::parse(after).ok())
-                    .map(|range| range.end_index)
-                    .unwrap_or_else(|| document_end_index(&document));
+                    .map(|range| {
+                        shift_index_for_insertions(
+                            range.end_index,
+                            inserted_ranges
+                                .get(&range.document_id)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                        )
+                    })
+                    .unwrap_or_else(|| document_start_index(&document));
                 let append_key = (
                     parent_id.0.clone(),
                     after.as_ref().map(|remote_id| remote_id.0.clone()),
@@ -607,6 +622,10 @@ fn apply_plan(
                     },
                 )?;
                 *append_offsets.entry(append_key).or_default() += inserted_len;
+                inserted_ranges
+                    .entry(parent_id.0.clone())
+                    .or_default()
+                    .push((index_position, inserted_len));
                 changed.insert(parent_id.clone());
                 effects.push(JournalApplyEffect::CreatedBlock {
                     operation_id,
@@ -620,6 +639,12 @@ fn apply_plan(
             }
             PushOperation::ArchiveBlock { block_id } => {
                 let range = GoogleBlockRange::parse(block_id)?;
+                let range = range.shifted_for_insertions(
+                    inserted_ranges
+                        .get(&range.document_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                );
                 let document = docs.get_document(&range.document_id)?;
                 docs.batch_update_document(
                     &range.document_id,
@@ -1390,6 +1415,17 @@ fn document_end_index(document: &GoogleDocument) -> usize {
         .unwrap_or(1)
 }
 
+fn document_start_index(document: &GoogleDocument) -> usize {
+    document
+        .body
+        .content
+        .iter()
+        .filter_map(|element| element.start_index)
+        .filter(|index| *index > 0)
+        .min()
+        .unwrap_or(1)
+}
+
 fn empty_document(id: &str, title: &str) -> GoogleDocument {
     GoogleDocument {
         document_id: id.to_string(),
@@ -1433,6 +1469,24 @@ impl GoogleBlockRange {
             end_index,
         })
     }
+
+    fn shifted_for_insertions(&self, insertions: &[(usize, usize)]) -> Self {
+        Self {
+            document_id: self.document_id.clone(),
+            start_index: shift_index_for_insertions(self.start_index, insertions),
+            end_index: shift_index_for_insertions(self.end_index, insertions),
+        }
+    }
+}
+
+fn shift_index_for_insertions(index: usize, insertions: &[(usize, usize)]) -> usize {
+    insertions.iter().fold(index, |shifted, (insert_at, len)| {
+        if *insert_at <= shifted {
+            shifted + len
+        } else {
+            shifted
+        }
+    })
 }
 
 fn allocate_path(
@@ -2687,7 +2741,7 @@ mod tests {
         let DocsRequest::InsertText { insert_text } = &heading_batch.requests[0] else {
             panic!("expected heading insert text request");
         };
-        assert_eq!(insert_text.location.index, 7);
+        assert_eq!(insert_text.location.index, 1);
         assert_eq!(insert_text.text, "Appended Section\n");
         assert!(
             heading_batch.requests.iter().any(|request| {
@@ -2703,7 +2757,7 @@ mod tests {
         let DocsRequest::InsertText { insert_text } = &list_batch.requests[0] else {
             panic!("expected list insert text request");
         };
-        assert_eq!(insert_text.location.index, 24);
+        assert_eq!(insert_text.location.index, 18);
         assert_eq!(insert_text.text, "Appended bullet\n");
         assert!(
             list_batch.requests.iter().any(|request| {
@@ -2721,7 +2775,7 @@ mod tests {
         let DocsRequest::InsertText { insert_text } = &ordered_list_batch.requests[0] else {
             panic!("expected ordered list insert text request");
         };
-        assert_eq!(insert_text.location.index, 40);
+        assert_eq!(insert_text.location.index, 34);
         assert_eq!(insert_text.text, "Appended number\n");
         assert!(
             ordered_list_batch.requests.iter().any(|request| {
@@ -2734,6 +2788,99 @@ mod tests {
             }),
             "expected appended ordered list item to use numbered shape without literal marker"
         );
+    }
+
+    #[test]
+    fn append_block_without_after_inserts_before_first_document_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::AppendBlock {
+                parent_id: RemoteId::new("doc-1"),
+                after: None,
+                content: "Before intro".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:append_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.location.index, 1);
+        assert_eq!(insert_text.text, "Before intro\n");
+    }
+
+    #[test]
+    fn archive_after_insert_before_block_uses_shifted_range() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Shape Doc",
+            "rev-1",
+            "Intro\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::AppendBlock {
+                    parent_id: RemoteId::new("doc-1"),
+                    after: None,
+                    content: "Before".to_string(),
+                },
+                PushOperation::ArchiveBlock {
+                    block_id: RemoteId::new("doc-1:10:16"),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:append_block:doc-1".to_string()),
+            PushOperationId("push-1:1:archive_block:doc-1:10:16".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let shifted_delete = first_delete_range(&batches[1].1);
+        assert_eq!(shifted_delete.start_index, 17);
+        assert_eq!(shifted_delete.end_index, 23);
     }
 
     #[test]
