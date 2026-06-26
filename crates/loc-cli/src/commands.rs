@@ -3240,6 +3240,12 @@ fn print_status_report(report: &StatusReport) {
 
     let mut printed_entries = 0;
     for mount in &report.mounts {
+        if mount.live_mode.enabled || mount.live_mode.state != "off" {
+            println!("{}  live_mode: {}", mount.mount_id, mount.live_mode.state);
+            if let Some(reason) = mount.live_mode.reason.as_deref() {
+                println!("  live_mode_reason: {reason}");
+            }
+        }
         for entry in &mount.entries {
             if matches!(
                 entry.sync_state,

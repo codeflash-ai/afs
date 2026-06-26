@@ -26,13 +26,14 @@ pub use memory::InMemoryStateStore;
 pub use records::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveState, ConnectionId, ConnectionRecord,
     ConnectorProfileId, ConnectorProfileRecord, EntityRecord, FreshnessStateRecord,
-    HydrationJobRecord, MountConfig, ProjectionMode, RemoteObservationRecord, ShadowBlockRecord,
-    ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
+    HydrationJobRecord, MountConfig, MountLiveModeRecord, MountLiveModeState, ProjectionMode,
+    RemoteObservationRecord, ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind,
+    VirtualMutationRecord,
 };
 pub use repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
     EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
-    ShadowRepository, VirtualMutationRepository,
+    HydrationJobRepository, JournalRepository, MountLiveModeRepository, MountRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 pub use sqlite::SqliteStateStore;

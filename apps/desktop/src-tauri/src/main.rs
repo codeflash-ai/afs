@@ -69,9 +69,10 @@ use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
-    MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository, open_credential_store,
+    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
+    ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+    SqliteStateStore, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    open_credential_store,
 };
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
@@ -132,6 +133,7 @@ struct DesktopSnapshot {
     health: AppHealth,
     connection: ConnectionSummary,
     mount: MountSummary,
+    live_mode: MountLiveModeSummary,
     needs_onboarding: bool,
     settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
@@ -214,6 +216,19 @@ struct LiveModeFileStatus {
     state: String,
     label: String,
     reason: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MountLiveModeSummary {
+    enabled: bool,
+    state: String,
+    label: String,
+    reason: Option<String>,
+    last_run_at: Option<String>,
+    pending_count: usize,
+    review_count: usize,
+    covered_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +342,12 @@ struct LiveModeFileChange {
     enabled: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MountLiveModeChange {
+    enabled: bool,
+}
+
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
@@ -334,6 +355,7 @@ static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_CURSOR: OnceLock<Mutex<usize>> = OnceLock::new();
 static LIVE_MODE_LOCAL_RECONCILE_TIMES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> =
     OnceLock::new();
+static LIVE_MODE_TICK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
     Mutex<WindowsCloudFilesProviderSupervisor>,
@@ -794,6 +816,24 @@ async fn live_mode_tick(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
+async fn set_mount_live_mode(app: AppHandle, change: MountLiveModeChange) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        set_mount_live_mode_blocking(change).unwrap_or_else(action_error)
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Live Mode worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
 async fn diff_notion_file(path: String) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
@@ -922,7 +962,51 @@ fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
 }
 
 fn live_mode_tick_blocking() -> ActionReport {
-    let remote_target = match live_mode_next_remote_pull_target() {
+    if LIVE_MODE_TICK_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return ActionReport {
+            ok: true,
+            message: "Live Mode is already syncing.".to_string(),
+        };
+    }
+
+    let report = live_mode_tick_blocking_inner();
+    LIVE_MODE_TICK_IN_PROGRESS.store(false, Ordering::Release);
+    report
+}
+
+fn live_mode_tick_blocking_inner() -> ActionReport {
+    let state_root = default_state_root();
+    let mount = match live_mode_enabled_mount(&state_root) {
+        Ok(Some(mount)) => mount,
+        Ok(None) => {
+            return ActionReport {
+                ok: true,
+                message: "Live Mode is off.".to_string(),
+            };
+        }
+        Err(message) => {
+            return ActionReport { ok: false, message };
+        }
+    };
+
+    if let Err(message) = mark_mount_live_mode_syncing(&state_root, &mount.mount_id) {
+        return ActionReport { ok: false, message };
+    }
+
+    let report = live_mode_tick_for_enabled_mount(&state_root, &mount);
+    if let Err(message) = record_mount_live_mode_tick_result(&state_root, &mount.mount_id, &report)
+    {
+        return ActionReport { ok: false, message };
+    }
+
+    report
+}
+
+fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> ActionReport {
+    let remote_target = match live_mode_next_remote_pull_target_for_state_root(state_root, mount) {
         Ok(target) => target,
         Err(message) => {
             return ActionReport { ok: false, message };
@@ -1060,9 +1144,8 @@ fn live_mode_has_mounted_folder(snapshot: &DesktopSnapshot) -> bool {
     snapshot.mount.status != "not_mounted" && !snapshot.mount.local_path.trim().is_empty()
 }
 
-fn live_mode_next_remote_pull_target() -> Result<Option<LiveModeRemoteTarget>, String> {
-    let state_root = default_state_root();
-    let store = SqliteStateStore::open(state_root)
+fn live_mode_enabled_mount(state_root: &Path) -> Result<Option<MountConfig>, String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
@@ -1070,8 +1153,103 @@ fn live_mode_next_remote_pull_target() -> Result<Option<LiveModeRemoteTarget>, S
     let Some(mount) = choose_mount(&mounts) else {
         return Ok(None);
     };
+    let enabled = store
+        .get_mount_live_mode(&mount.mount_id)
+        .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
+        .is_some_and(|record| record.enabled);
+    Ok(enabled.then_some(mount))
+}
 
-    live_mode_next_remote_pull_target_for_mount(&store, &mount)
+fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionReport, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root)
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not inspect mounted folders: {error}"))?;
+    let mount = choose_mount(&mounts)
+        .ok_or_else(|| "Create a Notion folder before turning on Live Mode.".to_string())?;
+    let now = live_mode_timestamp();
+    let existing = store
+        .get_mount_live_mode(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect Live Mode state: {error}"))?;
+    let record = existing.unwrap_or_else(|| {
+        MountLiveModeRecord::new(mount.mount_id.clone(), change.enabled, now.clone())
+    });
+    let record = if change.enabled {
+        record.active(None, now.clone(), now)
+    } else {
+        record.off(now)
+    };
+    store
+        .save_mount_live_mode(record)
+        .map_err(|error| format!("Could not update Live Mode state: {error}"))?;
+
+    Ok(ActionReport {
+        ok: true,
+        message: if change.enabled {
+            "Live Mode is on for this folder.".to_string()
+        } else {
+            "Live Mode is off for this folder.".to_string()
+        },
+    })
+}
+
+fn mark_mount_live_mode_syncing(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    let now = live_mode_timestamp();
+    let record = store
+        .get_mount_live_mode(mount_id)
+        .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
+        .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()))
+        .syncing(now);
+    store
+        .save_mount_live_mode(record)
+        .map_err(|error| format!("Live Mode could not update its state: {error}"))
+}
+
+fn record_mount_live_mode_tick_result(
+    state_root: &Path,
+    mount_id: &MountId,
+    report: &ActionReport,
+) -> Result<(), String> {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    let now = live_mode_timestamp();
+    let record = store
+        .get_mount_live_mode(mount_id)
+        .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
+        .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()));
+    let record = if report.ok {
+        record.active(non_empty_string(report.message.clone()), now.clone(), now)
+    } else {
+        record.error(report.message.clone(), now.clone(), now)
+    };
+    store
+        .save_mount_live_mode(record)
+        .map_err(|error| format!("Live Mode could not update its state: {error}"))
+}
+
+fn live_mode_timestamp() -> String {
+    auto_save_timestamp()
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn live_mode_next_remote_pull_target_for_state_root(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<Option<LiveModeRemoteTarget>, String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    live_mode_next_remote_pull_target_for_mount(&store, mount)
 }
 
 fn live_mode_next_remote_pull_target_for_mount<S>(
@@ -1635,6 +1813,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
         Some(mount) => pending_changes_for_mount(&store, &state_root, &mount.mount_id)?,
         None => Vec::new(),
     };
+    let live_mode = mount_live_mode_summary(&store, mount.as_ref(), &pending_changes);
     let daemon_ready = send_request(&state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
@@ -1652,6 +1831,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
         },
         connection: connection_summary(connection.as_ref()),
         mount: mount_summary(Some(&store), mount.as_ref(), connection.as_ref(), provider),
+        live_mode,
         needs_onboarding,
         settings: desktop_settings(),
         pending_changes,
@@ -1687,6 +1867,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             status: "error".to_string(),
             provider: None,
         },
+        live_mode: MountLiveModeSummary::off(),
         needs_onboarding: false,
         settings: desktop_settings(),
         pending_changes: Vec::new(),
@@ -1803,6 +1984,81 @@ fn mount_summary(
         read_only: mount.read_only,
         status: mount_status.to_string(),
         provider,
+    }
+}
+
+fn mount_live_mode_summary(
+    store: &SqliteStateStore,
+    mount: Option<&MountConfig>,
+    pending_changes: &[PendingChange],
+) -> MountLiveModeSummary {
+    let Some(mount) = mount else {
+        return MountLiveModeSummary::off();
+    };
+    let record = store.get_mount_live_mode(&mount.mount_id).ok().flatten();
+    MountLiveModeSummary::from_record(record.as_ref(), pending_changes)
+}
+
+impl MountLiveModeSummary {
+    fn off() -> Self {
+        Self {
+            enabled: false,
+            state: "off".to_string(),
+            label: "Live Mode off".to_string(),
+            reason: None,
+            last_run_at: None,
+            pending_count: 0,
+            review_count: 0,
+            covered_count: 0,
+        }
+    }
+
+    fn from_record(
+        record: Option<&MountLiveModeRecord>,
+        pending_changes: &[PendingChange],
+    ) -> Self {
+        let pending_count = pending_changes.len();
+        let review_count = pending_changes
+            .iter()
+            .filter(|change| change.state != "safe")
+            .count();
+        let covered_count = pending_changes
+            .iter()
+            .filter(|change| change.state == "safe")
+            .count();
+        let Some(record) = record else {
+            return Self {
+                pending_count,
+                review_count,
+                covered_count,
+                ..Self::off()
+            };
+        };
+        let state = mount_live_mode_state_label(record);
+
+        Self {
+            enabled: record.enabled,
+            state: state.0.to_string(),
+            label: state.1.to_string(),
+            reason: record.last_reason.clone(),
+            last_run_at: record.last_run_at.clone(),
+            pending_count,
+            review_count,
+            covered_count,
+        }
+    }
+}
+
+fn mount_live_mode_state_label(record: &MountLiveModeRecord) -> (&'static str, &'static str) {
+    if !record.enabled && record.state != MountLiveModeState::Error {
+        return ("off", "Live Mode off");
+    }
+
+    match record.state {
+        MountLiveModeState::Off => ("off", "Live Mode off"),
+        MountLiveModeState::Active => ("active", "Live Mode on"),
+        MountLiveModeState::Syncing => ("syncing", "Live Mode syncing"),
+        MountLiveModeState::Error => ("error", "Live Mode paused"),
     }
 }
 
@@ -8143,6 +8399,13 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 connector: "notion".to_string(),
                 root: "/tmp/notion".to_string(),
+                live_mode: loc_cli::status::StatusLiveMode {
+                    enabled: false,
+                    state: "off".to_string(),
+                    label: "Live Mode off".to_string(),
+                    reason: None,
+                    last_run_at: None,
+                },
                 entries: vec![entry],
             }],
         }
@@ -8830,6 +9093,7 @@ fn sample_snapshot() -> DesktopSnapshot {
             status: "ready".to_string(),
             provider: None,
         },
+        live_mode: MountLiveModeSummary::from_record(None, &sample_pending_changes()),
         needs_onboarding: false,
         settings: DesktopSettings {
             launch_at_login: true,
@@ -9279,6 +9543,7 @@ fn main() {
             start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
+            start_live_mode_runner(app.app_handle().clone());
             start_windows_cloud_files_provider_supervisor();
             start_agent_guidance_refresher();
             Ok(())
@@ -9303,6 +9568,7 @@ fn main() {
             push_notion_file,
             pull_notion_file,
             live_mode_tick,
+            set_mount_live_mode,
             diff_notion_file,
             inspect_notion_file,
             read_notion_file,
@@ -9334,6 +9600,36 @@ fn start_agent_guidance_refresher() {
             std::thread::sleep(std::time::Duration::from_secs(10 * 60));
         }
     });
+}
+
+fn start_live_mode_runner(app: AppHandle) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if !mount_live_mode_enabled() {
+                continue;
+            }
+            let report = live_mode_tick_blocking();
+            if live_mode_tick_should_refresh_surfaces(&report) {
+                refresh_desktop_surfaces(&app);
+            }
+        }
+    });
+}
+
+fn mount_live_mode_enabled() -> bool {
+    live_mode_enabled_mount(&default_state_root())
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+fn live_mode_tick_should_refresh_surfaces(report: &ActionReport) -> bool {
+    !report.ok
+        || report.message.contains("synced")
+        || report.message.contains("pulled")
+        || report.message.contains("paused")
+        || report.message.contains("off")
 }
 
 fn configure_main_window_chrome(app: &mut tauri::App) {

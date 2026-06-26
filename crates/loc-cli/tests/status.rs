@@ -15,7 +15,8 @@ use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    InMemoryStateStore, JournalRepository, MountConfig, MountLiveModeRecord,
+    MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
     RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
@@ -57,6 +58,37 @@ fn status_reports_clean_and_dirty_hydrated_files() {
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
     assert_eq!(entry_state(&report, "Notes.md"), StatusState::Dirty);
     assert_eq!(entry_issue(&report, "Notes.md"), "local_body_changed");
+}
+
+#[test]
+fn status_reports_mount_live_mode_state() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    let mut live_mode = MountLiveModeRecord::new(fixture.mount_id.clone(), true, "1");
+    live_mode.state = MountLiveModeState::Syncing;
+    live_mode.last_reason = Some("checking for changes".to_string());
+    live_mode.last_run_at = Some("2".to_string());
+    store
+        .save_mount_live_mode(live_mode)
+        .expect("save live mode");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(report.mounts[0].live_mode.enabled, true);
+    assert_eq!(report.mounts[0].live_mode.state, "syncing");
+    assert_eq!(report.mounts[0].live_mode.label, "Live Mode syncing");
+    assert_eq!(
+        report.mounts[0].live_mode.reason.as_deref(),
+        Some("checking for changes")
+    );
+    assert_eq!(report.mounts[0].live_mode.last_run_at.as_deref(), Some("2"));
 }
 
 #[test]

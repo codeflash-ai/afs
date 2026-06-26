@@ -17,7 +17,8 @@ use locality_core::planner::PushOperation;
 use locality_core::shadow::rendered_bodies_equivalent;
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
+    JournalRepository, MountConfig, MountLiveModeRecord, MountLiveModeRepository,
+    MountLiveModeState, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
@@ -66,7 +67,17 @@ pub struct StatusMountReport {
     pub mount_id: String,
     pub connector: String,
     pub root: String,
+    pub live_mode: StatusLiveMode,
     pub entries: Vec<StatusEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StatusLiveMode {
+    pub enabled: bool,
+    pub state: String,
+    pub label: String,
+    pub reason: Option<String>,
+    pub last_run_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -160,7 +171,8 @@ where
         + JournalRepository
         + RemoteObservationRepository
         + FreshnessStateRepository
-        + VirtualMutationRepository,
+        + VirtualMutationRepository
+        + MountLiveModeRepository,
 {
     let mounts = store.load_mounts().map_err(StatusError::Store)?;
     let target = options.path.as_deref().map(absolute_path).transpose()?;
@@ -203,6 +215,7 @@ where
             mount_id: scope.mount.mount_id.0.clone(),
             connector: scope.mount.connector.clone(),
             root: scope.mount.root.display().to_string(),
+            live_mode: status_live_mode_for_mount(store, &scope.mount.mount_id),
             entries: status_entries,
         });
     }
@@ -227,6 +240,49 @@ where
         summary,
         mounts: mount_reports,
     })
+}
+
+fn status_live_mode_for_mount<S>(store: &S, mount_id: &MountId) -> StatusLiveMode
+where
+    S: MountLiveModeRepository,
+{
+    let record = store.get_mount_live_mode(mount_id).ok().flatten();
+    StatusLiveMode::from_record(record.as_ref())
+}
+
+impl StatusLiveMode {
+    fn from_record(record: Option<&MountLiveModeRecord>) -> Self {
+        let Some(record) = record else {
+            return Self::off();
+        };
+        let (state, label) = if !record.enabled && record.state != MountLiveModeState::Error {
+            ("off", "Live Mode off")
+        } else {
+            match record.state {
+                MountLiveModeState::Off => ("off", "Live Mode off"),
+                MountLiveModeState::Active => ("active", "Live Mode on"),
+                MountLiveModeState::Syncing => ("syncing", "Live Mode syncing"),
+                MountLiveModeState::Error => ("error", "Live Mode paused"),
+            }
+        };
+        Self {
+            enabled: record.enabled,
+            state: state.to_string(),
+            label: label.to_string(),
+            reason: record.last_reason.clone(),
+            last_run_at: record.last_run_at.clone(),
+        }
+    }
+
+    fn off() -> Self {
+        Self {
+            enabled: false,
+            state: "off".to_string(),
+            label: "Live Mode off".to_string(),
+            reason: None,
+            last_run_at: None,
+        }
+    }
 }
 
 impl StatusSummary {

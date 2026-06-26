@@ -62,6 +62,7 @@ type DesktopSnapshot = {
     status: string;
     provider?: ProviderRuntimeSummary | null;
   };
+  liveMode: MountLiveMode;
   needsOnboarding: boolean;
   settings: {
     launchAtLogin: boolean;
@@ -70,6 +71,17 @@ type DesktopSnapshot = {
   pendingChanges: PendingChange[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
+};
+
+type MountLiveMode = {
+  enabled: boolean;
+  state: "off" | "active" | "syncing" | "error";
+  label: string;
+  reason?: string | null;
+  lastRunAt?: string | null;
+  pendingCount: number;
+  reviewCount: number;
+  coveredCount: number;
 };
 
 type PendingChange = {
@@ -202,6 +214,16 @@ const sampleSnapshot: DesktopSnapshot = {
     status: "ready",
     provider: null,
   },
+  liveMode: {
+    enabled: false,
+    state: "off",
+    label: "Live Mode off",
+    reason: null,
+    lastRunAt: null,
+    pendingCount: 3,
+    reviewCount: 1,
+    coveredCount: 2,
+  },
   needsOnboarding: false,
   settings: {
     launchAtLogin: true,
@@ -288,6 +310,16 @@ const loadingSnapshot: DesktopSnapshot = {
     accessScope: "Checking access",
     status: "loading",
     provider: null,
+  },
+  liveMode: {
+    enabled: false,
+    state: "off",
+    label: "Live Mode off",
+    reason: null,
+    lastRunAt: null,
+    pendingCount: 0,
+    reviewCount: 0,
+    coveredCount: 0,
   },
   needsOnboarding: false,
   pendingChanges: [],
@@ -411,14 +443,73 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function liveModeReportNeedsRefresh(message: string) {
-  return message.includes("synced") || message.includes("pulled") || message.includes("paused");
-}
-
 function liveModeTooltip(enabled: boolean) {
   return enabled
     ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
     : "Turn on Live Mode to keep this local Notion folder in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
+}
+
+function trayLiveModeLabel(liveMode: MountLiveMode, busy: boolean) {
+  if (busy || liveMode.state === "syncing") {
+    return "Syncing";
+  }
+  if (liveMode.state === "error") {
+    return "Needs attention";
+  }
+  if (!liveMode.enabled) {
+    return "Off";
+  }
+  if (liveMode.reviewCount > 0) {
+    return `${liveMode.reviewCount} need review`;
+  }
+  if (liveMode.coveredCount > 0) {
+    return `${liveMode.coveredCount} safe pending`;
+  }
+  return "On";
+}
+
+function useMountLiveModeController(
+  snapshot: DesktopSnapshot,
+  onRefresh: () => Promise<void>,
+) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const refreshRef = useRef(onRefresh);
+  const enabled = snapshot.liveMode.enabled;
+  const state = snapshot.liveMode.state;
+
+  useEffect(() => {
+    refreshRef.current = onRefresh;
+  }, [onRefresh]);
+
+  async function toggle() {
+    setBusy(true);
+    setMessage("");
+    try {
+      const report = await callCommand<ActionReport>(
+        "set_mount_live_mode",
+        { change: { enabled: !enabled } },
+        {
+          ok: true,
+          message: enabled ? "Live Mode is off for this folder." : "Live Mode is on for this folder.",
+        },
+      );
+      setMessage(report.message);
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      await refreshRef.current().catch(() => undefined);
+      setBusy(false);
+    }
+  }
+
+  return {
+    liveModeEnabled: enabled,
+    liveModeBusy: busy || state === "syncing",
+    liveModeState: state,
+    liveModeMessage: message || snapshot.liveMode.reason || "",
+    toggleLiveMode: toggle,
+  };
 }
 
 function emptyUpdateStatus(): UpdateStatus {
@@ -760,7 +851,7 @@ export default function App() {
   }, [route]);
 
   if (route === "#tray") {
-    return <TrayPopover snapshot={snapshot} />;
+    return <TrayPopover snapshot={snapshot} onRefresh={refreshSnapshot} />;
   }
 
   const shouldRenderOnboarding =
@@ -1528,88 +1619,14 @@ function HomeView({
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [actionError, setActionError] = useState("");
-  const [liveModeEnabled, setLiveModeEnabled] = useState(false);
-  const [liveModeBusy, setLiveModeBusy] = useState(false);
-  const [liveModeState, setLiveModeState] = useState<"idle" | "active" | "error">("idle");
-  const [liveModeMessage, setLiveModeMessage] = useState("");
-  const liveModeInFlight = useRef(false);
-  const liveModeSnapshot = useRef(snapshot);
-  const refreshHomeSnapshot = useRef(onRefresh);
+  const {
+    liveModeEnabled,
+    liveModeBusy,
+    liveModeState,
+    liveModeMessage,
+    toggleLiveMode,
+  } = useMountLiveModeController(snapshot, onRefresh);
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
-
-  useEffect(() => {
-    liveModeSnapshot.current = snapshot;
-  }, [snapshot]);
-
-  useEffect(() => {
-    refreshHomeSnapshot.current = onRefresh;
-  }, [onRefresh]);
-
-  useEffect(() => {
-    if (!liveModeEnabled) {
-      setLiveModeBusy(false);
-      return undefined;
-    }
-
-    let cancelled = false;
-    const runTick = async () => {
-      if (cancelled || liveModeInFlight.current) {
-        return;
-      }
-
-      const currentSnapshot = liveModeSnapshot.current;
-      if (connectionMissing(currentSnapshot) || mountMissing(currentSnapshot)) {
-        setLiveModeEnabled(false);
-        setLiveModeState("error");
-        setLiveModeMessage("Live Mode needs a connected Notion folder.");
-        return;
-      }
-
-      liveModeInFlight.current = true;
-      setLiveModeBusy(true);
-      try {
-        const report = await callCommand<ActionReport>(
-          "live_mode_tick",
-          undefined,
-          { ok: true, message: "Live Mode checked for changes." },
-        );
-        if (cancelled) {
-          return;
-        }
-        if (!report.ok) {
-          setLiveModeEnabled(false);
-          setLiveModeState("error");
-          setLiveModeMessage(report.message);
-          return;
-        }
-        setLiveModeState("active");
-        if (report.message) {
-          setLiveModeMessage((current) => (current === report.message ? current : report.message));
-        }
-        if (liveModeReportNeedsRefresh(report.message)) {
-          await refreshHomeSnapshot.current().catch(() => undefined);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setLiveModeEnabled(false);
-          setLiveModeState("error");
-          setLiveModeMessage(errorMessage(error));
-        }
-      } finally {
-        liveModeInFlight.current = false;
-        if (!cancelled) {
-          setLiveModeBusy(false);
-        }
-      }
-    };
-
-    void runTick();
-    const interval = window.setInterval(runTick, 500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [liveModeEnabled]);
 
   async function connectNotion() {
     setActionError("");
@@ -1649,13 +1666,6 @@ function HomeView({
     if (!report.ok) {
       setActionError(report.message);
     }
-  }
-
-  function toggleLiveMode() {
-    setActionError("");
-    setLiveModeMessage("");
-    setLiveModeState(liveModeEnabled ? "idle" : "active");
-    setLiveModeEnabled((enabled) => !enabled);
   }
 
   async function locatePage() {
@@ -2604,12 +2614,25 @@ function SettingsView({
   );
 }
 
-function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
+function TrayPopover({
+  snapshot,
+  onRefresh,
+}: {
+  snapshot: DesktopSnapshot;
+  onRefresh: () => Promise<void>;
+}) {
   const [url, setUrl] = useState("");
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [quitOptionsOpen, setQuitOptionsOpen] = useState(false);
+  const {
+    liveModeEnabled,
+    liveModeBusy,
+    liveModeState,
+    liveModeMessage,
+    toggleLiveMode,
+  } = useMountLiveModeController(snapshot, onRefresh);
   const quitOptionsRef = useRef<HTMLDivElement | null>(null);
   const { results: searchResults, searching } = useNotionSearchResults(url);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
@@ -2705,6 +2728,32 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
         >
           Open Notion Folder
         </PrimaryButton>
+      </section>
+
+      <section className="tray-section tray-live-mode">
+        <button
+          className={`tray-live-mode-control ${liveModeEnabled ? "active" : ""}`}
+          aria-pressed={liveModeEnabled}
+          aria-label={`${liveModeEnabled ? "Turn off" : "Turn on"} Live Mode`}
+          disabled={mountMissing(snapshot) || connectionMissing(snapshot)}
+          onClick={() => void toggleLiveMode()}
+        >
+          <span className="tray-live-mode-copy">
+            {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+            <span>
+              <strong>Live Mode</strong>
+              <small>{trayLiveModeLabel(snapshot.liveMode, liveModeBusy)}</small>
+            </span>
+          </span>
+          <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
+            <i />
+          </span>
+        </button>
+        {liveModeMessage && (
+          <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
+            {liveModeMessage}
+          </p>
+        )}
       </section>
 
       <section className="tray-section">

@@ -2094,6 +2094,66 @@ p {
   margin-top: 4px;
 }
 
+.tray-live-mode {
+  padding: 10px;
+}
+
+.tray-live-mode-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  width: 100%;
+  padding: 0 10px 0 12px;
+  border: 1px solid rgba(8, 123, 114, 0.22);
+  border-radius: 11px;
+  background: rgba(232, 248, 244, 0.72);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+  transition:
+    background-color 170ms ease,
+    border-color 170ms ease,
+    box-shadow 170ms ease,
+    opacity 170ms ease,
+    transform 90ms ease;
+}
+
+.tray-live-mode-control:hover:not(:disabled) {
+  border-color: rgba(8, 123, 114, 0.35);
+  background: rgba(232, 248, 244, 0.95);
+  box-shadow: 0 8px 20px rgba(20, 30, 43, 0.08);
+}
+
+.tray-live-mode-control:disabled {
+  opacity: 0.58;
+}
+
+.tray-live-mode-copy {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  text-align: left;
+}
+
+.tray-live-mode-copy span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.tray-live-mode-copy small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tray-locate-label {
   color: var(--ink);
   font-size: 12px;
