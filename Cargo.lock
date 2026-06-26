@@ -2122,6 +2122,7 @@ dependencies = [
  "futures-util",
  "libc",
  "locality-core",
+ "locality-store",
  "localityd",
  "serde",
  "serde_json",

@@ -35,7 +35,8 @@ use localityd::virtual_fs::{
     create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
     mount_point_directory_name, mount_point_identifier, refresh_virtual_fs_children,
     rename_virtual_fs_item, trash_virtual_fs_item, virtual_fs_children_with_content_root,
-    virtual_fs_content_path, virtual_fs_content_root,
+    virtual_fs_content_path, virtual_fs_content_root, virtual_projection_mount_point,
+    virtual_projection_root,
 };
 
 #[test]
@@ -208,6 +209,18 @@ fn virtual_projection_modes_share_create_rename_delete_contract() {
         .expect("delete local page directory");
         assert_eq!(deleted.identifier, local_page.identifier);
     }
+}
+
+#[test]
+fn linux_fuse_shared_root_keeps_mount_point_as_user_access_path() {
+    let fixture = ProjectionFixture::new(ProjectionMode::LinuxFuse);
+    let mount = fixture.mount_config();
+
+    assert_eq!(
+        virtual_projection_root(&mount),
+        mount.root.parent().expect("mount root has shared parent")
+    );
+    assert_eq!(virtual_projection_mount_point(&mount), mount.root);
 }
 
 fn virtual_projection_modes() -> [ProjectionMode; 3] {

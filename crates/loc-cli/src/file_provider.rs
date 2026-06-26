@@ -23,6 +23,12 @@ use serde_json::Value;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const LINUX_FUSE_ROOT_HINT_MAX_BYTES: usize = 48;
+#[cfg(target_os = "linux")]
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+#[cfg(target_os = "linux")]
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 #[cfg(target_os = "windows")]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(target_os = "windows")]
@@ -238,7 +244,8 @@ pub fn register_linux_fuse_mount(
 
     let locality_fuse =
         locality_fuse_helper_path().ok_or(LinuxFuseRegistrationError::HelperMissing)?;
-    let service = linux_fuse_unit_name(&mount.mount_id.0);
+    let root_id = linux_fuse_root_id(mount);
+    let service = linux_fuse_unit_name(&root_id);
     let unit_path = linux_fuse_unit_path(&service)?;
     write_linux_fuse_unit(&unit_path, &locality_fuse, state_root, mount)?;
     run_systemctl_user(&["daemon-reload"])?;
@@ -248,7 +255,7 @@ pub fn register_linux_fuse_mount(
     Ok(LinuxFuseRegistrationReport {
         service,
         unit_path,
-        mountpoint: mount.root.clone(),
+        mountpoint: localityd::virtual_fs::virtual_projection_root(mount),
         locality_fuse,
     })
 }
@@ -1175,13 +1182,11 @@ fn write_linux_fuse_unit(
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
     std::fs::create_dir_all(&log_dir)
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
-    std::fs::create_dir_all(&mount.root)
+    let projection_root = localityd::virtual_fs::virtual_projection_root(mount);
+    std::fs::create_dir_all(&projection_root)
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
 
-    let log_path = log_dir.join(format!(
-        "locality-fuse.{}.log",
-        sanitize_systemd_fragment(&mount.mount_id.0)
-    ));
+    let log_path = log_dir.join(format!("locality-fuse.{}.log", linux_fuse_root_id(mount)));
     let unit = linux_fuse_unit_contents(locality_fuse, state_root, mount, &log_path);
     std::fs::write(unit_path, unit)
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))
@@ -1194,13 +1199,12 @@ pub(crate) fn linux_fuse_unit_contents(
     mount: &MountConfig,
     log_path: &Path,
 ) -> String {
+    let projection_root = localityd::virtual_fs::virtual_projection_root(mount);
     format!(
-        "[Unit]\nDescription=Locality FUSE mount for {mount_id}\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={locality_fuse} --mount-id {mount_id_arg} --state-dir {state_root} --mountpoint {mountpoint}\nExecStop=/usr/bin/fusermount3 -uz {mountpoint}\nKillSignal=SIGINT\nTimeoutStopSec=10\nLimitCORE=0\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:{log_path}\nStandardError=append:{log_path}\n\n[Install]\nWantedBy=default.target\n",
-        mount_id = mount.mount_id.0,
+        "[Unit]\nDescription=Locality FUSE root for {mountpoint}\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={locality_fuse} --state-dir {state_root} --mountpoint {mountpoint}\nExecStop=/usr/bin/fusermount3 -uz {mountpoint}\nKillSignal=SIGINT\nTimeoutStopSec=10\nLimitCORE=0\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:{log_path}\nStandardError=append:{log_path}\n\n[Install]\nWantedBy=default.target\n",
         locality_fuse = systemd_quote(&locality_fuse.display().to_string()),
-        mount_id_arg = systemd_quote(&mount.mount_id.0),
         state_root = systemd_quote(&state_root.display().to_string()),
-        mountpoint = systemd_quote(&mount.root.display().to_string()),
+        mountpoint = systemd_quote(&projection_root.display().to_string()),
         log_path = log_path.display(),
     )
 }
@@ -1248,6 +1252,14 @@ pub(crate) fn linux_fuse_unit_name(mount_id: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
+pub fn linux_fuse_root_id(mount: &MountConfig) -> String {
+    let root = localityd::virtual_fs::virtual_projection_root(mount);
+    let root = root.display().to_string();
+    let hint = bounded_systemd_hint(&root, LINUX_FUSE_ROOT_HINT_MAX_BYTES);
+    format!("root-{hint}-{}", stable_hex_hash(&root))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn linux_fuse_unit_path(unit_name: &str) -> Result<PathBuf, LinuxFuseRegistrationError> {
     let home = home_dir_path()?;
     Ok(home.join(".config/systemd/user").join(unit_name))
@@ -1268,7 +1280,41 @@ fn sanitize_systemd_fragment(value: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
+fn bounded_systemd_hint(value: &str, max_bytes: usize) -> String {
+    let sanitized = sanitize_systemd_fragment(value);
+    let mut hint = String::with_capacity(max_bytes.min(sanitized.len()));
+    for character in sanitized.chars() {
+        if hint.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        hint.push(character);
+    }
+    let hint = hint.trim_matches('_');
+    if hint.is_empty() {
+        "root".to_string()
+    } else {
+        hint.to_string()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stable_hex_hash(value: &str) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(target_os = "linux")]
 fn systemd_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '-' | '_' | ':')
+    }) {
+        return value.to_string();
+    }
+
     let escaped = value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -1343,33 +1389,71 @@ mod linux_tests {
     use locality_store::{MountConfig, ProjectionMode};
 
     #[test]
-    fn linux_fuse_systemd_unit_uses_mount_specific_helper_args() {
+    fn linux_fuse_systemd_unit_uses_shared_root_helper_args() {
         let mount = MountConfig::new(
             MountId::new("notion/main"),
             "notion",
             "/home/example/loc notion",
         )
         .projection(ProjectionMode::LinuxFuse);
-        let unit_name = super::linux_fuse_unit_name(&mount.mount_id.0);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let log_path = format!("/home/example/.loc/logs/locality-fuse.{root_id}.log");
         let unit = super::linux_fuse_unit_contents(
             std::path::Path::new("/opt/agent fs/locality-fuse"),
             std::path::Path::new("/home/example/.loc"),
             &mount,
-            std::path::Path::new("/home/example/.loc/logs/locality-fuse.notion_main.log"),
+            std::path::Path::new(&log_path),
         );
 
-        assert_eq!(unit_name, "ai.codeflash.locality.fuse.notion_main.service");
+        assert!(root_id.starts_with("root-home_example-"));
+        assert!(root_id.len() <= 80);
+        assert_eq!(
+            unit_name,
+            format!("ai.codeflash.locality.fuse.{root_id}.service")
+        );
         assert!(unit.contains("ExecStart=\"/opt/agent fs/locality-fuse\""));
-        assert!(unit.contains("--mount-id \"notion/main\""));
-        assert!(unit.contains("--state-dir \"/home/example/.loc\""));
-        assert!(unit.contains("--mountpoint \"/home/example/loc notion\""));
-        assert!(unit.contains("ExecStop=/usr/bin/fusermount3 -uz \"/home/example/loc notion\""));
+        assert!(!unit.contains("--mount-id"));
+        assert!(unit.contains("--state-dir /home/example/.loc"));
+        assert!(unit.contains("--mountpoint /home/example"));
+        assert!(unit.contains("ExecStop=/usr/bin/fusermount3 -uz /home/example"));
         assert!(unit.contains("TimeoutStopSec=10"));
         assert!(unit.contains("LimitCORE=0"));
         assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains(
-            "StandardOutput=append:/home/example/.loc/logs/locality-fuse.notion_main.log"
-        ));
+        assert!(unit.contains(&format!("StandardOutput=append:{log_path}")));
+    }
+
+    #[test]
+    fn linux_fuse_root_id_distinguishes_sanitized_collisions() {
+        let colon_root = MountConfig::new(MountId::new("colon"), "notion", "/tmp/a:b/notion")
+            .projection(ProjectionMode::LinuxFuse);
+        let question_root = MountConfig::new(MountId::new("question"), "notion", "/tmp/a?b/notion")
+            .projection(ProjectionMode::LinuxFuse);
+
+        let colon_id = super::linux_fuse_root_id(&colon_root);
+        let question_id = super::linux_fuse_root_id(&question_root);
+
+        assert_ne!(colon_id, question_id);
+        assert_ne!(
+            super::linux_fuse_unit_name(&colon_id),
+            super::linux_fuse_unit_name(&question_id)
+        );
+    }
+
+    #[test]
+    fn linux_fuse_root_id_is_bounded_for_long_roots() {
+        let long_component = "x".repeat(300);
+        let root = format!("/tmp/{long_component}/notion");
+        let mount = MountConfig::new(MountId::new("long"), "notion", root)
+            .projection(ProjectionMode::LinuxFuse);
+
+        let root_id = super::linux_fuse_root_id(&mount);
+
+        assert!(
+            root_id.len() <= 80,
+            "root id should be bounded, got {} bytes: {root_id}",
+            root_id.len()
+        );
     }
 }
 
@@ -1377,6 +1461,26 @@ mod linux_tests {
 mod tests {
     use locality_core::model::MountId;
     use locality_store::{MountConfig, ProjectionMode};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fuse_unit_uses_shared_projection_root() {
+        let mount = MountConfig::new(
+            locality_core::model::MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/usr/bin/locality-fuse"),
+            std::path::Path::new("/tmp/.loc"),
+            &mount,
+            std::path::Path::new("/tmp/locality-fuse.log"),
+        );
+
+        assert!(unit.contains("--mountpoint /tmp/Locality"));
+        assert!(!unit.contains("--mount-id notion-main"));
+    }
 
     #[test]
     fn macos_file_provider_display_name_strips_locality_cloudstorage_prefix() {

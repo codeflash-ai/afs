@@ -714,7 +714,8 @@ fn linux_provider_status(mount: &MountConfig, findings: &mut Vec<DoctorFinding>)
     #[cfg(target_os = "linux")]
     {
         let helper = file_provider::locality_fuse_helper_path();
-        let service = file_provider::linux_fuse_unit_name(&mount.mount_id.0);
+        let root_id = file_provider::linux_fuse_root_id(mount);
+        let service = file_provider::linux_fuse_unit_name(&root_id);
         let unit_path = file_provider::linux_fuse_unit_path(&service)
             .ok()
             .map(|path| path.display().to_string());

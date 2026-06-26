@@ -13,13 +13,16 @@ use bytes::Bytes;
 use fuse3::path::prelude::*;
 use fuse3::{FileType, MountOptions, Result as FuseResult};
 use futures_util::stream;
-use locality_core::model::EntityKind;
+use locality_core::model::{EntityKind, MountId};
+use locality_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
 use localityd::ipc::{DaemonRequest, DaemonResponse, send_request_with_timeout};
 use localityd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, VirtualFsItem, VirtualFsItemKind,
     VirtualFsItemReport, VirtualFsMaterializeReport, VirtualFsMutationReport, VirtualFsWriteReport,
 };
 use serde::de::DeserializeOwned;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,10 +32,13 @@ const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MATERIALIZE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ROOT_PATH: &str = "/";
+const STAGING_HINT_MAX_BYTES: usize = 48;
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Clone, Debug)]
 struct FuseOptions {
-    mount_id: String,
+    mount_id: Option<String>,
     state_root: PathBuf,
     mountpoint: PathBuf,
 }
@@ -53,16 +59,18 @@ async fn run() -> Result<(), String> {
             options.mountpoint.display()
         )
     })?;
-    std::fs::create_dir_all(staging_root(&options.state_root, &options.mount_id))
+    let staging_id = staging_id_for_mount(options.mount_id.as_deref(), &options.mountpoint);
+    std::fs::create_dir_all(staging_root(&options.state_root, &staging_id))
         .map_err(|error| format!("failed to create staging directory: {error}"))?;
     wait_for_daemon(&options.state_root).await?;
 
     let fs = AgentFuse::new(DaemonClient {
         state_root: options.state_root.clone(),
         mount_id: options.mount_id.clone(),
+        mountpoint: options.mountpoint.clone(),
     });
     let mut mount_options = MountOptions::default();
-    mount_options.fs_name(format!("locality:{}", options.mount_id));
+    mount_options.fs_name(format!("locality:{staging_id}"));
     mount_options.nonempty(true);
 
     let handle = fuse3::path::Session::new(mount_options)
@@ -140,14 +148,12 @@ async fn wait_for_shutdown() -> std::io::Result<()> {
 fn parse_args(args: Vec<String>) -> Result<FuseOptions, String> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return Err(
-            "usage: locality-fuse --mount-id <id> --state-dir <path> --mountpoint <path>"
+            "usage: locality-fuse [--mount-id <id>] --state-dir <path> --mountpoint <path>"
                 .to_string(),
         );
     }
 
-    let mount_id = flag_value(&args, "--mount-id")
-        .ok_or_else(|| "locality-fuse requires --mount-id <id>".to_string())?
-        .to_string();
+    let mount_id = flag_value(&args, "--mount-id").map(str::to_string);
     let state_root = flag_value(&args, "--state-dir")
         .map(PathBuf::from)
         .unwrap_or_else(default_state_root);
@@ -180,6 +186,63 @@ fn staging_root(state_root: &Path, mount_id: &str) -> PathBuf {
     state_root.join("fuse-staging").join(mount_id)
 }
 
+fn staging_id_for_mount(mount_id: Option<&str>, mountpoint: &Path) -> String {
+    match mount_id {
+        Some(mount_id) => mount_id.to_string(),
+        None => {
+            let hint = bounded_staging_hint(mountpoint, STAGING_HINT_MAX_BYTES);
+            format!("root-{hint}-{}", stable_path_hash(mountpoint))
+        }
+    }
+}
+
+fn bounded_staging_hint(path: &Path, max_bytes: usize) -> String {
+    let sanitized = path
+        .display()
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let mut hint = String::with_capacity(max_bytes.min(sanitized.len()));
+    for character in sanitized.chars() {
+        if hint.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        hint.push(character);
+    }
+    let hint = hint.trim_matches('_');
+    if hint.is_empty() {
+        "root".to_string()
+    } else {
+        hint.to_string()
+    }
+}
+
+#[cfg(unix)]
+fn stable_path_hash(path: &Path) -> String {
+    stable_hex_hash(path.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn stable_path_hash(path: &Path) -> String {
+    stable_hex_hash(path.display().to_string().as_bytes())
+}
+
+fn stable_hex_hash(bytes: &[u8]) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 fn projection_root_identifier(mount_id: &str) -> String {
     format!("mount:{mount_id}")
 }
@@ -187,13 +250,16 @@ fn projection_root_identifier(mount_id: &str) -> String {
 #[derive(Clone, Debug)]
 struct DaemonClient {
     state_root: PathBuf,
-    mount_id: String,
+    mount_id: Option<String>,
+    mountpoint: PathBuf,
 }
 
 trait VirtualFsClient {
     fn state_root(&self) -> &Path;
 
-    fn mount_id(&self) -> &str;
+    fn staging_id(&self) -> String;
+
+    fn root_identifier(&self) -> String;
 
     fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError>;
 
@@ -234,38 +300,71 @@ impl VirtualFsClient for DaemonClient {
         &self.state_root
     }
 
-    fn mount_id(&self) -> &str {
-        &self.mount_id
+    fn staging_id(&self) -> String {
+        staging_id_for_mount(self.mount_id.as_deref(), &self.mountpoint)
+    }
+
+    fn root_identifier(&self) -> String {
+        match &self.mount_id {
+            Some(mount_id) => projection_root_identifier(mount_id),
+            None => ROOT_CONTAINER_IDENTIFIER.to_string(),
+        }
     }
 
     fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {
-        self.request_with_timeout(
+        if self.mount_id.is_none() && identifier == ROOT_CONTAINER_IDENTIFIER {
+            return Ok(VirtualFsItemReport {
+                mount_id: String::new(),
+                item: self.shared_root_item(),
+            });
+        }
+
+        let route = self.route_identifier(identifier)?;
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsItem {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                identifier: route.daemon_identifier.clone(),
             },
             METADATA_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_item_report(&route, &mut report);
+        Ok(report)
     }
 
     fn children(&self, container_identifier: &str) -> Result<VirtualFsChildrenReport, FuseError> {
-        self.request_with_timeout(
+        if self.mount_id.is_none() && container_identifier == ROOT_CONTAINER_IDENTIFIER {
+            return self.request_with_timeout(
+                &DaemonRequest::VirtualProjectionRootChildren {
+                    projection_root: self.mountpoint.clone(),
+                    projection: ProjectionMode::LinuxFuse,
+                },
+                METADATA_REQUEST_TIMEOUT,
+            );
+        }
+
+        let route = self.route_identifier(container_identifier)?;
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsChildren {
-                mount_id: self.mount_id.clone(),
-                container_identifier: container_identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                container_identifier: route.daemon_identifier.clone(),
             },
             METADATA_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_children_report(&route, container_identifier, &mut report);
+        Ok(report)
     }
 
     fn materialize(&self, identifier: &str) -> Result<VirtualFsMaterializeReport, FuseError> {
-        self.request_with_timeout(
+        let route = self.route_identifier(identifier)?;
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsMaterialize {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                identifier: route.daemon_identifier.clone(),
             },
             MATERIALIZE_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_materialize_report(&route, &mut report);
+        Ok(report)
     }
 
     fn commit_write(
@@ -273,14 +372,17 @@ impl VirtualFsClient for DaemonClient {
         identifier: &str,
         bytes: Vec<u8>,
     ) -> Result<VirtualFsWriteReport, FuseError> {
-        self.request_with_timeout(
+        let route = self.route_identifier(identifier)?;
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsCommitWrite {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                identifier: route.daemon_identifier.clone(),
                 contents_base64: BASE64.encode(bytes),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_write_report(&route, &mut report);
+        Ok(report)
     }
 
     fn create_file(
@@ -288,14 +390,17 @@ impl VirtualFsClient for DaemonClient {
         parent_identifier: &str,
         filename: &str,
     ) -> Result<VirtualFsMutationReport, FuseError> {
-        self.request_with_timeout(
+        let route = self.route_identifier(parent_identifier)?;
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsCreateFile {
-                mount_id: self.mount_id.clone(),
-                parent_identifier: parent_identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                parent_identifier: route.daemon_identifier.clone(),
                 filename: filename.to_string(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&route, &mut report);
+        Ok(report)
     }
 
     fn create_directory(
@@ -303,14 +408,17 @@ impl VirtualFsClient for DaemonClient {
         parent_identifier: &str,
         dirname: &str,
     ) -> Result<VirtualFsMutationReport, FuseError> {
-        self.request_with_timeout(
+        let route = self.route_identifier(parent_identifier)?;
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsCreateDirectory {
-                mount_id: self.mount_id.clone(),
-                parent_identifier: parent_identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                parent_identifier: route.daemon_identifier.clone(),
                 dirname: dirname.to_string(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&route, &mut report);
+        Ok(report)
     }
 
     fn rename(
@@ -319,29 +427,149 @@ impl VirtualFsClient for DaemonClient {
         new_parent_identifier: &str,
         new_filename: &str,
     ) -> Result<VirtualFsMutationReport, FuseError> {
-        self.request_with_timeout(
+        let route = self.route_identifier(identifier)?;
+        let parent_route = self.route_identifier(new_parent_identifier)?;
+        if route.mount_id != parent_route.mount_id {
+            return Err(FuseError::Invalid);
+        }
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsRename {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
-                new_parent_identifier: new_parent_identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                identifier: route.daemon_identifier.clone(),
+                new_parent_identifier: parent_route.daemon_identifier.clone(),
                 new_filename: new_filename.to_string(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&route, &mut report);
+        Ok(report)
     }
 
     fn trash(&self, identifier: &str) -> Result<VirtualFsMutationReport, FuseError> {
-        self.request_with_timeout(
+        let route = self.route_identifier(identifier)?;
+        let mut report = self.request_with_timeout(
             &DaemonRequest::VirtualFsTrash {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
+                mount_id: route.mount_id.0.clone(),
+                identifier: route.daemon_identifier.clone(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&route, &mut report);
+        Ok(report)
     }
 }
 
 impl DaemonClient {
+    fn route_identifier(&self, identifier: &str) -> Result<RoutedIdentifier, FuseError> {
+        if let Some(mount_id) = &self.mount_id {
+            return Ok(RoutedIdentifier {
+                mount_id: MountId::new(mount_id.clone()),
+                daemon_identifier: identifier.to_string(),
+                mount: None,
+            });
+        }
+
+        let shared =
+            localityd::virtual_projection::unwrap_identifier(identifier).map_err(|error| {
+                FuseError::Daemon(format!(
+                    "invalid shared projection identifier `{identifier}`: {error}"
+                ))
+            })?;
+        let mount = self.load_mount_config(&shared.mount_id)?;
+        Ok(RoutedIdentifier {
+            mount_id: shared.mount_id,
+            daemon_identifier: shared.daemon_identifier,
+            mount: Some(mount),
+        })
+    }
+
+    fn load_mount_config(&self, mount_id: &MountId) -> Result<MountConfig, FuseError> {
+        let store = SqliteStateStore::open(self.state_root.clone()).map_err(|error| {
+            FuseError::Daemon(format!(
+                "failed to open state store `{}`: {error}",
+                self.state_root.display()
+            ))
+        })?;
+        let mount = store
+            .get_mount(mount_id)
+            .map_err(|error| {
+                FuseError::Daemon(format!("failed to load mount `{}`: {error}", mount_id.0))
+            })?
+            .ok_or(FuseError::NotFound)?;
+        if mount.projection != ProjectionMode::LinuxFuse
+            || localityd::virtual_fs::virtual_projection_root(&mount) != self.mountpoint
+        {
+            return Err(FuseError::NotFound);
+        }
+        Ok(mount)
+    }
+
+    fn shared_root_item(&self) -> VirtualFsItem {
+        VirtualFsItem {
+            identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
+            parent_identifier: None,
+            filename: String::new(),
+            kind: VirtualFsItemKind::Folder,
+            entity_kind: None,
+            remote_id: None,
+            path: String::new(),
+            hydration: None,
+            content_type: "public.folder".to_string(),
+            remote_edited_at: None,
+            materialized_path: Some(self.mountpoint.display().to_string()),
+            byte_size: None,
+        }
+    }
+
+    fn wrap_item_report(&self, route: &RoutedIdentifier, report: &mut VirtualFsItemReport) {
+        if let Some(mount) = &route.mount {
+            report.item = localityd::virtual_projection::wrap_item(mount, report.item.clone());
+        }
+    }
+
+    fn wrap_children_report(
+        &self,
+        route: &RoutedIdentifier,
+        shared_container_identifier: &str,
+        report: &mut VirtualFsChildrenReport,
+    ) {
+        if let Some(mount) = &route.mount {
+            report.container_identifier = shared_container_identifier.to_string();
+            report.children = report
+                .children
+                .iter()
+                .cloned()
+                .map(|item| localityd::virtual_projection::wrap_item(mount, item))
+                .collect();
+        }
+    }
+
+    fn wrap_materialize_report(
+        &self,
+        route: &RoutedIdentifier,
+        report: &mut VirtualFsMaterializeReport,
+    ) {
+        if route.mount.is_some() {
+            report.identifier =
+                localityd::virtual_projection::wrap_identifier(&route.mount_id, &report.identifier);
+        }
+    }
+
+    fn wrap_write_report(&self, route: &RoutedIdentifier, report: &mut VirtualFsWriteReport) {
+        if route.mount.is_some() {
+            report.identifier =
+                localityd::virtual_projection::wrap_identifier(&route.mount_id, &report.identifier);
+        }
+    }
+
+    fn wrap_mutation_report(&self, route: &RoutedIdentifier, report: &mut VirtualFsMutationReport) {
+        if let Some(mount) = &route.mount {
+            report.item = localityd::virtual_projection::wrap_item(mount, report.item.clone());
+            report.identifier = report.item.identifier.clone();
+            report.path = report.item.path.clone();
+        }
+    }
+
     fn request_with_timeout<T>(
         &self,
         request: &DaemonRequest,
@@ -354,6 +582,13 @@ impl DaemonClient {
             .map_err(|error| FuseError::Daemon(error.message().to_string()))?;
         decode_response(response)
     }
+}
+
+#[derive(Clone, Debug)]
+struct RoutedIdentifier {
+    mount_id: MountId,
+    daemon_identifier: String,
+    mount: Option<MountConfig>,
 }
 
 fn decode_response<T>(response: DaemonResponse) -> Result<T, FuseError>
@@ -445,7 +680,7 @@ where
 {
     fn new(client: C) -> Self {
         let mut cache = BTreeMap::new();
-        if let Ok(report) = client.item(&projection_root_identifier(client.mount_id())) {
+        if let Ok(report) = client.item(&client.root_identifier()) {
             cache.insert(PathBuf::from(ROOT_PATH), report.item);
         }
         Self {
@@ -467,9 +702,7 @@ where
             return Ok(item);
         }
 
-        let report = self
-            .client
-            .item(&projection_root_identifier(self.client.mount_id()))?;
+        let report = self.client.item(&self.client.root_identifier())?;
         self.cache_item_at(PathBuf::from(ROOT_PATH), report.item.clone());
         Ok(report.item)
     }
@@ -692,7 +925,10 @@ where
 }
 
 fn is_local_cached_identifier(identifier: &str) -> bool {
-    identifier.starts_with("local:") || identifier.starts_with("children:local:")
+    let daemon_identifier = localityd::virtual_projection::unwrap_identifier(identifier)
+        .map(|shared| shared.daemon_identifier)
+        .unwrap_or_else(|_| identifier.to_string());
+    daemon_identifier.starts_with("local:") || daemon_identifier.starts_with("children:local:")
 }
 
 impl<C> PathFilesystem for AgentFuse<C>
@@ -757,8 +993,9 @@ where
         };
 
         if writable {
-            let temp_path = staging_root(self.client.state_root(), self.client.mount_id())
-                .join(format!("{fh}.tmp"));
+            let staging_id = self.client.staging_id();
+            let temp_path =
+                staging_root(self.client.state_root(), &staging_id).join(format!("{fh}.tmp"));
             if truncating {
                 std::fs::write(&temp_path, []).map_err(|error| {
                     FuseError::Io(format!("failed to create write stage: {error}"))
@@ -953,8 +1190,9 @@ where
             .map_err(fuse3::Errno::from)?;
 
         let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let temp_path = staging_root(self.client.state_root(), self.client.mount_id())
-            .join(format!("{fh}.tmp"));
+        let staging_id = self.client.staging_id();
+        let temp_path =
+            staging_root(self.client.state_root(), &staging_id).join(format!("{fh}.tmp"));
         std::fs::write(&temp_path, [])
             .map_err(|error| FuseError::Io(format!("failed to create write stage: {error}")))?;
         self.handles.lock().expect("fuse handles").insert(
@@ -1371,6 +1609,74 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accepts_shared_root_without_mount_id() {
+        let options = parse_args(vec![
+            "--state-dir".to_string(),
+            "/tmp/.loc".to_string(),
+            "--mountpoint".to_string(),
+            "/tmp/Locality".to_string(),
+        ])
+        .expect("parse shared root");
+
+        assert_eq!(options.state_root, PathBuf::from("/tmp/.loc"));
+        assert_eq!(options.mountpoint, PathBuf::from("/tmp/Locality"));
+        assert_eq!(options.mount_id, None);
+    }
+
+    #[test]
+    fn shared_root_staging_paths_are_distinct_per_mountpoint() {
+        let state_root = PathBuf::from("/tmp/.loc");
+        let first = DaemonClient {
+            state_root: state_root.clone(),
+            mount_id: None,
+            mountpoint: PathBuf::from("/tmp/Locality"),
+        };
+        let second = DaemonClient {
+            state_root: state_root.clone(),
+            mount_id: None,
+            mountpoint: PathBuf::from("/tmp/Other Locality"),
+        };
+        let per_mount = DaemonClient {
+            state_root: state_root.clone(),
+            mount_id: Some("notion-main".to_string()),
+            mountpoint: PathBuf::from("/tmp/Locality/notion-main"),
+        };
+
+        assert_ne!(first.staging_id(), second.staging_id());
+        assert_ne!(
+            staging_root(first.state_root(), &first.staging_id()),
+            staging_root(second.state_root(), &second.staging_id())
+        );
+        assert_eq!(per_mount.staging_id(), "notion-main");
+        assert_eq!(
+            staging_root(per_mount.state_root(), &per_mount.staging_id()),
+            state_root.join("fuse-staging").join("notion-main")
+        );
+    }
+
+    #[test]
+    fn shared_root_staging_ids_are_bounded_and_collision_resistant() {
+        let long_component = "x".repeat(300);
+        let long_id = staging_id_for_mount(
+            None,
+            &PathBuf::from(format!("/tmp/{long_component}/Locality")),
+        );
+        let colon_id = staging_id_for_mount(None, Path::new("/tmp/a:b"));
+        let question_id = staging_id_for_mount(None, Path::new("/tmp/a?b"));
+
+        assert!(
+            long_id.len() <= 80,
+            "shared staging id should be bounded, got {} bytes: {long_id}",
+            long_id.len()
+        );
+        assert_ne!(colon_id, question_id);
+        assert_eq!(
+            staging_id_for_mount(Some("notion-main"), Path::new("/tmp/Locality")),
+            "notion-main"
+        );
+    }
+
+    #[test]
     fn resolve_root_fetches_root_item_when_startup_cache_is_empty() {
         let root = test_root_item();
         let fs = AgentFuse {
@@ -1703,8 +2009,12 @@ mod tests {
             &self.state_root
         }
 
-        fn mount_id(&self) -> &str {
-            &self.mount_id
+        fn staging_id(&self) -> String {
+            self.mount_id.clone()
+        }
+
+        fn root_identifier(&self) -> String {
+            projection_root_identifier(&self.mount_id)
         }
 
         fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {

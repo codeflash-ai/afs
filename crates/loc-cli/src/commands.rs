@@ -33,6 +33,7 @@ use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
 use localityd::virtual_fs::{
     VirtualFsChildrenReport, virtual_fs_ancestor_container_identifiers, virtual_fs_content_root,
+    virtual_projection_root,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1678,12 +1679,34 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
     };
 
     let target_os = std::env::consts::OS;
+    if target_os == "linux" {
+        if let Ok(store) = SqliteStateStore::open(default_state_root())
+            && let Ok(mount) = resolve_mount_target(&store, target)
+        {
+            if let Err(error) = validate_virtual_projection_registration(&mount, "linux") {
+                return command_error(json, error, EXIT_USAGE);
+            }
+            let mounts = match store.load_mounts() {
+                Ok(mounts) => mounts,
+                Err(error) => {
+                    return command_error(
+                        json,
+                        CommandError::new("file-provider", "store_load_failed", error.to_string()),
+                        EXIT_INTERNAL,
+                    );
+                }
+            };
+            if let Err(error) = guard_linux_fuse_shared_root_unregister(&mounts, &mount) {
+                return command_error(json, error, EXIT_USAGE);
+            }
+            return run_linux_fuse_unregister(json, Some(&mount), target);
+        }
+        return run_linux_fuse_unregister(json, None, target);
+    }
+
     let resolved_mount = SqliteStateStore::open(default_state_root())
         .ok()
         .and_then(|store| resolve_mount_target(&store, target).ok());
-    if target_os == "linux" {
-        return run_linux_fuse_unregister(json, resolved_mount.as_ref(), target);
-    }
     if target_os == "windows" {
         let mount_id = resolved_mount
             .map(|mount| mount.mount_id.0)
@@ -3874,6 +3897,40 @@ fn open_path_for_linux_fuse(json: bool, mount: &MountConfig) -> i32 {
     )
 }
 
+fn guard_linux_fuse_shared_root_unregister(
+    mounts: &[MountConfig],
+    target: &MountConfig,
+) -> Result<(), CommandError> {
+    if target.projection != ProjectionMode::LinuxFuse {
+        return Ok(());
+    }
+    let target_root = virtual_projection_root(target);
+    let mut sibling_ids = mounts
+        .iter()
+        .filter(|mount| {
+            mount.mount_id != target.mount_id
+                && mount.projection == ProjectionMode::LinuxFuse
+                && virtual_projection_root(mount) == target_root
+        })
+        .map(|mount| mount.mount_id.0.clone())
+        .collect::<Vec<_>>();
+    sibling_ids.sort();
+    if sibling_ids.is_empty() {
+        return Ok(());
+    }
+
+    Err(CommandError::new(
+        "file-provider",
+        "linux_fuse_shared_root_in_use",
+        format!(
+            "Linux FUSE root `{}` is shared by sibling mount ids {}; unregistering `{}` would stop their provider too",
+            target_root.display(),
+            sibling_ids.join(", "),
+            target.mount_id.0
+        ),
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &str) -> i32 {
     if let Some(mount) = mount
@@ -3884,7 +3941,10 @@ fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &s
     let mount_id = mount
         .map(|mount| mount.mount_id.0.clone())
         .unwrap_or_else(|| target.to_string());
-    let unit_name = file_provider_helper::linux_fuse_unit_name(&mount_id);
+    let unit_id = mount
+        .map(file_provider_helper::linux_fuse_root_id)
+        .unwrap_or_else(|| mount_id.clone());
+    let unit_name = file_provider_helper::linux_fuse_unit_name(&unit_id);
     let unit_path = match file_provider_helper::linux_fuse_unit_path(&unit_name) {
         Ok(path) => path,
         Err(error) => return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL),
@@ -3892,9 +3952,10 @@ fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &s
 
     let _ = file_provider_helper::run_systemctl_user(&["disable", "--now", &unit_name]);
     if let Some(mount) = mount {
+        let projection_root = localityd::virtual_fs::virtual_projection_root(mount);
         let _ = ProcessCommand::new("fusermount3")
             .arg("-uz")
-            .arg(&mount.root)
+            .arg(&projection_root)
             .output();
     }
     let _ = std::fs::remove_file(&unit_path);
@@ -5345,12 +5406,12 @@ mod tests {
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
         absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
-        google_docs_oauth_broker_config, legacy_args_for_command, notion_authorize_url,
-        notion_oauth_broker_config, projection_mode_for_target,
-        projection_usage_options_for_target, prompt_for_push_confirmation,
-        pull_direct_fallback_error, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        validate_virtual_projection_registration,
+        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
+        legacy_args_for_command, notion_authorize_url, notion_oauth_broker_config,
+        projection_mode_for_target, projection_usage_options_for_target,
+        prompt_for_push_confirmation, pull_direct_fallback_error,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
     };
 
     #[test]
@@ -6032,6 +6093,61 @@ mod tests {
                 .message
                 .contains("--projection windows-cloud-files")
         );
+    }
+
+    #[test]
+    fn linux_fuse_unregister_guard_blocks_shared_root_siblings() {
+        let target = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let sibling = MountConfig::new(
+            MountId::new("docs-main"),
+            "google-docs",
+            "/tmp/Locality/docs",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let mounts = vec![target.clone(), sibling];
+
+        let error = guard_linux_fuse_shared_root_unregister(&mounts, &target)
+            .expect_err("shared root sibling should block unregister");
+
+        assert_eq!(error.code, "linux_fuse_shared_root_in_use");
+        assert!(error.message.contains("/tmp/Locality"));
+        assert!(error.message.contains("docs-main"));
+    }
+
+    #[test]
+    fn linux_fuse_unregister_guard_ignores_non_siblings() {
+        let target = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let different_root =
+            MountConfig::new(MountId::new("docs-main"), "google-docs", "/tmp/Other/docs")
+                .projection(ProjectionMode::LinuxFuse);
+        let different_projection =
+            MountConfig::new(MountId::new("plain"), "notion", "/tmp/Locality/plain")
+                .projection(ProjectionMode::PlainFiles);
+        let same_mount_id = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-copy",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let mounts = vec![
+            target.clone(),
+            different_root,
+            different_projection,
+            same_mount_id,
+        ];
+
+        guard_linux_fuse_shared_root_unregister(&mounts, &target)
+            .expect("non-siblings should not block unregister");
     }
 
     #[test]

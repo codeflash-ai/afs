@@ -183,7 +183,6 @@ localityd_pid="$!"
 wait_for_daemon
 
 LOCALITY_STATE_DIR="$state_root" "$fuse_bin" \
-  --mount-id "$mount_id" \
   --state-dir "$state_root" \
   --mountpoint "$loc_root" >"$fuse_log" 2>&1 &
 fuse_pid="$!"
