@@ -832,6 +832,15 @@ struct DocsParagraphIndentRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsParagraphSpacingRange {
+    start: usize,
+    end: usize,
+    line_spacing: Option<serde_json::Value>,
+    space_above: Option<serde_json::Value>,
+    space_below: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DocsBulletRange {
     start: usize,
     end: usize,
@@ -873,6 +882,9 @@ fn docs_text_requests_from_parsed(
     let preserved_paragraph_indents = style_source
         .map(|source| preserved_paragraph_indents(&inserted_text, source))
         .unwrap_or_default();
+    let preserved_paragraph_spacing = style_source
+        .map(|source| preserved_paragraph_spacing(&inserted_text, source))
+        .unwrap_or_default();
     let mut requests = vec![DocsRequest::InsertText {
         insert_text: InsertTextRequest {
             location: Location {
@@ -908,6 +920,11 @@ fn docs_text_requests_from_parsed(
         preserved_paragraph_indents
             .into_iter()
             .map(|range| paragraph_indent_request(location_index, range)),
+    );
+    requests.extend(
+        preserved_paragraph_spacing
+            .into_iter()
+            .map(|range| paragraph_spacing_request(location_index, range)),
     );
     requests.extend(
         preserved_color_ranges
@@ -1106,6 +1123,37 @@ fn paragraph_indent_request(location_index: usize, range: DocsParagraphIndentRan
             paragraph_style: ParagraphStylePatch {
                 indent_start: range.indent_start,
                 indent_first_line: range.indent_first_line,
+                ..ParagraphStylePatch::default()
+            },
+            fields: fields.join(","),
+        },
+    }
+}
+
+fn paragraph_spacing_request(
+    location_index: usize,
+    range: DocsParagraphSpacingRange,
+) -> DocsRequest {
+    let mut fields = Vec::new();
+    if range.line_spacing.is_some() {
+        fields.push("lineSpacing");
+    }
+    if range.space_above.is_some() {
+        fields.push("spaceAbove");
+    }
+    if range.space_below.is_some() {
+        fields.push("spaceBelow");
+    }
+    DocsRequest::UpdateParagraphStyle {
+        update_paragraph_style: UpdateParagraphStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            paragraph_style: ParagraphStylePatch {
+                line_spacing: range.line_spacing,
+                space_above: range.space_above,
+                space_below: range.space_below,
                 ..ParagraphStylePatch::default()
             },
             fields: fields.join(","),
@@ -1532,6 +1580,27 @@ fn preserved_paragraph_indents(
         .collect()
 }
 
+fn preserved_paragraph_spacing(
+    new_text: &str,
+    source: DocsTextStyleSource<'_>,
+) -> Vec<DocsParagraphSpacingRange> {
+    let (source_text, source_ranges) = source_text_paragraph_spacing_ranges(source);
+    source_ranges
+        .into_iter()
+        .filter_map(|range| {
+            let (start, end) =
+                map_paragraph_range_by_context(&source_text, range.start, range.end, new_text)?;
+            Some(DocsParagraphSpacingRange {
+                start,
+                end,
+                line_spacing: range.line_spacing,
+                space_above: range.space_above,
+                space_below: range.space_below,
+            })
+        })
+        .collect()
+}
+
 fn source_text_color_ranges(
     source: DocsTextStyleSource<'_>,
 ) -> (String, Vec<DocsForegroundColorRange>) {
@@ -1632,6 +1701,37 @@ fn source_text_paragraph_indent_ranges(
             end: range_end,
             indent_start: style.indent_start.clone(),
             indent_first_line: style.indent_first_line.clone(),
+        });
+    }
+    (source_text, ranges)
+}
+
+fn source_text_paragraph_spacing_ranges(
+    source: DocsTextStyleSource<'_>,
+) -> (String, Vec<DocsParagraphSpacingRange>) {
+    let mut source_text = String::new();
+    let mut ranges = Vec::new();
+    for (paragraph, range_start, range_end) in
+        source_paragraph_text_ranges(source, &mut source_text)
+    {
+        if range_end <= range_start {
+            continue;
+        }
+        let Some(style) = paragraph.paragraph_style.as_ref() else {
+            continue;
+        };
+        if style.line_spacing.is_none()
+            && style.space_above.is_none()
+            && style.space_below.is_none()
+        {
+            continue;
+        }
+        ranges.push(DocsParagraphSpacingRange {
+            start: range_start,
+            end: range_end,
+            line_spacing: style.line_spacing.clone(),
+            space_above: style.space_above.clone(),
+            space_below: style.space_below.clone(),
         });
     }
     (source_text, ranges)
@@ -4622,6 +4722,97 @@ mod tests {
                     && value["updateParagraphStyle"]["fields"] == "indentStart,indentFirstLine"
             }),
             "source paragraph indentation should be restored after editing the block: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_spacing_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Spaced", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Spaced",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 14,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "lineSpacing": 150,
+                                    "spaceAbove": {
+                                        "magnitude": 18,
+                                        "unit": "PT"
+                                    },
+                                    "spaceBelow": {
+                                        "magnitude": 6,
+                                        "unit": "PT"
+                                    }
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 14,
+                                    "textRun": {
+                                        "content": "Spacing line\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("spaced document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:14"),
+                content: "Spacing phrase".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 15
+                    && value["updateParagraphStyle"]["paragraphStyle"]["lineSpacing"] == 150
+                    && value["updateParagraphStyle"]["paragraphStyle"]["spaceAbove"]["magnitude"]
+                        == 18
+                    && value["updateParagraphStyle"]["paragraphStyle"]["spaceBelow"]["magnitude"]
+                        == 6
+                    && value["updateParagraphStyle"]["fields"]
+                        == "lineSpacing,spaceAbove,spaceBelow"
+            }),
+            "source paragraph spacing should be restored after editing the block: {serialized:#?}"
         );
     }
 
