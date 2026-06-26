@@ -600,7 +600,7 @@ fn apply_plan(
                     if let Err(error) = docs.batch_update_document(
                         created.id.as_str(),
                         BatchUpdateDocumentRequest {
-                            requests: docs_text_requests(1, body),
+                            requests: docs_document_text_requests(1, body),
                             write_control: write_control(&document),
                         },
                     ) {
@@ -697,8 +697,8 @@ struct DocsInlineStyle {
     link: Option<String>,
 }
 
-fn docs_text_requests(location_index: usize, content: &str) -> Vec<DocsRequest> {
-    docs_text_requests_with_style_source(location_index, content, None)
+fn docs_document_text_requests(location_index: usize, content: &str) -> Vec<DocsRequest> {
+    docs_text_requests_from_parsed(location_index, docs_document_text(content), None)
 }
 
 fn docs_text_requests_with_style_source(
@@ -872,6 +872,14 @@ fn docs_text(content: &str) -> DocsText {
             }
         })
         .collect();
+    parsed
+}
+
+fn docs_document_text(content: &str) -> DocsText {
+    let mut parsed = parse_docs_markdown_inline(content);
+    if !parsed.text.ends_with('\n') {
+        parsed.text.push('\n');
+    }
     parsed
 }
 
@@ -1778,6 +1786,62 @@ mod tests {
                     .is_some()
             }),
             "expected non-list block updates to clear inherited list bullets"
+        );
+    }
+
+    #[test]
+    fn create_entity_preserves_markdown_paragraph_breaks_as_docs_paragraphs() {
+        let drive = Arc::new(FakeDrive::default());
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "created-doc",
+            "Local Shape Create",
+            "rev-1",
+            "",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                title: "Local Shape Create".to_string(),
+                properties: BTreeMap::new(),
+                body: "# Local Shape Create\n\nIntro paragraph\n".to_string(),
+                source_path: PathBuf::from("local-shape-create/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(
+            insert_text.text,
+            "# Local Shape Create\n\nIntro paragraph\n"
+        );
+        assert!(
+            !insert_text.text.contains('\u{000b}'),
+            "full-document creates must not collapse Markdown blocks into soft breaks"
         );
     }
 
