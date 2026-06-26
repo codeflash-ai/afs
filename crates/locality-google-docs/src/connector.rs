@@ -840,6 +840,9 @@ fn docs_text_requests_from_parsed(
     let preserved_background_ranges = style_source
         .map(|source| preserved_background_ranges(&inserted_text, source, &docs_text.style_ranges))
         .unwrap_or_default();
+    let preserved_baseline_ranges = style_source
+        .map(|source| preserved_baseline_ranges(&inserted_text, source, &docs_text.style_ranges))
+        .unwrap_or_default();
     let mut requests = vec![DocsRequest::InsertText {
         insert_text: InsertTextRequest {
             location: Location {
@@ -875,6 +878,11 @@ fn docs_text_requests_from_parsed(
         preserved_background_ranges
             .into_iter()
             .map(|range| background_color_request(location_index, range)),
+    );
+    requests.extend(
+        preserved_baseline_ranges
+            .into_iter()
+            .map(|range| baseline_offset_request(location_index, range)),
     );
     requests.extend(
         docs_text
@@ -926,6 +934,13 @@ struct DocsBackgroundColorRange {
     background_color: serde_json::Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsBaselineOffsetRange {
+    start: usize,
+    end: usize,
+    baseline_offset: String,
+}
+
 fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest {
     DocsRequest::UpdateTextStyle {
         update_text_style: UpdateTextStyleRequest {
@@ -940,10 +955,12 @@ fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest
                 strikethrough: Some(false),
                 foreground_color: None,
                 background_color: None,
+                baseline_offset: Some("NONE".to_string()),
                 link: None,
             },
-            fields: "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,link"
-                .to_string(),
+            fields:
+                "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,baselineOffset,link"
+                    .to_string(),
         },
     }
 }
@@ -1018,6 +1035,22 @@ fn background_color_request(location_index: usize, range: DocsBackgroundColorRan
     }
 }
 
+fn baseline_offset_request(location_index: usize, range: DocsBaselineOffsetRange) -> DocsRequest {
+    DocsRequest::UpdateTextStyle {
+        update_text_style: UpdateTextStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            text_style: TextStylePatch {
+                baseline_offset: Some(range.baseline_offset),
+                ..TextStylePatch::default()
+            },
+            fields: "baselineOffset".to_string(),
+        },
+    }
+}
+
 fn text_style_request(
     location_index: usize,
     range: DocsTextStyleRange,
@@ -1043,6 +1076,16 @@ fn text_style_request(
                 || range.style.link.is_some()
         })
         .and_then(|style| style.background_color.clone());
+    let baseline_offset = existing_style
+        .filter(|_| {
+            range.style.bold
+                || range.style.italic
+                || range.style.underline
+                || range.style.strikethrough
+                || range.style.link.is_some()
+        })
+        .and_then(|style| style.baseline_offset.clone())
+        .filter(|baseline_offset| baseline_offset != "NONE");
     let mut fields = Vec::new();
     if range.style.bold {
         fields.push("bold");
@@ -1065,6 +1108,9 @@ fn text_style_request(
     if background_color.is_some() {
         fields.push("backgroundColor");
     }
+    if baseline_offset.is_some() {
+        fields.push("baselineOffset");
+    }
     DocsRequest::UpdateTextStyle {
         update_text_style: UpdateTextStyleRequest {
             range: Range {
@@ -1078,6 +1124,7 @@ fn text_style_request(
                 strikethrough: range.style.strikethrough.then_some(true),
                 foreground_color,
                 background_color,
+                baseline_offset,
                 link: range.style.link.map(|url| Link { url: Some(url) }),
             },
             fields: fields.join(","),
@@ -1132,6 +1179,32 @@ fn preserved_background_ranges(
                 start,
                 end,
                 background_color: range.background_color,
+            })
+        })
+        .collect()
+}
+
+fn preserved_baseline_ranges(
+    new_text: &str,
+    source: DocsTextStyleSource<'_>,
+    explicit_style_ranges: &[DocsTextStyleRange],
+) -> Vec<DocsBaselineOffsetRange> {
+    let (source_text, source_ranges) = source_text_baseline_ranges(source);
+    source_ranges
+        .into_iter()
+        .filter_map(|range| {
+            let (start, end) =
+                map_source_range_by_context(&source_text, range.start, range.end, new_text)?;
+            if explicit_style_ranges
+                .iter()
+                .any(|explicit| ranges_overlap(start, end, explicit.start, explicit.end))
+            {
+                return None;
+            }
+            Some(DocsBaselineOffsetRange {
+                start,
+                end,
+                baseline_offset: range.baseline_offset,
             })
         })
         .collect()
@@ -1237,6 +1310,57 @@ fn source_text_background_ranges(
     (source_text, ranges)
 }
 
+fn source_text_baseline_ranges(
+    source: DocsTextStyleSource<'_>,
+) -> (String, Vec<DocsBaselineOffsetRange>) {
+    let mut source_text = String::new();
+    let mut ranges = Vec::new();
+    for element in source
+        .document
+        .body
+        .content
+        .iter()
+        .filter_map(|element| element.paragraph.as_ref())
+        .flat_map(|paragraph| paragraph.elements.iter())
+    {
+        let (Some(element_start), Some(element_end), Some(text_run)) = (
+            element.start_index,
+            element.end_index,
+            element.text_run.as_ref(),
+        ) else {
+            continue;
+        };
+        let overlap_start = element_start.max(source.start_index);
+        let overlap_end = element_end.min(source.end_index);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let content = utf16_slice(
+            &text_run.content,
+            overlap_start - element_start,
+            overlap_end - element_start,
+        );
+        let range_start = docs_text_len(&source_text);
+        source_text.push_str(&content);
+        let range_end = docs_text_len(&source_text);
+        if let Some(baseline_offset) = text_run.text_style.baseline_offset.clone()
+            && baseline_offset != "NONE"
+            && range_end > range_start
+        {
+            push_merged_baseline_offset_range(
+                &mut ranges,
+                DocsBaselineOffsetRange {
+                    start: range_start,
+                    end: range_end,
+                    baseline_offset,
+                },
+            );
+        }
+    }
+    (source_text, ranges)
+}
+
 fn push_merged_foreground_color_range(
     ranges: &mut Vec<DocsForegroundColorRange>,
     range: DocsForegroundColorRange,
@@ -1265,6 +1389,20 @@ fn push_merged_background_color_range(
     ranges.push(range);
 }
 
+fn push_merged_baseline_offset_range(
+    ranges: &mut Vec<DocsBaselineOffsetRange>,
+    range: DocsBaselineOffsetRange,
+) {
+    if let Some(previous) = ranges.last_mut()
+        && previous.end == range.start
+        && previous.baseline_offset == range.baseline_offset
+    {
+        previous.end = range.end;
+        return;
+    }
+    ranges.push(range);
+}
+
 fn map_source_range_by_context(
     source_text: &str,
     source_start: usize,
@@ -1275,6 +1413,9 @@ fn map_source_range_by_context(
     let new_len = docs_text_len(new_text);
     if source_start > source_end || source_end > source_len {
         return None;
+    }
+    if source_len == new_len {
+        return (source_end > source_start).then_some((source_start, source_end));
     }
 
     let common_prefix = common_prefix_utf16(source_text, new_text);
@@ -2835,9 +2976,10 @@ mod tests {
                         "bold": false,
                         "italic": false,
                         "underline": false,
-                        "strikethrough": false
+                        "strikethrough": false,
+                        "baselineOffset": "NONE"
                     },
-                    "fields": "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,link"
+                    "fields": "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,baselineOffset,link"
                 }
             })
         );
@@ -3266,6 +3408,127 @@ mod tests {
             }),
             "background-only source style should be restored onto the edited span: {:#?}",
             batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_preserves_baseline_offset_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Formula", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Formula",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 18,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 11,
+                                        "textRun": {
+                                            "content": "Formula: x",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 11,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "2",
+                                            "textStyle": {
+                                                "baselineOffset": "SUPERSCRIPT"
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 12,
+                                        "endIndex": 16,
+                                        "textRun": {
+                                            "content": " + y",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 16,
+                                        "endIndex": 17,
+                                        "textRun": {
+                                            "content": "2",
+                                            "textStyle": {
+                                                "baselineOffset": "SUPERSCRIPT"
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 17,
+                                        "endIndex": 18,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("superscript document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:18"),
+                content: "Formula: x3 + y3".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 11
+                    && value["updateTextStyle"]["range"]["endIndex"] == 12
+                    && value["updateTextStyle"]["textStyle"]["baselineOffset"] == "SUPERSCRIPT"
+                    && value["updateTextStyle"]["fields"] == "baselineOffset"
+            }),
+            "first superscript source style should be restored onto the edited exponent: {serialized:#?}"
+        );
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 16
+                    && value["updateTextStyle"]["range"]["endIndex"] == 17
+                    && value["updateTextStyle"]["textStyle"]["baselineOffset"] == "SUPERSCRIPT"
+                    && value["updateTextStyle"]["fields"] == "baselineOffset"
+            }),
+            "second superscript source style should be restored onto the edited exponent: {serialized:#?}"
         );
     }
 
