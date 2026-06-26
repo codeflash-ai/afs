@@ -1016,9 +1016,13 @@ fn docs_document_text(content: &str) -> DocsText {
 
 fn docs_block_text(content: &str) -> DocsText {
     let trimmed = content.trim_start();
-    let (_, block_kind) = markdown_block_content(trimmed);
+    let (block_content, block_kind) = markdown_block_content(trimmed);
     if matches!(block_kind, MarkdownBlockKind::Paragraph) {
-        let mut parsed = docs_text(content);
+        let mut parsed = if block_content == trimmed {
+            docs_text(content)
+        } else {
+            docs_text(block_content)
+        };
         let end = docs_text_len(&parsed.text);
         if end > 0 {
             parsed.paragraph_styles.push(DocsParagraphStyleRange {
@@ -1136,6 +1140,9 @@ enum MarkdownBlockKind {
 }
 
 fn markdown_block_content(block: &str) -> (&str, MarkdownBlockKind) {
+    if let Some(content) = escaped_markdown_block_content(block) {
+        return (content, MarkdownBlockKind::Paragraph);
+    }
     if let Some((level, content)) = markdown_heading_content(block) {
         return (content, MarkdownBlockKind::Heading(level));
     }
@@ -1146,6 +1153,22 @@ fn markdown_block_content(block: &str) -> (&str, MarkdownBlockKind) {
         return (content, MarkdownBlockKind::OrderedList);
     }
     (block, MarkdownBlockKind::Paragraph)
+}
+
+fn escaped_markdown_block_content(block: &str) -> Option<&str> {
+    let content = block.strip_prefix('\\')?;
+    paragraph_block_start_marker_needs_escape(content).then_some(content)
+}
+
+fn paragraph_block_start_marker_needs_escape(value: &str) -> bool {
+    value.starts_with("::loc")
+        || markdown_heading_content(value).is_some()
+        || value.starts_with("- ")
+        || value.starts_with("* ")
+        || value.starts_with("+ ")
+        || markdown_ordered_list_content(value).is_some()
+        || value.starts_with("> ")
+        || value.trim_end() == "---"
 }
 
 fn markdown_heading_content(block: &str) -> Option<(usize, &str)> {
@@ -1530,7 +1553,7 @@ mod tests {
     use locality_core::planner::{PushOperation, PushPlan};
     use locality_core::push::RemotePrecondition;
 
-    use super::{GoogleDocsConfig, GoogleDocsConnector};
+    use super::{GoogleDocsConfig, GoogleDocsConnector, docs_block_text};
     use crate::client::{GoogleDocsApi, GoogleDriveApi};
     use crate::docs_dto::{BatchUpdateDocumentRequest, DocsRequest, GoogleDocument, Range};
     use crate::drive_dto::{
@@ -1882,6 +1905,35 @@ mod tests {
             1,
             "escaped literal markers should not emit inline style requests beyond the reset"
         );
+    }
+
+    #[test]
+    fn apply_decodes_escaped_literal_markdown_block_markers() {
+        for (escaped, literal) in [
+            ("\\# Literal heading", "# Literal heading\n"),
+            ("\\- Literal bullet", "- Literal bullet\n"),
+            ("\\1. Literal number", "1. Literal number\n"),
+            ("\\> Literal quote", "> Literal quote\n"),
+            ("\\---", "---\n"),
+            (
+                "\\::loc{id=literal type=paragraph}",
+                "::loc{id=literal type=paragraph}\n",
+            ),
+        ] {
+            let parsed = docs_block_text(escaped);
+            assert_eq!(parsed.text, literal, "escaped block marker {escaped:?}");
+            assert!(
+                parsed.bullet_ranges.is_empty(),
+                "escaped block marker must not create bullets: {escaped:?}"
+            );
+            assert!(
+                parsed
+                    .paragraph_styles
+                    .iter()
+                    .all(|range| range.named_style_type == "NORMAL_TEXT"),
+                "escaped block marker must remain a normal paragraph: {escaped:?}"
+            );
+        }
     }
 
     #[test]

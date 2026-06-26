@@ -167,7 +167,7 @@ fn render_paragraph(document: &GoogleDocument, paragraph: &Paragraph) -> Rendere
             .and_then(heading_level)
         {
             Some(level) => format!("{} {}", "#".repeat(level), text),
-            None => text.to_string(),
+            None => escape_paragraph_block_start_marker(text.to_string()),
         }
     };
 
@@ -276,6 +276,58 @@ fn escape_markdown_link_href(href: &str) -> String {
     href.replace('\\', "\\\\")
         .replace('(', "\\(")
         .replace(')', "\\)")
+}
+
+fn escape_paragraph_block_start_marker(text: String) -> String {
+    let Some((index, _)) = text
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, ' ' | '\t'))
+    else {
+        return text;
+    };
+
+    if paragraph_block_start_marker_needs_escape(&text[index..]) {
+        let mut escaped = String::with_capacity(text.len() + 1);
+        escaped.push_str(&text[..index]);
+        escaped.push('\\');
+        escaped.push_str(&text[index..]);
+        escaped
+    } else {
+        text
+    }
+}
+
+fn paragraph_block_start_marker_needs_escape(value: &str) -> bool {
+    value.starts_with("::loc")
+        || heading_marker(value)
+        || block_list_marker(value)
+        || quote_marker(value)
+        || divider_marker(value)
+}
+
+fn heading_marker(value: &str) -> bool {
+    let level = value.chars().take_while(|ch| *ch == '#').count();
+    (1..=6).contains(&level) && value[level..].starts_with(char::is_whitespace)
+}
+
+fn block_list_marker(value: &str) -> bool {
+    value.starts_with("- ")
+        || value.starts_with("* ")
+        || value.starts_with("+ ")
+        || ordered_list_marker(value)
+}
+
+fn ordered_list_marker(value: &str) -> bool {
+    let digit_count = value.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digit_count > 0 && value[digit_count..].starts_with(". ")
+}
+
+fn quote_marker(value: &str) -> bool {
+    value.starts_with("> ")
+}
+
+fn divider_marker(value: &str) -> bool {
+    value.trim_end() == "---"
 }
 
 fn literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
@@ -569,6 +621,49 @@ mod tests {
             "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com) \\<u>underline\\</u>\n"
         );
         assert_eq!(rendered.shadow.blocks.len(), 1);
+    }
+
+    #[test]
+    fn render_escapes_literal_markdown_block_start_markers() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Literal Block Markers"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Literal Block Markers",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 19, "paragraph": {
+                            "elements": [{ "textRun": { "content": "# Literal heading\n" } }]
+                        }},
+                        { "startIndex": 19, "endIndex": 36, "paragraph": {
+                            "elements": [{ "textRun": { "content": "- Literal bullet\n" } }]
+                        }},
+                        { "startIndex": 36, "endIndex": 54, "paragraph": {
+                            "elements": [{ "textRun": { "content": "1. Literal number\n" } }]
+                        }},
+                        { "startIndex": 54, "endIndex": 70, "paragraph": {
+                            "elements": [{ "textRun": { "content": "> Literal quote\n" } }]
+                        }},
+                        { "startIndex": 70, "endIndex": 74, "paragraph": {
+                            "elements": [{ "textRun": { "content": "---\n" } }]
+                        }},
+                        { "startIndex": 74, "endIndex": 108, "paragraph": {
+                            "elements": [{ "textRun": { "content": "::loc{id=literal type=paragraph}\n" } }]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "\\# Literal heading\n\n\\- Literal bullet\n\n\\1. Literal number\n\n\\> Literal quote\n\n\\---\n\n\\::loc{id=literal type=paragraph}\n"
+        );
+        assert!(!rendered.push_blocking_directives);
     }
 
     #[test]
