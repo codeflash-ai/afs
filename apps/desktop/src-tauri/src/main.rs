@@ -123,6 +123,8 @@ struct DesktopSnapshot {
     health: AppHealth,
     connection: ConnectionSummary,
     mount: MountSummary,
+    mounts: Vec<MountSummary>,
+    active_mount_id: Option<String>,
     needs_onboarding: bool,
     settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
@@ -149,14 +151,21 @@ struct ConnectionSummary {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MountSummary {
+    mount_id: String,
     connector: String,
+    connector_name: String,
+    connection_id: Option<String>,
     workspace_name: String,
     local_path: String,
     notion_url: Option<String>,
     access_scope: String,
+    remote_root_id: Option<String>,
     projection: String,
     read_only: bool,
     status: String,
+    root_exists: bool,
+    entity_count: usize,
+    pending_change_count: usize,
     provider: Option<ProviderRuntimeSummary>,
 }
 
@@ -1371,6 +1380,13 @@ fn quit_completely(app: AppHandle) -> ActionReport {
 fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root.clone()).map_err(|error| error.to_string())?;
+    load_desktop_snapshot_from_store(&store, &state_root)
+}
+
+fn load_desktop_snapshot_from_store(
+    store: &SqliteStateStore,
+    state_root: &Path,
+) -> Result<DesktopSnapshot, String> {
     let mounts = store.load_mounts().map_err(|error| error.to_string())?;
     let connections = store
         .list_connections()
@@ -1379,14 +1395,22 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let mount = choose_mount(&mounts);
     let connection = choose_connection(&connections, mount.as_ref());
     let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
+    let mount_summaries = mounts
+        .iter()
+        .map(|mount| {
+            let connection = choose_connection_for_mount(&connections, mount);
+            let provider = provider_runtime_summary(state_root, mount);
+            mount_summary(Some(store), Some(mount), connection.as_ref(), provider)
+        })
+        .collect::<Vec<_>>();
     let provider = mount
         .as_ref()
-        .and_then(|mount| provider_runtime_summary(&state_root, mount));
+        .and_then(|mount| provider_runtime_summary(state_root, mount));
     let pending_changes = match mount.as_ref() {
-        Some(mount) => pending_changes_for_mount(&store, &state_root, &mount.mount_id)?,
+        Some(mount) => pending_changes_for_mount(store, state_root, &mount.mount_id)?,
         None => Vec::new(),
     };
-    let daemon_ready = send_request(&state_root, &DaemonRequest::Ping)
+    let daemon_ready = send_request(state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
     let health_state = health_state(
@@ -1402,11 +1426,13 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
-        mount: mount_summary(Some(&store), mount.as_ref(), connection.as_ref(), provider),
+        mount: mount_summary(Some(store), mount.as_ref(), connection.as_ref(), provider),
+        mounts: mount_summaries,
+        active_mount_id: mount.as_ref().map(|mount| mount.mount_id.0.clone()),
         needs_onboarding,
         settings: desktop_settings(),
         pending_changes,
-        activity: activity_from_journals(&journals, &store, &state_root),
+        activity: activity_from_journals(&journals, store, state_root),
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
@@ -1428,16 +1454,25 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             status: "error".to_string(),
         },
         mount: MountSummary {
+            mount_id: String::new(),
             connector: "notion".to_string(),
+            connector_name: "Notion".to_string(),
+            connection_id: None,
             workspace_name: "Locality state unavailable".to_string(),
             local_path: absolute_display_path(&default_notion_access_root()),
             notion_url: None,
             access_scope: "State load failed".to_string(),
+            remote_root_id: None,
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
             status: "error".to_string(),
+            root_exists: false,
+            entity_count: 0,
+            pending_change_count: 0,
             provider: None,
         },
+        mounts: vec![mount_summary(None, None, None, None)],
+        active_mount_id: None,
         needs_onboarding: false,
         settings: desktop_settings(),
         pending_changes: Vec::new(),
@@ -1491,6 +1526,24 @@ fn choose_connection(
         .cloned()
 }
 
+fn choose_connection_for_mount(
+    connections: &[ConnectionRecord],
+    mount: &MountConfig,
+) -> Option<ConnectionRecord> {
+    if let Some(connection_id) = mount.connection_id.as_ref()
+        && let Some(connection) = connections
+            .iter()
+            .find(|connection| connection.connection_id == *connection_id)
+    {
+        return Some(connection.clone());
+    }
+
+    connections
+        .iter()
+        .find(|connection| connection.connector == mount.connector)
+        .cloned()
+}
+
 fn connection_summary(connection: Option<&ConnectionRecord>) -> ConnectionSummary {
     let Some(connection) = connection else {
         return ConnectionSummary {
@@ -1520,16 +1573,23 @@ fn mount_summary(
 ) -> MountSummary {
     let Some(mount) = mount else {
         return MountSummary {
+            mount_id: String::new(),
             connector: "notion".to_string(),
+            connector_name: "Notion".to_string(),
+            connection_id: None,
             workspace_name: connection
                 .and_then(|connection| connection.workspace_name.clone())
-                .unwrap_or_else(|| "No Notion folder".to_string()),
+                .unwrap_or_else(|| "No mounted workspace".to_string()),
             local_path: absolute_display_path(&default_notion_access_root()),
             notion_url: None,
-            access_scope: "No mounted Notion access yet".to_string(),
+            access_scope: "No mounted access yet".to_string(),
+            remote_root_id: None,
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
             status: "not_mounted".to_string(),
+            root_exists: false,
+            entity_count: 0,
+            pending_change_count: 0,
             provider: None,
         };
     };
@@ -1540,7 +1600,13 @@ fn mount_summary(
         .unwrap_or("ready");
 
     MountSummary {
+        mount_id: mount.mount_id.0.clone(),
         connector: mount.connector.clone(),
+        connector_name: connector_label(&mount.connector),
+        connection_id: mount
+            .connection_id
+            .as_ref()
+            .map(|connection_id| connection_id.0.clone()),
         workspace_name: connection
             .and_then(|connection| connection.workspace_name.clone())
             .unwrap_or_else(|| connector_label(&mount.connector)),
@@ -1548,11 +1614,26 @@ fn mount_summary(
         notion_url: mount
             .remote_root_id
             .as_ref()
+            .filter(|_| mount.connector == "notion")
             .map(|remote_id| notion_object_url(&remote_id.0)),
-        access_scope: notion_access_scope_label(store, mount),
+        access_scope: mount_access_scope_label(store, mount),
+        remote_root_id: mount
+            .remote_root_id
+            .as_ref()
+            .map(|remote_id| remote_id.0.clone()),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
         status: mount_status.to_string(),
+        root_exists: mount_access_root(mount).exists(),
+        entity_count: store
+            .and_then(|store| store.list_entities(&mount.mount_id).ok())
+            .map(|entities| entities.len())
+            .unwrap_or(0),
+        pending_change_count: store
+            .map(|store| pending_changes_for_mount(store, &default_state_root(), &mount.mount_id))
+            .and_then(Result::ok)
+            .map(|changes| changes.len())
+            .unwrap_or(0),
         provider,
     }
 }
@@ -2300,6 +2381,22 @@ fn notion_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConf
     match title {
         Some(title) => title,
         None => format!("Mounted root {}", notion_url_id(&remote_root_id.0)),
+    }
+}
+
+fn mount_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConfig) -> String {
+    match mount.connector.as_str() {
+        "notion" => notion_access_scope_label(store, mount),
+        "google-docs" => mount
+            .remote_root_id
+            .as_ref()
+            .map(|remote_id| format!("Drive folder {}", remote_id.0))
+            .unwrap_or_else(|| "Google Docs workspace folder".to_string()),
+        _ => mount
+            .remote_root_id
+            .as_ref()
+            .map(|remote_id| format!("Remote root {}", remote_id.0))
+            .unwrap_or_else(|| "Connector workspace".to_string()),
     }
 }
 
@@ -6218,8 +6315,9 @@ mod tests {
     use locality_core::shadow::ShadowDocument;
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
-        ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
-        MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+        ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
+        InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+        ShadowRepository, SqliteStateStore,
     };
     use tauri::{PhysicalPosition, PhysicalSize};
 
@@ -6271,6 +6369,78 @@ mod tests {
         let summary = super::mount_summary(None, None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
+    }
+
+    #[test]
+    fn desktop_snapshot_lists_all_mounts_and_marks_active_mount() {
+        let temp = TestTempDir::new("desktop-all-mounts");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let notion_connection = test_connection("workspace-1", "CodeFlash");
+        let google_connection = ConnectionRecord {
+            connection_id: ConnectionId::new("google-docs-default"),
+            profile_id: Some(ConnectorProfileId("google-docs-oauth-default".to_string())),
+            connector: "google-docs".to_string(),
+            display_name: "google-docs-default".to_string(),
+            account_label: Some("mohammed@example.com".to_string()),
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "oauth".to_string(),
+            secret_ref: "connection:google-docs-default".to_string(),
+            scopes: Vec::new(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            expires_at: None,
+        };
+        let notion_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(notion_connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        let google_mount = MountConfig::new(
+            MountId::new("google-docs-main"),
+            "google-docs",
+            temp.path().join("google-docs"),
+        )
+        .with_connection_id(google_connection.connection_id.clone())
+        .with_remote_root_id(RemoteId::new("drive-folder-1"))
+        .projection(ProjectionMode::LinuxFuse);
+
+        store
+            .save_connection(notion_connection)
+            .expect("save notion connection");
+        store
+            .save_connection(google_connection)
+            .expect("save google connection");
+        store.save_mount(google_mount).expect("save google mount");
+        store.save_mount(notion_mount).expect("save notion mount");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+
+        assert_eq!(snapshot.mounts.len(), 2);
+        assert_eq!(snapshot.active_mount_id.as_deref(), Some("notion-main"));
+        assert_eq!(snapshot.mount.mount_id, "notion-main");
+        assert_eq!(
+            snapshot
+                .mounts
+                .iter()
+                .map(|mount| mount.mount_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["google-docs-main", "notion-main"]
+        );
+        assert_eq!(
+            snapshot
+                .mounts
+                .iter()
+                .find(|mount| mount.mount_id == "google-docs-main")
+                .expect("google mount")
+                .connector_name,
+            "Google Docs"
+        );
     }
 
     #[test]
@@ -7937,6 +8107,24 @@ mod tests {
 
 #[cfg(test)]
 fn sample_snapshot() -> DesktopSnapshot {
+    let mount = MountSummary {
+        mount_id: "notion-main".to_string(),
+        connector: "notion".to_string(),
+        connector_name: "Notion".to_string(),
+        connection_id: Some("codeflash".to_string()),
+        workspace_name: "CodeFlash".to_string(),
+        local_path: absolute_display_path(&default_notion_mount_root()),
+        notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
+        access_scope: "Initial Idea".to_string(),
+        remote_root_id: Some("37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
+        projection: "macOS File Provider".to_string(),
+        read_only: false,
+        status: "ready".to_string(),
+        root_exists: true,
+        entity_count: 42,
+        pending_change_count: 3,
+        provider: None,
+    };
     DesktopSnapshot {
         health: AppHealth {
             state: "ready".to_string(),
@@ -7948,17 +8136,9 @@ fn sample_snapshot() -> DesktopSnapshot {
             account_label: "saurabh@codeflash.ai".to_string(),
             status: "ready".to_string(),
         },
-        mount: MountSummary {
-            connector: "notion".to_string(),
-            workspace_name: "CodeFlash".to_string(),
-            local_path: absolute_display_path(&default_notion_mount_root()),
-            notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
-            access_scope: "Initial Idea".to_string(),
-            projection: "macOS File Provider".to_string(),
-            read_only: false,
-            status: "ready".to_string(),
-            provider: None,
-        },
+        mount: mount.clone(),
+        mounts: vec![mount],
+        active_mount_id: Some("notion-main".to_string()),
         needs_onboarding: false,
         settings: DesktopSettings {
             launch_at_login: true,
