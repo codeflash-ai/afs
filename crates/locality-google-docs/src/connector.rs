@@ -480,7 +480,7 @@ fn apply_plan(
                         },
                     },
                 }];
-                requests.extend(docs_text_requests_with_style_source(
+                requests.extend(docs_block_text_requests_with_style_source(
                     range.start_index,
                     content,
                     Some(DocsTextStyleSource {
@@ -718,12 +718,12 @@ fn docs_document_text_requests(location_index: usize, content: &str) -> Vec<Docs
     docs_text_requests_from_parsed(location_index, docs_document_text(content), None)
 }
 
-fn docs_text_requests_with_style_source(
+fn docs_block_text_requests_with_style_source(
     location_index: usize,
     content: &str,
     style_source: Option<DocsTextStyleSource<'_>>,
 ) -> Vec<DocsRequest> {
-    docs_text_requests_from_parsed(location_index, docs_text(content), style_source)
+    docs_text_requests_from_parsed(location_index, docs_block_text(content), style_source)
 }
 
 fn docs_text_requests_from_parsed(
@@ -933,6 +933,27 @@ fn docs_text(content: &str) -> DocsText {
 
 fn docs_document_text(content: &str) -> DocsText {
     let mut parsed = parse_docs_markdown_blocks(content);
+    if !parsed.text.ends_with('\n') {
+        parsed.text.push('\n');
+    }
+    parsed
+}
+
+fn docs_block_text(content: &str) -> DocsText {
+    let trimmed = content.trim_start();
+    let (_, block_kind) = markdown_block_content(trimmed);
+    if matches!(block_kind, MarkdownBlockKind::Paragraph) {
+        return docs_text(content);
+    }
+
+    let mut parsed = DocsText::default();
+    append_markdown_block(&mut parsed, trimmed);
+    if matches!(
+        block_kind,
+        MarkdownBlockKind::UnorderedList | MarkdownBlockKind::OrderedList
+    ) {
+        parsed.list_block = true;
+    }
     if !parsed.text.ends_with('\n') {
         parsed.text.push('\n');
     }
@@ -2075,6 +2096,120 @@ mod tests {
                     ))
             }),
             "expected ordered list bullet creation"
+        );
+    }
+
+    #[test]
+    fn update_block_converts_markdown_heading_and_list_markers_to_docs_shape() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Shape Doc", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Shape Doc",
+                    "revisionId": "rev-1",
+                    "lists": {
+                        "bullets": {
+                            "listProperties": {
+                                "nestingLevels": [{ "glyphType": "BULLET" }]
+                            }
+                        }
+                    },
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 13,
+                                "paragraph": {
+                                    "paragraphStyle": { "namedStyleType": "HEADING_2" },
+                                    "elements": [{
+                                        "startIndex": 1,
+                                        "endIndex": 13,
+                                        "textRun": { "content": "Section Two\n" }
+                                    }]
+                                }
+                            },
+                            {
+                                "startIndex": 13,
+                                "endIndex": 26,
+                                "paragraph": {
+                                    "bullet": { "listId": "bullets", "nestingLevel": 0 },
+                                    "elements": [{
+                                        "startIndex": 13,
+                                        "endIndex": 26,
+                                        "textRun": { "content": "Bullet alpha\n" }
+                                    }]
+                                }
+                            }
+                        ]
+                    }
+                }))
+                .expect("shape document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:1:13"),
+                    content: "## Section Two Edited".to_string(),
+                },
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:13:26"),
+                    content: "- Bullet alpha edited".to_string(),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:update_block:doc-1".to_string()),
+            PushOperationId("push-1:1:update_block:doc-1".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let heading_batch = &batches[1].1;
+        let DocsRequest::InsertText { insert_text } = &heading_batch.requests[1] else {
+            panic!("expected heading insert text request");
+        };
+        assert_eq!(insert_text.text, "Section Two Edited\n");
+        assert!(
+            heading_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_2".to_string()))
+            }),
+            "expected heading update to preserve heading style without literal marker"
+        );
+
+        let list_batch = &batches[0].1;
+        let DocsRequest::InsertText { insert_text } = &list_batch.requests[1] else {
+            panic!("expected list insert text request");
+        };
+        assert_eq!(insert_text.text, "Bullet alpha edited\n");
+        assert!(
+            list_batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "BULLET_DISC_CIRCLE_SQUARE".to_string(),
+                    ))
+            }),
+            "expected list update to preserve bullet shape without literal marker"
         );
     }
 
