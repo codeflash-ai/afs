@@ -92,7 +92,8 @@ use localityd::virtual_fs::{
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Rect, WebviewUrl,
+    WebviewWindowBuilder,
     image::Image,
     menu::{Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -437,6 +438,39 @@ struct ScreenBounds {
     top: f64,
     right: f64,
     bottom: f64,
+}
+
+impl ScreenBounds {
+    fn contains(&self, point: PhysicalPosition<f64>) -> bool {
+        point.x >= self.left
+            && point.x <= self.right
+            && point.y >= self.top
+            && point.y <= self.bottom
+    }
+
+    fn distance_squared_to(&self, point: PhysicalPosition<f64>) -> f64 {
+        let dx = if point.x < self.left {
+            self.left - point.x
+        } else if point.x > self.right {
+            point.x - self.right
+        } else {
+            0.0
+        };
+        let dy = if point.y < self.top {
+            self.top - point.y
+        } else if point.y > self.bottom {
+            point.y - self.bottom
+        } else {
+            0.0
+        };
+        (dx * dx) + (dy * dy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MonitorScreenBounds {
+    screen: ScreenBounds,
+    work_area: ScreenBounds,
 }
 
 #[tauri::command]
@@ -7126,30 +7160,31 @@ mod tests {
         MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
-    use tauri::{PhysicalPosition, PhysicalSize};
+    use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup, PendingChange,
-        ScreenBounds, TerminalCliLinkState, TrayVisualState, clear_mount_cached_projection,
-        clear_state_root_contents, conflict_preview, connection_metadata_changed,
-        current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        exact_located_entity_record, failed_push_summary, has_unresolved_conflict_markers,
-        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
-        is_unsupported_schema_version_message, live_mode_content_hash_changed,
-        live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
-        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
-        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_merge_remote_drift_markdown,
-        live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
-        live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
-        load_desktop_activity, mount_has_pending_local_changes, mount_has_unfinished_journals,
-        notion_id_from_url, parse_daemon_build_info_json, pending_changes_from_status,
-        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
-        push_action_message, record_current_install_marker, record_desktop_activity,
-        sample_live_mode_status, sample_snapshot, shell_single_quote, should_hide_tray_popover,
+        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
+        MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
+        clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
+        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
+        diff_report_message, exact_located_entity_record, failed_push_summary,
+        has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        is_notion_access_lost_message, is_unsupported_schema_version_message,
+        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
+        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
+        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
+        live_mode_merge_remote_drift_markdown, live_mode_remote_pull_candidates,
+        live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
+        live_mode_tick_from_snapshot, load_desktop_activity, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
+        pending_changes_from_status, preserve_mount_pending_local_changes, pull_error_message,
+        pull_report_message, push_action_message, record_current_install_marker,
+        record_desktop_activity, sample_live_mode_status, sample_snapshot,
+        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_position, unique_suffix, validate_mount_root,
+        tray_popover_anchor, tray_popover_position, unique_suffix, validate_mount_root,
         virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
     };
 
@@ -7868,6 +7903,74 @@ mod tests {
             "main",
             &tauri::WindowEvent::Focused(false)
         ));
+    }
+
+    #[test]
+    fn tray_popover_anchor_uses_tray_icon_rect() {
+        let anchor = tray_popover_anchor(
+            PhysicalPosition::new(42.0, 12.0),
+            Rect {
+                position: PhysicalPosition::new(1600_i32, 4_i32).into(),
+                size: PhysicalSize::new(24_u32, 22_u32).into(),
+            },
+        );
+
+        assert_eq!(anchor, PhysicalPosition::new(1612.0, 26.0));
+    }
+
+    #[test]
+    fn tray_popover_anchor_falls_back_to_click_position_without_rect_size() {
+        let click_position = PhysicalPosition::new(42.0, 12.0);
+        let anchor = tray_popover_anchor(
+            click_position,
+            Rect {
+                position: PhysicalPosition::new(1600_i32, 4_i32).into(),
+                size: PhysicalSize::new(0_u32, 0_u32).into(),
+            },
+        );
+
+        assert_eq!(anchor, click_position);
+    }
+
+    #[test]
+    fn tray_monitor_selection_uses_monitor_containing_anchor() {
+        let left_work_area = ScreenBounds {
+            left: -1440.0,
+            top: 24.0,
+            right: 0.0,
+            bottom: 900.0,
+        };
+        let right_work_area = ScreenBounds {
+            left: 0.0,
+            top: 24.0,
+            right: 1440.0,
+            bottom: 900.0,
+        };
+        let monitors = [
+            MonitorScreenBounds {
+                screen: ScreenBounds {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 1440.0,
+                    bottom: 900.0,
+                },
+                work_area: right_work_area,
+            },
+            MonitorScreenBounds {
+                screen: ScreenBounds {
+                    left: -1440.0,
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 900.0,
+                },
+                work_area: left_work_area,
+            },
+        ];
+
+        assert_eq!(
+            screen_bounds_for_anchor_from_monitors(PhysicalPosition::new(-32.0, 12.0), &monitors),
+            Some(left_work_area)
+        );
     }
 
     #[test]
@@ -9710,12 +9813,13 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 position,
+                rect,
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
             } = event
             {
-                toggle_tray_popover(tray.app_handle(), position);
+                toggle_tray_popover(tray.app_handle(), tray_popover_anchor(position, rect));
             }
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -9746,6 +9850,22 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     refresh_tray_icon(app.app_handle());
 
     Ok(())
+}
+
+fn tray_popover_anchor(
+    click_position: PhysicalPosition<f64>,
+    icon_rect: Rect,
+) -> PhysicalPosition<f64> {
+    let rect_position = icon_rect.position.to_physical::<f64>(1.0);
+    let rect_size = icon_rect.size.to_physical::<f64>(1.0);
+    if rect_size.width <= 0.0 || rect_size.height <= 0.0 {
+        return click_position;
+    }
+
+    PhysicalPosition::new(
+        rect_position.x + (rect_size.width / 2.0),
+        rect_position.y + rect_size.height,
+    )
 }
 
 fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
@@ -9797,14 +9917,51 @@ fn screen_bounds_for_tray_anchor(
     app: &AppHandle,
     position: PhysicalPosition<f64>,
 ) -> Option<ScreenBounds> {
-    if let Ok(Some(monitor)) = app.monitor_from_point(position.x, position.y) {
-        return Some(monitor_work_area_bounds(&monitor));
+    if let Ok(monitors) = app.available_monitors() {
+        let monitor_bounds = monitors
+            .iter()
+            .map(monitor_screen_bounds)
+            .collect::<Vec<_>>();
+        if let Some(bounds) = screen_bounds_for_anchor_from_monitors(position, &monitor_bounds) {
+            return Some(bounds);
+        }
     }
 
     app.primary_monitor()
         .ok()
         .flatten()
         .map(|monitor| monitor_work_area_bounds(&monitor))
+}
+
+fn screen_bounds_for_anchor_from_monitors(
+    anchor: PhysicalPosition<f64>,
+    monitors: &[MonitorScreenBounds],
+) -> Option<ScreenBounds> {
+    monitors
+        .iter()
+        .find(|bounds| bounds.screen.contains(anchor))
+        .or_else(|| {
+            monitors.iter().min_by(|left, right| {
+                left.screen
+                    .distance_squared_to(anchor)
+                    .total_cmp(&right.screen.distance_squared_to(anchor))
+            })
+        })
+        .map(|bounds| bounds.work_area)
+}
+
+fn monitor_screen_bounds(monitor: &tauri::Monitor) -> MonitorScreenBounds {
+    let position = monitor.position();
+    let size = monitor.size();
+    MonitorScreenBounds {
+        screen: ScreenBounds {
+            left: f64::from(position.x),
+            top: f64::from(position.y),
+            right: f64::from(position.x) + f64::from(size.width),
+            bottom: f64::from(position.y) + f64::from(size.height),
+        },
+        work_area: monitor_work_area_bounds(monitor),
+    }
 }
 
 fn monitor_work_area_bounds(monitor: &tauri::Monitor) -> ScreenBounds {
