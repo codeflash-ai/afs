@@ -74,11 +74,12 @@ Create or reuse a Linux FUSE mount:
 ./target/debug/loc pull "$HOME/Locality/notion-main"
 ```
 
-Verify the mount and directory listing:
+Verify the daemon health, shared FUSE root, and mount-point directory listing:
 
 ```bash
-./target/debug/loc file-provider status "$HOME/Locality/notion-main"
+./target/debug/loc doctor
 findmnt -R "$HOME/Locality"
+findmnt -T "$HOME/Locality/notion-main"
 ls -la "$HOME/Locality"
 ls -la "$HOME/Locality/notion-main"
 ```

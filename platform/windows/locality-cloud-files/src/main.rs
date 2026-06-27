@@ -1184,6 +1184,48 @@ struct ResolvedIdentifier {
     daemon_identifier: String,
 }
 
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Eq, PartialEq)]
+struct LegacyResolvedIdentifier {
+    mount_id: locality_core::model::MountId,
+    daemon_identifier: String,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn resolve_legacy_provider_identifier(
+    legacy_mount_id: Option<&str>,
+    identifier: &str,
+) -> Result<Option<LegacyResolvedIdentifier>, HelperError> {
+    let Some(legacy_mount_id) = legacy_mount_id else {
+        return Ok(None);
+    };
+    let legacy_mount_id = locality_core::model::MountId::new(legacy_mount_id);
+
+    if !identifier.starts_with(localityd::virtual_projection::SHARED_IDENTIFIER_PREFIX) {
+        return Ok(Some(LegacyResolvedIdentifier {
+            mount_id: legacy_mount_id,
+            daemon_identifier: identifier.to_string(),
+        }));
+    }
+
+    let unwrapped = localityd::virtual_projection::unwrap_identifier(identifier)
+        .map_err(|error| HelperError::new("invalid_identifier", error.to_string()))?;
+    if unwrapped.mount_id != legacy_mount_id {
+        return Err(HelperError::new(
+            "mount_outside_sync_root",
+            format!(
+                "identifier belongs to mount `{}`, not legacy provider mount `{}`",
+                unwrapped.mount_id.0, legacy_mount_id.0
+            ),
+        ));
+    }
+
+    Ok(Some(LegacyResolvedIdentifier {
+        mount_id: legacy_mount_id,
+        daemon_identifier: unwrapped.daemon_identifier,
+    }))
+}
+
 #[cfg(target_os = "windows")]
 impl ProviderLocalFileIndex {
     fn remember(&self, path: &Path, identifier: &str) {
@@ -1411,13 +1453,13 @@ impl ProviderContext {
     }
 
     fn resolve_identifier(&self, identifier: &str) -> Result<ResolvedIdentifier, HelperError> {
-        if let Some(mount_id) = self.legacy_mount_id.as_deref()
-            && !identifier.starts_with(localityd::virtual_projection::SHARED_IDENTIFIER_PREFIX)
+        if let Some(resolved) =
+            resolve_legacy_provider_identifier(self.legacy_mount_id.as_deref(), identifier)?
         {
-            let mount = self.load_mount_config(&locality_core::model::MountId::new(mount_id))?;
+            let mount = self.load_mount_config(&resolved.mount_id)?;
             return Ok(ResolvedIdentifier {
                 mount,
-                daemon_identifier: identifier.to_string(),
+                daemon_identifier: resolved.daemon_identifier,
             });
         }
 
@@ -3728,6 +3770,46 @@ mod tests {
             &mount,
             Path::new("/users/ada/other-locality")
         ));
+    }
+
+    #[test]
+    fn legacy_provider_accepts_unwrapped_identifier_for_legacy_mount() {
+        let resolved = resolve_legacy_provider_identifier(Some("notion-main"), "page-1")
+            .expect("legacy identifier resolved")
+            .expect("legacy provider handled identifier");
+
+        assert_eq!(resolved.mount_id, locality_core::model::MountId::new("notion-main"));
+        assert_eq!(resolved.daemon_identifier, "page-1");
+    }
+
+    #[test]
+    fn legacy_provider_accepts_wrapped_identifier_for_matching_mount() {
+        let identifier = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-main"),
+            "page-1",
+        );
+
+        let resolved = resolve_legacy_provider_identifier(Some("notion-main"), &identifier)
+            .expect("legacy identifier resolved")
+            .expect("legacy provider handled identifier");
+
+        assert_eq!(resolved.mount_id, locality_core::model::MountId::new("notion-main"));
+        assert_eq!(resolved.daemon_identifier, "page-1");
+    }
+
+    #[test]
+    fn legacy_provider_rejects_wrapped_identifier_for_other_mount() {
+        let identifier = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-other"),
+            "page-1",
+        );
+
+        let error = resolve_legacy_provider_identifier(Some("notion-main"), &identifier)
+            .expect_err("cross-mount identifier rejected");
+
+        assert_eq!(error.code, "mount_outside_sync_root");
+        assert!(error.message.contains("notion-other"));
+        assert!(error.message.contains("notion-main"));
     }
 
     #[test]
