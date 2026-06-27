@@ -28,8 +28,8 @@ use loc_cli::file_provider::{
 };
 #[cfg(target_os = "macos")]
 use loc_cli::file_provider::{
-    macos_file_provider_domain_url, open_macos_file_provider_domain,
-    register_macos_file_provider_domain, run_macos_file_provider_helper,
+    macos_file_provider_domain_url, register_macos_file_provider_domain,
+    run_macos_file_provider_helper,
 };
 use loc_cli::local_oauth::run_local_oauth_authorization;
 use loc_cli::mount::{MountOptions, run_mount};
@@ -1013,7 +1013,7 @@ where
     if !live_mode_has_mounted_folder(snapshot) {
         return ActionReport {
             ok: false,
-            message: "Live Mode needs a mounted Notion folder.".to_string(),
+            message: "Live Mode needs a mounted Notion mount point.".to_string(),
         };
     }
 
@@ -2518,7 +2518,7 @@ fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>,
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
     if mounts.is_empty() {
-        return Err("Create a Notion folder before locating pages.".to_string());
+        return Err("Create a Notion mount point before locating pages.".to_string());
     }
 
     Ok(run_search_with_access_roots(
@@ -3566,7 +3566,7 @@ fn validate_desktop_mount_root(
                 .any(|provider_root| root.starts_with(provider_root) && root != *provider_root);
             if !inside_provider_root {
                 return Err(format!(
-                    "Choose a source folder inside the Locality File Provider root, for example {}.",
+                    "Choose a mount point inside the Locality File Provider root, for example {}.",
                     absolute_display_path(&default_notion_mount_root())
                 ));
             }
@@ -5434,10 +5434,7 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
     match macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID) {
         Ok(provider_root) => {
             let mount_point_root = provider_root.join(mount_point_directory_name(mount));
-            if mount_point_root.exists() {
-                return open_in_file_manager(&mount_point_root);
-            }
-            open_in_file_manager(&provider_root)
+            open_in_file_manager(&mount_point_root)
         }
         Err(error) => {
             let first_error = error.message();
@@ -5459,12 +5456,13 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
                     "file_provider.reregister_failed",
                     format!("could not re-register macOS File Provider domain: {error}"),
                 );
-            } else if open_macos_file_provider_domain(
+            } else if let Ok(provider_root) = macos_file_provider_domain_url(
                 localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
-            )
-            .is_ok()
-            {
-                return Ok(());
+            ) {
+                let mount_point_root = provider_root.join(mount_point_directory_name(mount));
+                if open_in_file_manager(&mount_point_root).is_ok() {
+                    return Ok(());
+                }
             }
 
             open_in_file_manager(&mount.root).map_err(|fallback_error| {
@@ -5613,7 +5611,7 @@ fn refresh_notion_mount_after_connect(
         .into_iter()
         .find(|mount| mount.mount_id.0 == "notion-main" && mount.connector == "notion")
     else {
-        return Ok("Create a Notion folder to mount the newly connected workspace.".to_string());
+        return Ok("Create a Notion mount point for the newly connected workspace.".to_string());
     };
 
     let next_connection = store
@@ -7300,11 +7298,11 @@ mod tests {
     }
 
     #[test]
-    fn virtual_projection_refresh_signal_identifiers_use_mount_point_root() {
+    fn virtual_projection_refresh_signals_shared_and_mount_point_roots() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            "/tmp/CloudStorage/Locality/notion",
+            "/tmp/Locality/notion-main",
         )
         .projection(ProjectionMode::MacosFileProvider);
 

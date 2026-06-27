@@ -271,7 +271,7 @@ const loadingSnapshot: DesktopSnapshot = {
   mount: {
     ...sampleSnapshot.mount,
     workspaceName: "Loading",
-    localPath: "~/Library/CloudStorage/Locality",
+    localPath: "~/Library/CloudStorage/Locality/notion-main",
     notionUrl: null,
     accessScope: "Checking access",
     status: "loading",
@@ -406,7 +406,7 @@ function liveModeReportNeedsRefresh(message: string) {
 function liveModeTooltip(enabled: boolean) {
   return enabled
     ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
-    : "Turn on Live Mode to keep this local Notion folder in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
+    : "Turn on Live Mode to keep this Notion mount point in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
 }
 
 function emptyUpdateStatus(): UpdateStatus {
@@ -775,7 +775,7 @@ function SetupLoading() {
               Checking setup
             </div>
             <h1>Checking your Locality setup</h1>
-            <p>Locality is checking your Notion connection and local folder.</p>
+            <p>Locality is checking your Notion connection and mount point.</p>
           </div>
         </SetupContent>
       </section>
@@ -1075,7 +1075,7 @@ function Onboarding({
                 {oauthReady
                   ? `${
                       connectedWorkspace || "Your workspace"
-                    } is ready. Next, choose where Locality should place the local folder.`
+                    } is ready. Next, choose the Notion mount point Locality should open.`
                   : "A browser window is open. Choose your workspace, pick the pages Locality can use, then approve access."}
               </p>
             </div>
@@ -1103,8 +1103,8 @@ function Onboarding({
             <div>
               <h1>Where should your Notion files appear?</h1>
               <p>
-                Locality keeps every source under one CloudStorage root. Notion will appear as the
-                live folder Finder and agents open.
+                Locality keeps every source under one CloudStorage root. Notion will appear at the
+                notion-main mount point that Finder and agents open.
               </p>
             </div>
             <div className="path-field">
@@ -1124,7 +1124,7 @@ function Onboarding({
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
             <p className="quiet-note">
-              The Notion folder will include AGENTS.md and CLAUDE.md to help your agents edit
+              The Notion mount point will include AGENTS.md and CLAUDE.md to help your agents edit
               files natively.
             </p>
           </SetupContent>
@@ -1135,7 +1135,7 @@ function Onboarding({
             <div>
               <h1>Locality is ready</h1>
               <p>
-                Your Notion folder is mounted. Agents can edit local Markdown now, and Locality
+                Your Notion mount point is ready. Agents can edit local Markdown now, and Locality
                 will keep review controls close when those edits are ready.
               </p>
             </div>
@@ -1146,7 +1146,7 @@ function Onboarding({
             <div className="ready-folder">
               <FolderOpen />
               <div>
-                <span>Notion folder</span>
+                <span>Notion mount point</span>
                 <code>{mountPath}</code>
               </div>
               <SecondaryButton compact icon={<Copy />} onClick={() => copyText(mountPath)}>
@@ -1155,7 +1155,7 @@ function Onboarding({
             </div>
             <div className="final-actions">
               <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
-                Open Notion Folder
+                Open Notion Mount Point
               </PrimaryButton>
             </div>
             <LocateBox
@@ -1245,7 +1245,7 @@ function AgentGuidanceSummary({
         <p>{fallbackTargets[0].detail}</p>
       )}
       {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length === 0 && !failed && (
-        <p>Locality is preparing local agent instructions for this Notion folder.</p>
+        <p>Locality is preparing local agent instructions for this Notion mount point.</p>
       )}
       {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
         <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
@@ -1504,7 +1504,7 @@ function HomeView({
       if (connectionMissing(currentSnapshot) || mountMissing(currentSnapshot)) {
         setLiveModeEnabled(false);
         setLiveModeState("error");
-        setLiveModeMessage("Live Mode needs a connected Notion folder.");
+        setLiveModeMessage("Live Mode needs a connected Notion mount point.");
         return;
       }
 
@@ -1654,14 +1654,14 @@ function HomeView({
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Create your Notion folder</h2>
-            <p>Use the default source folder under the shared Locality CloudStorage root.</p>
+            <h2>Create your Notion mount point</h2>
+            <p>Use the default notion-main mount point under the shared Locality CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
             onClick={() => void createMount()}
           >
-            Create Notion Folder
+            Create Notion Mount Point
           </PrimaryButton>
           {actionError && <p className="field-error">{actionError}</p>}
         </section>
@@ -1845,7 +1845,7 @@ function MountDetailView({
           <FolderOpen />
         </div>
         <div>
-          <p className="label">Notion folder</p>
+          <p className="label">Notion mount point</p>
           <h2>{snapshot.mount.localPath}</h2>
           <p>
             Locality follows your Notion workspace hierarchy here, starting with the pages and databases
@@ -2436,7 +2436,7 @@ function SettingsView({
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default folder" value="~/Library/CloudStorage/Locality" />
+          <SettingRow title="Default Notion mount point" value="~/Library/CloudStorage/Locality/notion-main" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
