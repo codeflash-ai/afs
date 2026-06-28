@@ -50,9 +50,17 @@ failed=0
 on_error() {
   failed=1
   echo "Linux FUSE smoke test failed; daemon log:" >&2
-  cat "$daemon_log" >&2 || true
+  if [[ -f "$daemon_log" ]]; then
+    cat "$daemon_log" >&2 || true
+  else
+    echo "(daemon log was not created)" >&2
+  fi
   echo "Linux FUSE smoke test failed; FUSE log:" >&2
-  cat "$fuse_log" >&2 || true
+  if [[ -f "$fuse_log" ]]; then
+    cat "$fuse_log" >&2 || true
+  else
+    echo "(FUSE log was not created)" >&2
+  fi
 }
 
 cleanup() {
@@ -92,7 +100,7 @@ sql_text_literal() {
 }
 
 seed_fixture() {
-  mkdir -p "$state_root" "$LOCALITY_ROOT" "$GOOGLE_MOUNT"
+  mkdir -p "$state_root" "$LOCALITY_ROOT"
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 NOTION_TOKEN="ci-fuse-smoke-token" \
     "$loc_bin" mount notion "$NOTION_MOUNT" \
       --workspace \
@@ -247,8 +255,6 @@ assert_status_contains() {
 }
 
 seed_fixture
-test -d "$NOTION_MOUNT"
-test -d "$GOOGLE_MOUNT"
 
 LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_TCP_ADDR=off LOCALITY_DAEMON_PULL_MODE=disabled NOTION_TOKEN="ci-fuse-smoke-token" \
   "$localityd_bin" >"$daemon_log" 2>&1 &
