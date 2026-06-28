@@ -365,7 +365,7 @@ fn workspace_virtual_mount_queues_hot_dirty_and_conflicted_pages_on_active_tick(
                 RemoteId::new("hot-page"),
                 FreshnessTier::Hot,
             )
-            .opened_at("unix_ms:10")
+            .opened_at(freshness_timestamp())
             .checked_at("unix_ms:100"),
         )
         .expect("save hot freshness");
@@ -415,6 +415,83 @@ fn workspace_virtual_mount_queues_hot_dirty_and_conflicted_pages_on_active_tick(
             ),
         ])
     );
+}
+
+#[test]
+fn workspace_virtual_mount_does_not_queue_stale_hot_page_on_active_tick() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-stale-hot");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "stale-hot-page",
+        "Stale Hot",
+        "Stale Hot.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("stale-hot-page"),
+                FreshnessTier::Hot,
+            )
+            .opened_at("unix_ms:1")
+            .checked_at("unix_ms:2"),
+        )
+        .expect("save stale hot freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert!(jobs.is_empty());
+}
+
+#[test]
+fn workspace_virtual_mount_skips_pages_deferred_until_future_check() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-future-check");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "deferred-page",
+        "Deferred",
+        "Deferred.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("deferred-page"),
+                FreshnessTier::Warm,
+            )
+            .next_check_at("unix_ms:18446744073709551615"),
+        )
+        .expect("save deferred freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: false,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert!(jobs.is_empty());
 }
 
 #[test]
@@ -515,6 +592,7 @@ fn workspace_freshness_cap_and_order_prefers_hot_then_oldest_checks() {
                 RemoteId::new("hot-recent"),
                 FreshnessTier::Hot,
             )
+            .opened_at(freshness_timestamp())
             .checked_at("unix_ms:999999"),
         )
         .expect("save hot freshness");

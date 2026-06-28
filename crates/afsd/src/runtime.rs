@@ -15,7 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use afs_connector::{Connector, ObserveRequest};
 use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
-use afs_core::freshness::{ChangeHintKind, FreshnessTier, RemoteObservation, SyncJob, SyncJobKind};
+use afs_core::freshness::{
+    ChangeHintKind, FreshnessOptimizationPolicy, FreshnessTier, RemoteObservation, SyncJob,
+    SyncJobKind,
+};
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
@@ -35,8 +38,8 @@ use crate::autosave::{auto_save_target_for_write, pause_auto_save_for_remote_cha
 use crate::execution::{DaemonEventReport, PushJob};
 use crate::file_provider::{self, FileProviderReadReport};
 use crate::freshness::{
-    FreshnessQueue, freshness_timestamp, parse_freshness_timestamp, record_file_opened,
-    record_local_change,
+    FreshnessQueue, freshness_timestamp, freshness_unix_ms, optimized_freshness_decision,
+    parse_freshness_timestamp, record_file_opened, record_local_change,
 };
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
@@ -2147,6 +2150,8 @@ where
     }
 
     let mut candidates = Vec::new();
+    let now_ms = freshness_unix_ms();
+    let policy = FreshnessOptimizationPolicy::default();
     for mount in mounts
         .iter()
         .filter(|mount| is_workspace_virtual_mount(mount))
@@ -2176,15 +2181,20 @@ where
                         default_workspace_freshness_tier(&entity),
                     )
                 });
-            let selected_by_active_tick =
-                tick.poll_active && is_active_workspace_freshness_candidate(&entity, &freshness);
+            if workspace_next_check_is_deferred(&freshness, now_ms) {
+                continue;
+            }
+            let optimized =
+                optimized_freshness_decision(&freshness, Some(&entity), now_ms, &policy);
+            let selected_by_active_tick = tick.poll_active
+                && is_active_workspace_freshness_candidate(&entity, &freshness, &optimized.tier);
             let selected_by_cold_tick = tick.poll_cold;
             if !selected_by_active_tick && !selected_by_cold_tick {
                 continue;
             }
 
             let reason = workspace_freshness_reason(&entity, &freshness, selected_by_active_tick);
-            let tier = workspace_freshness_tier(&entity, &freshness, &reason);
+            let tier = workspace_freshness_tier(&entity, &optimized.tier, &reason);
             candidates.push(WorkspaceFreshnessCandidate {
                 mount_id: entity.mount_id,
                 remote_id: entity.remote_id,
@@ -2228,15 +2238,13 @@ fn is_workspace_freshness_entity(entity: &EntityRecord) -> bool {
 fn is_active_workspace_freshness_candidate(
     entity: &EntityRecord,
     freshness: &FreshnessStateRecord,
+    tier: &FreshnessTier,
 ) -> bool {
     matches!(
         entity.hydration,
         HydrationState::Dirty | HydrationState::Conflicted
     ) || freshness.remote_hint_pending
-        || matches!(
-            freshness.tier,
-            FreshnessTier::Immediate | FreshnessTier::Hot
-        )
+        || matches!(tier, FreshnessTier::Immediate | FreshnessTier::Hot)
 }
 
 fn workspace_freshness_reason(
@@ -2261,10 +2269,10 @@ fn workspace_freshness_reason(
 
 fn workspace_freshness_tier(
     entity: &EntityRecord,
-    freshness: &FreshnessStateRecord,
+    optimized_tier: &FreshnessTier,
     reason: &ChangeHintKind,
 ) -> FreshnessTier {
-    let mut tier = freshness.tier.clone();
+    let mut tier = optimized_tier.clone();
     let reason_tier = reason.recommended_tier();
     if reason_tier.is_more_urgent_than(&tier) {
         tier = reason_tier;
@@ -2274,6 +2282,14 @@ fn workspace_freshness_tier(
         tier = default_tier;
     }
     tier
+}
+
+fn workspace_next_check_is_deferred(freshness: &FreshnessStateRecord, now_ms: u64) -> bool {
+    freshness
+        .next_check_at
+        .as_deref()
+        .and_then(parse_freshness_timestamp)
+        .is_some_and(|next_check_at| next_check_at > now_ms)
 }
 
 fn default_workspace_freshness_tier(entity: &EntityRecord) -> FreshnessTier {
