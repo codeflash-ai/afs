@@ -201,6 +201,7 @@ fn start_daemon(
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
     if is_running(options, paths) {
+        repair_linux_fuse_units_for_daemon_start(&options.state_root);
         return Ok(report(
             options.action,
             DaemonRunState::Running,
@@ -241,6 +242,7 @@ fn start_daemon(
         ));
     }
     write_metadata(options, paths, &artifacts)?;
+    repair_linux_fuse_units_for_daemon_start(&options.state_root);
 
     Ok(report(
         options.action,
@@ -252,6 +254,28 @@ fn start_daemon(
         "daemon started",
     ))
 }
+
+#[cfg(target_os = "linux")]
+fn repair_linux_fuse_units_for_daemon_start(state_root: &Path) {
+    use locality_store::{MountRepository, SqliteStateStore};
+
+    let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
+        return;
+    };
+    let Ok(mounts) = store.load_mounts() else {
+        return;
+    };
+    if let Err(error) = crate::file_provider::repair_linux_fuse_units_for_state(state_root, &mounts)
+    {
+        eprintln!(
+            "loc daemon start: skipped Linux FUSE stale unit repair: {}",
+            error.message()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn repair_linux_fuse_units_for_daemon_start(_state_root: &Path) {}
 
 fn stop_daemon(
     options: &DaemonOptions,

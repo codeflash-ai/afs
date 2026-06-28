@@ -84,7 +84,7 @@ where
         reject_duplicate_virtual_mount_point(store, &options.mount_id, &root, &options.projection)?;
     }
 
-    let guidance = if options.projection == ProjectionMode::MacosFileProvider {
+    let guidance = if options.projection.uses_virtual_filesystem() {
         virtual_mount_guidance(&root)
     } else {
         std::fs::create_dir_all(&root).map_err(|error| MountError::CreateRoot {

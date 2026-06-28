@@ -17,7 +17,11 @@ behavior as `macos_file_provider`.
   into daemon IPC.
 - `loc mount ... --projection linux-fuse` records a mount-point folder under the
   shared FUSE root; `loc file-provider register <mount>` can repair or restart
-  the shared-root registration.
+  the shared-root registration. The mount-point directory is virtual and appears
+  from daemon state; `loc mount` does not pre-create it in the mounted root.
+- `loc daemon start` prunes stale pre-shared-root systemd user units for the
+  selected state directory so removed mounts do not remount independently of
+  SQLite state.
 - Hydrated and edited contents for virtual projections live under
   `~/.loc/content/<mount-id>/files/`; the mounted root remains virtual.
 - Plain-directory projection remains the fallback for tests, unsupported systems,

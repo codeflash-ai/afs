@@ -141,6 +141,46 @@ fn macos_file_provider_mount_keeps_source_root_virtual() {
 }
 
 #[test]
+fn linux_fuse_mount_keeps_mount_point_virtual() {
+    let fixture = MountFixture::new("loc-cli-mount-linux-fuse");
+    let mut store = InMemoryStateStore::new();
+
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("mount");
+
+    assert_eq!(
+        report.guidance.agents_md.action,
+        GuidanceFileAction::Virtual
+    );
+    assert_eq!(
+        report.guidance.claude_md.action,
+        GuidanceFileAction::Virtual
+    );
+    assert!(
+        !fixture.root.exists(),
+        "Linux FUSE mount-point roots are virtual and must not be created before daemon state is updated"
+    );
+
+    let mount = store
+        .get_mount(&MountId::new("notion-main"))
+        .expect("load mount")
+        .expect("mount exists");
+    assert_eq!(mount.root, fixture.root);
+    assert_eq!(mount.projection, ProjectionMode::LinuxFuse);
+}
+
+#[test]
 fn mount_persists_connection_id() {
     let fixture = MountFixture::new("loc-cli-mount-connection");
     let mut store = InMemoryStateStore::new();

@@ -5,6 +5,8 @@
 //! than shelling through `loc file-provider`, so the CLI and desktop app share
 //! the same platform boundary.
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use locality_store::MountConfig;
+#[cfg(target_os = "linux")]
+use locality_store::ProjectionMode;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use localityd::ipc::{DaemonRequest, send_request_with_timeout};
 #[cfg(target_os = "windows")]
@@ -25,6 +29,10 @@ use serde_json::Value;
 const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const LINUX_FUSE_ROOT_HINT_MAX_BYTES: usize = 48;
+#[cfg(target_os = "linux")]
+const LINUX_FUSE_UNIT_PREFIX: &str = "ai.codeflash.locality.fuse.";
+#[cfg(target_os = "linux")]
+const LINUX_FUSE_UNIT_SUFFIX: &str = ".service";
 #[cfg(target_os = "linux")]
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 #[cfg(target_os = "linux")]
@@ -100,6 +108,30 @@ pub enum LinuxFuseRegistrationError {
     Io(String),
     SystemctlFailed(String),
     UnsupportedPlatform(String),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinuxFuseUnitFile {
+    unit_name: String,
+    unit_path: PathBuf,
+    contents: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StaleLinuxFuseUnit {
+    unit_name: String,
+    unit_path: PathBuf,
+    mountpoint: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinuxFuseExecStart {
+    state_dir: Option<PathBuf>,
+    mountpoint: Option<PathBuf>,
+    has_mount_id: bool,
 }
 
 impl LinuxFuseRegistrationError {
@@ -250,6 +282,7 @@ pub fn register_linux_fuse_mount(
 
     let locality_fuse =
         locality_fuse_helper_path().ok_or(LinuxFuseRegistrationError::HelperMissing)?;
+    repair_legacy_linux_fuse_units_for_state(state_root)?;
     let root_id = linux_fuse_root_id(mount);
     let service = linux_fuse_unit_name(&root_id);
     let unit_path = linux_fuse_unit_path(&service)?;
@@ -275,6 +308,25 @@ pub fn register_linux_fuse_mount(
         "linux_fuse registration is only supported on Linux; mount `{}` cannot be registered here",
         mount.mount_id.0
     )))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn repair_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let stale = stale_linux_fuse_units_for_state(state_root, mounts, unit_files);
+    remove_stale_linux_fuse_units(stale)
+}
+
+#[cfg(target_os = "linux")]
+fn repair_legacy_linux_fuse_units_for_state(
+    state_root: &Path,
+) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let stale = legacy_linux_fuse_units_for_state(state_root, unit_files);
+    remove_stale_linux_fuse_units(stale)
 }
 
 pub fn register_windows_cloud_files_sync_root(
@@ -1406,6 +1458,247 @@ pub(crate) fn run_systemctl_user(args: &[&str]) -> Result<(), LinuxFuseRegistrat
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn read_linux_fuse_unit_files() -> Result<Vec<LinuxFuseUnitFile>, LinuxFuseRegistrationError> {
+    let unit_dir = home_dir_path()?.join(".config/systemd/user");
+    let entries = match std::fs::read_dir(&unit_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(LinuxFuseRegistrationError::Io(error.to_string())),
+    };
+
+    let mut units = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
+        let unit_path = entry.path();
+        let Some(unit_name) = unit_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_locality_fuse_unit_name(unit_name) {
+            continue;
+        }
+        let contents = match std::fs::read_to_string(&unit_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(LinuxFuseRegistrationError::Io(error.to_string())),
+        };
+        units.push(LinuxFuseUnitFile {
+            unit_name: unit_name.to_string(),
+            unit_path,
+            contents,
+        });
+    }
+    Ok(units)
+}
+
+#[cfg(target_os = "linux")]
+fn stale_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<StaleLinuxFuseUnit> {
+    let desired_units = desired_linux_fuse_unit_names(mounts);
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if !same_path_for_linux_fuse_state(state_dir, state_root) {
+                return None;
+            }
+            if !exec_start.has_mount_id && desired_units.contains(&unit.unit_name) {
+                return None;
+            }
+            Some(StaleLinuxFuseUnit {
+                unit_name: unit.unit_name,
+                unit_path: unit.unit_path,
+                mountpoint: exec_start.mountpoint,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_linux_fuse_units_for_state(
+    state_root: &Path,
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<StaleLinuxFuseUnit> {
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if !exec_start.has_mount_id || !same_path_for_linux_fuse_state(state_dir, state_root) {
+                return None;
+            }
+            Some(StaleLinuxFuseUnit {
+                unit_name: unit.unit_name,
+                unit_path: unit.unit_path,
+                mountpoint: exec_start.mountpoint,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn remove_stale_linux_fuse_units(
+    stale: Vec<StaleLinuxFuseUnit>,
+) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
+    if stale.is_empty() {
+        return Ok(stale);
+    }
+
+    let mut first_error = None;
+    for unit in &stale {
+        if let Err(error) = run_systemctl_user(&["disable", "--now", unit.unit_name.as_str()])
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(mountpoint) = &unit.mountpoint {
+            let _ = Command::new("fusermount3")
+                .arg("-uz")
+                .arg(mountpoint)
+                .output();
+        }
+        match std::fs::remove_file(&unit.unit_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if first_error.is_none() => {
+                first_error = Some(LinuxFuseRegistrationError::Io(error.to_string()));
+            }
+            Err(_) => {}
+        }
+        let _ = run_systemctl_user(&["reset-failed", unit.unit_name.as_str()]);
+    }
+
+    if let Err(error) = run_systemctl_user(&["daemon-reload"])
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(stale)
+}
+
+#[cfg(target_os = "linux")]
+fn desired_linux_fuse_unit_names(mounts: &[MountConfig]) -> BTreeSet<String> {
+    mounts
+        .iter()
+        .filter(|mount| mount.projection == ProjectionMode::LinuxFuse)
+        .map(|mount| linux_fuse_unit_name(&linux_fuse_root_id(mount)))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_fuse_exec_start(contents: &str) -> Option<LinuxFuseExecStart> {
+    let line = contents
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("ExecStart="))?;
+    let args = split_systemd_exec_args(line);
+    let helper = args.first()?;
+    if Path::new(helper).file_name().and_then(|name| name.to_str()) != Some("locality-fuse") {
+        return None;
+    }
+
+    Some(LinuxFuseExecStart {
+        state_dir: command_flag_value(&args, "--state-dir").map(PathBuf::from),
+        mountpoint: command_flag_value(&args, "--mountpoint").map(PathBuf::from),
+        has_mount_id: command_has_flag(&args, "--mount-id"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn split_systemd_exec_args(value: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            token_started = true;
+            continue;
+        }
+        if character == '"' {
+            in_quotes = !in_quotes;
+            token_started = true;
+            continue;
+        }
+        if character.is_whitespace() && !in_quotes {
+            if token_started {
+                args.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+            continue;
+        }
+        current.push(character);
+        token_started = true;
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if token_started {
+        args.push(current);
+    }
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn command_flag_value(args: &[String], flag: &str) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            return args.get(index + 1).cloned();
+        }
+        if let Some(value) = arg
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn command_has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| {
+        arg == flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn same_path_for_linux_fuse_state(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_locality_fuse_unit_name(unit_name: &str) -> bool {
+    unit_name.starts_with(LINUX_FUSE_UNIT_PREFIX) && unit_name.ends_with(LINUX_FUSE_UNIT_SUFFIX)
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn daemon_is_running(state_root: &Path) -> bool {
     matches!(
@@ -1421,7 +1714,7 @@ fn daemon_is_running(state_root: &Path) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_fuse_unit_name(mount_id: &str) -> String {
     format!(
-        "ai.codeflash.locality.fuse.{}.service",
+        "{LINUX_FUSE_UNIT_PREFIX}{}{LINUX_FUSE_UNIT_SUFFIX}",
         sanitize_systemd_fragment(mount_id)
     )
 }
@@ -1629,6 +1922,120 @@ mod linux_tests {
             "root id should be bounded, got {} bytes: {root_id}",
             root_id.len()
         );
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_include_legacy_mount_id_units_for_current_state() {
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.locality.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /home/example/.loc --mountpoint /home/example/Locality/notion-main\n",
+            )],
+        );
+
+        assert_eq!(
+            stale,
+            vec![super::StaleLinuxFuseUnit {
+                unit_name: "ai.codeflash.locality.fuse.notion-main.service".to_string(),
+                unit_path: std::path::PathBuf::from(
+                    "/tmp/systemd/ai.codeflash.locality.fuse.notion-main.service"
+                ),
+                mountpoint: Some(std::path::PathBuf::from(
+                    "/home/example/Locality/notion-main"
+                )),
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_ignore_other_state_roots() {
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.locality.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /tmp/other/.loc --mountpoint /home/example/Locality/notion-main\n",
+            )],
+        );
+
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_keep_desired_shared_root_units() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![super::LinuxFuseUnitFile {
+                unit_name,
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_include_current_state_shared_units_not_in_mount_state() {
+        let old_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&old_mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &old_mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[],
+            vec![super::LinuxFuseUnitFile {
+                unit_name: unit_name.clone(),
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert_eq!(
+            stale,
+            vec![super::StaleLinuxFuseUnit {
+                unit_name,
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
+            }]
+        );
+    }
+
+    fn linux_fuse_unit_file(unit_name: &str, contents: &str) -> super::LinuxFuseUnitFile {
+        super::LinuxFuseUnitFile {
+            unit_name: unit_name.to_string(),
+            unit_path: std::path::PathBuf::from(format!("/tmp/systemd/{unit_name}")),
+            contents: contents.to_string(),
+        }
     }
 }
 
