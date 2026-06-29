@@ -1866,6 +1866,8 @@ function MountDetailView({
   const [actionError, setActionError] = useState("");
   const [accessMessage, setAccessMessage] = useState("");
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
+  const [pullMessage, setPullMessage] = useState("");
+  const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
   const accountLabel = snapshot.connection.accountLabel.trim();
   const showAccount = accountLabel.length > 0 && accountLabel !== snapshot.connection.workspaceName;
 
@@ -1915,6 +1917,30 @@ function MountDetailView({
     await onRefresh().catch(() => undefined);
   }
 
+  async function pullChanges() {
+    if (pullState === "pulling") {
+      return;
+    }
+
+    setActionError("");
+    setPullMessage("");
+    setPullState("pulling");
+
+    try {
+      const report = await callCommand<ActionReport>("pull_notion_file", {
+        path: snapshot.mount.localPath,
+      });
+      setPullMessage(report.message);
+      setPullState(report.ok ? "success" : "error");
+      if (report.ok) {
+        void onRefresh().catch(() => undefined);
+      }
+    } catch (error) {
+      setPullMessage(errorMessage(error));
+      setPullState("error");
+    }
+  }
+
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mount" }]} />
@@ -1957,6 +1983,14 @@ function MountDetailView({
           >
             {accessState === "changing" ? "Waiting for Notion" : "Change Notion Access"}
           </SecondaryButton>
+          <SecondaryButton
+            compact
+            disabled={!snapshot.mount.localPath.trim() || accessState === "changing" || pullState === "pulling"}
+            icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+            onClick={() => void pullChanges()}
+          >
+            {pullState === "pulling" ? "Pulling changes" : "Pull changes"}
+          </SecondaryButton>
         </div>
       </section>
       {actionError && <p className="field-error">{actionError}</p>}
@@ -1964,6 +1998,9 @@ function MountDetailView({
         <p className={accessState === "error" ? "field-error" : "quiet-note inline-note"}>
           {accessMessage}
         </p>
+      )}
+      {pullMessage && (
+        <p className={pullState === "error" ? "field-error" : "quiet-note inline-note"}>{pullMessage}</p>
       )}
 
       <section className="detail-grid">

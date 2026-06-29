@@ -6,7 +6,7 @@ DMG="${1:-}"
 ICON="${ROOT}/apps/desktop/src-tauri/icons/dmg-icon.icns"
 
 if [[ -z "${DMG}" ]]; then
-  DMG="$(find "${ROOT}/target/release/bundle/dmg" -maxdepth 1 -type f -name 'LOCALITY_*.dmg' | sort | tail -n 1)"
+  DMG="$(find "${ROOT}/target/release/bundle/dmg" -maxdepth 1 -type f \( -name 'Locality_*.dmg' -o -name 'LOCALITY_*.dmg' \) | sort | tail -n 1)"
 fi
 
 if [[ -z "${DMG}" || ! -f "${DMG}" ]]; then

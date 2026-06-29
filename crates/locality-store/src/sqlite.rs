@@ -1511,6 +1511,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
+        repair_missing_state_components(connection)?;
         return Ok(());
     }
 
@@ -2561,6 +2562,47 @@ fn seed_current_state_components(connection: &Connection) -> StoreResult<()> {
                 &updated_at,
             ],
         )?;
+    }
+    Ok(())
+}
+
+fn seed_missing_state_components(connection: &Connection) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let updated_at = unix_timestamp_string();
+    for definition in CURRENT_COMPONENT_DEFINITIONS {
+        connection.execute(
+            "INSERT OR IGNORE INTO state_components (
+                component_id,
+                component_kind,
+                version,
+                min_reader_version,
+                required,
+                rebuildable,
+                data_json,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                definition.component_id,
+                definition.component_kind,
+                definition.current_version,
+                definition.min_reader_version,
+                bool_to_int(definition.required),
+                bool_to_int(definition.rebuildable),
+                definition.data_json,
+                &updated_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn repair_missing_state_components(connection: &Connection) -> StoreResult<()> {
+    if inspect_state_component_issues(connection)?
+        .iter()
+        .any(|issue| matches!(issue, StateCompatibilityIssue::MissingComponent { .. }))
+    {
+        seed_missing_state_components(connection)?;
     }
     Ok(())
 }
