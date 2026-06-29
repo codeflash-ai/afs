@@ -363,9 +363,6 @@ where
     let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
     let parent_path = container_path(&mount, &entities, &[], container_identifier)?;
-    if has_known_entity_child(&entities, &parent_path) {
-        return Ok(0);
-    }
 
     let Some(container) = child_container_for_identifier(&mount, &entities, container_identifier)?
     else {
@@ -401,10 +398,7 @@ where
 {
     let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
-    let parent_path = container_path(&mount, &entities, &[], container_identifier)?;
-    if has_known_entity_child(&entities, &parent_path) {
-        return Ok(false);
-    }
+    let _ = container_path(&mount, &entities, &[], container_identifier)?;
 
     child_container_for_identifier(&mount, &entities, container_identifier)
         .map(|container| container.is_some())
@@ -2255,12 +2249,6 @@ fn child_container_for_identifier(
     })
 }
 
-fn has_known_entity_child(entities: &[EntityRecord], parent: &Path) -> bool {
-    entities
-        .iter()
-        .any(|entity| entity_listing_parent_path(entity) == parent)
-}
-
 fn refreshed_entity_record(
     entry: locality_core::model::TreeEntry,
     existing: Option<&EntityRecord>,
@@ -2816,13 +2804,12 @@ mod tests {
     }
 
     #[test]
-    fn refresh_children_fetches_missing_container_metadata_once() {
+    fn refresh_children_updates_cached_mount_point_metadata() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(virtual_mount(&mount_id))
-            .expect("save mount");
-        let connector = StaticChildrenConnector {
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
+        let mut connector = StaticChildrenConnector {
             entries: vec![TreeEntry {
                 mount_id: mount_id.clone(),
                 remote_id: RemoteId::new("page-root"),
@@ -2836,13 +2823,14 @@ mod tests {
             }],
             expected_parent_path: PathBuf::new(),
         };
+        let mount_point_root = mount_point_identifier(&mount);
 
         let saved =
-            refresh_virtual_fs_children(&mut store, &connector, &mount_id, "mount:notion-main")
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, &mount_point_root)
                 .expect("refresh children");
         assert_eq!(saved, 1);
 
-        let report = virtual_fs_children(&store, &mount_id, "mount:notion-main")
+        let report = virtual_fs_children(&store, &mount_id, &mount_point_root)
             .expect("mount point children");
         assert_eq!(report.children.len(), 3);
         assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
@@ -2852,10 +2840,27 @@ mod tests {
         assert_eq!(report.children[2].identifier, "children:page-root");
         assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
 
+        connector.entries.push(TreeEntry {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-new"),
+            kind: EntityKind::Page,
+            title: "New Page".to_string(),
+            path: "new-page/page.md".into(),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
+        });
         let saved =
-            refresh_virtual_fs_children(&mut store, &connector, &mount_id, "mount:notion-main")
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, &mount_point_root)
                 .expect("refresh cached children");
-        assert_eq!(saved, 0);
+        assert_eq!(saved, 2);
+
+        let report = virtual_fs_children(&store, &mount_id, &mount_point_root)
+            .expect("updated mount point children");
+        assert!(report.children.iter().any(|child| {
+            child.identifier == "children:page-new" && child.kind == VirtualFsItemKind::Folder
+        }));
     }
 
     #[test]

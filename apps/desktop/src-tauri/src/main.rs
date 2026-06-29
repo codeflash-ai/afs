@@ -219,6 +219,8 @@ impl Default for DesktopSettings {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingChange {
+    mount_id: String,
+    entity_id: String,
     title: String,
     local_path: String,
     summary: String,
@@ -1209,6 +1211,27 @@ where
     .unwrap_or_else(|_| PathBuf::from(&change.local_path));
 
     if change.state != "safe" {
+        if live_mode_change_is_remote_update_only(change) {
+            let target = match live_mode_remote_target_for_pending_change(change, &target) {
+                Ok(target) => target,
+                Err(message) => return ActionReport { ok: false, message },
+            };
+            match pull_remote_target(&target) {
+                Ok(true) => {
+                    return ActionReport {
+                        ok: true,
+                        message: "Live Mode pulled 1 remote change.".to_string(),
+                    };
+                }
+                Ok(false) => {
+                    return ActionReport {
+                        ok: true,
+                        message: "Live Mode checked 1 page for remote changes.".to_string(),
+                    };
+                }
+                Err(message) => return ActionReport { ok: false, message },
+            }
+        }
         if live_mode_change_may_merge_remote_drift(change) {
             match merge_remote_drift(change, &target) {
                 Ok(true) => {
@@ -1242,6 +1265,31 @@ where
         ok: true,
         message: "Live Mode synced 1 pending change.".to_string(),
     }
+}
+
+fn live_mode_change_is_remote_update_only(change: &PendingChange) -> bool {
+    change.state == "needs_review"
+        && change
+            .issue_codes
+            .iter()
+            .any(|code| code == "remote_changed")
+}
+
+fn live_mode_remote_target_for_pending_change(
+    change: &PendingChange,
+    path: &Path,
+) -> Result<LiveModeRemoteTarget, String> {
+    if change.mount_id.trim().is_empty() || change.entity_id.trim().is_empty() {
+        return Err(format!(
+            "Live Mode could not identify the remote page for `{}`.",
+            change.title
+        ));
+    }
+    Ok(LiveModeRemoteTarget {
+        mount_id: MountId::new(change.mount_id.clone()),
+        remote_id: RemoteId::new(change.entity_id.clone()),
+        path: path.to_path_buf(),
+    })
 }
 
 fn live_mode_change_may_merge_remote_drift(change: &PendingChange) -> bool {
@@ -1571,6 +1619,7 @@ fn live_mode_pull_remote_target_if_changed(target: &LiveModeRemoteTarget) -> Res
             Some(rendered.shadow.body_hash.as_str()),
         );
     if !remote_changed {
+        clear_live_mode_remote_hint(&mut store, &target.mount_id, &target.remote_id)?;
         return Ok(false);
     }
 
@@ -2499,7 +2548,9 @@ where
             })
         })
         .filter(|(_, entry, _)| status_entry_needs_desktop_attention(entry))
-        .map(|(_, entry, live_mode)| PendingChange {
+        .map(|(mount_id, entry, live_mode)| PendingChange {
+            mount_id: mount_id.0,
+            entity_id: entry.entity_id.clone(),
             title: entry.title.clone(),
             local_path: entry.path.clone(),
             summary: status_summary_for_entry(entry),
@@ -5042,6 +5093,7 @@ fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
         None => {}
     }
 
+    clear_stale_daemon_manager(state_root);
     start_daemon_for_current_binary(state_root)
 }
 
@@ -5052,6 +5104,32 @@ fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err("localityd did not start.".to_string())
+    }
+}
+
+fn clear_stale_daemon_manager(state_root: &Path) {
+    match run_daemon_control(&daemon_control_args_any_manager("stop", state_root)) {
+        Ok(report) if report.state == DaemonRunState::Stopped => {
+            if report.message != "daemon was not running" {
+                desktop_log(
+                    "info",
+                    "daemon.stale_manager_removed",
+                    format!(
+                        "cleared existing {} daemon manager before starting bundled localityd",
+                        report.manager.as_str()
+                    ),
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(error) => desktop_log(
+            "warn",
+            "daemon.stale_manager_remove_failed",
+            format!(
+                "could not clear stale daemon manager before starting bundled localityd: {}",
+                error.message()
+            ),
+        ),
     }
 }
 
@@ -8090,6 +8168,42 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_tick_pulls_remote_only_pending_change_instead_of_pausing() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "remote-page".to_string(),
+            title: "Remote Page".to_string(),
+            local_path: "Teamspace/Remote Page/page.md".to_string(),
+            summary: "remote update available".to_string(),
+            state: "needs_review".to_string(),
+            issue_codes: vec!["remote_changed".to_string()],
+            live_mode: sample_live_mode_status(true),
+        }];
+        let mut pulled = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            Some(&live_mode_target(
+                "/tmp/Locality/notion/another-page/page.md",
+            )),
+            |_, _| panic!("remote-only change should not run a local push"),
+            |target| {
+                pulled.push(target.clone());
+                Ok(true)
+            },
+            |_, _| panic!("remote-only change should not merge local drift"),
+        );
+
+        assert!(report.ok);
+        assert_eq!(report.message, "Live Mode pulled 1 remote change.");
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].mount_id, MountId::new("notion-main"));
+        assert_eq!(pulled[0].remote_id, RemoteId::new("remote-page"));
+        assert!(pulled[0].path.ends_with("Teamspace/Remote Page/page.md"));
+    }
+
+    #[test]
     fn live_mode_content_hash_changed_detects_remote_body_change() {
         assert!(live_mode_content_hash_changed(Some("old"), Some("new")));
         assert!(!live_mode_content_hash_changed(Some("same"), Some("same")));
@@ -8222,6 +8336,8 @@ mod tests {
     fn live_mode_tick_syncs_safe_pending_changes() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "roadmap-page".to_string(),
             title: "Roadmap".to_string(),
             local_path: "Engineering/Roadmap/page.md".to_string(),
             summary: "local edits pending review".to_string(),
@@ -8253,6 +8369,8 @@ mod tests {
     fn live_mode_tick_merges_remote_drift_before_syncing_obvious_case() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "roadmap-page".to_string(),
             title: "Roadmap".to_string(),
             local_path: "Engineering/Roadmap/page.md".to_string(),
             summary: "remote changed while local edits are pending".to_string(),
@@ -8293,6 +8411,8 @@ mod tests {
     fn live_mode_tick_pauses_for_review_required_changes() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "launch-plan-page".to_string(),
             title: "Launch Plan".to_string(),
             local_path: "Marketing/Launch Plan/page.md".to_string(),
             summary: "needs review: large deletion".to_string(),
@@ -10420,6 +10540,8 @@ fn unique_suffix() -> String {
 fn sample_pending_changes() -> Vec<PendingChange> {
     vec![
         PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "roadmap-2026".to_string(),
             title: "Roadmap 2026".to_string(),
             local_path: "Engineering/Roadmap 2026/page.md".to_string(),
             summary: "2 text edits".to_string(),
@@ -10428,6 +10550,8 @@ fn sample_pending_changes() -> Vec<PendingChange> {
             live_mode: sample_live_mode_status(false),
         },
         PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "launch-plan".to_string(),
             title: "Launch Plan".to_string(),
             local_path: "Marketing/Launch Plan/page.md".to_string(),
             summary: "needs review: large deletion".to_string(),
@@ -10436,6 +10560,8 @@ fn sample_pending_changes() -> Vec<PendingChange> {
             live_mode: sample_live_mode_status(false),
         },
         PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "customer-notes".to_string(),
             title: "Customer Notes".to_string(),
             local_path: "Sales/Customer Notes/page.md".to_string(),
             summary: "1 property edit".to_string(),

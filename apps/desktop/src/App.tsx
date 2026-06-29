@@ -96,6 +96,8 @@ type MountLiveMode = {
 };
 
 type PendingChange = {
+  mountId: string;
+  entityId: string;
   title: string;
   localPath: string;
   summary: string;
@@ -253,6 +255,8 @@ const sampleSnapshot: DesktopSnapshot = {
   },
   pendingChanges: [
     {
+      mountId: "notion-main",
+      entityId: "roadmap-2026",
       title: "Roadmap 2026",
       localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
@@ -261,6 +265,8 @@ const sampleSnapshot: DesktopSnapshot = {
       liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
+      mountId: "notion-main",
+      entityId: "launch-plan",
       title: "Launch Plan",
       localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
@@ -269,6 +275,8 @@ const sampleSnapshot: DesktopSnapshot = {
       liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
+      mountId: "notion-main",
+      entityId: "customer-notes",
       title: "Customer Notes",
       localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
@@ -925,7 +933,7 @@ function SetupLoading() {
     <main className="setup-shell">
       <section className="setup-window">
         <WindowChrome title="Locality Setup" meta="Checking" />
-        <SetupContent mark={<BrandTile>Locality</BrandTile>}>
+        <SetupContent mark={<BrandTile />}>
           <div>
             <div className="sync-note">
               <Loader2 className="spin" />
@@ -1796,7 +1804,7 @@ function HomeView({
                 onClick={toggleLiveMode}
               >
                 <span className="live-mode-copy">
-                  {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+                  {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
                   <span>Live Mode</span>
                 </span>
                 <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
@@ -2822,7 +2830,7 @@ function TrayPopover({
           onClick={() => void toggleLiveMode()}
         >
           <span className="tray-live-mode-copy">
-            {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+            {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
             <span>
               <strong>Live Mode</strong>
               <small>{trayLiveModeLabel(snapshot.liveMode, liveModeBusy)}</small>
@@ -3948,7 +3956,7 @@ function BrandTile({
       {variant === "folder" && <FolderOpen />}
       {variant === "progress" && <Loader2 />}
       {variant === "ready" && <Check />}
-      {!variant && children}
+      {!variant && (children ? <span className="brand-word">{children}</span> : <ApertureIcon />)}
       {variant === "notion" && children}
     </div>
   );
