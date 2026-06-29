@@ -34,6 +34,10 @@ const LINUX_FUSE_ROOT_HINT_MAX_BYTES: usize = 48;
 #[cfg(target_os = "linux")]
 const LINUX_FUSE_UNIT_PREFIX: &str = "ai.codeflash.locality.fuse.";
 #[cfg(target_os = "linux")]
+const LEGACY_AFS_FUSE_UNIT_PREFIX: &str = "ai.codeflash.afs.fuse.";
+#[cfg(target_os = "linux")]
+const LEGACY_AGENTFS_FUSE_UNIT_PREFIX: &str = "ai.codeflash.agentfs.fuse.";
+#[cfg(target_os = "linux")]
 const LINUX_FUSE_UNIT_SUFFIX: &str = ".service";
 #[cfg(target_os = "linux")]
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -495,7 +499,7 @@ pub(crate) fn repair_linux_fuse_units_for_state(
     mounts: &[MountConfig],
 ) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
     let unit_files = read_linux_fuse_unit_files()?;
-    let stale = stale_linux_fuse_units_for_state(state_root, mounts, unit_files);
+    let stale = stale_and_deprecated_linux_fuse_units_for_state(state_root, mounts, unit_files);
     remove_stale_linux_fuse_units(stale)
 }
 
@@ -523,7 +527,10 @@ fn repair_legacy_linux_fuse_units_for_state(
     state_root: &Path,
 ) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
     let unit_files = read_linux_fuse_unit_files()?;
-    let stale = legacy_linux_fuse_units_for_state(state_root, unit_files);
+    let stale = combine_stale_linux_fuse_units(
+        legacy_linux_fuse_units_for_state(state_root, unit_files.clone()),
+        deprecated_linux_fuse_units(unit_files),
+    );
     remove_stale_linux_fuse_units(stale)
 }
 
@@ -1718,6 +1725,18 @@ fn stale_linux_fuse_units_for_state(
 }
 
 #[cfg(target_os = "linux")]
+fn stale_and_deprecated_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<StaleLinuxFuseUnit> {
+    combine_stale_linux_fuse_units(
+        stale_linux_fuse_units_for_state(state_root, mounts, unit_files.clone()),
+        deprecated_linux_fuse_units(unit_files),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn legacy_linux_fuse_units_for_state(
     state_root: &Path,
     unit_files: Vec<LinuxFuseUnitFile>,
@@ -1738,6 +1757,53 @@ fn legacy_linux_fuse_units_for_state(
             })
         })
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn deprecated_linux_fuse_units(unit_files: Vec<LinuxFuseUnitFile>) -> Vec<StaleLinuxFuseUnit> {
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let uses_deprecated_unit_name = is_deprecated_linux_fuse_unit_name(&unit.unit_name);
+            let uses_deprecated_state_root = exec_start
+                .state_dir
+                .as_deref()
+                .is_some_and(is_deprecated_linux_fuse_state_root);
+            if !uses_deprecated_unit_name && !uses_deprecated_state_root {
+                return None;
+            }
+            Some(StaleLinuxFuseUnit {
+                unit_name: unit.unit_name,
+                unit_path: unit.unit_path,
+                mountpoint: exec_start.mountpoint,
+                legacy: true,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn combine_stale_linux_fuse_units(
+    left: Vec<StaleLinuxFuseUnit>,
+    right: Vec<StaleLinuxFuseUnit>,
+) -> Vec<StaleLinuxFuseUnit> {
+    let mut combined = BTreeMap::<String, StaleLinuxFuseUnit>::new();
+    for unit in left.into_iter().chain(right) {
+        match combined.entry(unit.unit_name.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.legacy |= unit.legacy;
+                if existing.mountpoint.is_none() {
+                    existing.mountpoint = unit.mountpoint;
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(unit);
+            }
+        }
+    }
+    combined.into_values().collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -1852,11 +1918,9 @@ fn linux_fuse_list_payload_for_state(
     mounts: &[MountConfig],
     unit_files: Vec<LinuxFuseUnitFile>,
 ) -> Result<Value, LinuxFuseRegistrationError> {
-    let stale_units = linux_fuse_stale_unit_reports(stale_linux_fuse_units_for_state(
-        state_root,
-        mounts,
-        unit_files.clone(),
-    ));
+    let stale_units = linux_fuse_stale_unit_reports(
+        stale_and_deprecated_linux_fuse_units_for_state(state_root, mounts, unit_files.clone()),
+    );
     let mut roots = linux_fuse_root_reports_for_state(state_root, mounts, unit_files);
     for root in &mut roots {
         root.active = if root.registered {
@@ -1994,7 +2058,11 @@ fn parse_linux_fuse_exec_start(contents: &str) -> Option<LinuxFuseExecStart> {
         .find_map(|line| line.strip_prefix("ExecStart="))?;
     let args = split_systemd_exec_args(line);
     let helper = args.first()?;
-    if Path::new(helper).file_name().and_then(|name| name.to_str()) != Some("locality-fuse") {
+    if !Path::new(helper)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_linux_fuse_helper_name)
+    {
         return None;
     }
 
@@ -2077,6 +2145,23 @@ fn command_has_flag(args: &[String], flag: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn is_linux_fuse_helper_name(name: &str) -> bool {
+    matches!(name, "locality-fuse" | "afs-fuse" | "agentfs-fuse")
+}
+
+#[cfg(target_os = "linux")]
+fn is_deprecated_linux_fuse_state_root(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(".afs")
+}
+
+#[cfg(target_os = "linux")]
+fn is_deprecated_linux_fuse_unit_name(unit_name: &str) -> bool {
+    (unit_name.starts_with(LEGACY_AFS_FUSE_UNIT_PREFIX)
+        || unit_name.starts_with(LEGACY_AGENTFS_FUSE_UNIT_PREFIX))
+        && unit_name.ends_with(LINUX_FUSE_UNIT_SUFFIX)
+}
+
+#[cfg(target_os = "linux")]
 fn same_path_for_linux_fuse_state(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -2089,7 +2174,8 @@ fn same_path_for_linux_fuse_state(left: &Path, right: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_locality_fuse_unit_name(unit_name: &str) -> bool {
-    unit_name.starts_with(LINUX_FUSE_UNIT_PREFIX) && unit_name.ends_with(LINUX_FUSE_UNIT_SUFFIX)
+    (unit_name.starts_with(LINUX_FUSE_UNIT_PREFIX) || is_deprecated_linux_fuse_unit_name(unit_name))
+        && unit_name.ends_with(LINUX_FUSE_UNIT_SUFFIX)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2670,6 +2756,57 @@ mod linux_tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn linux_fuse_list_payload_includes_deprecated_afs_units_from_legacy_state_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let payload = super::linux_fuse_list_payload_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.afs.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/afs-fuse --mount-id notion-main --state-dir /home/example/.afs --mountpoint /home/example/Documents/AFS\n",
+            )],
+        )
+        .expect("list payload");
+        let stale_units = payload
+            .get("stale_units")
+            .and_then(serde_json::Value::as_array)
+            .expect("stale units");
+
+        assert_eq!(stale_units.len(), 1);
+        assert_eq!(
+            stale_units[0]
+                .get("service")
+                .and_then(serde_json::Value::as_str),
+            Some("ai.codeflash.afs.fuse.notion-main.service")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("mountpoint")
+                .and_then(serde_json::Value::as_str),
+            Some("/home/example/Documents/AFS")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("legacy")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn linux_fuse_unit_name_filter_accepts_deprecated_afs_units() {
+        assert!(super::is_locality_fuse_unit_name(
+            "ai.codeflash.afs.fuse.notion-main.service"
+        ));
     }
 
     #[test]
