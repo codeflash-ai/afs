@@ -848,6 +848,51 @@ fn status_reports_review_needed_when_local_and_remote_changed() {
 }
 
 #[test]
+fn status_treats_resolved_conflict_markers_as_dirty_not_conflicted() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nResolved paragraph.");
+    store
+        .save_entity(entity_record(
+            &fixture.mount_id,
+            "page-1",
+            "Roadmap.md",
+            HydrationState::Conflicted,
+        ))
+        .expect("save conflicted entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow("page-1", "# Roadmap\n\nRemote paragraph."),
+        )
+        .expect("save shadow");
+    fixture.remote_observation(&mut store, "page-1", "remote-v2", true);
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(report.summary.conflicted, 0);
+    assert_eq!(report.summary.dirty, 1);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Dirty);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::ReviewNeeded
+    );
+    assert!(!entry_has_issue(
+        &report,
+        "Roadmap.md",
+        "unresolved_conflict_markers"
+    ));
+    assert!(!entry_has_issue(&report, "Roadmap.md", "entity_conflicted"));
+}
+
+#[test]
 fn status_reports_checking_freshness_without_attention() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();
