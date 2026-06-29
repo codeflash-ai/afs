@@ -3170,9 +3170,8 @@ function FileChangeList({
               </div>
               <PrimaryButton
                 compact
-                icon={shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
+                icon={isPushingFile ? <Loader2 className="spin-icon" /> : shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
                 disabled={isWorking}
-                icon={isPushingFile ? <Loader2 className="spin-icon" /> : undefined}
                 onClick={() => {
                   if (shouldReviewBeforePush) {
                     onReview?.();
