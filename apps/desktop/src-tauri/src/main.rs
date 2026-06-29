@@ -353,6 +353,7 @@ struct MountLiveModeChange {
 }
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
 static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
@@ -4661,6 +4662,17 @@ fn desktop_projection_mode() -> ProjectionMode {
 }
 
 fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
+    let _guard = daemon_lifecycle_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ensure_daemon_running_locked(state_root)
+}
+
+fn daemon_lifecycle_lock() -> &'static Mutex<()> {
+    DAEMON_LIFECYCLE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
     let current_build = expected_daemon_build_info();
     match running_daemon_build(state_root) {
         Some(build) if build == current_build => return Ok(()),
@@ -4703,14 +4715,28 @@ fn restart_daemon_for_current_binary(
     state_root: &Path,
     expected_build: &DaemonBuildInfo,
 ) -> Result<(), String> {
-    let _ = run_daemon_control(&daemon_control_args_any_manager("stop", state_root));
+    let stop_error = run_daemon_control(&daemon_control_args_any_manager("stop", state_root))
+        .err()
+        .map(|error| error.message());
+    if let Some(message) = stop_error.as_ref() {
+        desktop_log(
+            "warn",
+            "daemon.stop_before_restart_failed",
+            format!("could not stop existing localityd before restart: {message}"),
+        );
+    }
     start_daemon_for_current_binary(state_root)?;
     match running_daemon_build(state_root) {
         Some(build) if &build == expected_build => Ok(()),
-        Some(build) => Err(format!(
-            "localityd restarted, but reported build {} instead of {}.",
-            build.build_id, expected_build.build_id
-        )),
+        Some(build) => {
+            let stop_detail = stop_error
+                .map(|message| format!(" Previous stop attempt failed: {message}"))
+                .unwrap_or_default();
+            Err(format!(
+                "localityd restarted, but reported build {} instead of {}.{}",
+                build.build_id, expected_build.build_id, stop_detail
+            ))
+        }
         None => Err("localityd restarted, but did not report build metadata.".to_string()),
     }
 }
@@ -7349,6 +7375,31 @@ mod tests {
                 build_id: "build-123".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn daemon_lifecycle_lock_serializes_concurrent_callers() {
+        let guard = super::daemon_lifecycle_lock()
+            .lock()
+            .expect("daemon lifecycle lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("send started");
+            let _guard = super::daemon_lifecycle_lock()
+                .lock()
+                .expect("daemon lifecycle lock from worker");
+            entered_tx.send(()).expect("send entered");
+        });
+
+        started_rx.recv().expect("worker started");
+        assert!(entered_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        drop(guard);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered after lock release");
+        thread.join().expect("worker joined");
     }
 
     #[test]
