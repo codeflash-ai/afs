@@ -1522,6 +1522,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
+        repair_missing_state_components(connection)?;
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
@@ -2815,6 +2816,63 @@ fn seed_current_state_components(connection: &Connection) -> StoreResult<()> {
                 &updated_at,
             ],
         )?;
+    }
+    Ok(())
+}
+
+fn seed_missing_state_components(connection: &Connection) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let updated_at = unix_timestamp_string();
+    for definition in CURRENT_COMPONENT_DEFINITIONS {
+        if !repairable_missing_state_component(definition.component_id) {
+            continue;
+        }
+        connection.execute(
+            "INSERT OR IGNORE INTO state_components (
+                component_id,
+                component_kind,
+                version,
+                min_reader_version,
+                required,
+                rebuildable,
+                data_json,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                definition.component_id,
+                definition.component_kind,
+                definition.current_version,
+                definition.min_reader_version,
+                bool_to_int(definition.required),
+                bool_to_int(definition.rebuildable),
+                definition.data_json,
+                &updated_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn repairable_missing_state_component(component_id: &str) -> bool {
+    !matches!(
+        component_id,
+        "projection:linux_fuse" | "projection:windows_cloud_files"
+    )
+}
+
+fn repair_missing_state_components(connection: &Connection) -> StoreResult<()> {
+    if inspect_state_component_issues(connection)?
+        .iter()
+        .any(|issue| {
+            matches!(
+                issue,
+                StateCompatibilityIssue::MissingComponent { component_id }
+                    if repairable_missing_state_component(component_id)
+            )
+        })
+    {
+        seed_missing_state_components(connection)?;
     }
     Ok(())
 }

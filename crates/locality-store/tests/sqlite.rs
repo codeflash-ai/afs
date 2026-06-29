@@ -158,6 +158,38 @@ fn sqlite_store_seeds_state_compatibility_components() {
 }
 
 #[test]
+fn sqlite_store_repairs_missing_current_state_components() {
+    let fixture = SqliteFixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM state_components WHERE component_id = 'durable:live_mode'",
+            [],
+        )
+        .expect("delete live mode component");
+    drop(connection);
+    drop(store);
+
+    let before =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    assert_eq!(
+        before.issues,
+        vec![StateCompatibilityIssue::MissingComponent {
+            component_id: "durable:live_mode".to_string(),
+        }]
+    );
+
+    fixture.open();
+
+    let after =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(after.status, StateCompatibilityStatus::Ready);
+    assert!(after.issues.is_empty());
+}
+
+#[test]
 fn sqlite_schema_snapshot_matches_v15_contract() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
