@@ -115,9 +115,9 @@
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
   !insertmacro PREPARE_AFS_SIDECAR_FILES
-  File /oname=afs.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afs.exe"
-  File /oname=afsd.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afsd.exe"
-  File /oname=afs-cloud-files.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afs-cloud-files.exe"
+  File /oname=afs.exe "${__FILEDIR__}\afs.exe"
+  File /oname=afsd.exe "${__FILEDIR__}\afsd.exe"
+  File /oname=afs-cloud-files.exe "${__FILEDIR__}\afs-cloud-files.exe"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

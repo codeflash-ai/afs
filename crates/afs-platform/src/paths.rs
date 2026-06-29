@@ -55,15 +55,40 @@ impl DefaultHostPaths {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     }
+
+    fn first_var_path(&self, keys: &[&str]) -> Option<PathBuf> {
+        keys.iter().find_map(|key| self.var_path(key))
+    }
+
+    fn first_existing_path(
+        &self,
+        candidates: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<PathBuf> {
+        let _ = self;
+        candidates.into_iter().find(|candidate| candidate.exists())
+    }
 }
 
 impl HostPaths for DefaultHostPaths {
     fn state_root(&self) -> PathBuf {
-        if let Some(path) = self.var_path("AFS_STATE_DIR") {
+        if let Some(path) = self.first_var_path(&["AFS_STATE_DIR", "LOCALITY_STATE_DIR"]) {
             return path;
         }
 
         if self.target_os == "windows" {
+            if let Some(path) = self.first_existing_path(
+                [
+                    self.var_path("LOCALAPPDATA")
+                        .map(|path| path.join("AgentFS")),
+                    self.var_path("LOCALAPPDATA").map(|path| path.join("AFS")),
+                    self.var_path("USERPROFILE")
+                        .map(|path| path.join("AppData").join("Local").join("AgentFS")),
+                ]
+                .into_iter()
+                .flatten(),
+            ) {
+                return path;
+            }
             if let Some(path) = self.var_path("LOCALAPPDATA") {
                 return path.join("AgentFS");
             }
@@ -159,7 +184,9 @@ mod tests {
         DefaultHostPaths, HostPaths, host_path_from_logical_path, join_logical_path,
         logical_path_display,
     };
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn windows_state_root_uses_local_app_data() {
@@ -192,6 +219,40 @@ mod tests {
         );
 
         assert_eq!(paths.state_root(), PathBuf::from(r"D:\afs-state"));
+    }
+
+    #[test]
+    fn locality_state_dir_alias_overrides_platform_default() {
+        let paths = DefaultHostPaths::for_target_with_env(
+            "windows",
+            [
+                ("LOCALITY_STATE_DIR", r"D:\locality-state"),
+                ("LOCALAPPDATA", r"C:\Users\Ada\AppData\Local"),
+            ],
+        );
+
+        assert_eq!(paths.state_root(), PathBuf::from(r"D:\locality-state"));
+    }
+
+    #[test]
+    fn windows_state_root_prefers_existing_legacy_afs_directory() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let local_app_data =
+            std::env::temp_dir().join(format!("afs-platform-localappdata-{suffix}"));
+        let legacy_root = local_app_data.join("AFS");
+        fs::create_dir_all(&legacy_root).expect("legacy state root");
+
+        let paths = DefaultHostPaths::for_target_with_env(
+            "windows",
+            [("LOCALAPPDATA", local_app_data.as_os_str())],
+        );
+
+        assert_eq!(paths.state_root(), legacy_root);
+
+        let _ = fs::remove_dir_all(local_app_data);
     }
 
     #[test]

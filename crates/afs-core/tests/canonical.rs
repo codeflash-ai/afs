@@ -136,6 +136,47 @@ fn parses_quoted_and_unquoted_directive_attributes() {
 }
 
 #[test]
+fn parses_loc_frontmatter_and_directives_as_afs_compatibility_aliases() {
+    let input = r#"---
+loc:
+  id: page-1
+  type: page
+  parent: parent-1
+  synced_at: "2026-06-09T14:02:11Z"
+  remote_edited_at: "2026-06-09T13:58:40Z"
+title: Roadmap 2026
+---
+# Roadmap 2026
+
+::loc{id=block-1 type=synced_block title="Shared header"}
+"#;
+    let parsed = parse_canonical_markdown(input).expect("loc-compatible canonical document");
+
+    let afs = parsed
+        .frontmatter
+        .afs
+        .as_ref()
+        .expect("normalized afs metadata");
+    assert_eq!(afs.id, Some(RemoteId::new("page-1")));
+    assert_eq!(afs.parent, Some(RemoteId::new("parent-1")));
+    assert_eq!(afs.entity_type, Some(EntityKind::Page));
+    assert_eq!(parsed.directives.len(), 1);
+    assert_eq!(
+        parsed.directives[0].remote_id,
+        Some(RemoteId::new("block-1"))
+    );
+    assert_eq!(
+        parsed.directives[0].directive_type.as_deref(),
+        Some("synced_block")
+    );
+    assert_eq!(parsed.directives[0].title.as_deref(), Some("Shared header"));
+    assert_eq!(
+        parsed.directives[0].raw,
+        r#"::loc{id=block-1 type=synced_block title="Shared header"}"#
+    );
+}
+
+#[test]
 fn parses_escaped_directive_attribute_values() {
     let directive = parse_directive_line(
         r#"::afs{id=media-1 type=image title="Quote: \"hello\" and slash \\"}"#,

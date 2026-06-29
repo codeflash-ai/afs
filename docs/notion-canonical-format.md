@@ -29,6 +29,8 @@ Directive integrity is validated before push. Agents may move directive lines as
 
 The first renderer supports common text blocks, richer inline text, display equations, simple tables, bookmark/embed/link-preview URL blocks, child-page links, and file-like media blocks. Inline bold, italic, strikethrough, code, external links, date mentions, page/database mentions, link previews, and equations use ordinary Markdown or small HTML fallbacks when Markdown has no native equivalent. Child pages render as normal Markdown links whose URL contains the stable Notion page ID, for example `[Design Notes](https://www.notion.so/...)`; AFS can use that URL to locate the mounted child page, and the child page itself is edited through its own Markdown file. Child databases, toggles, synced blocks, column layouts, tabs, meeting notes, AI/custom blocks, URL-less media payloads, and unsupported/lossy blocks render as directives. This keeps the page inspectable while preserving remote block IDs for later safer round-trip support.
 
+Read-side compatibility also accepts legacy `loc:` identity frontmatter and `::loc{...}` directives from pre-rename projections. Normal AFS rewrites continue to emit `afs:` and `::afs{...}` spellings.
+
 Media blocks with a Notion `file.url` or `external.url` render as ordinary Markdown. Images use image syntax, while other file-like blocks use links. When AFS writes a page into a local projection, downloadable file-like media links point at the absolute local media file under the projection output root instead of the remote Notion/S3 URL. For virtual projections this is the daemon content cache:
 
 ```markdown
