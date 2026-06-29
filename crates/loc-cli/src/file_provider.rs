@@ -1122,6 +1122,18 @@ pub fn macos_file_provider_display_name(root: &Path, fallback: &str) -> String {
     }
 }
 
+pub fn windows_cloud_files_display_name(root: &Path, fallback: &str) -> String {
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return fallback.to_string();
+    };
+    let stripped = strip_file_provider_directory_prefix(name);
+    if stripped.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
 fn macos_file_provider_domain_path(root: &Path) -> &Path {
     let Some(parent) = root.parent() else {
         return root;
@@ -1482,6 +1494,28 @@ mod tests {
         );
         assert_eq!(
             super::macos_file_provider_display_name(std::path::Path::new("/"), "fallback"),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn windows_cloud_files_display_name_is_never_empty_for_locality_root() {
+        assert_eq!(
+            super::windows_cloud_files_display_name(
+                std::path::Path::new("/Users/example/CloudStorage/Locality"),
+                "fallback",
+            ),
+            "Locality"
+        );
+        assert_eq!(
+            super::windows_cloud_files_display_name(
+                std::path::Path::new("/Users/example/CloudStorage/Locality-Notion"),
+                "fallback",
+            ),
+            "Notion"
+        );
+        assert_eq!(
+            super::windows_cloud_files_display_name(std::path::Path::new("/"), "fallback"),
             "fallback"
         );
     }

@@ -4060,7 +4060,7 @@ fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn file_provider_display_name(mount: &MountConfig) -> String {
-    file_provider_helper::macos_file_provider_display_name(&mount.root, &mount.mount_id.0)
+    file_provider_helper::windows_cloud_files_display_name(&mount.root, &mount.mount_id.0)
 }
 
 fn stub(command: &str, json: bool) -> i32 {
