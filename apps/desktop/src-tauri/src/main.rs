@@ -39,7 +39,8 @@ use loc_cli::push::{
 };
 use loc_cli::restore::{RestoreOptions, run_restore};
 use loc_cli::search::{
-    SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
+    SearchOptions, SearchResult, is_notion_url_host, notion_id_from_url,
+    run_search_with_access_roots, source_url_host,
 };
 use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 use locality_core::canonical::parse_canonical_markdown;
@@ -2841,6 +2842,10 @@ fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4],
 }
 
 fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
+    if let Some(message) = unsupported_notion_locator_url_message(query) {
+        return Err(message);
+    }
+
     if notion_id_from_url(query).is_some() {
         prepare_exact_notion_url_path(query)?;
     }
@@ -2856,6 +2861,31 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
     })?;
     prioritize_located_notion_result(&result);
     Ok(located_item_for_search_result(result))
+}
+
+fn unsupported_notion_locator_url_message(query: &str) -> Option<String> {
+    let host = source_url_host(query)?;
+    if is_notion_url_host(host.as_str()) {
+        return None;
+    }
+
+    let source = match url_source_label(&host) {
+        Some(label) => label.to_string(),
+        None => format!("`{host}`"),
+    };
+    Some(format!(
+        "That looks like a {source} URL. This field opens Notion pages only; paste a Notion page URL, page title, or mounted Notion path."
+    ))
+}
+
+fn url_source_label(host: &str) -> Option<&'static str> {
+    if host == "github.com" || host.ends_with(".github.com") {
+        return Some("GitHub");
+    }
+    if host == "docs.google.com" || host == "drive.google.com" {
+        return Some("Google Docs");
+    }
+    None
 }
 
 fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
@@ -7428,8 +7458,9 @@ mod tests {
         should_prioritize_located_result, state_event_path_requires_refresh,
         state_event_path_wakes_live_mode, summarize_virtual_projection_children,
         terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
-        unique_suffix, validate_mount_root, virtual_projection_refresh_signal_identifiers,
-        wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
+        unique_suffix, unsupported_notion_locator_url_message, validate_mount_root,
+        virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
+        wake_live_mode_runner, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -7951,6 +7982,27 @@ mod tests {
             )
             .as_deref(),
             Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
+        );
+    }
+
+    #[test]
+    fn notion_locator_message_rejects_github_commit_urls() {
+        let message = unsupported_notion_locator_url_message(
+            "https://github.com/codeflash-ai/locality/commit/15e6dedcfd04d1cdb22df006b66a90dd4ab3753c",
+        )
+        .expect("unsupported URL message");
+
+        assert!(message.contains("GitHub"));
+        assert!(message.contains("Notion pages only"));
+    }
+
+    #[test]
+    fn notion_locator_message_allows_notion_urls() {
+        assert_eq!(
+            unsupported_notion_locator_url_message(
+                "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972",
+            ),
+            None
         );
     }
 
