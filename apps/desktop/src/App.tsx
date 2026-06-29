@@ -85,6 +85,8 @@ type MountLiveMode = {
 };
 
 type PendingChange = {
+  mountId: string;
+  entityId: string;
   title: string;
   localPath: string;
   summary: string;
@@ -231,6 +233,8 @@ const sampleSnapshot: DesktopSnapshot = {
   },
   pendingChanges: [
     {
+      mountId: "notion-main",
+      entityId: "roadmap-2026",
       title: "Roadmap 2026",
       localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
@@ -239,6 +243,8 @@ const sampleSnapshot: DesktopSnapshot = {
       liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
+      mountId: "notion-main",
+      entityId: "launch-plan",
       title: "Launch Plan",
       localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
@@ -247,6 +253,8 @@ const sampleSnapshot: DesktopSnapshot = {
       liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
+      mountId: "notion-main",
+      entityId: "customer-notes",
       title: "Customer Notes",
       localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
