@@ -272,6 +272,14 @@ fn repair_linux_fuse_units_for_daemon_start(state_root: &Path) {
             error.message()
         );
     }
+    if let Err(error) =
+        crate::file_provider::restart_linux_fuse_units_for_state(state_root, &mounts)
+    {
+        eprintln!(
+            "loc daemon start: skipped Linux FUSE unit restart: {}",
+            error.message()
+        );
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -281,6 +289,8 @@ fn stop_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
+    stop_linux_fuse_units_for_daemon_stop(&options.state_root);
+
     let was_running = is_running(options, paths);
     let mut stopped_by_shutdown = false;
     if was_running && request_graceful_shutdown(options, paths) {
@@ -332,6 +342,19 @@ fn stop_daemon(
         message,
     ))
 }
+
+#[cfg(target_os = "linux")]
+fn stop_linux_fuse_units_for_daemon_stop(state_root: &Path) {
+    if let Err(error) = crate::file_provider::stop_linux_fuse_units_for_state(state_root) {
+        eprintln!(
+            "loc daemon stop: skipped Linux FUSE unit stop: {}",
+            error.message()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stop_linux_fuse_units_for_daemon_stop(_state_root: &Path) {}
 
 fn request_graceful_shutdown(options: &DaemonOptions, paths: &DaemonPaths) -> bool {
     send_daemon_request(

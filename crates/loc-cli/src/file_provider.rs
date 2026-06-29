@@ -128,6 +128,13 @@ pub(crate) struct StaleLinuxFuseUnit {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinuxFuseManagedUnit {
+    unit_name: String,
+    mountpoint: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LinuxFuseExecStart {
     state_dir: Option<PathBuf>,
     mountpoint: Option<PathBuf>,
@@ -318,6 +325,25 @@ pub(crate) fn repair_linux_fuse_units_for_state(
     let unit_files = read_linux_fuse_unit_files()?;
     let stale = stale_linux_fuse_units_for_state(state_root, mounts, unit_files);
     remove_stale_linux_fuse_units(stale)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn restart_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let units = restartable_linux_fuse_units_for_state(state_root, mounts, unit_files);
+    restart_linux_fuse_units(units)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn stop_linux_fuse_units_for_state(
+    state_root: &Path,
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let units = stoppable_linux_fuse_units_for_state(state_root, unit_files);
+    stop_linux_fuse_units(units)
 }
 
 #[cfg(target_os = "linux")]
@@ -1541,6 +1567,53 @@ fn legacy_linux_fuse_units_for_state(
 }
 
 #[cfg(target_os = "linux")]
+fn restartable_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<LinuxFuseManagedUnit> {
+    let desired_units = desired_linux_fuse_unit_names(mounts);
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if exec_start.has_mount_id
+                || !same_path_for_linux_fuse_state(state_dir, state_root)
+                || !desired_units.contains(&unit.unit_name)
+            {
+                return None;
+            }
+            Some(LinuxFuseManagedUnit {
+                unit_name: unit.unit_name,
+                mountpoint: exec_start.mountpoint,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn stoppable_linux_fuse_units_for_state(
+    state_root: &Path,
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<LinuxFuseManagedUnit> {
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if !same_path_for_linux_fuse_state(state_dir, state_root) {
+                return None;
+            }
+            Some(LinuxFuseManagedUnit {
+                unit_name: unit.unit_name,
+                mountpoint: exec_start.mountpoint,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
 fn remove_stale_linux_fuse_units(
     stale: Vec<StaleLinuxFuseUnit>,
 ) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
@@ -1582,6 +1655,42 @@ fn remove_stale_linux_fuse_units(
         return Err(error);
     }
     Ok(stale)
+}
+
+#[cfg(target_os = "linux")]
+fn restart_linux_fuse_units(
+    units: Vec<LinuxFuseManagedUnit>,
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    for unit in &units {
+        run_systemctl_user(&["restart", unit.unit_name.as_str()])?;
+    }
+    Ok(units)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_fuse_units(
+    units: Vec<LinuxFuseManagedUnit>,
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    let mut first_error = None;
+    for unit in &units {
+        if let Err(error) = run_systemctl_user(&["stop", unit.unit_name.as_str()])
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(mountpoint) = &unit.mountpoint {
+            let _ = Command::new("fusermount3")
+                .arg("-uz")
+                .arg(mountpoint)
+                .output();
+        }
+        let _ = run_systemctl_user(&["reset-failed", unit.unit_name.as_str()]);
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(units)
 }
 
 #[cfg(target_os = "linux")]
@@ -2027,6 +2136,95 @@ mod linux_tests {
                 unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
                 mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
             }]
+        );
+    }
+
+    #[test]
+    fn restartable_linux_fuse_units_include_desired_shared_root_units_for_current_state() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let restartable = super::restartable_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![super::LinuxFuseUnitFile {
+                unit_name: unit_name.clone(),
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert_eq!(
+            restartable,
+            vec![super::LinuxFuseManagedUnit {
+                unit_name,
+                mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
+            }]
+        );
+    }
+
+    #[test]
+    fn stoppable_linux_fuse_units_include_all_current_state_units() {
+        let shared_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let shared_root_id = super::linux_fuse_root_id(&shared_mount);
+        let shared_unit_name = super::linux_fuse_unit_name(&shared_root_id);
+        let shared_unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &shared_mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let stoppable = super::stoppable_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            vec![
+                super::LinuxFuseUnitFile {
+                    unit_name: shared_unit_name.clone(),
+                    unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                    contents: shared_unit,
+                },
+                linux_fuse_unit_file(
+                    "ai.codeflash.locality.fuse.legacy.service",
+                    "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /home/example/.loc --mountpoint /home/example/Locality/notion-main\n",
+                ),
+                linux_fuse_unit_file(
+                    "ai.codeflash.locality.fuse.other-state.service",
+                    "[Service]\nExecStart=/opt/locality-fuse --state-dir /tmp/other/.loc --mountpoint /home/example/Locality\n",
+                ),
+            ],
+        );
+
+        assert_eq!(
+            stoppable,
+            vec![
+                super::LinuxFuseManagedUnit {
+                    unit_name: shared_unit_name,
+                    mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
+                },
+                super::LinuxFuseManagedUnit {
+                    unit_name: "ai.codeflash.locality.fuse.legacy.service".to_string(),
+                    mountpoint: Some(std::path::PathBuf::from(
+                        "/home/example/Locality/notion-main"
+                    )),
+                },
+            ]
         );
     }
 
