@@ -606,6 +606,29 @@ where
     })
 }
 
+pub fn materialize_virtual_fs_guidance_with_content_root<S>(
+    store: &S,
+    content_root: &Path,
+    mount_id: &MountId,
+    identifier: &str,
+) -> LocalityResult<Option<VirtualFsMaterializeReport>>
+where
+    S: MountRepository,
+{
+    if !is_guidance_identifier(identifier) {
+        return Ok(None);
+    }
+    let Some(mount) = store.get_mount(mount_id).map_err(LocalityError::from)? else {
+        return Ok(None);
+    };
+    if !mount.projection.uses_virtual_filesystem() {
+        return Err(LocalityError::Unsupported(
+            "plain-files mounts do not support virtual filesystem operations",
+        ));
+    }
+    materialize_guidance_item(&mount, content_root, identifier, true)
+}
+
 pub fn commit_virtual_fs_write<S>(
     store: &mut S,
     content_root: &Path,

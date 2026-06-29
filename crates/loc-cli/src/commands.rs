@@ -1404,12 +1404,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
         ),
         "open" => file_provider_open(args, json),
         "unregister" => file_provider_unregister(args, json),
-        "list" => run_platform_file_provider_helper(
-            json,
-            "list",
-            windows_cloud_files_state_args_for_platform(),
-            None,
-        ),
+        "list" => file_provider_list(json),
         "reset" => run_platform_file_provider_helper(
             json,
             "reset",
@@ -1537,8 +1532,8 @@ fn file_provider_lifecycle(
         VirtualProjectionRegistration::WindowsCloudFiles => {
             run_windows_cloud_files_lifecycle(json, &mount, action)
         }
-        VirtualProjectionRegistration::MacosFileProvider
-        | VirtualProjectionRegistration::LinuxFuse => command_error(
+        VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_lifecycle(json, &mount, action),
+        VirtualProjectionRegistration::MacosFileProvider => command_error(
             json,
             CommandError::new(
                 "file-provider",
@@ -1550,6 +1545,51 @@ fn file_provider_lifecycle(
             ),
             EXIT_USAGE,
         ),
+    }
+}
+
+fn file_provider_list(json: bool) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        let state_root = default_state_root();
+        let store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                    EXIT_INTERNAL,
+                );
+            }
+        };
+        let mounts = match store.load_mounts() {
+            Ok(mounts) => mounts,
+            Err(error) => {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", "store_error", error.to_string()),
+                    EXIT_INTERNAL,
+                );
+            }
+        };
+        let helper_report = match file_provider_helper::list_linux_fuse_roots(&state_root, &mounts)
+        {
+            Ok(report) => report,
+            Err(error) => {
+                return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL);
+            }
+        };
+        return file_provider_helper_success_report(json, "list", None, helper_report);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        run_platform_file_provider_helper(
+            json,
+            "list",
+            windows_cloud_files_state_args_for_platform(),
+            None,
+        )
     }
 }
 
@@ -1879,6 +1919,14 @@ fn mount(args: &[String], json: bool) -> i32 {
             .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
     );
     let read_only = has_flag(args, "--read-only");
+    if let Some(error) = mounted_projection_preflight_error(
+        projection.clone(),
+        std::env::consts::OS,
+        std::env::var_os("LOCALITY_DAEMON_DISABLE").is_some(),
+        || virtual_projection_daemon_is_running(&state_root),
+    ) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
     let remote_root_id = match mount_remote_root_id(
         args,
         &descriptor,
@@ -3758,6 +3806,64 @@ fn run_windows_cloud_files_lifecycle(
     )
 }
 
+#[cfg(target_os = "linux")]
+fn run_linux_fuse_lifecycle(
+    json: bool,
+    mount: &MountConfig,
+    action: file_provider_helper::WindowsCloudFilesLifecycleAction,
+) -> i32 {
+    let state_root = default_state_root();
+    let action = match action {
+        file_provider_helper::WindowsCloudFilesLifecycleAction::Start => {
+            file_provider_helper::LinuxFuseLifecycleAction::Start
+        }
+        file_provider_helper::WindowsCloudFilesLifecycleAction::Stop => {
+            file_provider_helper::LinuxFuseLifecycleAction::Stop
+        }
+        file_provider_helper::WindowsCloudFilesLifecycleAction::Status => {
+            file_provider_helper::LinuxFuseLifecycleAction::Status
+        }
+        file_provider_helper::WindowsCloudFilesLifecycleAction::Restart => {
+            file_provider_helper::LinuxFuseLifecycleAction::Restart
+        }
+    };
+    let helper_report =
+        match file_provider_helper::run_linux_fuse_lifecycle(&state_root, mount, action) {
+            Ok(report) => report,
+            Err(error) => {
+                return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL);
+            }
+        };
+    file_provider_helper_success_report(
+        json,
+        action.as_str(),
+        Some(mount.mount_id.0.clone()),
+        helper_report,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_linux_fuse_lifecycle(
+    json: bool,
+    mount: &MountConfig,
+    action: file_provider_helper::WindowsCloudFilesLifecycleAction,
+) -> i32 {
+    command_error(
+        json,
+        CommandError::new(
+            "file-provider",
+            "unsupported_platform",
+            format!(
+                "file-provider {} is only supported for Linux FUSE mounts on Linux; mount `{}` cannot {} here",
+                action.as_str(),
+                mount.mount_id.0,
+                action.as_str()
+            ),
+        ),
+        EXIT_USAGE,
+    )
+}
+
 fn run_windows_cloud_files_open(json: bool, mount: &MountConfig) -> i32 {
     let helper_report = match file_provider_helper::open_windows_cloud_files_sync_root(mount) {
         Ok(report) => report,
@@ -4158,50 +4264,8 @@ fn windows_cloud_files_command_error(
 
 fn print_file_provider_report(report: &FileProviderCommandReport) {
     if report.action == "list" {
-        if let Some(roots) = report.helper_report.get("roots").and_then(Value::as_array) {
-            if roots.is_empty() {
-                println!("no file provider domains");
-                return;
-            }
-            for root in roots {
-                let mount_id = root
-                    .get("mount_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>");
-                let display_name = root
-                    .get("display_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>");
-                let path = root
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>");
-                println!("{mount_id}\t{display_name}\t{path}");
-            }
-            return;
-        }
-        let Some(domains) = report
-            .helper_report
-            .get("domains")
-            .and_then(Value::as_array)
-        else {
-            println!("no file provider domains");
-            return;
-        };
-        if domains.is_empty() {
-            println!("no file provider domains");
-            return;
-        }
-        for domain in domains {
-            let identifier = domain
-                .get("identifier")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            let display_name = domain
-                .get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            println!("{identifier}\t{display_name}");
+        for line in file_provider_list_lines(report) {
+            println!("{line}");
         }
         return;
     }
@@ -4216,6 +4280,125 @@ fn print_file_provider_report(report: &FileProviderCommandReport) {
     } else {
         println!("file provider {} complete", report.action);
     }
+}
+
+fn file_provider_list_lines(report: &FileProviderCommandReport) -> Vec<String> {
+    if let Some(roots) = report.helper_report.get("roots").and_then(Value::as_array) {
+        let mut lines = Vec::new();
+        let linux_roots = roots
+            .iter()
+            .any(|root| root.get("mount_ids").is_some() || root.get("mountpoint").is_some());
+        if linux_roots {
+            for root in roots {
+                let mount_ids = root
+                    .get("mount_ids")
+                    .and_then(Value::as_array)
+                    .map(|mount_ids| {
+                        mount_ids
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .filter(|mount_ids| !mount_ids.is_empty())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let mountpoint = root
+                    .get("mountpoint")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                let registered = root
+                    .get("registered")
+                    .and_then(Value::as_bool)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let active = root
+                    .get("active")
+                    .and_then(Value::as_bool)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                lines.push(format!(
+                    "linux-fuse\t{mount_ids}\t{mountpoint}\tregistered={registered}\tactive={active}"
+                ));
+            }
+            if let Some(stale_units) = report
+                .helper_report
+                .get("stale_units")
+                .and_then(Value::as_array)
+            {
+                for unit in stale_units {
+                    let service = unit
+                        .get("service")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>");
+                    let mountpoint = unit
+                        .get("mountpoint")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>");
+                    let unit_path = unit
+                        .get("unit_path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>");
+                    let legacy = unit
+                        .get("legacy")
+                        .and_then(Value::as_bool)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    lines.push(format!(
+                        "stale-linux-fuse\t{service}\t{mountpoint}\t{unit_path}\tlegacy={legacy}"
+                    ));
+                }
+            }
+            return if lines.is_empty() {
+                vec!["no file provider domains".to_string()]
+            } else {
+                lines
+            };
+        }
+
+        if roots.is_empty() {
+            return vec!["no file provider domains".to_string()];
+        }
+        for root in roots {
+            let mount_id = root
+                .get("mount_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let display_name = root
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let path = root
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            lines.push(format!("{mount_id}\t{display_name}\t{path}"));
+        }
+        return lines;
+    }
+    let Some(domains) = report
+        .helper_report
+        .get("domains")
+        .and_then(Value::as_array)
+    else {
+        return vec!["no file provider domains".to_string()];
+    };
+    if domains.is_empty() {
+        return vec!["no file provider domains".to_string()];
+    }
+    domains
+        .iter()
+        .map(|domain| {
+            let identifier = domain
+                .get("identifier")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let display_name = domain
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            format!("{identifier}\t{display_name}")
+        })
+        .collect()
 }
 
 fn resolve_mount_target(store: &SqliteStateStore, target: &str) -> Result<MountConfig, String> {
@@ -5277,6 +5460,37 @@ fn auto_registration_for_mounted_projection(
     }
 }
 
+fn mounted_projection_preflight_error(
+    projection: ProjectionMode,
+    target_os: &str,
+    daemon_disabled: bool,
+    daemon_running: impl FnOnce() -> bool,
+) -> Option<CommandError> {
+    let registration =
+        auto_registration_for_mounted_projection(projection, target_os, daemon_disabled)?;
+    match registration {
+        VirtualProjectionRegistration::LinuxFuse if !daemon_running() => Some(
+            CommandError::new(
+                "mount",
+                "daemon_not_running",
+                "localityd is not running; start it with `loc daemon start` before mounting a Linux FUSE projection",
+            )
+            .with_suggested_command("loc daemon start"),
+        ),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn virtual_projection_daemon_is_running(state_root: &Path) -> bool {
+    file_provider_helper::daemon_is_running(state_root)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn virtual_projection_daemon_is_running(_state_root: &Path) -> bool {
+    false
+}
+
 fn auto_register_mounted_projection(
     state_root: &Path,
     store: &SqliteStateStore,
@@ -5545,16 +5759,17 @@ mod tests {
     use crate::search::{SearchOptions, SearchReport};
 
     use super::{
-        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
-        absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
+        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
+        VirtualProjectionRegistration, absolute_command_path,
+        auto_registration_for_mounted_projection, diff_report_exit_code, file_provider_list_lines,
         google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
         guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        notion_authorize_url, notion_oauth_broker_config, projection_mode_for_target,
-        projection_usage_options_for_target, prompt_for_push_confirmation,
-        pull_direct_fallback_error, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        validate_virtual_projection_registration,
+        mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
+        projection_mode_for_target, projection_usage_options_for_target,
+        prompt_for_push_confirmation, pull_direct_fallback_error,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
     };
 
     #[test]
@@ -6398,6 +6613,78 @@ mod tests {
         assert_eq!(
             auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", true),
             None
+        );
+    }
+
+    #[test]
+    fn linux_fuse_registration_preflight_requires_running_daemon_unless_disabled() {
+        let error =
+            mounted_projection_preflight_error(ProjectionMode::LinuxFuse, "linux", false, || false)
+                .expect("linux fuse should require daemon");
+
+        assert_eq!(error.code, "daemon_not_running");
+        assert!(error.message.contains("localityd is not running"));
+        assert!(
+            error
+                .suggested_command
+                .as_deref()
+                .is_some_and(|command| command.contains("loc daemon start"))
+        );
+
+        assert!(
+            mounted_projection_preflight_error(ProjectionMode::LinuxFuse, "linux", false, || true)
+                .is_none()
+        );
+        assert!(
+            mounted_projection_preflight_error(ProjectionMode::LinuxFuse, "linux", true, || {
+                panic!("daemon check should be skipped when daemon-disabled")
+            })
+            .is_none()
+        );
+        assert!(
+            mounted_projection_preflight_error(ProjectionMode::PlainFiles, "linux", false, || {
+                panic!("daemon check should be skipped for plain files")
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn file_provider_list_lines_print_linux_roots_and_stale_units() {
+        let report = FileProviderCommandReport {
+            ok: true,
+            command: "file-provider",
+            action: "list".to_string(),
+            mount_id: None,
+            helper: "systemctl".to_string(),
+            helper_report: serde_json::json!({
+                "message": "Linux FUSE roots listed",
+                "roots": [
+                    {
+                        "service": "ai.codeflash.locality.fuse.root-home.service",
+                        "mount_ids": ["google-docs-main", "notion-main"],
+                        "mountpoint": "/home/example/Locality",
+                        "registered": true,
+                        "active": false
+                    }
+                ],
+                "stale_units": [
+                    {
+                        "service": "ai.codeflash.locality.fuse.notion-main.service",
+                        "mountpoint": "/home/example/Locality/notion-main",
+                        "unit_path": "/home/example/.config/systemd/user/ai.codeflash.locality.fuse.notion-main.service",
+                        "legacy": true
+                    }
+                ]
+            }),
+        };
+
+        assert_eq!(
+            file_provider_list_lines(&report),
+            vec![
+                "linux-fuse\tgoogle-docs-main,notion-main\t/home/example/Locality\tregistered=true\tactive=false".to_string(),
+                "stale-linux-fuse\tai.codeflash.locality.fuse.notion-main.service\t/home/example/Locality/notion-main\t/home/example/.config/systemd/user/ai.codeflash.locality.fuse.notion-main.service\tlegacy=true".to_string(),
+            ]
         );
     }
 

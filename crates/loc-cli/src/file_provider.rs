@@ -6,7 +6,7 @@
 //! the same platform boundary.
 
 #[cfg(target_os = "linux")]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,9 @@ use locality_store::ProjectionMode;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use localityd::ipc::{DaemonRequest, send_request_with_timeout};
 #[cfg(target_os = "windows")]
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use serde::Serialize;
 use serde_json::Value;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -124,6 +126,7 @@ pub(crate) struct StaleLinuxFuseUnit {
     unit_name: String,
     unit_path: PathBuf,
     mountpoint: Option<PathBuf>,
+    legacy: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -131,6 +134,64 @@ pub(crate) struct StaleLinuxFuseUnit {
 pub(crate) struct LinuxFuseManagedUnit {
     unit_name: String,
     mountpoint: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinuxFuseLifecycleAction {
+    Start,
+    Stop,
+    Status,
+    Restart,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxFuseLifecycleAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Status => "status",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinuxFuseRootReport {
+    pub root_id: String,
+    pub service: String,
+    pub mountpoint: String,
+    pub state_dir: String,
+    pub mount_ids: Vec<String>,
+    pub registered: bool,
+    pub active: Option<bool>,
+    pub unit_path: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinuxFuseLifecycleReport {
+    pub message: String,
+    pub action: String,
+    pub state: String,
+    pub mount_id: String,
+    pub root_id: String,
+    pub service: String,
+    pub mountpoint: String,
+    pub state_dir: String,
+    pub registered: bool,
+    pub active: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinuxFuseStaleUnitReport {
+    pub service: String,
+    pub unit_path: String,
+    pub mountpoint: Option<String>,
+    pub legacy: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -306,6 +367,69 @@ pub fn register_linux_fuse_mount(
     })
 }
 
+#[cfg(target_os = "linux")]
+pub fn list_linux_fuse_roots(
+    state_root: &Path,
+    mounts: &[MountConfig],
+) -> Result<FileProviderHelperReport, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let helper_report = linux_fuse_list_payload_for_state(state_root, mounts, unit_files)?;
+    Ok(FileProviderHelperReport {
+        helper: PathBuf::from("systemctl"),
+        helper_report,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_linux_fuse_lifecycle(
+    state_root: &Path,
+    mount: &MountConfig,
+    action: LinuxFuseLifecycleAction,
+) -> Result<FileProviderHelperReport, LinuxFuseRegistrationError> {
+    let (registered, active) = match action {
+        LinuxFuseLifecycleAction::Start | LinuxFuseLifecycleAction::Restart => {
+            register_linux_fuse_mount(state_root, mount)?;
+            (true, true)
+        }
+        LinuxFuseLifecycleAction::Stop => {
+            let service = linux_fuse_unit_name(&linux_fuse_root_id(mount));
+            let unit_path = linux_fuse_unit_path(&service)?;
+            let mountpoint = localityd::virtual_fs::virtual_projection_root(mount);
+            stop_linux_fuse_lifecycle_with(
+                &service,
+                &mountpoint,
+                &unit_path,
+                |service| run_systemctl_user(&["stop", service]),
+                |mountpoint| {
+                    let _ = Command::new("fusermount3")
+                        .arg("-uz")
+                        .arg(mountpoint)
+                        .output();
+                },
+                |service| {
+                    let _ = run_systemctl_user(&["reset-failed", service]);
+                },
+            )?
+        }
+        LinuxFuseLifecycleAction::Status => {
+            let service = linux_fuse_unit_name(&linux_fuse_root_id(mount));
+            let registered = linux_fuse_unit_path(&service)?.exists();
+            let active = if registered {
+                linux_fuse_unit_is_active(&service)?
+            } else {
+                false
+            };
+            (registered, active)
+        }
+    };
+    let report = linux_fuse_lifecycle_report(action, state_root, mount, registered, active);
+    Ok(FileProviderHelperReport {
+        helper: PathBuf::from("systemctl"),
+        helper_report: serde_json::to_value(report)
+            .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?,
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn register_linux_fuse_mount(
     _state_root: &Path,
@@ -315,6 +439,54 @@ pub fn register_linux_fuse_mount(
         "linux_fuse registration is only supported on Linux; mount `{}` cannot be registered here",
         mount.mount_id.0
     )))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_lifecycle_report(
+    action: LinuxFuseLifecycleAction,
+    state_root: &Path,
+    mount: &MountConfig,
+    registered: bool,
+    active: bool,
+) -> LinuxFuseLifecycleReport {
+    let root_id = linux_fuse_root_id(mount);
+    let service = linux_fuse_unit_name(&root_id);
+    let mountpoint = localityd::virtual_fs::virtual_projection_root(mount);
+    let state = if active { "running" } else { "stopped" };
+    LinuxFuseLifecycleReport {
+        message: format!(
+            "Linux FUSE provider {state} for `{}` at {}",
+            mount.mount_id.0,
+            mountpoint.display()
+        ),
+        action: action.as_str().to_string(),
+        state: state.to_string(),
+        mount_id: mount.mount_id.0.clone(),
+        root_id,
+        service,
+        mountpoint: mountpoint.display().to_string(),
+        state_dir: state_root.display().to_string(),
+        registered,
+        active,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_fuse_lifecycle_with(
+    service: &str,
+    mountpoint: &Path,
+    unit_path: &Path,
+    stop_service: impl FnOnce(&str) -> Result<(), LinuxFuseRegistrationError>,
+    unmount: impl FnOnce(&Path),
+    reset_failed: impl FnOnce(&str),
+) -> Result<(bool, bool), LinuxFuseRegistrationError> {
+    let registered = unit_path.exists();
+    if registered {
+        stop_service(service)?;
+    }
+    unmount(mountpoint);
+    reset_failed(service);
+    Ok((registered, false))
 }
 
 #[cfg(target_os = "linux")]
@@ -1539,6 +1711,7 @@ fn stale_linux_fuse_units_for_state(
                 unit_name: unit.unit_name,
                 unit_path: unit.unit_path,
                 mountpoint: exec_start.mountpoint,
+                legacy: exec_start.has_mount_id,
             })
         })
         .collect()
@@ -1561,6 +1734,7 @@ fn legacy_linux_fuse_units_for_state(
                 unit_name: unit.unit_name,
                 unit_path: unit.unit_path,
                 mountpoint: exec_start.mountpoint,
+                legacy: true,
             })
         })
         .collect()
@@ -1611,6 +1785,116 @@ fn stoppable_linux_fuse_units_for_state(
             })
         })
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_root_reports_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<LinuxFuseRootReport> {
+    let mut registered = BTreeMap::new();
+    for unit in unit_files {
+        let Some(exec_start) = parse_linux_fuse_exec_start(&unit.contents) else {
+            continue;
+        };
+        let Some(unit_state_root) = exec_start.state_dir.as_deref() else {
+            continue;
+        };
+        if exec_start.has_mount_id || !same_path_for_linux_fuse_state(unit_state_root, state_root) {
+            continue;
+        }
+        registered.insert(
+            unit.unit_name,
+            (unit.unit_path.display().to_string(), exec_start.mountpoint),
+        );
+    }
+
+    let mut roots = BTreeMap::<PathBuf, Vec<String>>::new();
+    for mount in mounts
+        .iter()
+        .filter(|mount| mount.projection == ProjectionMode::LinuxFuse)
+    {
+        roots
+            .entry(localityd::virtual_fs::virtual_projection_root(mount))
+            .or_default()
+            .push(mount.mount_id.0.clone());
+    }
+
+    roots
+        .into_iter()
+        .map(|(mountpoint, mut mount_ids)| {
+            mount_ids.sort();
+            let root_id = linux_fuse_root_id_for_projection_root(&mountpoint);
+            let service = linux_fuse_unit_name(&root_id);
+            let registered_unit = registered.get(&service).filter(|(_, unit_mountpoint)| {
+                unit_mountpoint.as_deref().is_some_and(|unit_mountpoint| {
+                    same_path_for_linux_fuse_state(unit_mountpoint, &mountpoint)
+                })
+            });
+            LinuxFuseRootReport {
+                root_id,
+                service,
+                mountpoint: mountpoint.display().to_string(),
+                state_dir: state_root.display().to_string(),
+                mount_ids,
+                registered: registered_unit.is_some(),
+                active: None,
+                unit_path: registered_unit.map(|(unit_path, _)| unit_path.clone()),
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_list_payload_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Result<Value, LinuxFuseRegistrationError> {
+    let stale_units = linux_fuse_stale_unit_reports(stale_linux_fuse_units_for_state(
+        state_root,
+        mounts,
+        unit_files.clone(),
+    ));
+    let mut roots = linux_fuse_root_reports_for_state(state_root, mounts, unit_files);
+    for root in &mut roots {
+        root.active = if root.registered {
+            Some(linux_fuse_unit_is_active(&root.service)?)
+        } else {
+            Some(false)
+        };
+    }
+    Ok(serde_json::json!({
+        "message": "Linux FUSE roots listed",
+        "roots": roots,
+        "stale_units": stale_units,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_stale_unit_reports(units: Vec<StaleLinuxFuseUnit>) -> Vec<LinuxFuseStaleUnitReport> {
+    units
+        .into_iter()
+        .map(|unit| LinuxFuseStaleUnitReport {
+            service: unit.unit_name,
+            unit_path: unit.unit_path.display().to_string(),
+            mountpoint: unit
+                .mountpoint
+                .map(|mountpoint| mountpoint.display().to_string()),
+            legacy: unit.legacy,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_unit_is_active(service: &str) -> Result<bool, LinuxFuseRegistrationError> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(["is-active", "--quiet", service])
+        .output()
+        .map_err(|error| LinuxFuseRegistrationError::SystemctlFailed(error.to_string()))?;
+    Ok(output.status.success())
 }
 
 #[cfg(target_os = "linux")]
@@ -1809,7 +2093,7 @@ fn is_locality_fuse_unit_name(unit_name: &str) -> bool {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn daemon_is_running(state_root: &Path) -> bool {
+pub(crate) fn daemon_is_running(state_root: &Path) -> bool {
     matches!(
         send_request_with_timeout(
             state_root,
@@ -1831,6 +2115,11 @@ pub(crate) fn linux_fuse_unit_name(mount_id: &str) -> String {
 #[cfg(target_os = "linux")]
 pub fn linux_fuse_root_id(mount: &MountConfig) -> String {
     let root = localityd::virtual_fs::virtual_projection_root(mount);
+    linux_fuse_root_id_for_projection_root(&root)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_root_id_for_projection_root(root: &Path) -> String {
     let root = root.display().to_string();
     let hint = bounded_systemd_hint(&root, LINUX_FUSE_ROOT_HINT_MAX_BYTES);
     format!("root-{hint}-{}", stable_hex_hash(&root))
@@ -2054,6 +2343,7 @@ mod linux_tests {
                 mountpoint: Some(std::path::PathBuf::from(
                     "/home/example/Locality/notion-main"
                 )),
+                legacy: true,
             }]
         );
     }
@@ -2135,6 +2425,7 @@ mod linux_tests {
                 unit_name,
                 unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
                 mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
+                legacy: false,
             }]
         );
     }
@@ -2226,6 +2517,181 @@ mod linux_tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn linux_fuse_root_reports_group_mount_points_by_shared_root() {
+        let notion = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let docs = MountConfig::new(
+            MountId::new("google-docs-main"),
+            "google-docs",
+            "/home/example/Locality/google-docs-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let other = MountConfig::new(
+            MountId::new("notion-other"),
+            "notion",
+            "/home/example/Other/notion-other",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let plain = MountConfig::new(
+            MountId::new("plain"),
+            "notion",
+            "/home/example/Locality/plain",
+        );
+        let root_id = super::linux_fuse_root_id(&notion);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &notion,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let roots = super::linux_fuse_root_reports_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[notion, docs, other, plain],
+            vec![super::LinuxFuseUnitFile {
+                unit_name: unit_name.clone(),
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].mountpoint, "/home/example/Locality");
+        assert_eq!(roots[0].mount_ids, vec!["google-docs-main", "notion-main"]);
+        assert_eq!(roots[0].service, unit_name);
+        assert!(roots[0].registered);
+        assert_eq!(roots[1].mountpoint, "/home/example/Other");
+        assert_eq!(roots[1].mount_ids, vec!["notion-other"]);
+        assert!(!roots[1].registered);
+    }
+
+    #[test]
+    fn linux_fuse_lifecycle_report_uses_shared_root_metadata() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let service = super::linux_fuse_unit_name(&root_id);
+
+        let report = super::linux_fuse_lifecycle_report(
+            super::LinuxFuseLifecycleAction::Status,
+            std::path::Path::new("/home/example/.loc"),
+            &mount,
+            false,
+            false,
+        );
+
+        assert_eq!(report.action, "status");
+        assert_eq!(report.state, "stopped");
+        assert_eq!(report.mount_id, "notion-main");
+        assert_eq!(report.root_id, root_id);
+        assert_eq!(report.service, service);
+        assert_eq!(report.mountpoint, "/home/example/Locality");
+        assert_eq!(report.state_dir, "/home/example/.loc");
+        assert!(!report.registered);
+    }
+
+    #[test]
+    fn linux_fuse_root_reports_ignore_units_for_other_mountpoints() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+
+        let roots = super::linux_fuse_root_reports_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![linux_fuse_unit_file(
+                &unit_name,
+                "[Service]\nExecStart=/opt/locality-fuse --state-dir /home/example/.loc --mountpoint /home/example/Other\n",
+            )],
+        );
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].mountpoint, "/home/example/Locality");
+        assert!(!roots[0].registered);
+        assert_eq!(roots[0].unit_path, None);
+    }
+
+    #[test]
+    fn linux_fuse_list_payload_includes_legacy_stale_units() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let payload = super::linux_fuse_list_payload_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.locality.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /home/example/.loc --mountpoint /home/example/Locality/notion-main\n",
+            )],
+        )
+        .expect("list payload");
+        let stale_units = payload
+            .get("stale_units")
+            .and_then(serde_json::Value::as_array)
+            .expect("stale units");
+
+        assert_eq!(stale_units.len(), 1);
+        assert_eq!(
+            stale_units[0]
+                .get("service")
+                .and_then(serde_json::Value::as_str),
+            Some("ai.codeflash.locality.fuse.notion-main.service")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("mountpoint")
+                .and_then(serde_json::Value::as_str),
+            Some("/home/example/Locality/notion-main")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("legacy")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn linux_fuse_stop_lifecycle_skips_missing_units() {
+        let unmounted = std::cell::Cell::new(false);
+        let reset = std::cell::Cell::new(false);
+        let missing_unit = std::env::temp_dir().join("locality-missing-fuse-unit.service");
+
+        let (registered, active) = super::stop_linux_fuse_lifecycle_with(
+            "ai.codeflash.locality.fuse.root-home.service",
+            std::path::Path::new("/home/example/Locality"),
+            &missing_unit,
+            |_| panic!("systemctl stop should be skipped when the unit file is missing"),
+            |_| unmounted.set(true),
+            |_| reset.set(true),
+        )
+        .expect("missing units should be an idempotent stop");
+
+        assert!(!registered);
+        assert!(!active);
+        assert!(unmounted.get());
+        assert!(reset.get());
     }
 
     fn linux_fuse_unit_file(unit_name: &str, contents: &str) -> super::LinuxFuseUnitFile {

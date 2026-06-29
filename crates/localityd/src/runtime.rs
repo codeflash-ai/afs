@@ -52,6 +52,7 @@ use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_sour
 use crate::virtual_fs::{
     MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
     create_virtual_fs_directory, create_virtual_fs_file,
+    materialize_virtual_fs_guidance_with_content_root,
     materialize_virtual_fs_item_with_content_root, mount_point_identifier,
     refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
     virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
@@ -644,12 +645,24 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
             return response;
         }
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match materialize_virtual_fs_guidance_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &identifier,
+        ) {
+            Ok(Some(report)) => return DaemonResponse::ok(report),
+            Ok(None) => {}
+            Err(error) => {
+                return DaemonResponse::error(locality_error_code(&error), error.to_string());
+            }
+        }
         let credentials = open_credential_store(&state_root);
         let connector = match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
             Ok(connector) => connector,
             Err(error) => return DaemonResponse::error(error.code(), error.message()),
         };
-        let content_root = virtual_fs_content_root(&state_root, &mount_id);
         match materialize_virtual_fs_item_with_content_root(
             &mut store,
             &connector,
@@ -676,12 +689,32 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
             return response;
         }
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match materialize_virtual_fs_guidance_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &identifier,
+        ) {
+            Ok(Some(materialized)) => {
+                return file_provider_read_materialized(
+                    &store,
+                    &content_root,
+                    &mount_id,
+                    &identifier,
+                    materialized,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return DaemonResponse::error(locality_error_code(&error), error.to_string());
+            }
+        }
         let credentials = open_credential_store(&state_root);
         let connector = match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
             Ok(connector) => connector,
             Err(error) => return DaemonResponse::error(error.code(), error.message()),
         };
-        let content_root = virtual_fs_content_root(&state_root, &mount_id);
         let materialized = match materialize_virtual_fs_item_with_content_root(
             &mut store,
             &connector,
@@ -694,32 +727,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
                 return DaemonResponse::error(locality_error_code(&error), error.to_string());
             }
         };
-        let contents = match std::fs::read(&materialized.path) {
-            Ok(contents) => contents,
-            Err(error) => return DaemonResponse::error("read_failed", error.to_string()),
-        };
-        let item = match virtual_fs_item_with_content_root(
-            &store,
-            &content_root,
-            &mount_id,
-            &identifier,
-        ) {
-            Ok(report) => report.item,
-            Err(error) => {
-                return DaemonResponse::error(locality_error_code(&error), error.to_string());
-            }
-        };
-
-        DaemonResponse::ok(FileProviderReadReport {
-            mount_id: materialized.mount_id,
-            identifier: materialized.identifier,
-            remote_id: materialized.remote_id,
-            path: materialized.path,
-            outcome: materialized.outcome,
-            hydration: materialized.hydration,
-            item,
-            contents_base64: BASE64.encode(contents),
-        })
+        file_provider_read_materialized(&store, &content_root, &mount_id, &identifier, materialized)
     }
 
     fn run_file_provider_domain_children(
@@ -870,6 +878,36 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => DaemonResponse::error(locality_error_code(&error), error.to_string()),
         }
     }
+}
+
+fn file_provider_read_materialized(
+    store: &SqliteStateStore,
+    content_root: &Path,
+    mount_id: &MountId,
+    identifier: &str,
+    materialized: crate::virtual_fs::VirtualFsMaterializeReport,
+) -> DaemonResponse {
+    let contents = match std::fs::read(&materialized.path) {
+        Ok(contents) => contents,
+        Err(error) => return DaemonResponse::error("read_failed", error.to_string()),
+    };
+    let item = match virtual_fs_item_with_content_root(store, content_root, mount_id, identifier) {
+        Ok(report) => report.item,
+        Err(error) => {
+            return DaemonResponse::error(locality_error_code(&error), error.to_string());
+        }
+    };
+
+    DaemonResponse::ok(FileProviderReadReport {
+        mount_id: materialized.mount_id,
+        identifier: materialized.identifier,
+        remote_id: materialized.remote_id,
+        path: materialized.path,
+        outcome: materialized.outcome,
+        hydration: materialized.hydration,
+        item,
+        contents_base64: BASE64.encode(contents),
+    })
 }
 
 fn reject_plain_files_virtual_fs_mount<S>(store: &S, mount_id: &MountId) -> Option<DaemonResponse>
@@ -2993,21 +3031,25 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use locality_core::canonical::render_canonical_markdown;
     use locality_core::freshness::{RemoteObservation, RemoteVersion};
     use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
     use locality_core::shadow::ShadowDocument;
     use locality_store::{
-        AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, EntityRecord,
-        EntityRepository, InMemoryStateStore, MountConfig, MountRepository, ShadowRepository,
+        AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
+        ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, InMemoryStateStore,
+        MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
     };
 
     use crate::watcher::{FileEvent, FileEventKind};
 
     use super::{
         ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest,
-        execute_file_event, execute_observe_entity_job, observable_remote_identifier,
+        DefaultRuntimeJobRunner, RuntimeJobRunner, execute_file_event, execute_observe_entity_job,
+        observable_remote_identifier,
     };
 
     #[test]
@@ -3095,6 +3137,149 @@ mod tests {
         assert!(!observable_remote_identifier("children:page-1"));
         assert!(!observable_remote_identifier("mount:notion-main"));
         assert!(!observable_remote_identifier("source:notion"));
+    }
+
+    #[test]
+    fn virtual_fs_materialize_guidance_does_not_require_source_credentials() {
+        let state_root = temp_runtime_root("runtime-guidance-materialize");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        store
+            .save_connection(ConnectionRecord {
+                connection_id: ConnectionId::new("notion-work"),
+                profile_id: None,
+                connector: "notion".to_string(),
+                display_name: "Notion Work".to_string(),
+                account_label: Some("work@example.com".to_string()),
+                workspace_id: Some("workspace".to_string()),
+                workspace_name: Some("Workspace".to_string()),
+                auth_kind: "oauth".to_string(),
+                secret_ref: "missing-secret".to_string(),
+                scopes: Vec::new(),
+                capabilities_json: "{}".to_string(),
+                status: "active".to_string(),
+                created_at: "2026-06-29T00:00:00Z".to_string(),
+                updated_at: "2026-06-29T00:00:00Z".to_string(),
+                expires_at: None,
+            })
+            .expect("save connection");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    state_root.join("Locality/notion-main"),
+                )
+                .with_connection_id(ConnectionId::new("notion-work"))
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        drop(store);
+
+        let response = DefaultRuntimeJobRunner.run_virtual_fs_materialize(
+            state_root.clone(),
+            "notion-main".to_string(),
+            "guidance:AGENTS.md".to_string(),
+        );
+
+        assert!(
+            response.ok,
+            "guidance materialization should stay local: {:?}",
+            response.error
+        );
+        let payload = response.payload.expect("materialize payload");
+        let report: crate::virtual_fs::VirtualFsMaterializeReport =
+            serde_json::from_value(payload).expect("decode report");
+        assert_eq!(report.identifier, "guidance:AGENTS.md");
+        assert!(report.path.ends_with(".loc-guidance/AGENTS.md"));
+        let contents = std::fs::read_to_string(&report.path).expect("read guidance");
+        assert!(contents.contains("Locality"));
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_fs_materialize_missing_guidance_mount_reports_mount_not_found() {
+        let state_root = temp_runtime_root("runtime-guidance-missing-mount");
+        SqliteStateStore::open(state_root.clone()).expect("open store");
+
+        let response = DefaultRuntimeJobRunner.run_virtual_fs_materialize(
+            state_root.clone(),
+            "missing".to_string(),
+            "guidance:AGENTS.md".to_string(),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("mount_not_found")
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn file_provider_read_guidance_does_not_require_source_credentials() {
+        use base64::Engine as _;
+
+        let state_root = temp_runtime_root("runtime-guidance-read");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        store
+            .save_connection(ConnectionRecord {
+                connection_id: ConnectionId::new("notion-work"),
+                profile_id: None,
+                connector: "notion".to_string(),
+                display_name: "Notion Work".to_string(),
+                account_label: Some("work@example.com".to_string()),
+                workspace_id: Some("workspace".to_string()),
+                workspace_name: Some("Workspace".to_string()),
+                auth_kind: "oauth".to_string(),
+                secret_ref: "missing-secret".to_string(),
+                scopes: Vec::new(),
+                capabilities_json: "{}".to_string(),
+                status: "active".to_string(),
+                created_at: "2026-06-29T00:00:00Z".to_string(),
+                updated_at: "2026-06-29T00:00:00Z".to_string(),
+                expires_at: None,
+            })
+            .expect("save connection");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    state_root.join("Locality/notion-main"),
+                )
+                .with_connection_id(ConnectionId::new("notion-work"))
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        drop(store);
+
+        let response = DefaultRuntimeJobRunner.run_file_provider_read(
+            state_root.clone(),
+            "notion-main".to_string(),
+            "guidance:AGENTS.md".to_string(),
+        );
+
+        assert!(
+            response.ok,
+            "guidance read should stay local: {:?}",
+            response.error
+        );
+        let payload = response.payload.expect("read payload");
+        let report: crate::file_provider::FileProviderReadReport =
+            serde_json::from_value(payload).expect("decode report");
+        assert_eq!(report.identifier, "guidance:AGENTS.md");
+        assert!(report.path.ends_with(".loc-guidance/AGENTS.md"));
+        assert_eq!(report.item.identifier, "guidance:AGENTS.md");
+        assert_eq!(report.item.hydration, Some(HydrationState::Hydrated));
+        let contents = base64::engine::general_purpose::STANDARD
+            .decode(report.contents_base64)
+            .expect("decode contents");
+        let contents = String::from_utf8(contents).expect("utf8 guidance");
+        assert!(contents.contains("Locality"));
+
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -3257,6 +3442,21 @@ mod tests {
             [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
         )
         .expect("shadow")
+    }
+
+    fn temp_runtime_root(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{unique}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     struct ObservingConnector {
