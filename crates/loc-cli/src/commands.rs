@@ -1680,26 +1680,35 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
 
     let target_os = std::env::consts::OS;
     if target_os == "linux" {
-        if let Ok(store) = SqliteStateStore::open(default_state_root())
-            && let Ok(mount) = resolve_mount_target(&store, target)
-        {
-            if let Err(error) = validate_virtual_projection_registration(&mount, "linux") {
-                return command_error(json, error, EXIT_USAGE);
-            }
-            let mounts = match store.load_mounts() {
-                Ok(mounts) => mounts,
-                Err(error) => {
-                    return command_error(
-                        json,
-                        CommandError::new("file-provider", "store_load_failed", error.to_string()),
-                        EXIT_INTERNAL,
-                    );
+        if let Ok(store) = SqliteStateStore::open(default_state_root()) {
+            if let Ok(mount) = resolve_mount_target(&store, target) {
+                if let Err(error) = validate_virtual_projection_registration(&mount, "linux") {
+                    return command_error(json, error, EXIT_USAGE);
                 }
-            };
-            if let Err(error) = guard_linux_fuse_shared_root_unregister(&mounts, &mount) {
+                let mounts = match store.load_mounts() {
+                    Ok(mounts) => mounts,
+                    Err(error) => {
+                        return command_error(
+                            json,
+                            CommandError::new(
+                                "file-provider",
+                                "store_load_failed",
+                                error.to_string(),
+                            ),
+                            EXIT_INTERNAL,
+                        );
+                    }
+                };
+                if let Err(error) = guard_linux_fuse_shared_root_unregister(&mounts, &mount) {
+                    return command_error(json, error, EXIT_USAGE);
+                }
+                return run_linux_fuse_unregister(json, Some(&mount), target);
+            }
+            if let Ok(mounts) = store.load_mounts()
+                && let Err(error) = guard_unresolved_linux_fuse_unregister(&mounts, target)
+            {
                 return command_error(json, error, EXIT_USAGE);
             }
-            return run_linux_fuse_unregister(json, Some(&mount), target);
         }
         return run_linux_fuse_unregister(json, None, target);
     }
@@ -3977,9 +3986,38 @@ fn guard_unresolved_windows_cloud_files_unregister(
     mounts: &[MountConfig],
     target: &str,
 ) -> Result<(), CommandError> {
+    guard_unresolved_virtual_projection_unregister(
+        mounts,
+        target,
+        ProjectionMode::WindowsCloudFiles,
+        "windows_cloud_files_unresolved_shared_root",
+        "Windows Cloud Files",
+    )
+}
+
+fn guard_unresolved_linux_fuse_unregister(
+    mounts: &[MountConfig],
+    target: &str,
+) -> Result<(), CommandError> {
+    guard_unresolved_virtual_projection_unregister(
+        mounts,
+        target,
+        ProjectionMode::LinuxFuse,
+        "linux_fuse_unresolved_shared_root",
+        "Linux FUSE",
+    )
+}
+
+fn guard_unresolved_virtual_projection_unregister(
+    mounts: &[MountConfig],
+    target: &str,
+    projection: ProjectionMode,
+    code: &'static str,
+    label: &'static str,
+) -> Result<(), CommandError> {
     let mut mount_ids = mounts
         .iter()
-        .filter(|mount| mount.projection == ProjectionMode::WindowsCloudFiles)
+        .filter(|mount| mount.projection == projection)
         .map(|mount| mount.mount_id.0.clone())
         .collect::<Vec<_>>();
     mount_ids.sort();
@@ -3989,9 +4027,9 @@ fn guard_unresolved_windows_cloud_files_unregister(
 
     Err(CommandError::new(
         "file-provider",
-        "windows_cloud_files_unresolved_shared_root",
+        code,
         format!(
-            "Windows Cloud Files unregister target `{target}` does not match a known mount; refusing raw unregister while shared Windows Cloud Files mounts exist: {}",
+            "{label} unregister target `{target}` does not match a known mount; refusing raw unregister while shared {label} mounts exist: {}",
             mount_ids.join(", ")
         ),
     ))
@@ -5510,7 +5548,7 @@ mod tests {
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
         absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
         google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        guard_unresolved_windows_cloud_files_unregister,
+        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         notion_authorize_url, notion_oauth_broker_config, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
@@ -6253,6 +6291,32 @@ mod tests {
 
         guard_linux_fuse_shared_root_unregister(&mounts, &target)
             .expect("non-siblings should not block unregister");
+    }
+
+    #[test]
+    fn unresolved_linux_fuse_unregister_is_blocked_when_shared_mounts_exist() {
+        let mounts = vec![
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                "/tmp/Locality/notion",
+            )
+            .projection(ProjectionMode::LinuxFuse),
+            MountConfig::new(
+                MountId::new("docs-main"),
+                "google-docs",
+                "/tmp/Locality/docs",
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        ];
+
+        let error = guard_unresolved_linux_fuse_unregister(&mounts, "root-tmp-Locality")
+            .expect_err("unresolved raw target should not unregister shared roots");
+
+        assert_eq!(error.code, "linux_fuse_unresolved_shared_root");
+        assert!(error.message.contains("root-tmp-Locality"));
+        assert!(error.message.contains("notion-main"));
+        assert!(error.message.contains("docs-main"));
     }
 
     #[test]
