@@ -250,7 +250,7 @@ where
 ///
 /// This is used before explicit pull so a missed local edit is preserved, while
 /// an older stale visible replica does not get mistaken for a local edit.
-pub fn reconcile_newer_visible_projection<S>(
+pub fn reconcile_newer_macos_file_provider_projection<S>(
     store: &mut S,
     state_root: &Path,
     target: Option<&Path>,
