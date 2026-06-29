@@ -343,6 +343,10 @@ where
         }]);
     }
 
+    if let Some(scopes) = shared_virtual_root_scopes(mounts, &cwd) {
+        return Ok(scopes);
+    }
+
     Ok(mounts
         .iter()
         .cloned()
@@ -391,18 +395,28 @@ where
         return Ok(vec![StatusScope { mount, filter }]);
     }
 
+    if let Some(scopes) = shared_virtual_root_scopes(mounts, target) {
+        return Ok(scopes);
+    }
+
+    Err(StatusError::MountNotFound(target.to_path_buf()))
+}
+
+fn shared_virtual_root_scopes(mounts: &[MountConfig], target: &Path) -> Option<Vec<StatusScope>> {
     let shared_root_mounts = shared_virtual_root_mounts(mounts, target);
-    if !shared_root_mounts.is_empty() {
-        return Ok(shared_root_mounts
+    if shared_root_mounts.is_empty() {
+        return None;
+    }
+
+    Some(
+        shared_root_mounts
             .into_iter()
             .map(|mount| StatusScope {
                 mount: mount.clone(),
                 filter: ScopeFilter::All,
             })
-            .collect());
-    }
-
-    Err(StatusError::MountNotFound(target.to_path_buf()))
+            .collect(),
+    )
 }
 
 fn shared_virtual_root_mounts<'a>(
