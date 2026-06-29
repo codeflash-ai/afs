@@ -2938,7 +2938,7 @@ function TrayPopover({
 type FileActionStatus = {
   state: "working" | "success" | "error";
   message: string;
-  action?: "diff" | "push" | "resolve" | "autosave";
+  action?: "diff" | "push" | "resolve" | "reset" | "live_mode";
 };
 
 type FileDetailStatus = {
@@ -3111,10 +3111,16 @@ function FileChangeList({
     }
   }
 
-  async function runFileAction(change: PendingChange, action: "diff" | "push" | "resolve") {
+  async function runFileAction(change: PendingChange, action: "diff" | "push" | "resolve" | "reset") {
     const path = joinMountPath(mountPath, change.localPath);
     const workingMessage =
-      action === "diff" ? "Checking diff..." : action === "push" ? "Pushing this file..." : "Pulling latest...";
+      action === "diff"
+        ? "Checking diff..."
+        : action === "push"
+          ? "Pushing this file..."
+          : action === "reset"
+            ? "Resetting to remote..."
+            : "Pulling latest...";
     setActions((current) => ({
       ...current,
       [change.localPath]: { state: "working", message: workingMessage, action },
@@ -3122,7 +3128,13 @@ function FileChangeList({
 
     try {
       const command =
-        action === "diff" ? "diff_notion_file" : action === "push" ? "push_notion_file" : "pull_notion_file";
+        action === "diff"
+          ? "diff_notion_file"
+          : action === "push"
+            ? "push_notion_file"
+            : action === "reset"
+              ? "reset_notion_file_to_remote"
+              : "pull_notion_file";
       const args =
         action === "push"
           ? { path, confirmDangerous }
@@ -3138,7 +3150,7 @@ function FileChangeList({
           action,
         },
       }));
-      if (report.ok && action === "resolve" && selectedPath === change.localPath) {
+      if (report.ok && (action === "resolve" || action === "reset") && selectedPath === change.localPath) {
         await loadFileDetails(change);
       }
       if (report.ok && action !== "diff") {
@@ -3170,7 +3182,7 @@ function FileChangeList({
       [change.localPath]: {
         state: "working",
         message: enabled ? "Turning on Live Mode..." : "Turning off Live Mode...",
-        action: "autosave",
+        action: "live_mode",
       },
     }));
 
@@ -3183,7 +3195,7 @@ function FileChangeList({
         [change.localPath]: {
           state: report.ok ? "success" : "error",
           message: report.message,
-          action: "autosave",
+          action: "live_mode",
         },
       }));
       if (!report.ok) {
@@ -3200,7 +3212,7 @@ function FileChangeList({
       }));
       setActions((current) => ({
         ...current,
-        [change.localPath]: { state: "error", message: errorMessage(error), action: "autosave" },
+        [change.localPath]: { state: "error", message: errorMessage(error), action: "live_mode" },
       }));
     }
   }
@@ -3290,6 +3302,12 @@ function FileChangeList({
                   disabled={isWorking}
                   icon={<RefreshCw />}
                   onClick={() => void runFileAction(change, "resolve")}
+                />
+                <IconButton
+                  label="Reset to remote"
+                  disabled={isWorking}
+                  icon={<RotateCcw />}
+                  onClick={() => void runFileAction(change, "reset")}
                 />
                 <IconButton
                   label="Open file"
