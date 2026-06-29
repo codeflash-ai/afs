@@ -602,6 +602,9 @@ where
         {
             return Err(FuseError::NotFound);
         }
+        if error.code == "unsupported" {
+            return Err(FuseError::Invalid);
+        }
         return Err(FuseError::Daemon(format!(
             "{}: {}",
             error.code, error.message
@@ -1624,6 +1627,17 @@ mod tests {
         .expect_err("daemon error should fail readiness");
 
         assert_eq!(error, "not_ready: daemon is still starting");
+    }
+
+    #[test]
+    fn decode_response_maps_unsupported_operations_to_invalid() {
+        let error = decode_response::<VirtualFsMutationReport>(DaemonResponse::error(
+            "unsupported",
+            "moving virtual filesystem files across parents is not supported yet",
+        ))
+        .expect_err("unsupported virtual filesystem operation");
+
+        assert!(matches!(error, FuseError::Invalid));
     }
 
     #[test]
