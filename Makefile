@@ -100,12 +100,20 @@ audit-mas-readiness: ## Run static checks for Mac App Store release readiness.
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
 	$(DESKTOP_DIR)/scripts/prepare-macos-file-provider.sh
 
+.PHONY: install-macos-file-provider
+install-macos-file-provider: ## Install/register the local macOS File Provider development bundle.
+	platform/macos/LocalityFileProvider/scripts/install-dev-bundle.sh
+
+.PHONY: prepare-desktop-dev-sidecars
+prepare-desktop-dev-sidecars: ## Build debug desktop sidecars used by Tauri dev.
+	$(DESKTOP_NPM) run dev:prepare
+
 .PHONY: clean-start-plan
-clean-start-plan: ## Print the local AFS clean-start reset actions without deleting anything.
+clean-start-plan: ## Print the local Locality clean-start reset actions without deleting anything.
 	scripts/clean-start.sh
 
 .PHONY: clean-start
-clean-start: ## Stop AFS and remove local app/state/mounts/credentials for fresh manual testing.
+clean-start: ## Stop Locality and remove local app/state/mounts/credentials for fresh manual testing.
 	scripts/clean-start.sh --yes
 
 .PHONY: check
@@ -176,12 +184,12 @@ dev-tauri: ## Start the Tauri desktop app in development mode.
 	$(DESKTOP_NPM) run tauri -- dev
 
 .PHONY: run-cli
-run-cli: ## Run the afs CLI; pass args with ARGS='status --json'.
-	$(CARGO) run -p afs-cli -- $(ARGS)
+run-cli: ## Run the loc CLI; pass args with ARGS='status --json'.
+	$(CARGO) run -p loc-cli -- $(ARGS)
 
 .PHONY: run-daemon
-run-daemon: ## Run the afsd daemon.
-	$(CARGO) run -p afsd
+run-daemon: ## Run the localityd daemon.
+	$(CARGO) run -p localityd
 
 .PHONY: clean
 clean: ## Remove Rust and desktop build outputs.
