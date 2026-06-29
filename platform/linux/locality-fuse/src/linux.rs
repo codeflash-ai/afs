@@ -776,7 +776,25 @@ where
     }
 
     fn trash_path(&self, path: &Path, expected_kind: VirtualFsItemKind) -> Result<(), FuseError> {
-        let item = self.resolve_path(path)?;
+        let path = normalize_path(path);
+        let cached_pending_folder = expected_kind == VirtualFsItemKind::Folder
+            && self
+                .cache
+                .lock()
+                .expect("fuse item cache")
+                .get(&path)
+                .is_some_and(|item| {
+                    item.kind == VirtualFsItemKind::Folder
+                        && is_local_cached_identifier(&item.identifier)
+                });
+        let item = match self.resolve_path(&path) {
+            Ok(item) => item,
+            Err(FuseError::NotFound) if cached_pending_folder => {
+                self.remove_cached_path(&path);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if item.kind != expected_kind {
             return Err(match expected_kind {
                 VirtualFsItemKind::File => FuseError::NotFile,
@@ -785,7 +803,7 @@ where
         }
         ensure_writable_item(&item)?;
         self.client.trash(&item.identifier)?;
-        self.remove_cached_path(path);
+        self.remove_cached_path(&path);
         Ok(())
     }
 
@@ -1879,6 +1897,41 @@ mod tests {
                 .lock()
                 .expect("fuse item cache")
                 .contains_key(Path::new("/Draft/page.md"))
+        );
+    }
+
+    #[test]
+    fn trash_path_treats_stale_pending_page_directory_as_already_removed() {
+        let root = test_root_item();
+        let stale_dir = test_named_item("children:local:draft", "Draft", VirtualFsItemKind::Folder);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::from([("mount:notion-main".to_string(), Vec::new())]),
+                created_files: RefCell::new(Vec::new()),
+                created_item: None,
+                renamed: RefCell::new(Vec::new()),
+                trashed: RefCell::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft"), stale_dir),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.trash_path(Path::new("/Draft"), VirtualFsItemKind::Folder)
+            .expect("stale pending folder was already removed");
+
+        assert!(fs.client.trashed.borrow().is_empty());
+        assert!(
+            !fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/Draft"))
         );
     }
 
