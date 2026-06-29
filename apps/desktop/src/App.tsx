@@ -1778,7 +1778,7 @@ function HomeView({
                 onClick={toggleLiveMode}
               >
                 <span className="live-mode-copy">
-                  {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+                  {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
                   <span>Live Mode</span>
                 </span>
                 <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
@@ -2804,7 +2804,7 @@ function TrayPopover({
           onClick={() => void toggleLiveMode()}
         >
           <span className="tray-live-mode-copy">
-            {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+            {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
             <span>
               <strong>Live Mode</strong>
               <small>{trayLiveModeLabel(snapshot.liveMode, liveModeBusy)}</small>
