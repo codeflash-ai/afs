@@ -4,6 +4,7 @@
 //! real file tree. Mount-root pulls enumerate the remote projection and write
 //! stubs; page-file pulls hydrate one entity and persist its shadow snapshot.
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use locality_connector::{ChildContainer, EnumerateRequest, ListChildrenRequest};
@@ -375,7 +376,9 @@ where
 
     let mut enumerated = 0;
     let mut row_ids = Vec::new();
+    let mut page_ids = Vec::new();
     let is_database_directory = target.schema_database_id.is_some();
+    let recursive_page_hydration = target.container.is_some() && !is_database_directory;
     if let Some(container) = target.container {
         let result = source
             .list_children(ListChildrenRequest {
@@ -400,7 +403,10 @@ where
             let record = virtual_child_entity_record(entry, existing.as_ref());
             store.save_entity(record).map_err(PullError::Store)?;
             if should_hydrate_rows && is_row {
-                row_ids.push(row_id);
+                row_ids.push(row_id.clone());
+            }
+            if recursive_page_hydration && is_row {
+                page_ids.push(row_id);
             }
         }
     }
@@ -443,6 +449,16 @@ where
         }
     }
 
+    if recursive_page_hydration {
+        let mut visited = BTreeSet::new();
+        let recursive_report =
+            hydrate_page_descendants(store, source, mount, page_ids, state_root, &mut visited)?;
+        enumerated += recursive_report.enumerated;
+        hydrated += recursive_report.hydrated;
+        skipped_dirty += recursive_report.skipped_dirty;
+        conflicts.extend(recursive_report.conflicts);
+    }
+
     Ok(Some(PullReport {
         ok: skipped_dirty == 0,
         command: "pull".to_string(),
@@ -460,6 +476,93 @@ where
 
 fn should_hydrate_database_directory_rows(row_count: usize, limit: isize) -> bool {
     limit >= 0 && row_count <= limit as usize
+}
+
+#[derive(Debug, Default)]
+struct RecursivePageHydrationReport {
+    enumerated: usize,
+    hydrated: usize,
+    skipped_dirty: usize,
+    conflicts: Vec<PullConflict>,
+}
+
+fn hydrate_page_descendants<S, Source>(
+    store: &mut S,
+    source: &Source,
+    mount: &MountConfig,
+    page_ids: Vec<locality_core::model::RemoteId>,
+    state_root: Option<&Path>,
+    visited: &mut BTreeSet<locality_core::model::RemoteId>,
+) -> Result<RecursivePageHydrationReport, PullError>
+where
+    S: EntityRepository
+        + ShadowRepository
+        + locality_store::FreshnessStateRepository
+        + locality_store::RemoteObservationRepository,
+    Source: SourceAdapter,
+{
+    let mut report = RecursivePageHydrationReport::default();
+
+    for page_id in page_ids {
+        if !visited.insert(page_id.clone()) {
+            continue;
+        }
+        let Some(page) = store
+            .get_entity(&mount.mount_id, &page_id)
+            .map_err(PullError::Store)?
+        else {
+            continue;
+        };
+        if page.kind != EntityKind::Page {
+            continue;
+        }
+
+        match hydrate_entity(store, source, mount, page.clone(), state_root)? {
+            HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => report.hydrated += 1,
+            HydrationOutcome::RemoteDeleted => continue,
+            HydrationOutcome::SkippedDirty => {
+                report.skipped_dirty += 1;
+                continue;
+            }
+            HydrationOutcome::Conflicted(conflict) => {
+                report.skipped_dirty += 1;
+                report.conflicts.push(conflict);
+                continue;
+            }
+        }
+
+        let result = source
+            .list_children(ListChildrenRequest {
+                mount_id: mount.mount_id.clone(),
+                container: ChildContainer::PageChildren(page.remote_id.clone()),
+                parent_path: page_container_path(&page.path).to_path_buf(),
+            })
+            .map_err(PullError::Connector)?;
+        report.enumerated += result.entries.len();
+
+        let mut child_page_ids = Vec::new();
+        for entry in result.entries {
+            let child_id = entry.remote_id.clone();
+            let is_page = entry.kind == EntityKind::Page;
+            let existing = store
+                .get_entity(&entry.mount_id, &entry.remote_id)
+                .map_err(PullError::Store)?;
+            let record = virtual_child_entity_record(entry, existing.as_ref());
+            store.save_entity(record).map_err(PullError::Store)?;
+            if is_page {
+                child_page_ids.push(child_id);
+            }
+        }
+
+        let child_report =
+            hydrate_page_descendants(store, source, mount, child_page_ids, state_root, visited)?;
+        report.enumerated += child_report.enumerated;
+        report.hydrated += child_report.hydrated;
+        report.skipped_dirty += child_report.skipped_dirty;
+        report.conflicts.extend(child_report.conflicts);
+    }
+
+    Ok(report)
 }
 
 fn virtual_child_entity_record(entry: TreeEntry, existing: Option<&EntityRecord>) -> EntityRecord {
@@ -500,6 +603,26 @@ where
         return Ok(None);
     }
 
+    let page_container_target = store
+        .list_entities(&mount.mount_id)
+        .map_err(PullError::Store)?
+        .into_iter()
+        .find_map(|entity| {
+            if entity.kind == EntityKind::Page && page_container_path(&entity.path) == relative_path
+            {
+                Some(VirtualDirectoryTarget {
+                    parent_path: relative_path.to_path_buf(),
+                    container: Some(ChildContainer::PageChildren(entity.remote_id)),
+                    schema_database_id: None,
+                })
+            } else {
+                None
+            }
+        });
+    if page_container_target.is_some() {
+        return Ok(page_container_target);
+    }
+
     if let Some(entity) = store
         .find_entity_by_path(&mount.mount_id, relative_path)
         .map_err(PullError::Store)?
@@ -519,20 +642,7 @@ where
         });
     }
 
-    let entities = store
-        .list_entities(&mount.mount_id)
-        .map_err(PullError::Store)?;
-    Ok(entities.into_iter().find_map(|entity| {
-        if entity.kind == EntityKind::Page && page_container_path(&entity.path) == relative_path {
-            Some(VirtualDirectoryTarget {
-                parent_path: relative_path.to_path_buf(),
-                container: Some(ChildContainer::PageChildren(entity.remote_id)),
-                schema_database_id: None,
-            })
-        } else {
-            None
-        }
-    }))
+    Ok(None)
 }
 
 fn pull_entity_path<S, Source>(

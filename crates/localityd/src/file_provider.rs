@@ -691,6 +691,13 @@ fn refresh_candidate_path(
         return Some(target.to_path_buf());
     }
 
+    if let Some(target_match) = target_match
+        && target_match.relative_path != entity.path
+        && entity.path.starts_with(&target_match.relative_path)
+    {
+        return Some(target_match.access_root.join(&entity.path));
+    }
+
     newest_existing_projection_path(mount, &entity.path)
 }
 
@@ -793,8 +800,13 @@ fn refresh_projection_candidate_if_clean(
     let Ok(cache_contents) = std::fs::read(&content_path) else {
         return Ok(ProjectionRefreshOutcome::MissingCache);
     };
-    let Ok(projection_contents) = std::fs::read(&projection_path) else {
-        return Ok(ProjectionRefreshOutcome::MissingProjection);
+    let projection_contents = match std::fs::read(&projection_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_binary_atomic(&projection_path, &cache_contents).map_err(LocalityError::from)?;
+            return Ok(ProjectionRefreshOutcome::Refreshed);
+        }
+        Err(_) => return Ok(ProjectionRefreshOutcome::MissingProjection),
     };
 
     if projection_contents == cache_contents {

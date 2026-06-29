@@ -669,6 +669,120 @@ fn pull_virtual_file_accepts_source_directory_target() {
 }
 
 #[test]
+fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("loc-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector_with_nested_child("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("directory-shadow"),
+            EntityKind::Directory,
+            "Roadmap",
+            "roadmap",
+        ))
+        .expect("save page directory shadow");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.source_root().join("roadmap"),
+        Some(&state_root),
+    )
+    .expect("pull virtual page directory");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 3);
+    assert_eq!(report.hydrated, 2);
+    assert_eq!(report.stubbed, 0);
+    let child = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/design-notes/page.md"),
+        )
+        .expect("find child")
+        .expect("child entity");
+    assert_eq!(child.hydration, HydrationState::Hydrated);
+    let nested = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/design-notes/appendix/page.md"),
+        )
+        .expect("find nested child")
+        .expect("nested child entity");
+    assert_eq!(nested.hydration, HydrationState::Hydrated);
+    assert!(
+        content_root
+            .join("roadmap")
+            .join("design-notes")
+            .join("page.md")
+            .exists()
+    );
+    assert!(
+        content_root
+            .join("roadmap")
+            .join("design-notes")
+            .join("appendix")
+            .join("page.md")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_file_provider_page_directory_materializes_visible_child_pages() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("loc-cli-pull-visible-directory-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::WindowsCloudFiles);
+    let connector = fixture.connector_with_nested_child("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.source_root().join("roadmap"),
+        Some(&state_root),
+    )
+    .expect("pull visible page directory");
+
+    assert!(report.ok);
+    assert_eq!(report.hydrated, 2);
+    let visible_child = fixture
+        .source_root()
+        .join("roadmap")
+        .join("design-notes")
+        .join("page.md");
+    let visible_nested = fixture
+        .source_root()
+        .join("roadmap")
+        .join("design-notes")
+        .join("appendix")
+        .join("page.md");
+    assert!(visible_child.exists());
+    assert!(visible_nested.exists());
+    assert!(
+        fs::read_to_string(&visible_child)
+            .expect("read visible child")
+            .contains("Child body.")
+    );
+    assert!(
+        fs::read_to_string(&visible_nested)
+            .expect("read visible nested child")
+            .contains("Nested child body.")
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
 fn pull_virtual_file_conflict_reports_source_directory_path() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");
@@ -1269,6 +1383,22 @@ impl PullFixture {
         )
     }
 
+    fn connector_with_nested_child(&self, root_title: &str) -> NotionConnector {
+        NotionConnector::with_api(
+            NotionConfig::default(),
+            Arc::new(
+                FixtureNotionApi::new(
+                    self.root_page_id.as_str(),
+                    self.canonical_root_page_id.as_str(),
+                    root_title,
+                    "Root body.",
+                    "2026-06-11T00:00:00.000Z",
+                )
+                .with_nested_child(),
+            ),
+        )
+    }
+
     fn connector_missing_page(&self, missing_page_id: &str) -> NotionConnector {
         let mut api = FixtureNotionApi::new(
             self.root_page_id.as_str(),
@@ -1610,6 +1740,36 @@ impl FixtureNotionApi {
             (data_source_id.to_string(), None),
             PaginatedListDto {
                 results: rows,
+                next_cursor: None,
+                has_more: false,
+            },
+        );
+        self
+    }
+
+    fn with_nested_child(mut self) -> Self {
+        let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let nested_child_id = "99999999999999999999999999999999";
+        let last_edited_time = "2026-06-11T00:00:00.000Z";
+        self.pages.insert(
+            nested_child_id.to_string(),
+            page(nested_child_id, "Appendix", last_edited_time),
+        );
+        self.children.insert(
+            (nested_child_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![paragraph_block("paragraph-nested", "Nested child body.")],
+                next_cursor: None,
+                has_more: false,
+            },
+        );
+        self.children.insert(
+            (child_page_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![
+                    paragraph_block("paragraph-2", "Child body."),
+                    child_page_block(nested_child_id, "Appendix"),
+                ],
                 next_cursor: None,
                 has_more: false,
             },
