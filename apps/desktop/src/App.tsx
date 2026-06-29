@@ -38,7 +38,7 @@ const appStoreDistribution = distributionChannel === "mas";
 
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
-type OnboardingStep = 1 | 2 | 3 | 4;
+type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 
 type DesktopSnapshot = {
   health: {
@@ -370,7 +370,7 @@ const sampleSearchResults: LocatedItem[] = [
 ];
 
 function suggestedAgentPrompt(mountPath: string) {
-  return `Use Locality to edit my Notion workspace. Open the Notion files under ${mountPath}, make the requested edits directly in Markdown, and leave the changes pending for Locality review.`;
+  return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -585,8 +585,8 @@ export default function App() {
     routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
   );
   const [onboardingKey, setOnboardingKey] = useState(0);
-  const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
-    initialRoute === "#onboarding-ready" ? 4 : 1,
+  const [onboardingInitialStep, setOnboardingInitialStep] = useState<OnboardingStep>(() =>
+    initialRoute === "#onboarding-ready" ? 5 : 1,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
   const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
@@ -775,7 +775,7 @@ export default function App() {
     }
 
     if (route === "#onboarding-ready") {
-      setOnboardingInitialStep(4);
+      setOnboardingInitialStep(5);
       setShowOnboarding(true);
       return;
     }
@@ -986,7 +986,7 @@ function Onboarding({
   }, [mountPathDirty, snapshot.mount.localPath]);
 
   useEffect(() => {
-    if (step !== 2 || !oauthInFlight || oauthReady) {
+    if (step !== 3 || !oauthInFlight || oauthReady) {
       return;
     }
 
@@ -1007,21 +1007,26 @@ function Onboarding({
   }, [oauthInFlight, oauthReady, step]);
 
   useEffect(() => {
-    if (!snapshotLoaded || window.location.hash === "#onboarding-ready" || connectionMissing(snapshot)) {
+    if (
+      !snapshotLoaded ||
+      window.location.hash === "#onboarding" ||
+      window.location.hash === "#onboarding-ready" ||
+      connectionMissing(snapshot)
+    ) {
       return;
     }
 
     setOauthReady(true);
     setStep((current) => {
       if (mountMissing(snapshot)) {
-        return current < 3 ? 3 : current;
+        return current < 4 ? 4 : current;
       }
-      return current < 4 ? 4 : current;
+      return current < 5 ? 5 : current;
     });
   }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
 
   useEffect(() => {
-    if (step !== 4 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
+    if (step !== 5 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
       return;
     }
     void installAgentGuidance(mountPath);
@@ -1033,7 +1038,7 @@ function Onboarding({
     setLoginCopyMessage("");
     setOauthReady(false);
     setOauthInFlight(true);
-    setStep(2);
+    setStep(3);
     try {
       const report = await callCommand<ActionReport>(
         "connect_notion",
@@ -1102,7 +1107,7 @@ function Onboarding({
       setMountPathDirty(false);
       setMountPath(nextSnapshot.mount.localPath);
       await installAgentGuidance(nextSnapshot.mount.localPath);
-      setStep(4);
+      setStep(5);
     } catch (error) {
       setMountError(errorMessage(error));
     } finally {
@@ -1145,7 +1150,7 @@ function Onboarding({
     }
   }
 
-  async function openFolderAndFinish() {
+  async function openMountFolder() {
     setMountError("");
     const report = await callCommand<ActionReport>(
       "open_path",
@@ -1156,6 +1161,9 @@ function Onboarding({
       setMountError(report.message);
       return;
     }
+  }
+
+  function finishOnboarding() {
     onComplete();
   }
 
@@ -1186,75 +1194,117 @@ function Onboarding({
     }
   }
 
+  const connectionReady = oauthReady || !connectionMissing(snapshot);
+  const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
+  const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
+
   return (
     <main className="setup-shell">
       <section className="setup-window">
-        <WindowChrome title="Locality Setup" meta={`${step} of 4`} />
+        <WindowChrome title="Locality Setup" meta={`${step} of 5`} />
         {step === 1 && (
-          <SetupContent mark={<BrandTile>Locality</BrandTile>}>
+          <SetupContent side={<ProductLoopDemo />}>
             <div>
-              <h1>Let your agents edit Notion as local files.</h1>
+              <div className="eyebrow">Meet Locality</div>
+              <h1>Your work apps, as local files for agents.</h1>
               <p>
-                Mount your Notion workspace in CloudStorage. Agents edit local
-                files, then Locality syncs reviewed changes back to Notion.
+                Locality gives agents like Claude and Codex a safe local folder for tools like
+                Notion. Agents and humans can edit Markdown side by side, and you review what
+                changes before it updates the content in the connected app.
               </p>
             </div>
-            <PrimaryButton onClick={startConnect}>Connect Notion</PrimaryButton>
-            <p className="quiet-note">Local edits stay pending until you review and push.</p>
+            <PrimaryButton onClick={() => setStep(2)}>Set Up Locality</PrimaryButton>
+            <div className="onboarding-pill-row">
+              <span>Works in Finder</span>
+              <span>Agents edit Markdown</span>
+              <span>Review before sync</span>
+            </div>
           </SetupContent>
         )}
 
         {step === 2 && (
-          <SetupContent
-            mark={
-              <BrandTile variant={oauthReady ? "ready" : "notion"}>
-                {oauthReady ? undefined : "N"}
-              </BrandTile>
-            }
-          >
+          <SetupContent side={<AgentWorkspaceDemo />}>
             <div>
-              <div className={`sync-note ${oauthReady ? "connected" : ""}`}>
-                {oauthReady ? <Check /> : <Loader2 className={oauthInFlight ? "spin" : ""} />}
-                {oauthReady ? "Notion connected" : "Waiting for Notion"}
-              </div>
-              <h1>{oauthReady ? "Your Notion workspace is connected" : "Finish connecting in Notion"}</h1>
+              <div className="eyebrow">How agents use it</div>
+              <h1>Agents work in files you can see.</h1>
               <p>
-                {oauthReady
-                  ? `${
-                      connectedWorkspace || "Your workspace"
-                    } is ready. Next, choose where Locality should place the local folder.`
-                  : "A browser window is open. Choose your workspace, pick the pages Locality can use, then approve access."}
+                Each app appears as a folder. Pages and docs become page.md files that stay in sync
+                with the connected app. Locality adds AGENTS.md and CLAUDE.md so agents know how to
+                work in the folder safely.
               </p>
             </div>
-            <ProgressList
-              items={[
-                { label: "Browser opened", state: oauthError ? "idle" : "done" },
-                { label: "Select workspace and pages", state: oauthReady ? "done" : "active" },
-                { label: "Approve access", state: oauthReady ? "done" : "idle" },
-              ]}
-            />
-            <PrimaryButton disabled={!oauthReady} onClick={() => setStep(3)}>
-              {oauthReady ? "Continue to folder setup" : oauthInFlight ? "Waiting for Notion" : "Continue"}
-            </PrimaryButton>
-            <TextButton disabled={!oauthInFlight && !loginUrl} onClick={() => void copyLoginLink()}>
-              Copy login link
-            </TextButton>
-            {loginCopyMessage && <p className="quiet-note">{loginCopyMessage}</p>}
-            {oauthError && <p className="field-error">{oauthError}</p>}
-            <p className="quiet-note">Credentials are stored securely in the OS credential store.</p>
+            <PrimaryButton onClick={() => setStep(3)}>Continue</PrimaryButton>
           </SetupContent>
         )}
 
         {step === 3 && (
-          <SetupContent mark={<BrandTile variant={mounting ? "progress" : "folder"} />}>
+          <SetupContent
+            side={<ConnectorOptions connected={connectionReady} />}
+          >
             <div>
-              <h1>Where should your Notion files appear?</h1>
+              <div className="eyebrow">Connect app</div>
+              {(oauthInFlight || connectionReady) && (
+                <div className={`sync-note ${connectionReady ? "connected" : ""}`}>
+                  {connectionReady ? <Check /> : <Loader2 className="spin-icon" />}
+                  {connectionReady ? "Notion connected" : "Waiting for Notion"}
+                </div>
+              )}
+              <h1>
+                {connectionReady
+                  ? "Your Notion workspace is connected"
+                  : oauthInFlight
+                    ? "Finish connecting in Notion."
+                    : "Start with Notion."}
+              </h1>
               <p>
-                Locality keeps every source under one CloudStorage root. Notion will appear as the
-                live folder Finder and agents open.
+                {connectionReady
+                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the local folder.`
+                  : oauthInFlight
+                    ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
+                    : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
               </p>
             </div>
-            <div className="path-field">
+            {oauthInFlight && !connectionReady && (
+              <ProgressList
+                items={[
+                  { label: "Browser opened", state: oauthError ? "idle" : "done" },
+                  { label: "Select workspace and pages", state: "active" },
+                  { label: "Approve access", state: "idle" },
+                ]}
+              />
+            )}
+            <div className="button-row">
+              <PrimaryButton
+                busy={oauthInFlight && !connectionReady}
+                onClick={connectionReady ? () => setStep(4) : startConnect}
+              >
+                {connectionReady ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Connect Notion"}
+              </PrimaryButton>
+              <SecondaryButton disabled={!oauthInFlight && !loginUrl} onClick={() => void copyLoginLink()}>
+                Copy login link
+              </SecondaryButton>
+            </div>
+            <div className="onboarding-pill-row">
+              <span>Scoped access</span>
+              <span>Credentials in Keychain</span>
+              <span>Direct app connection</span>
+            </div>
+            {loginCopyMessage && <p className="quiet-note inline-note">{loginCopyMessage}</p>}
+            {oauthError && <p className="field-error">{oauthError}</p>}
+          </SetupContent>
+        )}
+
+        {step === 4 && (
+          <SetupContent variant="wide">
+            <div>
+              <div className="eyebrow">Local folder</div>
+              <h1>Choose where your files appear.</h1>
+              <p>
+                Locality keeps your connected apps under one CloudStorage root. Agents and Finder
+                will use this folder.
+              </p>
+            </div>
+            <div className="path-field setup-path-field">
               <input
                 value={mountPath}
                 disabled={mounting}
@@ -1263,93 +1313,63 @@ function Onboarding({
                   setMountPath(event.target.value);
                 }}
               />
-              <SecondaryButton compact disabled={mounting} onClick={chooseFolder}>
+              <SecondaryButton disabled={mounting} onClick={chooseFolder}>
                 Choose
               </SecondaryButton>
             </div>
             <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
-              {mounting ? "Mounting Notion" : "Continue"}
+              {mounting ? "Mounting Notion" : "Create Local Folder"}
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
-            <p className="quiet-note">
-              The Notion folder will include AGENTS.md and CLAUDE.md to help your agents edit
-              files natively.
-            </p>
           </SetupContent>
         )}
 
-        {step === 4 && (
+        {step === 5 && (
           <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
-              <h1>Locality is ready</h1>
+              <h1>Locality is ready!</h1>
               <p>
-                Your Notion folder is mounted. Agents can edit local Markdown now, and Locality
-                will keep review controls close when those edits are ready.
+                Your Notion files are now mounted locally. Agents can open this folder, edit
+                Markdown, and leave changes for Locality review. Open the app to review changes,
+                manage sync, and turn on Live Mode when you want file saves to update Notion and
+                new Notion changes to appear locally.
               </p>
             </div>
-            <div className="live-mode-intro">
-              <Zap />
-              <span>Live Mode can watch this folder, sync safe edits, and pause when a change needs review.</span>
-            </div>
-            <div className="ready-folder">
-              <FolderOpen />
-              <div>
-                <span>Notion folder</span>
-                <code>{mountPath}</code>
-              </div>
-              <SecondaryButton compact icon={<Copy />} onClick={() => copyText(mountPath)}>
-                Copy
-              </SecondaryButton>
-            </div>
+            {mountError && <p className="field-error">{mountError}</p>}
             <div className="final-actions">
-              <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
-                Open Notion Folder
+              <PrimaryButton onClick={finishOnboarding}>
+                Open Locality
               </PrimaryButton>
             </div>
-            <LocateBox
-              label="Open a Notion page"
-              value={locateUrl}
-              onChange={(next) => {
-                setLocateUrl(next);
-                setLocateState("idle");
-                setLocatedItem(null);
-              }}
-              onSubmit={locatePage}
-              onSelect={(item) => {
-                setLocatedItem(item);
-                setLocateState("ready");
-                setLocateError("");
-                setLocateUrl(item.title);
-              }}
-              state={locateState}
-              error={locateError}
-            />
-            {locatedItem && <LocatedPath item={locatedItem} />}
-            <div className="agent-demo compact-agent-demo">
-              <div className="agent-demo-title">
-                <Clipboard />
-                <span>Try this with an agent</span>
+            <div className="folder-inline final-folder-card">
+              <div className="ready-head">
+                <div>
+                  <strong>Folder</strong>
+                  <p>Your Notion files are mounted here.</p>
+                </div>
+                <span className="onboarding-pill">Mounted</span>
               </div>
-              <div className="agent-prompt-row">
-                <div className="agent-demo-command">
-                  {agentGuidanceReport?.prompt ||
-                    `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`}
+              <div className="path-field ready-path-field">
+                <span>{mountPath}</span>
+                <SecondaryButton onClick={() => void openMountFolder()}>
+                  Open Folder
+                </SecondaryButton>
+              </div>
+            </div>
+            <div className="agent-demo compact-agent-demo">
+              <div className="agent-demo-header">
+                <div>
+                  <strong>Try this agent prompt</strong>
+                  <p>Claude, Codex are now setup to use Locality.</p>
                 </div>
                 <SecondaryButton
-                  compact
-                  icon={<Copy />}
-                  onClick={() =>
-                    copyText(
-                      agentGuidanceReport?.prompt ||
-                        `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`,
-                    )
-                  }
+                  onClick={() => copyText(finalPrompt)}
                 >
                   Copy
                 </SecondaryButton>
               </div>
+              <div className="agent-demo-command">{finalPrompt}</div>
             </div>
-            <AgentGuidanceSummary report={agentGuidanceReport} state={agentGuidanceState} />
           </SetupContent>
         )}
       </section>
@@ -3593,6 +3613,124 @@ function ViewHeader({
   );
 }
 
+function ProductLoopDemo() {
+  return (
+    <div className="onboarding-product-demo">
+      <div className="demo-card-header">
+        <span>Product demo</span>
+        <strong>Ready</strong>
+      </div>
+      <div className="demo-tile-grid">
+        <div className="demo-tile">
+          <div>
+            <strong>Notion</strong>
+            <span>Connected</span>
+          </div>
+          <p>Launch Plan</p>
+        </div>
+        <div className="demo-tile">
+          <div>
+            <strong>Local Markdown</strong>
+            <span>Editable</span>
+          </div>
+          <code>Locality/notion/Launch Plan/page.md</code>
+        </div>
+        <div className="demo-tile">
+          <div>
+            <strong>Pending review</strong>
+            <span>Safe</span>
+          </div>
+          <p>Edited intro paragraph</p>
+          <p>Updated launch checklist</p>
+        </div>
+        <div className="demo-tile">
+          <div>
+            <strong>Notion</strong>
+            <span>Updated</span>
+          </div>
+          <p>Launch Plan reflects the approved Markdown edits.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AgentWorkspaceDemo() {
+  return (
+    <div className="agent-workspace-demo">
+      <div className="demo-card-header">
+        <span>Locality folder</span>
+        <strong>Visible</strong>
+      </div>
+      <div className="agent-surface-demo">
+        <div className="folder-pane-demo">
+          <span className="active">Locality</span>
+          <span>notion</span>
+          <span>google-docs</span>
+          <span>linear</span>
+          <pre>{`notion/
+  AGENTS.md
+  CLAUDE.md
+  Engineering/
+    Roadmap/
+      page.md
+  Launch Plan/
+    page.md`}</pre>
+        </div>
+        <div className="markdown-pane-demo">
+          <div>
+            <strong>Launch Plan/page.md</strong>
+            <span>Edited</span>
+          </div>
+          <pre>{`# Launch Plan
+
+Owner: Growth
+Status: Ready
+
+## Launch checklist
+- Finalize onboarding
+- Review pricing page
+- Publish announcement
+
+loc: notion-page`}</pre>
+        </div>
+      </div>
+      <div className="review-strip">
+        <strong>3 local edits ready to sync</strong>
+        <span>Review before updating Notion</span>
+      </div>
+    </div>
+  );
+}
+
+function ConnectorOptions({ connected }: { connected: boolean }) {
+  return (
+    <div className="connector-options">
+      <div className="connector-option available">
+        <div>
+          <strong>Notion</strong>
+          <small>Pages, databases, properties, and Markdown edits.</small>
+        </div>
+        <span>{connected ? "Connected" : "Available"}</span>
+      </div>
+      <div className="connector-option">
+        <div>
+          <strong>Google Docs</strong>
+          <small>Docs and Drive folders through the same local model.</small>
+        </div>
+        <span>Next</span>
+      </div>
+      <div className="connector-option">
+        <div>
+          <strong>Linear</strong>
+          <small>Issues and projects as agent-editable files.</small>
+        </div>
+        <span>Planned</span>
+      </div>
+    </div>
+  );
+}
+
 function WindowChrome({
   title,
   meta,
@@ -3686,14 +3824,32 @@ function SetupContent({
   mark,
   children,
   variant,
+  side,
 }: {
-  mark: React.ReactNode;
+  mark?: React.ReactNode;
   children: React.ReactNode;
-  variant?: "final";
+  variant?: "final" | "wide";
+  side?: React.ReactNode;
 }) {
+  if (side) {
+    return (
+      <div className="setup-content split-setup">
+        <div className="setup-copy">
+          {mark ? mark : null}
+          {children}
+        </div>
+        <aside className="setup-side">{side}</aside>
+      </div>
+    );
+  }
+
   return (
-    <div className={`setup-content ${variant === "final" ? "final-setup" : ""}`}>
-      {mark}
+    <div
+      className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
+        variant === "wide" ? "wide-setup" : ""
+      }`}
+    >
+      {mark ? mark : null}
       {children}
     </div>
   );
