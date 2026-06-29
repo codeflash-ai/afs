@@ -24,6 +24,10 @@ fn hydration_reasons_map_to_expected_priorities() {
         HydrationPriority::Normal
     );
     assert_eq!(
+        hydration_priority(&HydrationReason::LiveModeRemoteFastForward),
+        HydrationPriority::High
+    );
+    assert_eq!(
         hydration_priority(&HydrationReason::Prefetch),
         HydrationPriority::Low
     );
@@ -34,8 +38,17 @@ fn queue_drains_high_priority_before_policy_and_prefetch() {
     let mut queue = HydrationQueue::new();
     queue.queue_request(request("mount", "prefetch", HydrationReason::Prefetch));
     queue.queue_request(request("mount", "policy", HydrationReason::Policy));
+    queue.queue_request(request(
+        "mount",
+        "live",
+        HydrationReason::LiveModeRemoteFastForward,
+    ));
     queue.queue_request(request("mount", "read", HydrationReason::StubRead));
 
+    assert_eq!(
+        queue.pop_ready().expect("live mode request").remote_id,
+        RemoteId::new("live")
+    );
     assert_eq!(
         queue.pop_ready().expect("read request").remote_id,
         RemoteId::new("read")

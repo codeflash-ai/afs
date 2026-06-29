@@ -341,15 +341,29 @@ Desktop Live Mode uses the same boundary in a bounded loop. The primary
 local-write path is File Provider `modifyItem`; the visible CloudStorage
 reconciliation fallback is throttled and scoped to the selected
 already-hydrated page so the app does not poll the user-visible file every tick.
-Remote checks fetch one already-hydrated page into the daemon content cache and
-compare the rendered shadow before refreshing the visible projection. This avoids
-relying on Notion page metadata that can miss some body edits, while leaving
-unchanged CloudStorage replicas untouched. The desktop runner must not poll the
-SQLite state store while Live Mode is off. Live Mode state changes publish an
-explicit local signal under the state root through the shared store boundary;
-the app's watcher wakes the runner from that signal, while ordinary SQLite
-WAL/SHM churn remains ignored. The runner keeps a low-frequency recovery recheck
-only as a missed-event fallback, not as the normal state-change path.
+Remote checks enqueue `observe_entity` freshness work in `localityd`, and
+remote-only pending changes enqueue `remote_fast_forward` hydration work instead
+of fetching Notion inline from the desktop process. Those fetches flow through
+the same serialized daemon queues, connector rate limits, persisted hydration
+jobs, and visible-projection refresh path as scheduled pull. Live Mode remote
+fast-forwards for the active page use interactive hydration priority so the page
+the user or agent is working on does not sit behind unrelated background pages.
+Scheduled and discovery-driven remote fast-forwards remain normal/background
+work.
+
+After a `remote_fast_forward` succeeds, the daemon compares the previous and
+current Synced Tree shadows for structural discovery hints. If the set of
+rendered `child_page` links changed, the daemon queues a background refresh for
+`children:<parent_page_id>` through the existing child-refresh queue. This makes
+newly created remote child pages discoverable in the mounted tree without
+blocking the parent page hydration or running an unbounded workspace scan.
+
+The desktop runner must not poll the SQLite state store while Live Mode is off.
+Live Mode state changes publish an explicit local signal under the state root
+through the shared store boundary; the app's watcher wakes the runner from that
+signal, while ordinary SQLite WAL/SHM churn remains ignored. The runner keeps a
+low-frequency recovery recheck only as a missed-event fallback, not as the normal
+state-change path.
 
 ## Scheduled Pull Reconciliation
 

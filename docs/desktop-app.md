@@ -340,15 +340,22 @@ Important language:
   review-required changes. The normal local-write path comes from File Provider
   callbacks; a visible-file reconciliation fallback is throttled and scoped to
   the active already-hydrated page. When there is no local pending change, Live
-  Mode fetches one already-hydrated page into the daemon content cache and
-  compares the rendered shadow before touching the visible CloudStorage
-  projection, so stale Notion metadata does not hide body edits and unchanged
-  files are not repeatedly read or rewritten. When Live Mode is disabled, the
-  desktop runner must sleep on an explicit Live Mode state-change signal rather
-  than polling durable SQLite; writers that change the source-of-truth state
-  publish that signal so the app wakes on the state change. A low-frequency
-  recovery recheck is still allowed for missed filesystem events, but ordinary
-  SQLite WAL/SHM churn must not drive the runner.
+  Mode asks `localityd` to queue one remote check for an already-hydrated page.
+  If the daemon sees a remote change, it hydrates the page through the normal
+  `RemoteFastForward` path and refreshes the visible CloudStorage projection
+  only if the visible file still matches the old shadow. Remote-only pending
+  changes also enqueue a daemon fast-forward instead of fetching from the
+  desktop process. These active-page Live Mode fast-forwards use interactive
+  hydration priority, matching the real-time expectation for the page currently
+  being worked on. When a fast-forwarded shadow adds or removes rendered
+  child-page links, the daemon queues a background child refresh for that parent
+  so newly created remote pages become visible in the local tree. When Live Mode is
+  disabled, the desktop runner must sleep on an explicit Live Mode state-change
+  signal rather than polling durable SQLite; writers that change the
+  source-of-truth state publish that signal so the app wakes on the state
+  change. A low-frequency recovery recheck is still allowed for missed
+  filesystem events, but ordinary SQLite WAL/SHM churn must not drive the
+  runner.
 
 ## Main App Structure
 
