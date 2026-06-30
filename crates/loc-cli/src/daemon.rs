@@ -201,6 +201,7 @@ fn start_daemon(
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
     if is_running(options, paths) {
+        repair_linux_fuse_units_for_daemon_start(&options.state_root);
         return Ok(report(
             options.action,
             DaemonRunState::Running,
@@ -241,6 +242,7 @@ fn start_daemon(
         ));
     }
     write_metadata(options, paths, &artifacts)?;
+    repair_linux_fuse_units_for_daemon_start(&options.state_root);
 
     Ok(report(
         options.action,
@@ -253,10 +255,42 @@ fn start_daemon(
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn repair_linux_fuse_units_for_daemon_start(state_root: &Path) {
+    use locality_store::{MountRepository, SqliteStateStore};
+
+    let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
+        return;
+    };
+    let Ok(mounts) = store.load_mounts() else {
+        return;
+    };
+    if let Err(error) = crate::file_provider::repair_linux_fuse_units_for_state(state_root, &mounts)
+    {
+        eprintln!(
+            "loc daemon start: skipped Linux FUSE stale unit repair: {}",
+            error.message()
+        );
+    }
+    if let Err(error) =
+        crate::file_provider::restart_linux_fuse_units_for_state(state_root, &mounts)
+    {
+        eprintln!(
+            "loc daemon start: skipped Linux FUSE unit restart: {}",
+            error.message()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn repair_linux_fuse_units_for_daemon_start(_state_root: &Path) {}
+
 fn stop_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
+    stop_linux_fuse_units_for_daemon_stop(&options.state_root);
+
     let was_running = is_running(options, paths);
     let mut stopped_by_shutdown = false;
     if was_running && request_graceful_shutdown(options, paths) {
@@ -308,6 +342,19 @@ fn stop_daemon(
         message,
     ))
 }
+
+#[cfg(target_os = "linux")]
+fn stop_linux_fuse_units_for_daemon_stop(state_root: &Path) {
+    if let Err(error) = crate::file_provider::stop_linux_fuse_units_for_state(state_root) {
+        eprintln!(
+            "loc daemon stop: skipped Linux FUSE unit stop: {}",
+            error.message()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stop_linux_fuse_units_for_daemon_stop(_state_root: &Path) {}
 
 fn request_graceful_shutdown(options: &DaemonOptions, paths: &DaemonPaths) -> bool {
     send_daemon_request(
@@ -659,6 +706,12 @@ fn find_localityd_binary(explicit: Option<&Path>) -> Result<PathBuf, DaemonContr
         return Ok(path);
     }
 
+    for candidate in installed_app_localityd_candidates() {
+        if let Some(path) = existing_file(&candidate) {
+            return Ok(path);
+        }
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest_dir.join("../..");
     for candidate in [
@@ -682,6 +735,29 @@ fn find_localityd_binary(explicit: Option<&Path>) -> Result<PathBuf, DaemonContr
         "binary_missing",
         "localityd binary was not found; build/install localityd or pass --localityd-bin <path>",
     ))
+}
+
+fn installed_app_localityd_candidates() -> Vec<PathBuf> {
+    installed_app_localityd_candidates_for_target(std::env::consts::OS, env::var_os("HOME"))
+}
+
+fn installed_app_localityd_candidates_for_target(
+    target_os: &str,
+    home: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    if target_os != "macos" {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(PathBuf::from(
+        "/Applications/Locality.app/Contents/MacOS/localityd",
+    ));
+    if let Some(home) = home {
+        candidates
+            .push(PathBuf::from(home).join("Applications/Locality.app/Contents/MacOS/localityd"));
+    }
+    candidates
 }
 
 fn existing_file(path: &Path) -> Option<PathBuf> {
@@ -825,6 +901,33 @@ mod tests {
             false,
             "macos"
         ));
+    }
+
+    #[test]
+    fn macos_installed_app_daemon_candidates_prefer_system_then_user_app() {
+        let candidates = installed_app_localityd_candidates_for_target(
+            "macos",
+            Some(std::ffi::OsString::from("/Users/ada")),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/Applications/Locality.app/Contents/MacOS/localityd"),
+                PathBuf::from("/Users/ada/Applications/Locality.app/Contents/MacOS/localityd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_macos_installed_app_daemon_candidates_are_empty() {
+        assert!(
+            installed_app_localityd_candidates_for_target(
+                "linux",
+                Some(std::ffi::OsString::from("/home/ada")),
+            )
+            .is_empty()
+        );
     }
 
     #[cfg(unix)]

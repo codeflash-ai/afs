@@ -98,7 +98,8 @@ where
     let mount = mount.clone();
     let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
-    let refresh_bases = prepare_visible_projection_pull(store, state_root, &mount, &target_path)?;
+    let refresh_bases =
+        prepare_visible_projection_pull(store, state_root, &mount, &relative_path, &target_path)?;
 
     let report = if should_pull_mount_root(&mount, &relative_path, &target_path) {
         pull_mount_root(store, &source, &mount, target_path.clone(), state_root)
@@ -136,6 +137,7 @@ fn prepare_visible_projection_pull<S>(
     store: &mut S,
     state_root: Option<&Path>,
     mount: &MountConfig,
+    relative_path: &Path,
     target_path: &Path,
 ) -> Result<Vec<ProjectionRefreshBase>, PullError>
 where
@@ -153,6 +155,9 @@ where
         locality_store::ProjectionMode::MacosFileProvider
             | locality_store::ProjectionMode::WindowsCloudFiles
     ) {
+        return Ok(Vec::new());
+    }
+    if mount.projection.uses_virtual_filesystem() && !is_page_document_path(relative_path) {
         return Ok(Vec::new());
     }
 
@@ -1235,12 +1240,7 @@ fn projected_report_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
         mount.projection,
         ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
     ) {
-        return mount
-            .root
-            .join(crate::virtual_fs::source_root_directory_name(
-                &mount.connector,
-            ))
-            .join(relative_path);
+        return crate::virtual_fs::virtual_projection_mount_point(mount).join(relative_path);
     }
 
     mount.root.join(relative_path)

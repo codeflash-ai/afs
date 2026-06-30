@@ -10,10 +10,8 @@ use std::path::{Path, PathBuf};
 use locality_core::model::{EntityKind, HydrationState, RemoteId};
 use locality_store::{
     EntityRecord, EntityRepository, EntitySearchCandidate, EntitySearchRepository, MountConfig,
-    MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
-    StoreError,
+    MountRepository, RemoteObservationRecord, RemoteObservationRepository, StoreError,
 };
-use localityd::virtual_fs::source_root_directory_name;
 use serde::Serialize;
 
 const DEFAULT_LIMIT: usize = 10;
@@ -258,6 +256,13 @@ where
 }
 
 pub fn notion_id_from_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if let Some(host) = source_url_host(url)
+        && !is_notion_url_host(&host)
+    {
+        return None;
+    }
+
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
     for segment in without_query.rsplit('/') {
         if let Some(candidate) = compact_notion_id_suffix(segment) {
@@ -266,6 +271,48 @@ pub fn notion_id_from_url(url: &str) -> Option<String> {
     }
 
     compact_notion_id_suffix(url)
+}
+
+pub fn source_url_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (without_scheme, has_scheme) = if let Some((scheme, rest)) = value.split_once("://") {
+        if !scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        }) {
+            return None;
+        }
+        (rest, true)
+    } else {
+        (value, false)
+    };
+    if !has_scheme && value.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let authority = without_scheme.split(['/', '?', '#']).next()?.trim();
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .split(':')
+        .next()
+        .unwrap_or(authority)
+        .trim()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if !host.contains('.') {
+        return None;
+    }
+    if !has_scheme && !value.contains('/') && !host.starts_with("www.") {
+        return None;
+    }
+    Some(host)
+}
+
+pub fn is_notion_url_host(host: &str) -> bool {
+    matches!(host, "notion.so" | "notion.site" | "notion.com")
+        || host.ends_with(".notion.so")
+        || host.ends_with(".notion.site")
+        || host.ends_with(".notion.com")
 }
 
 pub fn search_indexed_entities(
@@ -543,12 +590,7 @@ fn source_display_name(connector: &str) -> String {
 }
 
 fn default_access_root(mount: &MountConfig) -> PathBuf {
-    match mount.projection {
-        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles => mount
-            .root
-            .join(source_root_directory_name(&mount.connector)),
-        ProjectionMode::PlainFiles | ProjectionMode::MacosFileProvider => mount.root.clone(),
-    }
+    mount.root.clone()
 }
 
 fn entity_kind_name(kind: &EntityKind) -> &str {

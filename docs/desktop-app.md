@@ -87,21 +87,24 @@ Default mount base:
 ~/Library/CloudStorage/Locality
 ```
 
-Suggested concrete folder:
+Suggested concrete folders:
 
 ```text
-~/Library/CloudStorage/Locality/notion
+~/Library/CloudStorage/Locality/
+  notion-main/
+  notion-my-company/
+  google-docs-main/
 ```
 
 On macOS, the real Locality root is assigned by File Provider and must be read from
 `NSFileProviderManager.getUserVisibleURL`. Packaged builds and the local
 development bundle identify the host app as `Locality`, so new installs should
 resolve to `~/Library/CloudStorage/Locality`. Older roots such as `Locality` and
-`Locality-Locality` are repair aliases only. Each connector gets a stable child folder
-such as `notion`, `linear`, or `gmail`. Locality should not create a Documents alias
-or symlink; the app should show the actual CloudStorage folder directly. This
-step should be framed as "Where should your Notion files appear?" rather than
-"configure mount root."
+`Locality-Locality` are repair aliases only. Each mount gets a stable mount-point
+folder such as `notion-main`, rather than a connector-derived child folder such as
+`notion`. Locality should not create a Documents alias or symlink; the app should
+show the actual CloudStorage folder directly. This step should be framed as
+"Where should your Notion files appear?" rather than "configure mount root."
 
 Local diagnostics live under the Locality state root in `logs/`. Desktop actions and
 File Provider repair failures are mirrored to `desktop.log` with event markers
@@ -340,15 +343,22 @@ Important language:
   review-required changes. The normal local-write path comes from File Provider
   callbacks; a visible-file reconciliation fallback is throttled and scoped to
   the active already-hydrated page. When there is no local pending change, Live
-  Mode fetches one already-hydrated page into the daemon content cache and
-  compares the rendered shadow before touching the visible CloudStorage
-  projection, so stale Notion metadata does not hide body edits and unchanged
-  files are not repeatedly read or rewritten. When Live Mode is disabled, the
-  desktop runner must sleep on an explicit Live Mode state-change signal rather
-  than polling durable SQLite; writers that change the source-of-truth state
-  publish that signal so the app wakes on the state change. A low-frequency
-  recovery recheck is still allowed for missed filesystem events, but ordinary
-  SQLite WAL/SHM churn must not drive the runner.
+  Mode asks `localityd` to queue one remote check for an already-hydrated page.
+  If the daemon sees a remote change, it hydrates the page through the normal
+  `RemoteFastForward` path and refreshes the visible CloudStorage projection
+  only if the visible file still matches the old shadow. Remote-only pending
+  changes also enqueue a daemon fast-forward instead of fetching from the
+  desktop process. These active-page Live Mode fast-forwards use interactive
+  hydration priority, matching the real-time expectation for the page currently
+  being worked on. When a fast-forwarded shadow adds or removes rendered
+  child-page links, the daemon queues a background child refresh for that parent
+  so newly created remote pages become visible in the local tree. When Live Mode is
+  disabled, the desktop runner must sleep on an explicit Live Mode state-change
+  signal rather than polling durable SQLite; writers that change the
+  source-of-truth state publish that signal so the app wakes on the state
+  change. A low-frequency recovery recheck is still allowed for missed
+  filesystem events, but ordinary SQLite WAL/SHM churn must not drive the
+  runner.
 
 ## Main App Structure
 

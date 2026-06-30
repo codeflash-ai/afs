@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loc_cli::search::{SearchError, SearchOptions, run_search};
+use loc_cli::search::{SearchError, SearchOptions, notion_id_from_url, run_search};
 use locality_core::freshness::RemoteVersion;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_store::{
@@ -61,6 +61,44 @@ fn search_ranks_title_path_and_remote_id_matches() {
                 .join("page.md")
         )
     );
+}
+
+#[test]
+fn notion_id_parser_rejects_non_notion_urls_with_hex_suffixes() {
+    assert_eq!(
+        notion_id_from_url(
+            "https://github.com/codeflash-ai/locality/commit/15e6dedcfd04d1cdb22df006b66a90dd4ab3753c",
+        ),
+        None
+    );
+    assert_eq!(
+        notion_id_from_url(
+            "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972",
+        )
+        .as_deref(),
+        Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
+    );
+    assert_eq!(
+        notion_id_from_url("37b3ac0e-bb88-802c-bcf4-d53c9cfc4972").as_deref(),
+        Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
+    );
+}
+
+#[test]
+fn search_does_not_treat_github_commit_links_as_notion_ids() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.store();
+    fixture.seed_entities(&mut store);
+
+    let report = run_search(
+        &store,
+        SearchOptions::new(
+            "https://github.com/codeflash-ai/locality/commit/15e6dedcfd04d1cdb22df006b66a90dd4ab3753c",
+        ),
+    )
+    .expect("github URL search");
+
+    assert!(report.results.is_empty());
 }
 
 #[test]
@@ -269,27 +307,67 @@ fn notion_url_locate_keeps_workspace_fallback_when_root_entity_is_unknown() {
 }
 
 #[test]
-fn search_reports_linux_fuse_absolute_path_under_source_root() {
+fn search_reports_linux_fuse_absolute_path_under_mount_point_root() {
     let fixture = SearchFixture::new();
     let mut store = InMemoryStateStore::new();
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
     store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
+        .save_mount(mount.clone())
         .expect("save linux fuse mount");
     fixture.seed_entities(&mut store);
 
     let report = run_search(&store, SearchOptions::new("initial")).expect("search");
 
-    let expected = fixture
+    let expected = mount
         .root
-        .join("notion")
         .join("Product")
         .join("Initial Idea")
         .join("page.md")
         .display()
         .to_string();
+    assert_eq!(report.results[0].absolute_path, expected);
+}
+
+#[test]
+fn search_absolute_path_uses_mount_point_root() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_mount(
+            MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion-main")
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-1"),
+            kind: EntityKind::Page,
+            title: "Roadmap".to_string(),
+            path: PathBuf::from("Roadmap/page.md"),
+            hydration: HydrationState::Hydrated,
+            content_hash: None,
+            remote_edited_at: None,
+        })
+        .expect("save entity");
+
+    let report = run_search(
+        &store,
+        SearchOptions {
+            query: "Roadmap".to_string(),
+            connector: None,
+            limit: 10,
+        },
+    )
+    .expect("search");
+
+    let expected = locality_platform::join_logical_path(
+        Path::new("/tmp/Locality/notion-main"),
+        Path::new("Roadmap/page.md"),
+    )
+    .display()
+    .to_string();
     assert_eq!(report.results[0].absolute_path, expected);
 }
 

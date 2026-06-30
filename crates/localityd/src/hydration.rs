@@ -133,7 +133,7 @@ where
             .to_path_buf();
         let path = request_path(&mount, &request.path);
         let can_replace = self.can_replace_file(&mount, &entity, &path)?;
-        if !can_replace && request.reason == HydrationReason::RemoteFastForward {
+        if !can_replace && request.reason.is_remote_fast_forward() {
             self.mark_dirty_if_allowed(entity)?;
             return Ok(HydrationOutcome::SkippedDirty);
         }
@@ -470,6 +470,30 @@ impl HydrationQueue {
         self.pending.remove(&key)
     }
 
+    pub fn debug_requests(&self, limit: usize) -> Vec<HydrationRequest> {
+        let mut requests = self
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| {
+                self.pending
+                    .get(key)
+                    .cloned()
+                    .map(|request| (index, request))
+            })
+            .collect::<Vec<_>>();
+        requests.sort_by(|(left_index, left), (right_index, right)| {
+            hydration_priority(&right.reason)
+                .cmp(&hydration_priority(&left.reason))
+                .then_with(|| left_index.cmp(right_index))
+        });
+        requests
+            .into_iter()
+            .take(limit)
+            .map(|(_, request)| request)
+            .collect()
+    }
+
     pub fn drain_ready_with(
         &mut self,
         mut hydrate: impl FnMut(HydrationRequest) -> LocalityResult<()>,
@@ -537,9 +561,10 @@ pub enum HydrationPriority {
 
 pub fn hydration_priority(reason: &HydrationReason) -> HydrationPriority {
     match reason {
-        HydrationReason::ExplicitPull | HydrationReason::FileOpen | HydrationReason::StubRead => {
-            HydrationPriority::High
-        }
+        HydrationReason::ExplicitPull
+        | HydrationReason::FileOpen
+        | HydrationReason::LiveModeRemoteFastForward
+        | HydrationReason::StubRead => HydrationPriority::High,
         HydrationReason::Policy | HydrationReason::RemoteFastForward => HydrationPriority::Normal,
         HydrationReason::Prefetch => HydrationPriority::Low,
     }

@@ -51,17 +51,9 @@ type DesktopSnapshot = {
     accountLabel: string;
     status: string;
   };
-  mount: {
-    connector: string;
-    workspaceName: string;
-    localPath: string;
-    notionUrl?: string | null;
-    accessScope: string;
-    projection: string;
-    readOnly: boolean;
-    status: string;
-    provider?: ProviderRuntimeSummary | null;
-  };
+  mount: MountSummary;
+  mounts: MountSummary[];
+  activeMountId?: string | null;
   liveMode: MountLiveMode;
   needsOnboarding: boolean;
   settings: {
@@ -71,6 +63,25 @@ type DesktopSnapshot = {
   pendingChanges: PendingChange[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
+};
+
+type MountSummary = {
+  mountId: string;
+  connector: string;
+  connectorName: string;
+  connectionId?: string | null;
+  workspaceName: string;
+  localPath: string;
+  notionUrl?: string | null;
+  accessScope: string;
+  remoteRootId?: string | null;
+  projection: string;
+  readOnly: boolean;
+  status: string;
+  rootExists: boolean;
+  entityCount: number;
+  pendingChangeCount: number;
+  provider?: ProviderRuntimeSummary | null;
 };
 
 type MountLiveMode = {
@@ -85,6 +96,8 @@ type MountLiveMode = {
 };
 
 type PendingChange = {
+  mountId: string;
+  entityId: string;
   title: string;
   localPath: string;
   summary: string;
@@ -105,6 +118,42 @@ type ActivityItem = {
   occurredAt?: string | null;
   kind: string;
   undoAvailable: boolean;
+};
+
+type DebugQueueStatus = {
+  generatedAtUnixMs: number;
+  active: DebugQueueActive[];
+  sections: DebugQueueSection[];
+  schedulerMode: string;
+  activeIntervalMs: number;
+  coldIntervalMs: number;
+};
+
+type DebugQueueActive = {
+  kind: string;
+  target?: string | null;
+  elapsedMs: number;
+  startedAtUnixMs: number;
+};
+
+type DebugQueueSection = {
+  name: string;
+  label: string;
+  total: number;
+  ready?: number | null;
+  deferred?: number | null;
+  items: DebugQueueItem[];
+};
+
+type DebugQueueItem = {
+  kind: string;
+  target?: string | null;
+  mountId?: string | null;
+  remoteId?: string | null;
+  path?: string | null;
+  reason?: string | null;
+  priority?: string | null;
+  nextEligibleAt?: string | null;
 };
 
 type ConnectorSuggestion = {
@@ -192,6 +241,25 @@ type AgentGuidanceInstallReport = {
   prompt: string;
 };
 
+const sampleMount: MountSummary = {
+  mountId: "notion-main",
+  connector: "notion",
+  connectorName: "Notion",
+  connectionId: "notion-main",
+  workspaceName: "CodeFlash",
+  localPath: "~/Library/CloudStorage/Locality/notion-main",
+  notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
+  accessScope: "Initial Idea",
+  remoteRootId: "37b3ac0ebb88802cbcf4d53c9cfc4972",
+  projection: "macOS File Provider",
+  readOnly: false,
+  status: "ready",
+  rootExists: true,
+  entityCount: 24,
+  pendingChangeCount: 3,
+  provider: null,
+};
+
 const sampleSnapshot: DesktopSnapshot = {
   health: {
     state: "ready",
@@ -203,17 +271,9 @@ const sampleSnapshot: DesktopSnapshot = {
     accountLabel: "saurabh@codeflash.ai",
     status: "ready",
   },
-  mount: {
-    connector: "notion",
-    workspaceName: "CodeFlash",
-    localPath: "~/Library/CloudStorage/Locality/notion",
-    notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
-    accessScope: "Initial Idea",
-    projection: "macOS File Provider",
-    readOnly: false,
-    status: "ready",
-    provider: null,
-  },
+  mount: sampleMount,
+  mounts: [sampleMount],
+  activeMountId: sampleMount.mountId,
   liveMode: {
     enabled: false,
     state: "off",
@@ -231,6 +291,8 @@ const sampleSnapshot: DesktopSnapshot = {
   },
   pendingChanges: [
     {
+      mountId: "notion-main",
+      entityId: "roadmap-2026",
       title: "Roadmap 2026",
       localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
@@ -239,6 +301,8 @@ const sampleSnapshot: DesktopSnapshot = {
       liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
+      mountId: "notion-main",
+      entityId: "launch-plan",
       title: "Launch Plan",
       localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
@@ -247,6 +311,8 @@ const sampleSnapshot: DesktopSnapshot = {
       liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
+      mountId: "notion-main",
+      entityId: "customer-notes",
       title: "Customer Notes",
       localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
@@ -290,6 +356,67 @@ const sampleSnapshot: DesktopSnapshot = {
   ],
 };
 
+const sampleDebugQueueStatus: DebugQueueStatus = {
+  generatedAtUnixMs: 1782033300000,
+  active: [
+    {
+      kind: "hydration",
+      target: "~/Library/CloudStorage/Locality/notion/Launch Plan/page.md",
+      elapsedMs: 842,
+      startedAtUnixMs: 1782033299158,
+    },
+  ],
+  sections: [
+    {
+      name: "hydrations",
+      label: "Hydration fetches",
+      total: 2,
+      ready: 2,
+      deferred: null,
+      items: [
+        {
+          kind: "hydration",
+          target: "Launch Plan/page.md",
+          mountId: "notion-main",
+          remoteId: "launch-plan",
+          path: "Launch Plan/page.md",
+          reason: "live_mode_remote_fast_forward",
+          priority: "high",
+        },
+        {
+          kind: "hydration",
+          target: "Roadmap/page.md",
+          mountId: "notion-main",
+          remoteId: "roadmap",
+          path: "Roadmap/page.md",
+          reason: "policy",
+          priority: "normal",
+        },
+      ],
+    },
+    {
+      name: "freshness",
+      label: "Freshness observations",
+      total: 1,
+      ready: 1,
+      deferred: 0,
+      items: [
+        {
+          kind: "ObserveEntity",
+          target: "notion-main:launch-plan",
+          mountId: "notion-main",
+          remoteId: "launch-plan",
+          reason: "RemoteMaybeChanged",
+          priority: "hot",
+        },
+      ],
+    },
+  ],
+  schedulerMode: "polling",
+  activeIntervalMs: 5000,
+  coldIntervalMs: 60000,
+};
+
 const loadingSnapshot: DesktopSnapshot = {
   ...sampleSnapshot,
   health: {
@@ -305,7 +432,7 @@ const loadingSnapshot: DesktopSnapshot = {
   mount: {
     ...sampleSnapshot.mount,
     workspaceName: "Loading",
-    localPath: "~/Library/CloudStorage/Locality",
+    localPath: "~/Library/CloudStorage/Locality/notion-main",
     notionUrl: null,
     accessScope: "Checking access",
     status: "loading",
@@ -358,13 +485,13 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion/Marketing/Launch Plan/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion-main/Marketing/Launch Plan/page.md",
     state: "online_only",
   },
 ];
@@ -446,7 +573,7 @@ function errorMessage(error: unknown) {
 function liveModeTooltip(enabled: boolean) {
   return enabled
     ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
-    : "Turn on Live Mode to keep this local Notion folder in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
+    : "Turn on Live Mode to keep this Notion mount point in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
 }
 
 function trayLiveModeLabel(liveMode: MountLiveMode, busy: boolean) {
@@ -903,14 +1030,14 @@ function SetupLoading() {
     <main className="setup-shell">
       <section className="setup-window">
         <WindowChrome title="Locality Setup" meta="Checking" />
-        <SetupContent mark={<BrandTile>Locality</BrandTile>}>
+        <SetupContent mark={<BrandTile />}>
           <div>
             <div className="sync-note">
               <Loader2 className="spin" />
               Checking setup
             </div>
             <h1>Checking your Locality setup</h1>
-            <p>Locality is checking your Notion connection and local folder.</p>
+            <p>Locality is checking your Notion connection and mount point.</p>
           </div>
         </SetupContent>
       </section>
@@ -1181,7 +1308,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1258,7 +1385,7 @@ function Onboarding({
               </h1>
               <p>
                 {connectionReady
-                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the local folder.`
+                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the Notion mount point.`
                   : oauthInFlight
                     ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
                     : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
@@ -1321,6 +1448,10 @@ function Onboarding({
               {mounting ? "Mounting Notion" : "Create Local Folder"}
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
+            <p className="quiet-note">
+              The Notion mount point will include AGENTS.md and CLAUDE.md to help your agents edit
+              files natively.
+            </p>
           </SetupContent>
         )}
 
@@ -1329,7 +1460,7 @@ function Onboarding({
             <div>
               <h1>Locality is ready!</h1>
               <p>
-                Your Notion files are now mounted locally. Agents can open this folder, edit
+                Your Notion mount point is ready. Agents can open this folder, edit
                 Markdown, and leave changes for Locality review. Open the app to review changes,
                 manage sync, and turn on Live Mode when you want file saves to update Notion and
                 new Notion changes to appear locally.
@@ -1413,7 +1544,7 @@ function AgentGuidanceSummary({
         <p>{fallbackTargets[0].detail}</p>
       )}
       {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length === 0 && !failed && (
-        <p>Locality is preparing local agent instructions for this Notion folder.</p>
+        <p>Locality is preparing local agent instructions for this Notion mount point.</p>
       )}
       {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
         <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
@@ -1701,7 +1832,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1741,14 +1872,14 @@ function HomeView({
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Create your Notion folder</h2>
-            <p>Use the default source folder under the shared Locality CloudStorage root.</p>
+            <h2>Create your Notion mount point</h2>
+            <p>Use the default notion-main mount point under the shared Locality CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
             onClick={() => void createMount()}
           >
-            Create Notion Folder
+            Create Notion Mount Point
           </PrimaryButton>
           {actionError && <p className="field-error">{actionError}</p>}
         </section>
@@ -1770,7 +1901,7 @@ function HomeView({
                 onClick={toggleLiveMode}
               >
                 <span className="live-mode-copy">
-                  {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+                  {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
                   <span>Live Mode</span>
                 </span>
                 <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
@@ -1958,7 +2089,7 @@ function MountDetailView({
           <FolderOpen />
         </div>
         <div>
-          <p className="label">Notion folder</p>
+          <p className="label">Notion mount point</p>
           <h2>{snapshot.mount.localPath}</h2>
           <p>
             Locality follows your Notion workspace hierarchy here, starting with the pages and databases
@@ -2282,6 +2413,7 @@ function ReviewView({
 }
 
 function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: () => void }) {
+  const [tab, setTab] = useState<"recent" | "debug">("recent");
   const grouped = useMemo(() => {
     return snapshot.activity.reduce<Record<string, ActivityItem[]>>((acc, item) => {
       const label = activityGroupLabel(item);
@@ -2293,31 +2425,218 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Activity" }]} />
-      <ViewHeader title="Recent activity" />
-      {Object.entries(grouped).map(([when, items]) => (
-        <section className="activity-group" key={when}>
-          <p className="label">{when}</p>
-          {items.map((item) => (
-            <article className="activity-item" key={`${when}-${item.kind}-${item.title}-${item.occurredAt ?? item.when}`}>
-              <span className="activity-time" title={activityFullTimeLabel(item)}>
-                <Clock3 />
-                <span>{activityTimeLabel(item)}</span>
-              </span>
-              <div>
-                <h3>{item.title}</h3>
-                <p>{item.detail}</p>
-              </div>
-              {item.undoAvailable && (
-                <SecondaryButton compact icon={<RotateCcw />}>
-                  Undo Push
-                </SecondaryButton>
-              )}
-            </article>
-          ))}
-        </section>
-      ))}
+      <ViewHeader title="Activity">
+        <div className="activity-tabs" role="tablist" aria-label="Activity sections">
+          <button className={tab === "recent" ? "active" : ""} onClick={() => setTab("recent")} role="tab">
+            Recent
+          </button>
+          <button className={tab === "debug" ? "active" : ""} onClick={() => setTab("debug")} role="tab">
+            Queue Debug
+          </button>
+        </div>
+      </ViewHeader>
+      {tab === "recent" ? (
+        Object.entries(grouped).map(([when, items]) => (
+          <section className="activity-group" key={when}>
+            <p className="label">{when}</p>
+            {items.map((item) => (
+              <article className="activity-item" key={`${when}-${item.kind}-${item.title}-${item.occurredAt ?? item.when}`}>
+                <span className="activity-time" title={activityFullTimeLabel(item)}>
+                  <Clock3 />
+                  <span>{activityTimeLabel(item)}</span>
+                </span>
+                <div>
+                  <h3>{item.title}</h3>
+                  <p>{item.detail}</p>
+                </div>
+                {item.undoAvailable && (
+                  <SecondaryButton compact icon={<RotateCcw />}>
+                    Undo Push
+                  </SecondaryButton>
+                )}
+              </article>
+            ))}
+          </section>
+        ))
+      ) : (
+        <DebugQueueView />
+      )}
     </div>
   );
+}
+
+function DebugQueueView() {
+  const [status, setStatus] = useState<DebugQueueStatus | null>(() =>
+    isTauriRuntime() ? null : sampleDebugQueueStatus,
+  );
+  const [loading, setLoading] = useState(() => isTauriRuntime());
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function refresh() {
+      try {
+        const next = await callCommand<DebugQueueStatus>(
+          "debug_notion_queue_status",
+          undefined,
+          sampleDebugQueueStatus,
+        );
+        if (!cancelled) {
+          setStatus(next);
+          setError(null);
+          setLoading(false);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setError(errorMessage(error));
+          setLoading(false);
+        }
+      }
+    }
+
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  return (
+    <section className="debug-queue-panel">
+      <div className="debug-queue-heading">
+        <div>
+          <p className="label">Debug only</p>
+          <h2>Notion request queue</h2>
+          <p>Runtime queue snapshot. This tab polls only while it is open.</p>
+        </div>
+        <div className="debug-queue-meta">
+          {loading ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+          <span>{status ? `Updated ${debugTimestampLabel(status.generatedAtUnixMs)}` : "Waiting"}</span>
+        </div>
+      </div>
+
+      {error && <p className="debug-queue-error">{error}</p>}
+      {status && (
+        <>
+          <div className="debug-queue-summary">
+            <Metric label="Active" value={status.active.length} />
+            <Metric label="Scheduler" value={status.schedulerMode} />
+            <Metric label="Active poll" value={formatDuration(status.activeIntervalMs)} />
+            <Metric label="Cold poll" value={formatDuration(status.coldIntervalMs)} />
+          </div>
+          <DebugActiveJobs active={status.active} />
+          <div className="debug-queue-sections">
+            {status.sections.map((section) => (
+              <DebugQueueSectionView section={section} key={section.name} />
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function DebugActiveJobs({ active }: { active: DebugQueueActive[] }) {
+  return (
+    <section className="debug-queue-section">
+      <div className="debug-queue-section-header">
+        <div>
+          <h3>Currently executing</h3>
+          <p>{active.length ? `${active.length} active request${active.length === 1 ? "" : "s"}` : "No active request"}</p>
+        </div>
+      </div>
+      {active.length ? (
+        active.map((item) => (
+          <DebugQueueRow
+            key={`${item.kind}-${item.target ?? ""}-${item.startedAtUnixMs}`}
+            title={item.kind}
+            detail={item.target || "No target"}
+            meta={[`elapsed ${formatDuration(item.elapsedMs)}`, `started ${debugTimestampLabel(item.startedAtUnixMs)}`]}
+          />
+        ))
+      ) : (
+        <p className="debug-queue-empty">The daemon is idle.</p>
+      )}
+    </section>
+  );
+}
+
+function DebugQueueSectionView({ section }: { section: DebugQueueSection }) {
+  const meta = [
+    `${section.total} total`,
+    section.ready === null || section.ready === undefined ? null : `${section.ready} ready`,
+    section.deferred === null || section.deferred === undefined ? null : `${section.deferred} deferred`,
+  ].filter(Boolean) as string[];
+
+  return (
+    <section className="debug-queue-section">
+      <div className="debug-queue-section-header">
+        <div>
+          <h3>{section.label}</h3>
+          <p>{meta.join(" · ")}</p>
+        </div>
+      </div>
+      {section.items.length ? (
+        section.items.map((item, index) => (
+          <DebugQueueRow
+            key={`${section.name}-${item.kind}-${item.target ?? item.remoteId ?? index}`}
+            title={item.kind}
+            detail={item.target || item.path || item.remoteId || "No target"}
+            meta={[item.priority, item.reason, item.nextEligibleAt ? `eligible ${item.nextEligibleAt}` : null].filter(Boolean) as string[]}
+          />
+        ))
+      ) : (
+        <p className="debug-queue-empty">No queued requests.</p>
+      )}
+    </section>
+  );
+}
+
+function DebugQueueRow({ title, detail, meta }: { title: string; detail: string; meta: string[] }) {
+  return (
+    <article className="debug-queue-row">
+      <div>
+        <strong>{title}</strong>
+        <p>{detail}</p>
+      </div>
+      {meta.length > 0 && (
+        <div className="debug-queue-tags">
+          {meta.map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function debugTimestampLabel(unixMs: number) {
+  if (!Number.isFinite(unixMs) || unixMs <= 0) {
+    return "unknown";
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(unixMs));
+}
+
+function formatDuration(ms: number) {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return "unknown";
+  }
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`;
+  }
+  if (ms < 60_000) {
+    const seconds = ms / 1000;
+    return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+  }
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
 function activityGroupLabel(item: ActivityItem) {
@@ -2560,7 +2879,7 @@ function SettingsView({
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default folder" value="~/Library/CloudStorage/Locality" />
+          <SettingRow title="Default Notion mount point" value="~/Library/CloudStorage/Locality/notion-main" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
@@ -2604,7 +2923,7 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Agent Instructions" />
           <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
-          <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
+          <SettingRow title="Notion guidance" value="Installed under /Locality/notion-main" />
           <SecondaryButton
             compact
             icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
@@ -2733,7 +3052,7 @@ function TrayPopover({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -2796,7 +3115,7 @@ function TrayPopover({
           onClick={() => void toggleLiveMode()}
         >
           <span className="tray-live-mode-copy">
-            {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+            {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
             <span>
               <strong>Live Mode</strong>
               <small>{trayLiveModeLabel(snapshot.liveMode, liveModeBusy)}</small>
@@ -2912,7 +3231,7 @@ function TrayPopover({
 type FileActionStatus = {
   state: "working" | "success" | "error";
   message: string;
-  action?: "diff" | "push" | "resolve" | "autosave";
+  action?: "diff" | "push" | "resolve" | "reset" | "live_mode";
 };
 
 type FileDetailStatus = {
@@ -3085,10 +3404,16 @@ function FileChangeList({
     }
   }
 
-  async function runFileAction(change: PendingChange, action: "diff" | "push" | "resolve") {
+  async function runFileAction(change: PendingChange, action: "diff" | "push" | "resolve" | "reset") {
     const path = joinMountPath(mountPath, change.localPath);
     const workingMessage =
-      action === "diff" ? "Checking diff..." : action === "push" ? "Pushing this file..." : "Pulling latest...";
+      action === "diff"
+        ? "Checking diff..."
+        : action === "push"
+          ? "Pushing this file..."
+          : action === "reset"
+            ? "Resetting to remote..."
+            : "Pulling latest...";
     setActions((current) => ({
       ...current,
       [change.localPath]: { state: "working", message: workingMessage, action },
@@ -3096,7 +3421,13 @@ function FileChangeList({
 
     try {
       const command =
-        action === "diff" ? "diff_notion_file" : action === "push" ? "push_notion_file" : "pull_notion_file";
+        action === "diff"
+          ? "diff_notion_file"
+          : action === "push"
+            ? "push_notion_file"
+            : action === "reset"
+              ? "reset_notion_file_to_remote"
+              : "pull_notion_file";
       const args =
         action === "push"
           ? { path, confirmDangerous }
@@ -3112,7 +3443,7 @@ function FileChangeList({
           action,
         },
       }));
-      if (report.ok && action === "resolve" && selectedPath === change.localPath) {
+      if (report.ok && (action === "resolve" || action === "reset") && selectedPath === change.localPath) {
         await loadFileDetails(change);
       }
       if (report.ok && action !== "diff") {
@@ -3144,7 +3475,7 @@ function FileChangeList({
       [change.localPath]: {
         state: "working",
         message: enabled ? "Turning on Live Mode..." : "Turning off Live Mode...",
-        action: "autosave",
+        action: "live_mode",
       },
     }));
 
@@ -3157,7 +3488,7 @@ function FileChangeList({
         [change.localPath]: {
           state: report.ok ? "success" : "error",
           message: report.message,
-          action: "autosave",
+          action: "live_mode",
         },
       }));
       if (!report.ok) {
@@ -3174,7 +3505,7 @@ function FileChangeList({
       }));
       setActions((current) => ({
         ...current,
-        [change.localPath]: { state: "error", message: errorMessage(error), action: "autosave" },
+        [change.localPath]: { state: "error", message: errorMessage(error), action: "live_mode" },
       }));
     }
   }
@@ -3264,6 +3595,12 @@ function FileChangeList({
                   disabled={isWorking}
                   icon={<RefreshCw />}
                   onClick={() => void runFileAction(change, "resolve")}
+                />
+                <IconButton
+                  label="Reset to remote"
+                  disabled={isWorking}
+                  icon={<RotateCcw />}
+                  onClick={() => void runFileAction(change, "reset")}
                 />
                 <IconButton
                   label="Open file"
@@ -3904,7 +4241,7 @@ function BrandTile({
       {variant === "folder" && <FolderOpen />}
       {variant === "progress" && <Loader2 />}
       {variant === "ready" && <Check />}
-      {!variant && children}
+      {!variant && (children ? <span className="brand-word">{children}</span> : <ApertureIcon />)}
       {variant === "notion" && children}
     </div>
   );
@@ -4115,7 +4452,7 @@ function PathRow({ path }: { path: string }) {
   );
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
+function Metric({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <article className="metric">
       <strong>{value}</strong>

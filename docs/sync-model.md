@@ -134,6 +134,22 @@ A `SyncJob` is bounded daemon work:
 Jobs carry priority, freshness tier, reason, estimated cost, next eligible time,
 connector rate-limit bucket, and a dedupe key.
 
+### Diff Discovery Hints
+
+Some remote diffs reveal tree structure before the tree has been explicitly
+enumerated. A Live Mode `remote_fast_forward` hydration can show that a parent
+page gained or lost rendered `child_page` links, which usually means a remote
+child page was created, moved, archived, or restored.
+
+Locality treats these as discovery hints, not as a separate scan path. After the
+parent hydration succeeds, the daemon compares the old and new Synced Tree
+shadows. If the child-page link set changed, it queues a background refresh for
+the parent `children:<page_id>` container through the existing child-refresh
+queue. The hint never blocks the original hydration, never bypasses connector
+rate limits, and never eagerly hydrates the new child page body. The parent
+Live Mode fast-forward itself can still run at interactive priority when it is
+the active page; only the follow-up discovery work is background priority.
+
 ## Invariant
 
 ```text

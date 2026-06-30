@@ -9,6 +9,8 @@ use std::os::unix::net::UnixStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use locality_store::ProjectionMode;
+
 pub const DEFAULT_TCP_ADDR: &str = "127.0.0.1:38567";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +18,7 @@ pub const DEFAULT_TCP_ADDR: &str = "127.0.0.1:38567";
 pub enum DaemonRequest {
     Ping,
     Status,
+    DebugQueueStatus,
     ReloadMounts,
     Shutdown,
     Pull {
@@ -31,6 +34,15 @@ pub enum DaemonRequest {
         remote_id: String,
         path: PathBuf,
     },
+    ObserveEntity {
+        mount_id: String,
+        remote_id: String,
+    },
+    RemoteFastForward {
+        mount_id: String,
+        remote_id: String,
+        path: PathBuf,
+    },
     VirtualFsItem {
         mount_id: String,
         identifier: String,
@@ -38,6 +50,10 @@ pub enum DaemonRequest {
     VirtualFsChildren {
         mount_id: String,
         container_identifier: String,
+    },
+    VirtualProjectionRootChildren {
+        projection_root: PathBuf,
+        projection: ProjectionMode,
     },
     VirtualFsMaterialize {
         mount_id: String,
@@ -130,6 +146,45 @@ pub struct DaemonRuntimeStatus {
     pub scheduler_mode: String,
     pub active_interval_ms: u64,
     pub cold_interval_ms: u64,
+}
+
+/// Debug-only queue snapshot for the desktop Activity debug tab.
+///
+/// This is intentionally a read-only diagnostics surface, not a public API for
+/// scheduling policy. Keep it easy to delete when the network policy stabilizes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDebugQueueStatus {
+    pub generated_at_unix_ms: u64,
+    pub active: Vec<DaemonActiveJobStatus>,
+    pub sections: Vec<DaemonDebugQueueSection>,
+    pub scheduler_mode: String,
+    pub active_interval_ms: u64,
+    pub cold_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDebugQueueSection {
+    pub name: String,
+    pub label: String,
+    pub total: usize,
+    pub ready: Option<usize>,
+    pub deferred: Option<usize>,
+    pub items: Vec<DaemonDebugQueueItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDebugQueueItem {
+    pub kind: String,
+    pub target: Option<String>,
+    pub mount_id: Option<String>,
+    pub remote_id: Option<String>,
+    pub path: Option<String>,
+    pub reason: Option<String>,
+    pub priority: Option<String>,
+    pub next_eligible_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,10 +560,12 @@ mod tests {
     #[cfg(unix)]
     use super::DaemonClientError;
     use super::{DaemonEndpoint, DaemonRequest, DaemonResponse, DaemonTransport};
+    use locality_store::ProjectionMode;
     #[cfg(unix)]
     use std::io::{BufRead, BufReader};
     #[cfg(unix)]
     use std::net::TcpListener;
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::sync::Mutex;
     use std::time::Duration;
@@ -528,6 +585,22 @@ mod tests {
             DaemonRequest::VirtualFsItem {
                 mount_id: "notion-main".to_string(),
                 identifier: "page-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn virtual_projection_root_children_command_decodes() {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_projection_root_children","projection_root":"/home/example/Locality","projection":"linux_fuse"}"#,
+        )
+        .expect("decode shared projection root children request");
+
+        assert_eq!(
+            request,
+            DaemonRequest::VirtualProjectionRootChildren {
+                projection_root: PathBuf::from("/home/example/Locality"),
+                projection: ProjectionMode::LinuxFuse,
             }
         );
     }
@@ -561,6 +634,34 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 identifier: "page-1".to_string(),
                 contents_base64: "SGVsbG8=".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn remote_queue_commands_decode() {
+        let observe: DaemonRequest = serde_json::from_str(
+            r#"{"command":"observe_entity","mount_id":"notion-main","remote_id":"page-1"}"#,
+        )
+        .expect("decode observe request");
+        let fast_forward: DaemonRequest = serde_json::from_str(
+            r#"{"command":"remote_fast_forward","mount_id":"notion-main","remote_id":"page-1","path":"Roadmap/page.md"}"#,
+        )
+        .expect("decode remote fast-forward request");
+
+        assert_eq!(
+            observe,
+            DaemonRequest::ObserveEntity {
+                mount_id: "notion-main".to_string(),
+                remote_id: "page-1".to_string(),
+            }
+        );
+        assert_eq!(
+            fast_forward,
+            DaemonRequest::RemoteFastForward {
+                mount_id: "notion-main".to_string(),
+                remote_id: "page-1".to_string(),
+                path: "Roadmap/page.md".into(),
             }
         );
     }
