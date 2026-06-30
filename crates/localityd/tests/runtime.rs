@@ -29,7 +29,6 @@ use localityd::runtime::{
     workspace_virtual_freshness_jobs,
 };
 use localityd::scheduler::PullSchedulerTick;
-#[cfg(target_os = "macos")]
 use localityd::virtual_fs::virtual_fs_content_root;
 use localityd::virtual_fs::{ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport};
 use localityd::watcher::{FileEvent, FileEventKind};
