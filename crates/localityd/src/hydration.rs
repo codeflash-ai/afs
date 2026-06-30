@@ -133,7 +133,7 @@ where
             .to_path_buf();
         let path = request_path(&mount, &request.path);
         let can_replace = self.can_replace_file(&mount, &entity, &path)?;
-        if !can_replace && request.reason == HydrationReason::RemoteFastForward {
+        if !can_replace && request.reason.is_remote_fast_forward() {
             self.mark_dirty_if_allowed(entity)?;
             return Ok(HydrationOutcome::SkippedDirty);
         }
@@ -537,9 +537,10 @@ pub enum HydrationPriority {
 
 pub fn hydration_priority(reason: &HydrationReason) -> HydrationPriority {
     match reason {
-        HydrationReason::ExplicitPull | HydrationReason::FileOpen | HydrationReason::StubRead => {
-            HydrationPriority::High
-        }
+        HydrationReason::ExplicitPull
+        | HydrationReason::FileOpen
+        | HydrationReason::LiveModeRemoteFastForward
+        | HydrationReason::StubRead => HydrationPriority::High,
         HydrationReason::Policy | HydrationReason::RemoteFastForward => HydrationPriority::Normal,
         HydrationReason::Prefetch => HydrationPriority::Low,
     }

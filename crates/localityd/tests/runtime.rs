@@ -1617,6 +1617,84 @@ fn runtime_queues_remote_fast_forward_from_freshness_report() {
     runtime.shutdown();
 }
 
+#[test]
+fn runtime_remote_fast_forward_request_uses_daemon_hydration_queue() {
+    let config = relay_config("remote-fast-forward-request");
+    let mount_root = temp_root("remote-fast-forward-request-mount");
+    seed_clean_remote_changed_page(&config.state_root, &mount_root);
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        AutoFastForwardRunner {
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap.md"),
+    });
+
+    assert!(
+        response.ok,
+        "remote fast-forward request failed: {response:?}"
+    );
+    let request = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("remote fast-forward hydration drained");
+    assert_eq!(request.mount_id, MountId::new("notion-main"));
+    assert_eq!(request.remote_id, RemoteId::new("page-1"));
+    assert_eq!(request.reason, HydrationReason::LiveModeRemoteFastForward);
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_queues_child_refresh_when_remote_fast_forward_discovers_child_link_diff() {
+    let config = relay_config("remote-fast-forward-discovery");
+    let mount_root = temp_root("remote-fast-forward-discovery-mount");
+    seed_clean_page_with_child_links(
+        &config.state_root,
+        &mount_root,
+        ProjectionMode::LinuxFuse,
+        ["child-a"],
+    );
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        DiscoveryHintRunner {
+            hydrated: hydrated_tx,
+            refresh_tx,
+            next_child_ids: vec!["child-a".to_string(), "child-b".to_string()],
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap/page.md"),
+    });
+
+    assert!(
+        response.ok,
+        "remote fast-forward request failed: {response:?}"
+    );
+    let request = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("remote fast-forward hydration drained");
+    assert_eq!(request.reason, HydrationReason::LiveModeRemoteFastForward);
+    assert_eq!(
+        refresh_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("child refresh queued from discovery hint"),
+        ("notion-main".to_string(), "children:page-1".to_string())
+    );
+    runtime.shutdown();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn runtime_refreshes_macos_visible_replica_after_remote_fast_forward() {
@@ -2541,6 +2619,12 @@ struct AutoFastForwardRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
 }
 
+struct DiscoveryHintRunner {
+    hydrated: mpsc::Sender<HydrationRequest>,
+    refresh_tx: mpsc::Sender<(String, String)>,
+    next_child_ids: Vec<String>,
+}
+
 #[cfg(target_os = "macos")]
 struct MacosProjectionFastForwardRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
@@ -3024,6 +3108,62 @@ impl RuntimeJobRunner for AutoFastForwardRunner {
     }
 }
 
+impl RuntimeJobRunner for DiscoveryHintRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        state_root: PathBuf,
+        request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        let mut store = SqliteStateStore::open(state_root).map_err(LocalityError::from)?;
+        let shadow = child_link_shadow("page-1", self.next_child_ids.iter().map(String::as_str));
+        store
+            .save_shadow(&request.mount_id, shadow.clone())
+            .map_err(LocalityError::from)?;
+        let mut entity = store
+            .get_entity(&request.mount_id, &request.remote_id)
+            .map_err(LocalityError::from)?
+            .expect("entity");
+        entity.hydration = HydrationState::Hydrated;
+        entity.content_hash = Some(shadow.body_hash);
+        entity.remote_edited_at = Some("remote-v2".to_string());
+        store.save_entity(entity).map_err(LocalityError::from)?;
+
+        self.hydrated.send(request).expect("notify hydrated");
+        Ok(HydrationOutcome::Hydrated)
+    }
+
+    fn run_virtual_fs_refresh_children(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> locality_core::LocalityResult<usize> {
+        self.refresh_tx
+            .send((mount_id, container_identifier))
+            .expect("send child refresh");
+        Ok(0)
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl RuntimeJobRunner for MacosProjectionFastForwardRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
@@ -3377,6 +3517,95 @@ fn seed_clean_remote_changed_page(state_root: &Path, mount_root: &Path) {
         render_canonical_markdown(&document),
     )
     .expect("write clean page");
+}
+
+fn seed_clean_page_with_child_links<const N: usize>(
+    state_root: &Path,
+    mount_root: &Path,
+    projection: ProjectionMode,
+    child_ids: [&str; N],
+) {
+    let mount_id = MountId::new("notion-main");
+    let remote_id = RemoteId::new("page-1");
+    let shadow = child_link_shadow("page-1", child_ids);
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(mount_id.clone(), "notion", mount_root.to_path_buf())
+                .projection(projection),
+        )
+        .expect("save mount");
+    store
+        .save_shadow(&mount_id, shadow.clone())
+        .expect("save shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_content_hash(shadow.body_hash)
+            .with_remote_edited_at("remote-v1"),
+        )
+        .expect("save entity");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(mount_id.clone(), remote_id.clone(), FreshnessTier::Hot)
+                .remote_hint_pending(true),
+        )
+        .expect("save freshness");
+    let content_path = virtual_fs_content_root(state_root, &mount_id).join("Roadmap/page.md");
+    std::fs::create_dir_all(content_path.parent().expect("content parent"))
+        .expect("create content parent");
+    std::fs::write(
+        content_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            shadow.frontmatter.clone(),
+            shadow.rendered_body.clone(),
+        )),
+    )
+    .expect("write clean virtual page");
+}
+
+fn child_link_shadow<'a>(
+    entity_id: &str,
+    child_ids: impl IntoIterator<Item = &'a str>,
+) -> ShadowDocument {
+    let mut body = "# Roadmap\n".to_string();
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new(entity_id),
+        "# Roadmap\n",
+        1,
+        [RemoteId::new("heading-1")],
+    )
+    .expect("base shadow")
+    .with_frontmatter(frontmatter());
+    shadow.blocks[0].native_kind = Some("heading_1".to_string());
+
+    for (index, child_id) in child_ids.into_iter().enumerate() {
+        let text = format!("[Child {index}](https://www.notion.so/{child_id})");
+        body.push_str("\n");
+        body.push_str(&text);
+        body.push('\n');
+        shadow.blocks.push(locality_core::shadow::ShadowBlock {
+            remote_id: RemoteId::new(child_id),
+            kind: locality_core::shadow::MarkdownBlockKind::Paragraph,
+            source_span: locality_core::model::SourceSpan {
+                start_line: 3 + index * 2,
+                end_line: 3 + index * 2,
+            },
+            content_hash: format!("child-{child_id}"),
+            text,
+            native_kind: Some("child_page".to_string()),
+        });
+    }
+    shadow.rendered_body = body;
+    shadow.body_hash = format!("child-link-count-{}", shadow.blocks.len());
+    shadow
 }
 
 #[cfg(target_os = "macos")]

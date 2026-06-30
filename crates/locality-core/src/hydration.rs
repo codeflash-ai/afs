@@ -61,8 +61,18 @@ pub enum HydrationReason {
     FileOpen,
     Policy,
     RemoteFastForward,
+    LiveModeRemoteFastForward,
     StubRead,
     Prefetch,
+}
+
+impl HydrationReason {
+    pub fn is_remote_fast_forward(&self) -> bool {
+        matches!(
+            self,
+            Self::RemoteFastForward | Self::LiveModeRemoteFastForward
+        )
+    }
 }
 
 pub fn should_eager_hydrate(workspace_page_count: u32, policy: &HydrationPolicy) -> bool {

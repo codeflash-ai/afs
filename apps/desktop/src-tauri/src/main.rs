@@ -79,7 +79,7 @@ use locality_store::{
 };
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
-use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
+use localityd::hydration::HydrationSource;
 use localityd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use localityd::media::{document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use localityd::push::execute_auto_save_push_job_with_content_root;
@@ -1151,7 +1151,8 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
                     Err(push_report_message(&push_report))
                 }
             },
-            live_mode_pull_remote_target_if_changed,
+            live_mode_queue_remote_observe,
+            live_mode_queue_remote_fast_forward,
             live_mode_merge_remote_drift_target,
         ),
         Err(message) => ActionReport {
@@ -1161,16 +1162,18 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
     }
 }
 
-fn live_mode_tick_from_snapshot<Sync, Pull, Merge>(
+fn live_mode_tick_from_snapshot<Sync, Check, FastForward, Merge>(
     snapshot: &DesktopSnapshot,
     remote_pull_target: Option<&LiveModeRemoteTarget>,
     mut sync_target: Sync,
-    mut pull_remote_target: Pull,
+    mut check_remote_target: Check,
+    mut fast_forward_remote_target: FastForward,
     mut merge_remote_drift: Merge,
 ) -> ActionReport
 where
     Sync: FnMut(&PendingChange, &Path) -> Result<(), String>,
-    Pull: FnMut(&LiveModeRemoteTarget) -> Result<bool, String>,
+    Check: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
+    FastForward: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
     Merge: FnMut(&PendingChange, &Path) -> Result<bool, String>,
 {
     if !live_mode_has_mounted_folder(snapshot) {
@@ -1182,17 +1185,11 @@ where
 
     let Some(change) = snapshot.pending_changes.first() else {
         if let Some(target) = remote_pull_target {
-            match pull_remote_target(target) {
-                Ok(true) => {
+            match check_remote_target(target) {
+                Ok(()) => {
                     return ActionReport {
                         ok: true,
-                        message: "Live Mode pulled 1 remote change.".to_string(),
-                    };
-                }
-                Ok(false) => {
-                    return ActionReport {
-                        ok: true,
-                        message: "Live Mode checked 1 page for remote changes.".to_string(),
+                        message: "Live Mode queued 1 remote check.".to_string(),
                     };
                 }
                 Err(message) => return ActionReport { ok: false, message },
@@ -1216,17 +1213,11 @@ where
                 Ok(target) => target,
                 Err(message) => return ActionReport { ok: false, message },
             };
-            match pull_remote_target(&target) {
-                Ok(true) => {
+            match fast_forward_remote_target(&target) {
+                Ok(()) => {
                     return ActionReport {
                         ok: true,
-                        message: "Live Mode pulled 1 remote change.".to_string(),
-                    };
-                }
-                Ok(false) => {
-                    return ActionReport {
-                        ok: true,
-                        message: "Live Mode checked 1 page for remote changes.".to_string(),
+                        message: "Live Mode queued 1 remote update.".to_string(),
                     };
                 }
                 Err(message) => return ActionReport { ok: false, message },
@@ -1445,12 +1436,23 @@ fn record_mount_live_mode_tick_result(
         .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()));
     let record = if report.ok {
         record.active(non_empty_string(report.message.clone()), now.clone(), now)
-    } else {
+    } else if live_mode_failure_should_pause(&report.message) {
         record.error(report.message.clone(), now.clone(), now)
+    } else {
+        record.active(non_empty_string(report.message.clone()), now.clone(), now)
     };
     store
         .save_mount_live_mode(record)
         .map_err(|error| format!("Live Mode could not update its state: {error}"))
+}
+
+fn live_mode_failure_should_pause(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.starts_with("Live Mode paused for")
+        || message.contains("Review required before pushing")
+        || lower.contains("conflict")
+        || lower.contains("changed since last sync")
+        || lower.contains("could not identify the remote page")
 }
 
 fn live_mode_timestamp() -> String {
@@ -1582,89 +1584,38 @@ fn live_mode_should_reconcile_local_target_for_key(
     true
 }
 
-fn live_mode_pull_remote_target_if_changed(target: &LiveModeRemoteTarget) -> Result<bool, String> {
-    let state_root = default_state_root();
-    let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
-    let entity = store
-        .get_entity(&target.mount_id, &target.remote_id)
-        .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
-        .ok_or_else(|| {
-            format!(
-                "Live Mode could not find `{}` in the mounted folder.",
-                target.remote_id.0
-            )
-        })?;
-    let previous_shadow = live_mode_load_shadow(&store, target)?;
+fn live_mode_queue_remote_observe(target: &LiveModeRemoteTarget) -> Result<(), String> {
+    live_mode_send_daemon_queue_request(DaemonRequest::ObserveEntity {
+        mount_id: target.mount_id.0.clone(),
+        remote_id: target.remote_id.0.clone(),
+    })
+}
 
-    let credentials = open_credential_store(&state_root);
-    let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &target.mount_id)
-        .map_err(|error| error.message())?;
-    let render_request = HydrationRequest::new(
-        target.mount_id.clone(),
-        target.remote_id.clone(),
-        entity.path.clone(),
-        HydrationState::Hydrated,
-        HydrationReason::RemoteFastForward,
-    );
-    let rendered = connector
-        .fetch_render(&render_request)
-        .map_err(|error| format!("Live Mode could not inspect Notion changes: {error}"))?;
+fn live_mode_queue_remote_fast_forward(target: &LiveModeRemoteTarget) -> Result<(), String> {
+    live_mode_send_daemon_queue_request(DaemonRequest::RemoteFastForward {
+        mount_id: target.mount_id.0.clone(),
+        remote_id: target.remote_id.0.clone(),
+        path: target.path.clone(),
+    })
+}
 
-    let remote_changed = previous_shadow
-        .as_ref()
-        .is_none_or(|shadow| shadow != &rendered.shadow)
-        || live_mode_content_hash_changed(
-            entity.content_hash.as_deref(),
-            Some(rendered.shadow.body_hash.as_str()),
-        );
-    if !remote_changed {
-        clear_live_mode_remote_hint(&mut store, &target.mount_id, &target.remote_id)?;
-        return Ok(false);
+fn live_mode_send_daemon_queue_request(request: DaemonRequest) -> Result<(), String> {
+    match send_request(&default_state_root(), &request) {
+        Ok(response) if response.ok => Ok(()),
+        Ok(response) => {
+            let message = response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "daemon rejected the Live Mode request".to_string());
+            Err(format!(
+                "Live Mode could not queue remote sync work: {message}"
+            ))
+        }
+        Err(error) => Err(format!(
+            "Live Mode could not reach the Locality daemon to queue remote sync work: {}",
+            error.message()
+        )),
     }
-
-    live_mode_reconcile_local_target_with_store(&mut store, &state_root, target)?;
-    let entity = store
-        .get_entity(&target.mount_id, &target.remote_id)
-        .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
-        .ok_or_else(|| {
-            format!(
-                "Live Mode could not find `{}` in the mounted folder.",
-                target.remote_id.0
-            )
-        })?;
-    let previous_shadow = live_mode_load_shadow(&store, target)?;
-    let content_path = virtual_fs_content_path(&state_root, &target.mount_id, &entity.path)
-        .map_err(|error| format!("Live Mode could not resolve local content cache: {error}"))?;
-    let output_root = virtual_fs_content_root(&state_root, &target.mount_id);
-    let request = HydrationRequest::new(
-        target.mount_id.clone(),
-        target.remote_id.clone(),
-        content_path,
-        HydrationState::Hydrated,
-        HydrationReason::RemoteFastForward,
-    );
-    let outcome = HydrationExecutor::new_with_output_root(&mut store, &connector, output_root)
-        .hydrate_request(request)
-        .map_err(|error| format!("Live Mode could not pull Notion changes: {error}"))?;
-    if outcome == HydrationOutcome::SkippedDirty {
-        return Ok(false);
-    }
-
-    if let Some(previous_shadow) = previous_shadow.as_ref() {
-        daemon_file_provider::refresh_macos_file_provider_entity_projection_if_clean(
-            &store,
-            &state_root,
-            &target.mount_id,
-            &target.remote_id,
-            previous_shadow,
-        )
-        .map_err(|error| {
-            format!("Live Mode could not refresh the visible File Provider file: {error}")
-        })?;
-    }
-
-    Ok(true)
 }
 
 fn live_mode_merge_remote_drift_target(
@@ -1865,27 +1816,6 @@ fn clear_live_mode_remote_hint(
     store
         .save_freshness_state(freshness)
         .map_err(|error| format!("Live Mode could not update freshness metadata: {error}"))
-}
-
-fn live_mode_load_shadow(
-    store: &SqliteStateStore,
-    target: &LiveModeRemoteTarget,
-) -> Result<Option<locality_core::shadow::ShadowDocument>, String> {
-    match store.load_shadow(&target.mount_id, &target.remote_id) {
-        Ok(shadow) => Ok(Some(shadow)),
-        Err(locality_store::StoreError::ShadowMissing { .. }) => Ok(None),
-        Err(error) => Err(format!(
-            "Live Mode could not inspect the current page shadow: {error}"
-        )),
-    }
-}
-
-fn live_mode_content_hash_changed(before: Option<&str>, after: Option<&str>) -> bool {
-    match (before, after) {
-        (Some(before), Some(after)) => before != after,
-        (None, None) => false,
-        _ => true,
-    }
 }
 
 #[tauri::command]
@@ -2387,6 +2317,20 @@ impl MountLiveModeSummary {
                 ..Self::off()
             };
         };
+        if !record.enabled
+            && record.state == MountLiveModeState::Error
+            && !record
+                .last_reason
+                .as_deref()
+                .is_some_and(live_mode_failure_should_pause)
+        {
+            return Self {
+                pending_count,
+                review_count,
+                covered_count,
+                ..Self::off()
+            };
+        }
         let state = mount_live_mode_state_label(record);
 
         Self {
@@ -7790,13 +7734,14 @@ mod tests {
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
         InMemoryStateStore, JournalRepository, LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig,
-        MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+        MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
+        ProjectionMode, ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
+        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
         MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
         clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
         connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
@@ -7804,17 +7749,17 @@ mod tests {
         has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
         install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
         is_notion_access_lost_message, is_unsupported_schema_version_message,
-        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
-        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
-        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
-        live_mode_merge_remote_drift_markdown, live_mode_remote_pull_candidates,
-        live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
-        live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
-        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
-        parse_daemon_build_info_json, pending_changes_from_status,
-        prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
-        pull_error_message, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, refresh_visible_target_from_cache,
+        live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
+        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
+        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_merge_remote_drift_markdown,
+        live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
+        live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
+        live_mode_wake_generation, load_desktop_activity, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
+        pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        record_mount_live_mode_tick_result, refresh_visible_target_from_cache,
         reset_to_remote_message, sample_live_mode_status, sample_snapshot,
         screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
@@ -8096,7 +8041,8 @@ mod tests {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
         let mut sync_calls = 0usize;
-        let mut pull_calls = 0usize;
+        let mut check_calls = 0usize;
+        let mut fast_forward_calls = 0usize;
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
@@ -8106,8 +8052,12 @@ mod tests {
                 Ok(())
             },
             |_| {
-                pull_calls += 1;
-                Ok(false)
+                check_calls += 1;
+                Ok(())
+            },
+            |_| {
+                fast_forward_calls += 1;
+                Ok(())
             },
             |_, _| panic!("no pending changes should not merge remote drift"),
         );
@@ -8115,16 +8065,17 @@ mod tests {
         assert!(report.ok);
         assert_eq!(report.message, "Live Mode checked for changes.");
         assert_eq!(sync_calls, 0);
-        assert_eq!(pull_calls, 0);
+        assert_eq!(check_calls, 0);
+        assert_eq!(fast_forward_calls, 0);
     }
 
     #[test]
-    fn live_mode_tick_pulls_remote_candidate_without_pending_changes() {
+    fn live_mode_tick_queues_remote_candidate_without_pending_changes() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
         let target = live_mode_target("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
         let mut sync_calls = 0usize;
-        let mut pulled = Vec::new();
+        let mut checked = Vec::new();
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
@@ -8134,23 +8085,21 @@ mod tests {
                 Ok(())
             },
             |target| {
-                pulled.push(target.path.clone());
-                Ok(false)
+                checked.push(target.path.clone());
+                Ok(())
             },
+            |_| panic!("remote check should not queue a fast-forward"),
             |_, _| panic!("remote-only tick should not merge local drift"),
         );
 
         assert!(report.ok);
-        assert_eq!(
-            report.message,
-            "Live Mode checked 1 page for remote changes."
-        );
+        assert_eq!(report.message, "Live Mode queued 1 remote check.");
         assert_eq!(sync_calls, 0);
-        assert_eq!(pulled, vec![target.path]);
+        assert_eq!(checked, vec![target.path]);
     }
 
     #[test]
-    fn live_mode_tick_reports_remote_pull_when_file_changed() {
+    fn live_mode_tick_reports_remote_queue_failure() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
         let target = live_mode_target("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
@@ -8159,16 +8108,17 @@ mod tests {
             &snapshot,
             Some(&target),
             |_, _| panic!("remote pull should not sync local changes"),
-            |_| Ok(true),
+            |_| Err("daemon unreachable".to_string()),
+            |_| panic!("remote check failure should not queue a fast-forward"),
             |_, _| panic!("remote-only tick should not merge local drift"),
         );
 
-        assert!(report.ok);
-        assert_eq!(report.message, "Live Mode pulled 1 remote change.");
+        assert!(!report.ok);
+        assert_eq!(report.message, "daemon unreachable");
     }
 
     #[test]
-    fn live_mode_tick_pulls_remote_only_pending_change_instead_of_pausing() {
+    fn live_mode_tick_queues_remote_only_pending_change_instead_of_pausing() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes = vec![PendingChange {
             mount_id: "notion-main".to_string(),
@@ -8188,27 +8138,20 @@ mod tests {
                 "/tmp/Locality/notion/another-page/page.md",
             )),
             |_, _| panic!("remote-only change should not run a local push"),
+            |_| panic!("remote-only pending change should not use the generic check cursor"),
             |target| {
                 pulled.push(target.clone());
-                Ok(true)
+                Ok(())
             },
             |_, _| panic!("remote-only change should not merge local drift"),
         );
 
         assert!(report.ok);
-        assert_eq!(report.message, "Live Mode pulled 1 remote change.");
+        assert_eq!(report.message, "Live Mode queued 1 remote update.");
         assert_eq!(pulled.len(), 1);
         assert_eq!(pulled[0].mount_id, MountId::new("notion-main"));
         assert_eq!(pulled[0].remote_id, RemoteId::new("remote-page"));
         assert!(pulled[0].path.ends_with("Teamspace/Remote Page/page.md"));
-    }
-
-    #[test]
-    fn live_mode_content_hash_changed_detects_remote_body_change() {
-        assert!(live_mode_content_hash_changed(Some("old"), Some("new")));
-        assert!(!live_mode_content_hash_changed(Some("same"), Some("same")));
-        assert!(live_mode_content_hash_changed(None, Some("hydrated")));
-        assert!(!live_mode_content_hash_changed(None, None));
     }
 
     #[test]
@@ -8355,6 +8298,7 @@ mod tests {
                 Ok(())
             },
             |_| panic!("pending changes should take the live mode tick"),
+            |_| panic!("pending changes should not queue a remote fast-forward"),
             |_, _| panic!("safe pending changes should not merge remote drift"),
         );
 
@@ -8389,6 +8333,7 @@ mod tests {
                 Ok(())
             },
             |_| panic!("mergeable local+remote drift should not block on remote pull cursor"),
+            |_| panic!("mergeable local+remote drift should not queue remote fast-forward"),
             |change, target| {
                 merged.push((change.title.clone(), target.to_path_buf()));
                 Ok(true)
@@ -8430,6 +8375,7 @@ mod tests {
                 Ok(())
             },
             |_| panic!("review-required changes should pause before remote pulls"),
+            |_| panic!("review-required changes should not queue remote fast-forward"),
             |_, _| panic!("large review-required changes should not merge remote drift"),
         );
 
@@ -8437,6 +8383,99 @@ mod tests {
         assert!(report.message.contains("Launch Plan"));
         assert!(report.message.contains("needs review"));
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn live_mode_summary_hides_stale_disabled_error_without_pending_changes() {
+        let record = MountLiveModeRecord::new(MountId::new("notion-main"), true, "1").error(
+            "Live Mode could not inspect Notion changes: network unavailable",
+            "2",
+            "2",
+        );
+
+        let summary = super::MountLiveModeSummary::from_record(Some(&record), &[]);
+
+        assert!(!summary.enabled);
+        assert_eq!(summary.state, "off");
+        assert_eq!(summary.label, "Live Mode off");
+        assert_eq!(summary.reason, None);
+    }
+
+    #[test]
+    fn live_mode_transient_failures_remain_enabled_for_retry() {
+        let temp = TestTempDir::new("live-mode-transient-failure");
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp.path().join("notion"),
+            ))
+            .expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1"))
+            .expect("save live mode");
+        drop(store);
+
+        record_mount_live_mode_tick_result(
+            temp.path(),
+            &mount_id,
+            &ActionReport {
+                ok: false,
+                message: "Live Mode could not inspect Notion changes: network unavailable"
+                    .to_string(),
+            },
+        )
+        .expect("record transient result");
+
+        let store = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Active);
+        assert_eq!(
+            record.last_reason.as_deref(),
+            Some("Live Mode could not inspect Notion changes: network unavailable")
+        );
+    }
+
+    #[test]
+    fn live_mode_review_failures_pause_until_user_action() {
+        let temp = TestTempDir::new("live-mode-review-failure");
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp.path().join("notion"),
+            ))
+            .expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1"))
+            .expect("save live mode");
+        drop(store);
+
+        record_mount_live_mode_tick_result(
+            temp.path(),
+            &mount_id,
+            &ActionReport {
+                ok: false,
+                message: "Live Mode paused for `Roadmap`: needs review.".to_string(),
+            },
+        )
+        .expect("record review result");
+
+        let store = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(!record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Error);
     }
 
     #[test]
