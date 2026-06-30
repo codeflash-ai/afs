@@ -3375,7 +3375,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use locality_core::canonical::render_canonical_markdown;
@@ -3537,7 +3537,7 @@ mod tests {
         let report: crate::virtual_fs::VirtualFsMaterializeReport =
             serde_json::from_value(payload).expect("decode report");
         assert_eq!(report.identifier, "guidance:AGENTS.md");
-        assert!(report.path.ends_with(".loc-guidance/AGENTS.md"));
+        assert!(Path::new(&report.path).ends_with(Path::new(".loc-guidance").join("AGENTS.md")));
         let contents = std::fs::read_to_string(&report.path).expect("read guidance");
         assert!(contents.contains("Locality"));
 
@@ -3617,7 +3617,7 @@ mod tests {
         let report: crate::file_provider::FileProviderReadReport =
             serde_json::from_value(payload).expect("decode report");
         assert_eq!(report.identifier, "guidance:AGENTS.md");
-        assert!(report.path.ends_with(".loc-guidance/AGENTS.md"));
+        assert!(Path::new(&report.path).ends_with(Path::new(".loc-guidance").join("AGENTS.md")));
         assert_eq!(report.item.identifier, "guidance:AGENTS.md");
         assert_eq!(report.item.hydration, Some(HydrationState::Hydrated));
         let contents = base64::engine::general_purpose::STANDARD

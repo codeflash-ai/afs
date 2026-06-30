@@ -362,10 +362,13 @@ fn search_absolute_path_uses_mount_point_root() {
     )
     .expect("search");
 
-    assert_eq!(
-        report.results[0].absolute_path,
-        "/tmp/Locality/notion-main/Roadmap/page.md"
-    );
+    let expected = locality_platform::join_logical_path(
+        Path::new("/tmp/Locality/notion-main"),
+        Path::new("Roadmap/page.md"),
+    )
+    .display()
+    .to_string();
+    assert_eq!(report.results[0].absolute_path, expected);
 }
 
 struct SearchFixture {

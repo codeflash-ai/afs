@@ -4285,6 +4285,7 @@ fn macos_file_provider_cloud_storage_roots() -> Vec<PathBuf> {
     dedupe_path_list(roots)
 }
 
+#[cfg(target_os = "macos")]
 fn dedupe_path_list(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut deduped = Vec::new();
     for path in paths {
@@ -4630,6 +4631,7 @@ fn reveal_missing_virtual_mount_path(path: &Path, mount: &MountConfig) -> Result
 
             #[cfg(not(target_os = "macos"))]
             {
+                let _ = path;
                 open_virtual_projection(mount)
             }
         }
@@ -8956,8 +8958,11 @@ mod tests {
         assert!(super::WINDOWS_DESKTOP_ACTIVATION_EVENT.starts_with(r"Local\"));
 
         let wide = super::windows_wide_null("Locality");
-        assert_eq!(wide.last().copied(), Some(0));
-        assert_eq!(&wide[..3], &['A' as u16, 'F' as u16, 'S' as u16]);
+        let expected = "Locality"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        assert_eq!(wide, expected);
     }
 
     #[test]
