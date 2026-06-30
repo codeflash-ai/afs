@@ -3343,6 +3343,7 @@ fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>,
             query: query.to_string(),
             connector: Some("notion".to_string()),
             limit,
+            include_stale_access: false,
         },
         mount_access_root,
     )
