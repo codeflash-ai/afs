@@ -1605,14 +1605,40 @@ function MainShell({
   const selectedMount = selectedMountRow(mountTableRows, selectedMountId);
 
   useEffect(() => {
+    if (view !== "mount" && selectedMountId) {
+      setSelectedMountId(null);
+    }
+  }, [selectedMountId, view]);
+
+  useEffect(() => {
     if (selectedMountId && !selectedMount) {
       setSelectedMountId(null);
     }
   }, [selectedMount, selectedMountId]);
 
+  useEffect(() => {
+    const clearSelectionForMountOpen = (event: Event) => {
+      const nextView = (event as CustomEvent<string>).detail;
+      if (nextView === "mount") {
+        setSelectedMountId(null);
+      }
+    };
+
+    window.addEventListener("loc-open-view", clearSelectionForMountOpen);
+    return () => window.removeEventListener("loc-open-view", clearSelectionForMountOpen);
+  }, []);
+
   function openMountsView() {
     setSelectedMountId(null);
     onViewChange("mount");
+  }
+
+  function openStatusTarget() {
+    if (statusTarget) {
+      onViewChange(statusTarget);
+      return;
+    }
+    openMountsView();
   }
 
   return (
@@ -1662,7 +1688,7 @@ function MainShell({
             <button
               className="status-button"
               title={statusTitle}
-              onClick={() => onViewChange(statusTarget ?? "mount")}
+              onClick={openStatusTarget}
             >
               <StatusPill tone={healthTone(snapshot.health.state)} title={statusTitle}>
                 {sidebarStatusLabel(snapshot)}
@@ -1941,7 +1967,7 @@ function HomeView({
                 Open Folder
               </SecondaryButton>
               <SecondaryButton icon={<ChevronRight />} onClick={onMount}>
-                Mount Detail
+                View Mounts
               </SecondaryButton>
             </div>
           </section>
