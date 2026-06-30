@@ -129,6 +129,36 @@ fn status_hides_stale_disabled_live_mode_error_when_entries_are_clean() {
 }
 
 #[test]
+fn status_treats_materialized_stub_that_matches_shadow_as_clean() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.stub_page(&mut store, "page-1", "Roadmap.md");
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(report.summary.dirty, 0);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::AllSynced
+    );
+}
+
+#[test]
 fn status_keeps_disabled_live_mode_error_when_entries_need_attention() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();

@@ -1255,21 +1255,12 @@ where
         );
     }
 
-    if matches!(
+    let is_stub_entity = matches!(
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub
-    ) {
-        return if contents.contains(CanonicalDocument::STUB_MARKER) {
-            (StatusState::Stub, Vec::new())
-        } else {
-            (
-                StatusState::Dirty,
-                vec![StatusIssue::new(
-                    "stub_content_changed",
-                    "stub file has local content changes",
-                )],
-            )
-        };
+    );
+    if is_stub_entity && contents.contains(CanonicalDocument::STUB_MARKER) {
+        return (StatusState::Stub, Vec::new());
     }
 
     let parsed = match parse_canonical_markdown(contents) {
@@ -1300,6 +1291,15 @@ where
 
     let shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
         Ok(shadow) => shadow,
+        Err(StoreError::ShadowMissing { .. }) if is_stub_entity => {
+            return (
+                StatusState::Dirty,
+                vec![StatusIssue::new(
+                    "stub_content_changed",
+                    "stub file has local content changes",
+                )],
+            );
+        }
         Err(StoreError::ShadowMissing { .. }) => {
             return (
                 StatusState::Error,
