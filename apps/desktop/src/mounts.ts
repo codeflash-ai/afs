@@ -62,7 +62,10 @@ export function mountRows(
   }));
 }
 
-export function selectedMountRow(rows: MountRow[], selectedMountId: string | null): MountRow | null {
+export function selectedMountRow(
+  rows: MountRow[],
+  selectedMountId: string | null | undefined,
+): MountRow | null {
   if (!selectedMountId) {
     return null;
   }
@@ -74,6 +77,9 @@ export function mountAccessLabel(mount: MountSummary): string {
 }
 
 export function mountStatusLabel(mount: MountSummary): string {
+  if (!isReadyStatus(mount.status)) {
+    return titleFromStatus(mount.status);
+  }
   const providerMessage = mount.provider?.message?.trim();
   if (providerMessage) {
     return providerMessage;
@@ -94,7 +100,10 @@ export function mountStatusTone(mount: MountSummary): "ready" | "warn" | "danger
     return "danger";
   }
   if (
+    mount.provider?.registered === false ||
+    providerState.includes("unregistered") ||
     providerState.includes("stale") ||
+    status.includes("unregistered") ||
     status.includes("preparing") ||
     status.includes("pending") ||
     status.includes("review") ||
@@ -103,6 +112,10 @@ export function mountStatusTone(mount: MountSummary): "ready" | "warn" | "danger
     return "warn";
   }
   return "ready";
+}
+
+function isReadyStatus(status: string): boolean {
+  return status.trim().toLowerCase() === "ready";
 }
 
 function isRealMount(mount: MountSummary): boolean {

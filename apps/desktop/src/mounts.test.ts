@@ -3,6 +3,7 @@ import {
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
+  mountStatusTone,
   selectedMountRow,
   type MountSummary,
 } from "./mounts";
@@ -97,6 +98,7 @@ describe("mount display helpers", () => {
     expect(selectedMountRow(rows, "google-docs-main")?.mount).toEqual(google);
     expect(selectedMountRow(rows, "missing")).toBeNull();
     expect(selectedMountRow(rows, null)).toBeNull();
+    expect(selectedMountRow(rows, undefined)).toBeNull();
   });
 
   it("uses mount and provider state for readable labels", () => {
@@ -117,5 +119,58 @@ describe("mount display helpers", () => {
         }),
       ),
     ).toBe("registered=true active=false");
+  });
+
+  it("uses non-ready mount statuses instead of generic provider messages", () => {
+    expect(
+      mountStatusLabel(
+        mount({
+          status: "provider_unregistered",
+          provider: {
+            state: "running",
+            message: "running",
+            daemonRunning: true,
+            registered: false,
+            pid: 123,
+            stalePidFile: false,
+          },
+        }),
+      ),
+    ).toBe("Provider unregistered");
+  });
+
+  it("classifies provider mount statuses by readiness", () => {
+    expect(
+      mountStatusTone(
+        mount({
+          status: "provider_unregistered",
+          provider: {
+            state: "running",
+            message: "running",
+            daemonRunning: true,
+            registered: false,
+            pid: 123,
+            stalePidFile: false,
+          },
+        }),
+      ),
+    ).toBe("warn");
+    expect(
+      mountStatusTone(
+        mount({
+          status: "ready",
+          provider: {
+            state: "running",
+            message: "running",
+            daemonRunning: true,
+            registered: false,
+            pid: 123,
+            stalePidFile: false,
+          },
+        }),
+      ),
+    ).toBe("warn");
+    expect(mountStatusTone(mount({ status: "provider_stopped" }))).toBe("danger");
+    expect(mountStatusTone(mount({ status: "provider_error" }))).toBe("danger");
   });
 });
