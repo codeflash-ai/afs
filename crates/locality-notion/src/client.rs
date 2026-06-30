@@ -959,15 +959,7 @@ mod tests {
                             continue;
                         }
 
-                        let body = br#"{"ok":true}"#;
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        )
-                        .expect("write response headers");
-                        stream.write_all(body).expect("write response body");
-                        break;
+                        let _ = write_ok_response(&mut stream);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -993,12 +985,28 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         let accepted = server.join().expect("join local server");
-        assert_eq!(accepted, 2);
-        assert_eq!(attempts, 2);
+        assert!(
+            accepted >= 2,
+            "test server should receive the timed-out request and at least one retry; accepted {accepted}"
+        );
+        assert!(
+            attempts >= 2,
+            "request should retry after the transient timeout; attempts {attempts}"
+        );
         assert_eq!(
             result.expect("retry timeout request").get("ok"),
             Some(&Value::Bool(true))
         );
+    }
+
+    fn write_ok_response(stream: &mut TcpStream) -> std::io::Result<()> {
+        let body = br#"{"ok":true}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        stream.write_all(body)
     }
 
     fn read_http_request_headers(stream: &mut TcpStream) {

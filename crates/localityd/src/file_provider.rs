@@ -689,7 +689,25 @@ fn refresh_candidate_path(
         return Some(target.to_path_buf());
     }
 
+    if let Some(target_match) = target_match
+        && target_match.relative_path != entity.path
+        && entity.path.starts_with(&target_match.relative_path)
+    {
+        return source_projection_root_for_match(mount, target_match)
+            .map(|root| root.join(&entity.path));
+    }
+
     newest_existing_projection_path(mount, &entity.path)
+}
+
+fn source_projection_root_for_match(
+    mount: &MountConfig,
+    target_match: &MountPathMatch,
+) -> Option<PathBuf> {
+    source_projection_roots(mount)
+        .into_iter()
+        .filter(|root| root.starts_with(&target_match.access_root))
+        .max_by_key(|root| root.components().count())
 }
 
 fn newest_existing_projection_path(mount: &MountConfig, relative_path: &Path) -> Option<PathBuf> {
@@ -791,8 +809,13 @@ fn refresh_projection_candidate_if_clean(
     let Ok(cache_contents) = std::fs::read(&content_path) else {
         return Ok(ProjectionRefreshOutcome::MissingCache);
     };
-    let Ok(projection_contents) = std::fs::read(&projection_path) else {
-        return Ok(ProjectionRefreshOutcome::MissingProjection);
+    let projection_contents = match std::fs::read(&projection_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_binary_atomic(&projection_path, &cache_contents).map_err(LocalityError::from)?;
+            return Ok(ProjectionRefreshOutcome::Refreshed);
+        }
+        Err(_) => return Ok(ProjectionRefreshOutcome::MissingProjection),
     };
 
     if projection_contents == cache_contents {
@@ -1130,13 +1153,14 @@ mod tests {
     use crate::virtual_fs::virtual_projection_root;
     #[cfg(target_os = "macos")]
     use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-    use locality_core::model::MountId;
     #[cfg(target_os = "macos")]
-    use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId};
+    use locality_core::model::CanonicalDocument;
+    use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
     #[cfg(target_os = "macos")]
     use locality_core::shadow::ShadowDocument;
+    use locality_store::EntityRecord;
     #[cfg(target_os = "macos")]
-    use locality_store::{EntityRecord, EntityRepository, ShadowRepository};
+    use locality_store::{EntityRepository, ShadowRepository};
     use locality_store::{InMemoryStateStore, MountRepository, ProjectionMode};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1413,6 +1437,59 @@ mod tests {
             matched.relative_path,
             PathBuf::from("notion/roadmap/page.md")
         );
+    }
+
+    #[test]
+    fn refresh_windows_projection_from_mount_root_writes_under_mount_point_directory() {
+        let root = temp_root("loc-file-provider-windows-root-refresh");
+        let state_root = temp_root("loc-file-provider-windows-root-refresh-state");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let content_path = crate::virtual_fs::virtual_fs_content_root(&state_root, &mount_id)
+            .join("roadmap/page.md");
+        fs::create_dir_all(content_path.parent().expect("content parent")).expect("content parent");
+        fs::write(
+            &content_path,
+            "---\ntitle: Roadmap\n---\nPulled remote body.\n",
+        )
+        .expect("write cache");
+
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &root)
+                    .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id,
+                    remote_id,
+                    EntityKind::Page,
+                    "Roadmap",
+                    "roadmap/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save entity");
+
+        let report = refresh_visible_projection(&store, &state_root, Some(&root), &[])
+            .expect("refresh projection");
+
+        let visible_path = root.join("roadmap/page.md");
+        let obsolete_connector_child_path = root.join("notion/roadmap/page.md");
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refreshed, 1);
+        assert!(
+            fs::read_to_string(visible_path)
+                .expect("read mount point projection")
+                .contains("Pulled remote body.")
+        );
+        assert!(!obsolete_connector_child_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]

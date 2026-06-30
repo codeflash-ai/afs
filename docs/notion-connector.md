@@ -9,6 +9,9 @@ The current implementation is a live-capable read, pull, and narrow write projec
 - `HttpNotionApi` calls the live Notion REST API with a bearer token resolved from an OAuth connection, an explicit PAT connection, or the legacy `NOTION_TOKEN` environment fallback.
 - `search_pages` can enumerate all pages shared with the integration when no root page is configured.
 - root-page enumeration walks child-page and child-database blocks and projects the tree into stable Locality paths.
+- pulling a projected page directory in a virtual/File Provider mount recursively enumerates child-page
+  blocks below that page, hydrates those child pages, and materializes clean visible replicas when
+  the platform projection supports them.
 - child databases retrieve their data sources, write `_schema.yaml`, and enumerate row pages under the database directory.
 - database row stubs carry the row properties in YAML frontmatter before the body is hydrated.
 - `fetch` retrieves page metadata and recursively retrieves paginated block children.
