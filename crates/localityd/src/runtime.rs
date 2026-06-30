@@ -5,7 +5,7 @@
 //! worker threads, so health checks and future control-plane work stay
 //! responsive during network I/O.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -1259,6 +1259,43 @@ impl RuntimeState {
                 })));
                 self.maybe_start_next_job();
             }
+            DaemonRequest::ObserveEntity {
+                mount_id,
+                remote_id,
+            } => {
+                self.queue_freshness(SyncJob::new(
+                    MountId::new(mount_id.clone()),
+                    Some(RemoteId::new(remote_id.clone())),
+                    SyncJobKind::ObserveEntity,
+                    ChangeHintKind::RemoteMaybeChanged,
+                ));
+                let _ = respond_to.send(DaemonResponse::ok(json!({
+                    "queued": true,
+                    "mount_id": mount_id,
+                    "remote_id": remote_id,
+                })));
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::RemoteFastForward {
+                mount_id,
+                remote_id,
+                path,
+            } => {
+                self.queue_hydration(HydrationRequest::new(
+                    MountId::new(mount_id.clone()),
+                    RemoteId::new(remote_id.clone()),
+                    path.clone(),
+                    HydrationState::Hydrated,
+                    HydrationReason::LiveModeRemoteFastForward,
+                ));
+                let _ = respond_to.send(DaemonResponse::ok(json!({
+                    "queued": true,
+                    "mount_id": mount_id,
+                    "remote_id": remote_id,
+                    "path": path,
+                })));
+                self.maybe_start_next_job();
+            }
             DaemonRequest::VirtualFsItem {
                 mount_id,
                 identifier,
@@ -1534,6 +1571,10 @@ impl RuntimeState {
                             &request,
                             previous_shadow.as_ref(),
                         );
+                        self.queue_remote_fast_forward_discovery_hints(
+                            &request,
+                            previous_shadow.as_ref(),
+                        );
                     }
                 }
                 Err(error) => {
@@ -1710,7 +1751,7 @@ impl RuntimeState {
     }
 
     fn queue_hydration(&mut self, request: HydrationRequest) {
-        if request.reason == HydrationReason::RemoteFastForward {
+        if request.reason.is_remote_fast_forward() {
             match self.auto_fast_forward_queue_decision(&request) {
                 Ok(AutoFastForwardQueueDecision::Queue) => {}
                 Ok(AutoFastForwardQueueDecision::Skip) => return,
@@ -1917,7 +1958,7 @@ impl RuntimeState {
         request: &HydrationRequest,
         previous_shadow: Option<&ShadowDocument>,
     ) {
-        if request.reason != HydrationReason::RemoteFastForward {
+        if !request.reason.is_remote_fast_forward() {
             return;
         }
         let Some(previous_shadow) = previous_shadow else {
@@ -1944,6 +1985,66 @@ impl RuntimeState {
                 "localityd failed to refresh visible projection after remote fast-forward for `{}`: {error}",
                 request.path.display()
             );
+        }
+    }
+
+    fn queue_remote_fast_forward_discovery_hints(
+        &mut self,
+        request: &HydrationRequest,
+        previous_shadow: Option<&ShadowDocument>,
+    ) {
+        if !request.reason.is_remote_fast_forward() {
+            return;
+        }
+        let Some(previous_shadow) = previous_shadow else {
+            return;
+        };
+
+        let store = match SqliteStateStore::open(self.config.state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "localityd failed to open state for remote discovery hints after fast-forward: {error}"
+                );
+                return;
+            }
+        };
+        let mount = match store.get_mount(&request.mount_id) {
+            Ok(Some(mount)) => mount,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!(
+                    "localityd failed to inspect mount for remote discovery hints after fast-forward: {error}"
+                );
+                return;
+            }
+        };
+        if !mount.projection.uses_virtual_filesystem() {
+            return;
+        }
+        let current_shadow = match store.load_shadow(&request.mount_id, &request.remote_id) {
+            Ok(shadow) => shadow,
+            Err(error) => {
+                eprintln!(
+                    "localityd failed to load updated shadow for remote discovery hints after fast-forward: {error}"
+                );
+                return;
+            }
+        };
+
+        for hint in remote_fast_forward_discovery_hints(previous_shadow, &current_shadow) {
+            match hint {
+                RemoteDiscoveryHint::RefreshChildren {
+                    container_identifier,
+                } => {
+                    self.queue_child_refresh(
+                        request.mount_id.0.clone(),
+                        container_identifier,
+                        ChildRefreshPriority::Background,
+                        0,
+                    );
+                }
+            }
         }
     }
 
@@ -1993,6 +2094,33 @@ impl RuntimeState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteDiscoveryHint {
+    RefreshChildren { container_identifier: String },
+}
+
+fn remote_fast_forward_discovery_hints(
+    previous_shadow: &ShadowDocument,
+    current_shadow: &ShadowDocument,
+) -> Vec<RemoteDiscoveryHint> {
+    if child_page_link_ids(previous_shadow) == child_page_link_ids(current_shadow) {
+        return Vec::new();
+    }
+
+    vec![RemoteDiscoveryHint::RefreshChildren {
+        container_identifier: format!("children:{}", current_shadow.entity_id.0),
+    }]
+}
+
+fn child_page_link_ids(shadow: &ShadowDocument) -> BTreeSet<RemoteId> {
+    shadow
+        .blocks
+        .iter()
+        .filter(|block| block.native_kind.as_deref() == Some("child_page"))
+        .map(|block| block.remote_id.clone())
+        .collect()
+}
+
 fn load_persisted_hydrations(state_root: &Path) -> HydrationQueue {
     let mut queue = HydrationQueue::new();
     match SqliteStateStore::open(state_root.to_path_buf())
@@ -2013,7 +2141,7 @@ fn remote_fast_forward_previous_shadow(
     state_root: &Path,
     request: &HydrationRequest,
 ) -> Option<ShadowDocument> {
-    if std::env::consts::OS != "macos" || request.reason != HydrationReason::RemoteFastForward {
+    if !request.reason.is_remote_fast_forward() {
         return None;
     }
 
@@ -3252,8 +3380,10 @@ mod tests {
 
     use locality_core::canonical::render_canonical_markdown;
     use locality_core::freshness::{RemoteObservation, RemoteVersion};
-    use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
-    use locality_core::shadow::ShadowDocument;
+    use locality_core::model::{
+        CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, SourceSpan,
+    };
+    use locality_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
         ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, InMemoryStateStore,
@@ -3264,8 +3394,9 @@ mod tests {
 
     use super::{
         ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest,
-        DefaultRuntimeJobRunner, RuntimeJobRunner, execute_file_event, execute_observe_entity_job,
-        observable_remote_identifier,
+        DefaultRuntimeJobRunner, RemoteDiscoveryHint, RuntimeJobRunner, execute_file_event,
+        execute_observe_entity_job, observable_remote_identifier,
+        remote_fast_forward_discovery_hints,
     };
 
     #[test]
@@ -3499,6 +3630,27 @@ mod tests {
     }
 
     #[test]
+    fn remote_fast_forward_hints_refresh_parent_children_when_child_links_change() {
+        let previous = shadow_with_child_page_links("page-1", ["child-a"]);
+        let current = shadow_with_child_page_links("page-1", ["child-a", "child-b"]);
+
+        assert_eq!(
+            remote_fast_forward_discovery_hints(&previous, &current),
+            vec![RemoteDiscoveryHint::RefreshChildren {
+                container_identifier: "children:page-1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn remote_fast_forward_hints_ignore_unchanged_child_links() {
+        let previous = shadow_with_child_page_links("page-1", ["child-a"]);
+        let current = shadow_with_child_page_links("page-1", ["child-a"]);
+
+        assert!(remote_fast_forward_discovery_hints(&previous, &current).is_empty());
+    }
+
+    #[test]
     fn write_event_queues_auto_push_for_enrolled_dirty_file() {
         let fixture = RuntimeAutoSaveFixture::new();
         let mut store = fixture.store();
@@ -3673,6 +3825,48 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn shadow_with_child_page_links<const N: usize>(
+        entity_id: &str,
+        child_ids: [&str; N],
+    ) -> ShadowDocument {
+        let mut rendered_body = "# Parent\n".to_string();
+        let mut blocks = vec![ShadowBlock {
+            remote_id: RemoteId::new("heading-1"),
+            kind: MarkdownBlockKind::Heading,
+            source_span: SourceSpan {
+                start_line: 1,
+                end_line: 1,
+            },
+            content_hash: "heading".to_string(),
+            text: "# Parent".to_string(),
+            native_kind: Some("heading_1".to_string()),
+        }];
+        for (index, child_id) in child_ids.into_iter().enumerate() {
+            let line = index + 3;
+            rendered_body.push_str(&format!(
+                "\n[Child {index}](https://www.notion.so/{child_id})\n"
+            ));
+            blocks.push(ShadowBlock {
+                remote_id: RemoteId::new(child_id),
+                kind: MarkdownBlockKind::Paragraph,
+                source_span: SourceSpan {
+                    start_line: line,
+                    end_line: line,
+                },
+                content_hash: format!("child-{child_id}"),
+                text: format!("[Child {index}](https://www.notion.so/{child_id})"),
+                native_kind: Some("child_page".to_string()),
+            });
+        }
+        ShadowDocument {
+            entity_id: RemoteId::new(entity_id),
+            frontmatter: String::new(),
+            body_hash: format!("hash-{N}"),
+            rendered_body,
+            blocks,
+        }
     }
 
     struct ObservingConnector {

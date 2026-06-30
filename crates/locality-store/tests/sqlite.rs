@@ -1145,6 +1145,11 @@ fn persisted_json_uses_stable_snake_case_names() {
         "\"remote_fast_forward\""
     );
     assert_eq!(
+        serde_json::to_string(&HydrationReason::LiveModeRemoteFastForward)
+            .expect("hydration reason json"),
+        "\"live_mode_remote_fast_forward\""
+    );
+    assert_eq!(
         serde_json::to_string(&ProjectionMode::MacosFileProvider).expect("projection json"),
         "\"macos_file_provider\""
     );

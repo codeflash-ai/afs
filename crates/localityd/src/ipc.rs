@@ -33,6 +33,15 @@ pub enum DaemonRequest {
         remote_id: String,
         path: PathBuf,
     },
+    ObserveEntity {
+        mount_id: String,
+        remote_id: String,
+    },
+    RemoteFastForward {
+        mount_id: String,
+        remote_id: String,
+        path: PathBuf,
+    },
     VirtualFsItem {
         mount_id: String,
         identifier: String,
@@ -585,6 +594,34 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 identifier: "page-1".to_string(),
                 contents_base64: "SGVsbG8=".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn remote_queue_commands_decode() {
+        let observe: DaemonRequest = serde_json::from_str(
+            r#"{"command":"observe_entity","mount_id":"notion-main","remote_id":"page-1"}"#,
+        )
+        .expect("decode observe request");
+        let fast_forward: DaemonRequest = serde_json::from_str(
+            r#"{"command":"remote_fast_forward","mount_id":"notion-main","remote_id":"page-1","path":"Roadmap/page.md"}"#,
+        )
+        .expect("decode remote fast-forward request");
+
+        assert_eq!(
+            observe,
+            DaemonRequest::ObserveEntity {
+                mount_id: "notion-main".to_string(),
+                remote_id: "page-1".to_string(),
+            }
+        );
+        assert_eq!(
+            fast_forward,
+            DaemonRequest::RemoteFastForward {
+                mount_id: "notion-main".to_string(),
+                remote_id: "page-1".to_string(),
+                path: "Roadmap/page.md".into(),
             }
         );
     }
