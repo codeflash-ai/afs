@@ -4,6 +4,8 @@ import {
   mountRows,
   mountStatusLabel,
   mountStatusTone,
+  selectedMountIdAfterOpenViewEvent,
+  selectedMountIdAfterViewChange,
   selectedMountRow,
   type MountSummary,
 } from "./mounts";
@@ -172,5 +174,25 @@ describe("mount display helpers", () => {
     ).toBe("warn");
     expect(mountStatusTone(mount({ status: "provider_stopped" }))).toBe("danger");
     expect(mountStatusTone(mount({ status: "provider_error" }))).toBe("danger");
+  });
+});
+
+describe("selected mount navigation helpers", () => {
+  it("clears the selected mount when leaving the mount view", () => {
+    expect(selectedMountIdAfterViewChange("google-docs-main", "home")).toBeNull();
+  });
+
+  it("keeps the selected mount while staying on the mount view", () => {
+    expect(selectedMountIdAfterViewChange("google-docs-main", "mount")).toBe("google-docs-main");
+    expect(selectedMountIdAfterViewChange(null, "mount")).toBeNull();
+  });
+
+  it("clears the selected mount when an open-view event requests the mount list", () => {
+    expect(selectedMountIdAfterOpenViewEvent("google-docs-main", "mount")).toBeNull();
+  });
+
+  it("leaves the selected mount unchanged when an open-view event requests another view", () => {
+    expect(selectedMountIdAfterOpenViewEvent("google-docs-main", "pending")).toBe("google-docs-main");
+    expect(selectedMountIdAfterOpenViewEvent(null, "pending")).toBeNull();
   });
 });

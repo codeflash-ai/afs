@@ -37,6 +37,8 @@ import {
   mountRows,
   mountStatusLabel,
   mountStatusTone,
+  selectedMountIdAfterOpenViewEvent,
+  selectedMountIdAfterViewChange,
   selectedMountRow,
   type MountRow,
   type MountSummary,
@@ -1605,8 +1607,9 @@ function MainShell({
   const selectedMount = selectedMountRow(mountTableRows, selectedMountId);
 
   useEffect(() => {
-    if (view !== "mount" && selectedMountId) {
-      setSelectedMountId(null);
+    const nextSelectedMountId = selectedMountIdAfterViewChange(selectedMountId, view);
+    if (nextSelectedMountId !== selectedMountId) {
+      setSelectedMountId(nextSelectedMountId);
     }
   }, [selectedMountId, view]);
 
@@ -1619,14 +1622,15 @@ function MainShell({
   useEffect(() => {
     const clearSelectionForMountOpen = (event: Event) => {
       const nextView = (event as CustomEvent<string>).detail;
-      if (nextView === "mount") {
-        setSelectedMountId(null);
+      const nextSelectedMountId = selectedMountIdAfterOpenViewEvent(selectedMountId, nextView);
+      if (nextSelectedMountId !== selectedMountId) {
+        setSelectedMountId(nextSelectedMountId);
       }
     };
 
     window.addEventListener("loc-open-view", clearSelectionForMountOpen);
     return () => window.removeEventListener("loc-open-view", clearSelectionForMountOpen);
-  }, []);
+  }, [selectedMountId]);
 
   function openMountsView() {
     setSelectedMountId(null);

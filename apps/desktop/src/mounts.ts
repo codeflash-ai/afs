@@ -72,6 +72,20 @@ export function selectedMountRow(
   return rows.find((row) => row.id === selectedMountId) ?? null;
 }
 
+export function selectedMountIdAfterViewChange(
+  selectedMountId: string | null,
+  nextView: string,
+): string | null {
+  return nextView === "mount" ? selectedMountId : null;
+}
+
+export function selectedMountIdAfterOpenViewEvent(
+  selectedMountId: string | null,
+  nextView: string,
+): string | null {
+  return nextView === "mount" ? null : selectedMountId;
+}
+
 export function mountAccessLabel(mount: MountSummary): string {
   return mount.readOnly ? "Read only" : "Edit enabled";
 }
