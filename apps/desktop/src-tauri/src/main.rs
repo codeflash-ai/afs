@@ -11284,7 +11284,6 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
         return;
     }
 
-    refresh_tray_icon(app);
     let scale_factor = window.scale_factor().unwrap_or(1.0);
     let popover_size = window.outer_size().unwrap_or_else(|_| {
         PhysicalSize::new(
@@ -11298,6 +11297,7 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
     let _ = window.eval("window.dispatchEvent(new CustomEvent('loc-refresh-snapshot'));");
     let _ = window.show();
     let _ = window.set_focus();
+    schedule_tray_icon_refresh(app.clone());
 }
 
 fn screen_bounds_for_tray_anchor(
