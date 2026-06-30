@@ -11010,9 +11010,8 @@ fn main() {
         .setup(move |app| {
             if desktop_smoke_test_requested() {
                 configure_main_window_chrome(app);
-                build_tray(app)?;
-                app.app_handle().exit(0);
-                return Ok(());
+                // Keep release smoke tests isolated from the user's daemon state.
+                std::process::exit(0);
             }
             if let Err(error) = apply_launch_at_login_preference() {
                 eprintln!("loc desktop could not apply launch-at-login preference: {error}");
