@@ -37,7 +37,7 @@ Core rules:
 | Surface | Suggested size | Purpose |
 |---|---:|---|
 | First-run window | 720 x 560 | Focused onboarding wizard |
-| Main window | 960 x 680 | Mounts, locate, pending changes, activity, settings |
+| Main window | 960 x 680 | Files, locate, pending changes, activity, settings |
 | Tray popover | 360 x 520 | Quick status and actions |
 | Modal dialog | 520 x variable | Focused confirmations or short forms |
 
@@ -48,6 +48,7 @@ The main window should use a compact left sidebar:
 ```text
 Locality
   Home
+  Files
   Pending Changes
   Activity
   Settings
@@ -86,9 +87,9 @@ Daily Use
   Tray Icon States
   Tray Popover
   Home
+  Files
   Pending Changes
   Push Review
-  Mount Detail
   Activity
   Settings
   Diagnostics
@@ -508,7 +509,7 @@ Error states:
 
 ## Files
 
-Goal: help users and agents find files that are usable in the current mounted
+Goal: help users and agents find files that are usable in the current workspace
 access without surfacing old disconnected Notion access by default.
 
 Default search scope:
@@ -519,9 +520,9 @@ Current access only
 
 This means:
 
-- active mounts only;
+- active workspaces only;
 - active connections only;
-- files under those mount roots only;
+- files under those workspace roots only;
 - no disconnected or revoked access unless an advanced/diagnostic scope is
   explicitly selected.
 
@@ -530,7 +531,12 @@ Layout:
 ```text
 Files
 
-Search mounted files
+Current Workspace
+CodeFlash
+~/Library/CloudStorage/Locality/notion-main      [ Copy ] [ Reveal ] [ VS Code ]
+[ Change Access ] [ Pull Latest ]
+
+Search current files
 ┌──────────────────────────────────────────────────────────────┐
 │ Search current Notion files                                  │
 └──────────────────────────────────────────────────────────────┘
@@ -541,16 +547,22 @@ General / Engineering Wiki / Standups with Locality
 ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/standups-with-locality/last-friday/page.md
 [ Copy Path ] [ Reveal ]
 
-Mounted Workspaces
+Workspaces
 Engineering Wiki
 ~/Library/CloudStorage/Locality/notion-main/engineering-wiki
 [ Open ]
 ```
 
-Recent files should come from current active mount state, such as opened files,
-local changes, or files needing review. If the mount is tied to a revoked or
-inactive connection, recent files should be hidden and the user should be routed
-to reconnect or change access.
+Recent files should come from current active workspace state, such as opened
+files, local changes, or files needing review. If the workspace is tied to a
+revoked or inactive connection, recent files should be hidden and the user
+should be routed to reconnect or change access.
+
+The current workspace section owns the old mount-detail controls. `Mount` should
+not be a top-level sidebar item; it is an implementation term. Keep path actions
+next to the path itself as compact icon buttons: copy path, reveal in Finder, and
+open in editor. Advanced diagnostics can live behind disclosure inside Files or
+Settings.
 
 Search results should label safety states clearly:
 
@@ -562,6 +574,22 @@ Search results should label safety states clearly:
 
 Normal search should not show stale entities from old access scopes. Recovery
 or diagnostics can expose old access with a deliberate advanced filter.
+
+### Workspace States
+
+These states appear inside the current workspace section rather than on a
+separate mount screen.
+
+Read-only state:
+
+- status label: `Read Only`;
+- push actions hidden or disabled;
+- copy: "This workspace is for reading and locating files."
+
+Reconnect state:
+
+- primary action changes to `Reconnect Notion`;
+- keep folder actions available if local files still exist.
 
 ## Pending Changes
 
@@ -678,54 +706,6 @@ Pushed to Notion
 
 [ Done ]
 ```
-
-## Mount Detail
-
-Goal: show one mounted workspace with practical controls.
-
-Primary action: `Open Folder`
-
-Secondary action: `Move...`
-
-Layout:
-
-```text
-Notion
-
-CodeFlash
-~/Library/CloudStorage/Locality/notion-main
-
-Location
-~/Library/CloudStorage/Locality/notion-main        [ Move... ]
-
-[ Open Folder ]
-
-Status
-Ready
-
-Pending Changes
-0
-
-Access
-Edit enabled
-
-Source scope
-CodeFlash workspace
-
-Mounted content
-Uses Notion's workspace and top-level page hierarchy inside the local folder.
-```
-
-Read-only state:
-
-- status label: `Read Only`;
-- push actions hidden or disabled;
-- copy: "This mount is for reading and locating files."
-
-Reconnect state:
-
-- primary action changes to `Reconnect Notion`;
-- keep folder actions available if local files still exist.
 
 ## Activity
 
@@ -956,6 +936,6 @@ Avoid in normal UI:
 3. Tray popover and quit options.
 4. Home screen.
 5. Pending changes and push review.
-6. Mount detail.
+6. Files screen with current workspace controls.
 7. Activity.
 8. Settings and diagnostics.

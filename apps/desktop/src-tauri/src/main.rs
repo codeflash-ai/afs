@@ -11217,7 +11217,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                         .unwrap_or_else(|_| PathBuf::from(snapshot.mount.local_path));
                     let _ = open_virtual_mount_or_path(&path);
                 }
-                show_main_window_with_view(app, Some("mount"));
+                show_main_window_with_view(app, Some("files"));
             }
             "review_pending" => show_main_window_with_view(app, Some("pending")),
             "hide_menubar" => {

@@ -1819,6 +1819,76 @@ p {
   gap: 8px;
 }
 
+.workspace-detail-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.workspace-path-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) repeat(3, 32px);
+  align-items: center;
+  gap: 8px;
+  min-height: 46px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.workspace-path-row > svg {
+  width: 17px;
+  height: 17px;
+  color: var(--accent);
+}
+
+.workspace-path-row code {
+  overflow: hidden;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-action-row,
+.workspace-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.workspace-facts {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.workspace-facts span {
+  min-height: 24px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.workspace-diagnostics {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.workspace-diagnostics summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.workspace-diagnostics .workspace-facts {
+  margin-top: 10px;
+}
+
 .file-discovery-row,
 .workspace-discovery-row {
   display: grid;
@@ -1844,6 +1914,14 @@ p {
   color: var(--accent);
 }
 
+.workspace-row-path {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
 .file-discovery-row strong,
 .workspace-discovery-row strong {
   display: block;
@@ -1857,7 +1935,6 @@ p {
 .workspace-discovery-row code {
   display: block;
   overflow: hidden;
-  margin-top: 4px;
   color: var(--ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;

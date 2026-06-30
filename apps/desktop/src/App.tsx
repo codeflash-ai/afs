@@ -36,7 +36,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
 
-type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
+type AppView = "home" | "files" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 
@@ -952,8 +952,8 @@ export default function App() {
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
-      const nextView = (event as CustomEvent<string>).detail;
-      if (!isAppView(nextView)) {
+      const nextView = normalizeAppView((event as CustomEvent<string>).detail);
+      if (!nextView) {
         return;
       }
       setShowOnboarding(false);
@@ -1642,9 +1642,6 @@ function MainShell({
             <SidebarButton active={view === "files"} icon={<Search />} onClick={() => onViewChange("files")}>
               Files
             </SidebarButton>
-            <SidebarButton active={view === "mount"} icon={<FolderOpen />} onClick={() => onViewChange("mount")}>
-              Mount
-            </SidebarButton>
             <SidebarButton
               active={view === "pending" || view === "review"}
               icon={<ListChecks />}
@@ -1671,7 +1668,7 @@ function MainShell({
             <button
               className="status-button"
               title={statusTitle}
-              onClick={() => onViewChange(statusTarget ?? "mount")}
+              onClick={() => onViewChange(statusTarget ?? "files")}
             >
               <StatusPill tone={healthTone(snapshot.health.state)} title={statusTitle}>
                 {sidebarStatusLabel(snapshot)}
@@ -1691,14 +1688,12 @@ function MainShell({
             <HomeView
               snapshot={snapshot}
               onFiles={() => onViewChange("files")}
-              onMount={() => onViewChange("mount")}
               onReview={() => onViewChange("pending")}
               onRefresh={onRefresh}
             />
           )}
-          {view === "files" && <FilesView snapshot={snapshot} onHome={() => onViewChange("home")} />}
-          {view === "mount" && (
-            <MountDetailView
+          {view === "files" && (
+            <FilesView
               snapshot={snapshot}
               onHome={() => onViewChange("home")}
               onRefresh={onRefresh}
@@ -1786,13 +1781,11 @@ function UpdateBanner({
 function HomeView({
   snapshot,
   onFiles,
-  onMount,
   onReview,
   onRefresh,
 }: {
   snapshot: DesktopSnapshot;
   onFiles: () => void;
-  onMount: () => void;
   onReview: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -1903,14 +1896,14 @@ function HomeView({
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Create your Notion mount point</h2>
-            <p>Use the default notion-main mount point under the shared Locality CloudStorage root.</p>
+            <h2>Create your Notion folder</h2>
+            <p>Use the default notion-main folder under the shared Locality CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
             onClick={() => void createMount()}
           >
-            Create Notion Mount Point
+            Create Notion Folder
           </PrimaryButton>
           {actionError && <p className="field-error">{actionError}</p>}
         </section>
@@ -1942,8 +1935,8 @@ function HomeView({
               <SecondaryButton icon={<FolderOpen />} onClick={() => void openWorkspaceFolder(snapshot.mount.localPath)}>
                 Open Folder
               </SecondaryButton>
-              <SecondaryButton icon={<ChevronRight />} onClick={onMount}>
-                Mount Detail
+              <SecondaryButton icon={<ChevronRight />} onClick={onFiles}>
+                Files
               </SecondaryButton>
             </div>
           </section>
@@ -2004,7 +1997,7 @@ function HomeView({
         <div>
           <p className="label">Suggestion</p>
           <h3>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</h3>
-          <p>{snapshot.suggestions[0]?.description ?? "Mount more workspaces as local files."}</p>
+          <p>{snapshot.suggestions[0]?.description ?? "Connect more workspaces as local files."}</p>
         </div>
         <SecondaryButton compact disabled>
           Coming Soon
@@ -2014,7 +2007,17 @@ function HomeView({
   );
 }
 
-function FilesView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: () => void }) {
+function FilesView({
+  snapshot,
+  onHome,
+  onRefresh,
+  onReview,
+}: {
+  snapshot: DesktopSnapshot;
+  onHome: () => void;
+  onRefresh: () => Promise<void>;
+  onReview: () => void;
+}) {
   const [query, setQuery] = useState("");
   const { results, searching } = useNotionSearchResults(query, !mountMissing(snapshot));
 
@@ -2029,11 +2032,15 @@ function FilesView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: ()
         />
       </ViewHeader>
 
+      {!mountMissing(snapshot) && (
+        <CurrentWorkspacePanel snapshot={snapshot} onRefresh={onRefresh} onReview={onReview} />
+      )}
+
       <section className="panel discovery-panel">
         <div>
           <p className="label">Current access</p>
-          <h2>Search mounted files</h2>
-          <p>Results come from active mounts and active connections only.</p>
+          <h2>Search current files</h2>
+          <p>Results come from active workspaces and active connections only.</p>
         </div>
         <div className="locate-row">
           <Search />
@@ -2060,135 +2067,12 @@ function FilesView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: ()
   );
 }
 
-function RecentFilesPanel({
-  items,
-  onOpenFiles,
-  compact = false,
-}: {
-  items: LocatedItem[];
-  onOpenFiles?: () => void;
-  compact?: boolean;
-}) {
-  const visibleItems = compact ? items.slice(0, 3) : items;
-
-  return (
-    <section className="panel discovery-panel">
-      <div className="discovery-heading">
-        <div>
-          <p className="label">Recent files</p>
-          <h2>{items.length ? "Recently opened or changed" : "No recent files yet"}</h2>
-          <p>{items.length ? "Files from the active mount that were opened, changed, or need review." : "Open or edit mounted files and they will appear here."}</p>
-        </div>
-        {onOpenFiles && (
-          <SecondaryButton compact icon={<ChevronRight />} onClick={onOpenFiles}>
-            View Files
-          </SecondaryButton>
-        )}
-      </div>
-      {visibleItems.length ? (
-        <div className="file-discovery-list">
-          {visibleItems.map((item) => (
-            <FileDiscoveryRow key={`${item.kind}-${item.localPath}`} item={item} />
-          ))}
-        </div>
-      ) : (
-        <EmptyDiscoveryState text="No active files have been opened or changed yet." />
-      )}
-    </section>
-  );
-}
-
-function MountedWorkspacesPanel({ mounts }: { mounts: MountSummary[] }) {
-  return (
-    <section className="panel discovery-panel">
-      <div>
-        <p className="label">Mounted workspaces</p>
-        <h2>{mounts.length ? "Current mounts" : "No mounts yet"}</h2>
-        <p>These are the roots Locality exposes as local folders.</p>
-      </div>
-      {mounts.length ? (
-        <div className="workspace-discovery-list">
-          {mounts.map((mount) => (
-            <div className="workspace-discovery-row" key={mount.mountId}>
-              <FolderOpen />
-              <div>
-                <strong>{mount.workspaceName}</strong>
-                <code>{mount.localPath}</code>
-                <span>{mount.connectorName} · {mount.accessScope}</span>
-              </div>
-              <SecondaryButton
-                compact
-                icon={<FolderOpen />}
-                onClick={() => void callCommand("open_path", { path: mount.localPath }, { ok: true })}
-              >
-                Open
-              </SecondaryButton>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <EmptyDiscoveryState text="Create a mount to make files available locally." />
-      )}
-    </section>
-  );
-}
-
-function FileDiscoveryRow({ item }: { item: LocatedItem }) {
-  const [error, setError] = useState("");
-  const stateIcon =
-    item.state === "conflict" ? (
-      <AlertTriangle />
-    ) : item.state === "pending_changes" || item.state === "remote_update_available" ? (
-      <Clock3 />
-    ) : (
-      <Check />
-    );
-
-  async function reveal() {
-    setError("");
-    try {
-      const report = await callCommand<ActionReport>("reveal_path", { path: item.localPath }, { ok: true, message: "" });
-      if (!report.ok) {
-        setError(report.message);
-      }
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
-  }
-
-  return (
-    <div className={`file-discovery-row ${item.state}`}>
-      <div className="file-state">{stateIcon}</div>
-      <div>
-        <strong>{item.title}</strong>
-        <code>{item.localPath}</code>
-        <span>{item.kind} · {locatedStateLabel(item.state)}</span>
-        {error && <p className="field-error">{error}</p>}
-      </div>
-      <div className="file-discovery-actions">
-        <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(item.localPath)}>
-          <Copy />
-        </button>
-        <SecondaryButton compact icon={<FolderOpen />} onClick={() => void reveal()}>
-          Reveal
-        </SecondaryButton>
-      </div>
-    </div>
-  );
-}
-
-function EmptyDiscoveryState({ text }: { text: string }) {
-  return <p className="discovery-empty">{text}</p>;
-}
-
-function MountDetailView({
+function CurrentWorkspacePanel({
   snapshot,
-  onHome,
   onRefresh,
   onReview,
 }: {
   snapshot: DesktopSnapshot;
-  onHome: () => void;
   onRefresh: () => Promise<void>;
   onReview: () => void;
 }) {
@@ -2272,57 +2156,59 @@ function MountDetailView({
   }
 
   return (
-    <div className="view-stack">
-      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mount" }]} />
-      <ViewHeader title={snapshot.mount.workspaceName}>
+    <section className="panel workspace-detail-panel">
+      <div className="discovery-heading">
+        <div>
+          <p className="label">Current workspace</p>
+          <h2>{snapshot.mount.workspaceName}</h2>
+          <p>{snapshot.mount.connectorName} · {snapshot.mount.accessScope}</p>
+        </div>
         <StatusPill
           tone={healthTone(snapshot.health.state)}
           title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
         >
           {healthLabel(snapshot.health.state)}
         </StatusPill>
-      </ViewHeader>
+      </div>
 
-      <section className="mount-hero">
-        <div className="mount-hero-icon">
+      <div className="workspace-path-row">
+        <FolderOpen />
+        <code>{snapshot.mount.localPath}</code>
+        <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(snapshot.mount.localPath)}>
+          <Copy />
+        </button>
+        <button className="icon-button has-tooltip" data-tooltip="Reveal in Finder" onClick={() => void openFolder()}>
           <FolderOpen />
-        </div>
-        <div>
-          <p className="label">Notion mount point</p>
-          <h2>{snapshot.mount.localPath}</h2>
-          <p>
-            Locality follows your Notion workspace hierarchy here, starting with the pages and databases
-            your connection can access.
-          </p>
-        </div>
-        <div className="mount-actions">
-          <PrimaryButton icon={<FolderOpen />} onClick={() => void openFolder()}>
-            Open Folder
+        </button>
+        <button className="icon-button has-tooltip" data-tooltip="Open in VS Code" onClick={() => void openVsCode()}>
+          <Code2 />
+        </button>
+      </div>
+
+      <div className="workspace-action-row">
+        <SecondaryButton
+          compact
+          disabled={connectionMissing(snapshot) || accessState === "changing"}
+          icon={accessState === "changing" ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
+          onClick={() => void changeNotionAccess()}
+        >
+          {accessState === "changing" ? "Waiting for Notion" : "Change Access"}
+        </SecondaryButton>
+        <SecondaryButton
+          compact
+          disabled={!snapshot.mount.localPath.trim() || accessState === "changing" || pullState === "pulling"}
+          icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+          onClick={() => void pullChanges()}
+        >
+          {pullState === "pulling" ? "Pulling" : "Pull Latest"}
+        </SecondaryButton>
+        {hasPendingChanges && (
+          <PrimaryButton compact icon={<ListChecks />} onClick={onReview}>
+            Review Pending
           </PrimaryButton>
-          <SecondaryButton compact icon={<Copy />} onClick={() => copyText(snapshot.mount.localPath)}>
-            Copy Path
-          </SecondaryButton>
-          <SecondaryButton compact icon={<Code2 />} onClick={() => void openVsCode()}>
-            Open in VS Code
-          </SecondaryButton>
-          <SecondaryButton
-            compact
-            disabled={connectionMissing(snapshot) || accessState === "changing"}
-            icon={accessState === "changing" ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
-            onClick={() => void changeNotionAccess()}
-          >
-            {accessState === "changing" ? "Waiting for Notion" : "Change Notion Access"}
-          </SecondaryButton>
-          <SecondaryButton
-            compact
-            disabled={!snapshot.mount.localPath.trim() || accessState === "changing" || pullState === "pulling"}
-            icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
-            onClick={() => void pullChanges()}
-          >
-            {pullState === "pulling" ? "Pulling changes" : "Pull changes"}
-          </SecondaryButton>
-        </div>
-      </section>
+        )}
+      </div>
+
       {actionError && <p className="field-error">{actionError}</p>}
       {accessMessage && (
         <p className={accessState === "error" ? "field-error" : "quiet-note inline-note"}>
@@ -2333,60 +2219,150 @@ function MountDetailView({
         <p className={pullState === "error" ? "field-error" : "quiet-note inline-note"}>{pullMessage}</p>
       )}
 
-      <section className="detail-grid">
-        <div className="panel">
-          <PanelTitle title="Notion Access" />
-          <SettingRow title="Workspace" value={snapshot.connection.workspaceName} />
-          {showAccount && <SettingRow title="Account" value={accountLabel} />}
-          <SettingRow title="Selected access" value={snapshot.mount.accessScope} />
-          {snapshot.mount.notionUrl && (
-            <SettingRow title="Mounted root" value="Open in Notion" href={snapshot.mount.notionUrl} />
-          )}
-          <SettingRow title="Permission" value={snapshot.mount.readOnly ? "Read only" : "Edit enabled"} />
-        </div>
+      <div className="workspace-facts">
+        <span>Permission: {snapshot.mount.readOnly ? "Read only" : "Edit enabled"}</span>
+        <span>Projection: {snapshot.mount.projection}</span>
+        <span>Files: {snapshot.mount.entityCount}</span>
+        {showAccount && <span>Account: {accountLabel}</span>}
+      </div>
 
-        <div className="panel">
-          <PanelTitle title="Local Files" />
-          <SettingRow title="Location" value={snapshot.mount.localPath} />
-          <SettingRow title="Projection" value={snapshot.mount.projection} />
-          <SettingRow title="Mounted content" value="Workspace hierarchy" />
-          <SettingRow title="Agent guidance" value="AGENTS.md and CLAUDE.md" />
-        </div>
-      </section>
-
-      <section className="safety-strip">
-        <ShieldCheck />
-        <div>
-          <h2>Edits stay pending until reviewed</h2>
-          <p>
-            Local changes are staged first. Push review shows what will update in Notion before
-            remote writes happen.
-          </p>
-        </div>
-        {hasPendingChanges && (
-          <PrimaryButton compact icon={<ListChecks />} onClick={onReview}>
-            Review
-          </PrimaryButton>
-        )}
-      </section>
-
-      <details className="advanced-panel">
-        <summary>Advanced diagnostics</summary>
-        <div className="settings-grid compact-settings">
-          <div className="panel">
-            <SettingRow title="Locality process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
-            <SettingRow title="State folder" value="~/.loc" />
-            <SettingRow title="Connector" value={snapshot.mount.connector} />
-          </div>
-          <div className="panel">
-            <SettingRow title="Connection status" value={snapshot.connection.status} />
-            <SettingRow title="Mount status" value={snapshot.mount.status} />
-            <SettingRow title="Pending changes" value={String(snapshot.pendingChanges.length)} />
-          </div>
+      <details className="workspace-diagnostics">
+        <summary>Diagnostics</summary>
+        <div className="workspace-facts">
+          <span>Connection: {snapshot.connection.status}</span>
+          <span>Status: {snapshot.mount.status}</span>
+          <span>Connector: {snapshot.mount.connector}</span>
+          <span>Pending: {snapshot.pendingChanges.length}</span>
         </div>
       </details>
+    </section>
+  );
+}
+
+function RecentFilesPanel({
+  items,
+  onOpenFiles,
+  compact = false,
+}: {
+  items: LocatedItem[];
+  onOpenFiles?: () => void;
+  compact?: boolean;
+}) {
+  const visibleItems = compact ? items.slice(0, 3) : items;
+
+  return (
+    <section className="panel discovery-panel">
+      <div className="discovery-heading">
+        <div>
+          <p className="label">Recent files</p>
+          <h2>{items.length ? "Recently opened or changed" : "No recent files yet"}</h2>
+          <p>{items.length ? "Files from the active workspace that were opened, changed, or need review." : "Open or edit Locality files and they will appear here."}</p>
+        </div>
+        {onOpenFiles && (
+          <SecondaryButton compact icon={<ChevronRight />} onClick={onOpenFiles}>
+            View Files
+          </SecondaryButton>
+        )}
+      </div>
+      {visibleItems.length ? (
+        <div className="file-discovery-list">
+          {visibleItems.map((item) => (
+            <FileDiscoveryRow key={`${item.kind}-${item.localPath}`} item={item} />
+          ))}
+        </div>
+      ) : (
+        <EmptyDiscoveryState text="No active files have been opened or changed yet." />
+      )}
+    </section>
+  );
+}
+
+function MountedWorkspacesPanel({ mounts }: { mounts: MountSummary[] }) {
+  return (
+    <section className="panel discovery-panel">
+      <div>
+        <p className="label">Workspaces</p>
+        <h2>{mounts.length ? "Local folders" : "No workspaces yet"}</h2>
+        <p>These are the roots Locality exposes as local folders.</p>
+      </div>
+      {mounts.length ? (
+        <div className="workspace-discovery-list">
+          {mounts.map((mount) => (
+            <div className="workspace-discovery-row" key={mount.mountId}>
+              <FolderOpen />
+              <div>
+                <strong>{mount.workspaceName}</strong>
+                <div className="workspace-row-path">
+                  <code>{mount.localPath}</code>
+                  <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(mount.localPath)}>
+                    <Copy />
+                  </button>
+                </div>
+                <span>{mount.connectorName} · {mount.accessScope}</span>
+              </div>
+              <SecondaryButton
+                compact
+                icon={<FolderOpen />}
+                onClick={() => void callCommand("open_path", { path: mount.localPath }, { ok: true })}
+              >
+                Open
+              </SecondaryButton>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <EmptyDiscoveryState text="Connect a workspace to make files available locally." />
+      )}
+    </section>
+  );
+}
+
+function FileDiscoveryRow({ item }: { item: LocatedItem }) {
+  const [error, setError] = useState("");
+  const stateIcon =
+    item.state === "conflict" ? (
+      <AlertTriangle />
+    ) : item.state === "pending_changes" || item.state === "remote_update_available" ? (
+      <Clock3 />
+    ) : (
+      <Check />
+    );
+
+  async function reveal() {
+    setError("");
+    try {
+      const report = await callCommand<ActionReport>("reveal_path", { path: item.localPath }, { ok: true, message: "" });
+      if (!report.ok) {
+        setError(report.message);
+      }
+    } catch (caught) {
+      setError(errorMessage(caught));
+    }
+  }
+
+  return (
+    <div className={`file-discovery-row ${item.state}`}>
+      <div className="file-state">{stateIcon}</div>
+      <div>
+        <strong>{item.title}</strong>
+        <code>{item.localPath}</code>
+        <span>{item.kind} · {locatedStateLabel(item.state)}</span>
+        {error && <p className="field-error">{error}</p>}
+      </div>
+      <div className="file-discovery-actions">
+        <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(item.localPath)}>
+          <Copy />
+        </button>
+        <SecondaryButton compact icon={<FolderOpen />} onClick={() => void reveal()}>
+          Reveal
+        </SecondaryButton>
+      </div>
     </div>
   );
+}
+
+function EmptyDiscoveryState({ text }: { text: string }) {
+  return <p className="discovery-empty">{text}</p>;
 }
 
 function PendingView({
@@ -4687,8 +4663,15 @@ function mountMissing(snapshot: DesktopSnapshot) {
   return snapshot.mount.status === "not_mounted";
 }
 
+function normalizeAppView(value: string): AppView | null {
+  if (value === "mount") {
+    return "files";
+  }
+  return isAppView(value) ? value : null;
+}
+
 function isAppView(value: string): value is AppView {
-  return value === "home" || value === "files" || value === "mount" || value === "pending" || value === "review" || value === "activity" || value === "settings";
+  return value === "home" || value === "files" || value === "pending" || value === "review" || value === "activity" || value === "settings";
 }
 
 function chromeStatusLabel(snapshot: DesktopSnapshot) {
