@@ -48,6 +48,7 @@ The main window should use a compact left sidebar:
 ```text
 Locality
   Home
+  Mounts
   Pending Changes
   Activity
   Settings
