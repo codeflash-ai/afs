@@ -1970,7 +1970,10 @@ fn identity_for_path(
 
 #[cfg(target_os = "windows")]
 fn cached_identity_refresh_unavailable(error: &HelperError) -> bool {
-    matches!(error.code, "daemon_unavailable" | "state_open_failed")
+    matches!(
+        error.code,
+        "daemon_unavailable" | "state_open_failed" | "mount_not_found"
+    )
 }
 
 fn is_local_identity(identifier: &str) -> bool {
