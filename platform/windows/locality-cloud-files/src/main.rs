@@ -1726,7 +1726,7 @@ fn is_remove_like_event(kind: &notify::event::EventKind) -> bool {
     )
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(test, target_os = "windows"))]
 fn is_modify_like_event(kind: &notify::event::EventKind) -> bool {
     local_modify_event_kind(kind).is_some()
 }
@@ -1959,13 +1959,18 @@ fn identity_for_path(
             match daemon_identity_for_path(context, &path) {
                 Ok(Some(refreshed)) => return Ok(Some(refreshed)),
                 Ok(None) => {}
-                Err(error) if error.code == "daemon_unavailable" => {}
+                Err(error) if cached_identity_refresh_unavailable(&error) => {}
                 Err(error) => return Err(error),
             }
         }
         return Ok(Some(identifier));
     }
     daemon_identity_for_path(context, &path)
+}
+
+#[cfg(target_os = "windows")]
+fn cached_identity_refresh_unavailable(error: &HelperError) -> bool {
+    matches!(error.code, "daemon_unavailable" | "state_open_failed")
 }
 
 fn is_local_identity(identifier: &str) -> bool {

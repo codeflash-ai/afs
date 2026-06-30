@@ -273,11 +273,16 @@ fn targeted_info_uses_matched_access_root_for_entity_and_schema_paths() {
     assert_eq!(report.mount.root, mount.root.display().to_string());
     assert_eq!(report.subject.role, InfoRole::DatabaseDirectory);
     assert_eq!(report.subject.path, "roadmap/tasks");
-    let expected_schema = access_root
-        .join("roadmap/tasks/_schema.yaml")
-        .display()
-        .to_string();
-    let expected_entity_path = access_root.join("roadmap/tasks").display().to_string();
+    let expected_schema = locality_platform::join_logical_path(
+        &access_root,
+        &PathBuf::from("roadmap/tasks/_schema.yaml"),
+    )
+    .display()
+    .to_string();
+    let expected_entity_path =
+        locality_platform::join_logical_path(&access_root, &PathBuf::from("roadmap/tasks"))
+            .display()
+            .to_string();
     assert_eq!(
         report.subject.schema_path.as_deref(),
         Some(expected_schema.as_str())
