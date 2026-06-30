@@ -217,6 +217,50 @@ fn daemon_push_job_blocks_when_remote_tree_content_changed_before_apply() {
 }
 
 #[test]
+fn daemon_push_job_reconciles_stale_macos_file_provider_copy_then_blocks_remote_deleted() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store_with_projection("Old body.", ProjectionMode::MacosFileProvider);
+    let cache_path = virtual_fs_content_path(
+        &fixture.state_root,
+        &fixture.mount_id,
+        Path::new("Roadmap.md"),
+    )
+    .expect("content cache path");
+    fs::create_dir_all(cache_path.parent().expect("content cache parent"))
+        .expect("content cache parent");
+    fixture.write_page_to(&cache_path, "Old body.");
+    fixture.write_page("Local File Provider body.");
+    let source = FakePushSource::remote_not_found();
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        fixture.push_job(true),
+        &source,
+        Some(&fixture.state_root),
+    )
+    .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(report.journal_status, Some(JournalStatus::Reverted));
+    assert_eq!(source.applied_count(), 0);
+    assert_eq!(
+        report.error.as_ref().expect("error").code,
+        "remote_not_found"
+    );
+    assert_eq!(source.requested_paths(), vec![PathBuf::from("Roadmap.md")]);
+    let cached = fs::read_to_string(cache_path).expect("read reconciled cache");
+    assert!(cached.contains("Local File Provider body."));
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Dirty);
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].status, JournalStatus::Reverted);
+}
+
+#[test]
 fn daemon_push_job_preflights_unsupported_operations_before_journal() {
     let fixture = PushFixture::new();
     let mut supervisor = fixture.supervisor("Old body.");
@@ -918,6 +962,7 @@ fn daemon_push_job_plans_normal_update_for_pending_virtual_rename_path() {
 
 struct PushFixture {
     root: PathBuf,
+    state_root: PathBuf,
     mount_id: MountId,
     remote_id: RemoteId,
 }
@@ -928,11 +973,18 @@ impl PushFixture {
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("loc-daemon-push-{}-{unique}", std::process::id()));
+        let state_root = std::env::temp_dir().join(format!(
+            "loc-daemon-push-state-{}-{unique}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&state_root);
         fs::create_dir_all(&root).expect("fixture root");
+        fs::create_dir_all(&state_root).expect("fixture state root");
 
         Self {
             root,
+            state_root,
             mount_id: MountId::new("notion-main"),
             remote_id: RemoteId::new("page-1"),
         }
@@ -953,8 +1005,17 @@ impl PushFixture {
     }
 
     fn store(&self, synced_body: &str) -> InMemoryStateStore {
+        self.store_with_projection(synced_body, ProjectionMode::PlainFiles)
+    }
+
+    fn store_with_projection(
+        &self,
+        synced_body: &str,
+        projection: ProjectionMode,
+    ) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
-        let mount = MountConfig::new(self.mount_id.clone(), "notion", self.root.clone());
+        let mount = MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
+            .projection(projection);
         store.save_mount(mount).expect("save mount");
         store
             .save_entity(
@@ -999,6 +1060,7 @@ impl PushFixture {
 impl Drop for PushFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.state_root);
     }
 }
 
@@ -1018,6 +1080,7 @@ impl FileWatcher for RecordingWatcher {
 struct FakePushSource {
     remote_before_apply: Option<HydratedEntity>,
     remote_after_apply: Option<HydratedEntity>,
+    remote_not_found: bool,
     applied: std::cell::Cell<usize>,
     requested_paths: std::cell::RefCell<Vec<PathBuf>>,
     supported_operations: Option<BTreeSet<PushOperationKind>>,
@@ -1041,6 +1104,13 @@ impl FakePushSource {
         Self {
             remote_before_apply: Some(remote_before_apply),
             remote_after_apply: Some(remote_after_apply),
+            ..Self::default()
+        }
+    }
+
+    fn remote_not_found() -> Self {
+        Self {
+            remote_not_found: true,
             ..Self::default()
         }
     }
@@ -1085,6 +1155,9 @@ impl HydrationSource for FakePushSource {
             return Err(LocalityError::InvalidState(
                 "unexpected remote id".to_string(),
             ));
+        }
+        if self.remote_not_found {
+            return Err(LocalityError::RemoteNotFound("page-1".to_string()));
         }
 
         let remote = if self.applied.get() == 0 {

@@ -847,6 +847,53 @@ fn status_reports_stub_virtual_cache_edits_as_dirty() {
 }
 
 #[test]
+fn status_reports_remote_deleted_with_macos_file_provider_local_pending_as_review_needed() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save virtual mount");
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nOriginal paragraph.",
+    );
+    fixture.write_virtual_cache(
+        "Roadmap.md",
+        canonical_markdown("page-1", "# Roadmap\n\nLocal File Provider paragraph."),
+    );
+    fixture.remote_deleted_observation(&mut store, "page-1");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Dirty);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::ReviewNeeded
+    );
+    assert!(entry_has_issue(
+        &report,
+        "Roadmap.md",
+        "remote_deleted_with_local_pending"
+    ));
+    assert_eq!(report.summary.review_needed, 1);
+    assert_eq!(report.summary.pending_local_changes, 0);
+}
+
+#[test]
 fn status_reports_stub_virtual_cache_conflicts_as_conflicted() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -1603,6 +1650,36 @@ impl StatusFixture {
                 )
                 .checked_at("unix_ms:2")
                 .remote_hint_pending(remote_hint_pending),
+            )
+            .expect("save freshness state");
+    }
+
+    fn remote_deleted_observation<S>(&self, store: &mut S, remote_id: &str)
+    where
+        S: RemoteObservationRepository + FreshnessStateRepository,
+    {
+        store
+            .save_remote_observation(
+                RemoteObservationRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                    "unix_ms:2",
+                )
+                .deleted(true),
+            )
+            .expect("save deleted remote observation");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    FreshnessTier::Hot,
+                )
+                .checked_at("unix_ms:2")
+                .remote_hint_pending(true),
             )
             .expect("save freshness state");
     }

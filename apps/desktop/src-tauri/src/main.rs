@@ -2766,6 +2766,14 @@ fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
         && entry
             .issues
             .iter()
+            .any(|issue| issue.code.starts_with("remote_deleted"))
+    {
+        return "remote deleted while local edits are pending".to_string();
+    }
+    if matches!(entry.sync_state, StatusSyncState::ReviewNeeded)
+        && entry
+            .issues
+            .iter()
             .any(|issue| issue.code.starts_with("remote_"))
     {
         return "remote changed while local edits are pending".to_string();
@@ -9622,6 +9630,30 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].state, "blocked");
         assert!(changes[0].summary.contains("Previous push failed"));
+    }
+
+    #[test]
+    fn pending_changes_surface_remote_deleted_local_pending_as_review_needed() {
+        let status = status_report_with_entry(status_entry(
+            loc_cli::status::StatusState::Dirty,
+            loc_cli::status::StatusSyncState::ReviewNeeded,
+            0,
+            vec![status_issue(
+                "remote_deleted_with_local_pending",
+                "remote object was deleted while local edits are pending",
+            )],
+        ));
+
+        let store = InMemoryStateStore::new();
+        let changes = pending_changes_from_status(&store, &status);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].state, "needs_review");
+        assert_eq!(
+            changes[0].issue_codes,
+            vec!["remote_deleted_with_local_pending"]
+        );
+        assert!(changes[0].summary.contains("remote deleted"));
     }
 
     #[test]
