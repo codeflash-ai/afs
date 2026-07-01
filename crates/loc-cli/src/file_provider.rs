@@ -16,6 +16,8 @@ use std::process::Stdio;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
 
+#[cfg(target_os = "windows")]
+use locality_platform::process::{DefaultSessionProcessManager, SessionProcessManager};
 use locality_store::MountConfig;
 #[cfg(target_os = "linux")]
 use locality_store::ProjectionMode;
@@ -830,9 +832,8 @@ fn start_windows_cloud_files_lifecycle(
         .args(windows_cloud_files_run_command_args(state_root, mount))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    configure_hidden_windows_command(&mut command);
-    let mut child = command
-        .spawn()
+    let mut child = DefaultSessionProcessManager
+        .spawn_detached(&mut command)
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     let pid = child.id();
     let metadata = WindowsCloudFilesProcessMetadata {

@@ -3,6 +3,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { npmDevServerCommand } from "./dev-script-helpers.mjs";
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const desktopDir = resolve(scriptDir, "..");
 
@@ -20,12 +22,18 @@ if ((prepare.status ?? 1) !== 0) {
   process.exit(prepare.status ?? 1);
 }
 
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const dev = spawn(npm, ["run", "dev"], {
-  cwd: desktopDir,
-  env: process.env,
-  stdio: "inherit",
-});
+const devCommand = npmDevServerCommand();
+let dev;
+try {
+  dev = spawn(devCommand.program, devCommand.args, {
+    cwd: desktopDir,
+    env: process.env,
+    stdio: "inherit",
+  });
+} catch (error) {
+  console.error(`dev-command: failed to start npm dev server: ${error.message}`);
+  process.exit(1);
+}
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
