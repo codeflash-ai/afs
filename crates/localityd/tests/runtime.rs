@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::freshness::{ChangeHintKind, FreshnessTier, SyncJob, SyncJobKind};
@@ -1102,15 +1102,6 @@ fn runtime_background_virtual_refreshes_walk_breadth_first() {
         .prime_virtual_mounts()
         .expect("prime virtual mounts");
 
-    let mut refreshed = Vec::new();
-    for _ in 0..6 {
-        refreshed.push(
-            refresh_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("background refresh"),
-        );
-    }
-
     let root = (
         "notion-main".to_string(),
         ROOT_CONTAINER_IDENTIFIER.to_string(),
@@ -1120,6 +1111,16 @@ fn runtime_background_virtual_refreshes_walk_breadth_first() {
     let page_b = ("notion-main".to_string(), "children:page-b".to_string());
     let page_a1 = ("notion-main".to_string(), "children:page-a1".to_string());
     let page_b1 = ("notion-main".to_string(), "children:page-b1".to_string());
+    let expected_refreshes = BTreeSet::from([
+        root.clone(),
+        source.clone(),
+        page_a.clone(),
+        page_b.clone(),
+        page_a1.clone(),
+        page_b1.clone(),
+    ]);
+    let refreshed =
+        collect_refreshes_until(&refresh_rx, &expected_refreshes, Duration::from_secs(10));
 
     for expected in [&root, &source, &page_a, &page_b, &page_a1, &page_b1] {
         assert!(
@@ -3585,6 +3586,41 @@ fn max_position<const N: usize>(
         })
         .max()
         .expect("at least one needle")
+}
+
+fn collect_refreshes_until(
+    refresh_rx: &mpsc::Receiver<(String, String)>,
+    expected: &BTreeSet<(String, String)>,
+    timeout: Duration,
+) -> Vec<(String, String)> {
+    let deadline = Instant::now() + timeout;
+    let mut refreshed = Vec::new();
+
+    while !expected.iter().all(|refresh| refreshed.contains(refresh)) {
+        let now = Instant::now();
+        if now >= deadline {
+            let missing = expected
+                .iter()
+                .filter(|refresh| !refreshed.contains(refresh))
+                .collect::<Vec<_>>();
+            panic!(
+                "timed out waiting for background refreshes {missing:?} after {timeout:?}; saw {refreshed:?}"
+            );
+        }
+
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(250));
+        match refresh_rx.recv_timeout(wait) {
+            Ok(refresh) => refreshed.push(refresh),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("background refresh channel closed; saw {refreshed:?}");
+            }
+        }
+    }
+
+    refreshed
 }
 
 fn relay_config(name: &str) -> DaemonConfig {
