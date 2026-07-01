@@ -3521,8 +3521,9 @@ fn seed_missing_credential_notion_connection(connection_id: &str) -> MissingCred
 fn seed_missing_credential_dirty_page(seeded: &MissingCredentialMount) -> PathBuf {
     let remote_id = RemoteId::new("page-1");
     let title = "Missing Credential Page";
-    let page_path = seeded.fixture.root.join("Missing Credential Page/page.md");
     let relative_path = "Missing Credential Page/page.md";
+    let page_path =
+        locality_platform::join_logical_path(&seeded.fixture.root, Path::new(relative_path));
     let frontmatter = "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Missing Credential Page\n";
     let synced_body = "Synced body before credential loss.";
     let dirty_body = "Edited while credential is missing.";
