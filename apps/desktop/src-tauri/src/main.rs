@@ -1204,8 +1204,15 @@ fn live_mode_tick_blocking_inner() -> ActionReport {
         }
     };
 
-    if let Err(message) = mark_mount_live_mode_syncing(&state_root, &mount.mount_id) {
-        return ActionReport { ok: false, message };
+    match mark_mount_live_mode_syncing(&state_root, &mount.mount_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ActionReport {
+                ok: true,
+                message: "Live Mode is off.".to_string(),
+            };
+        }
+        Err(message) => return ActionReport { ok: false, message },
     }
 
     let report = live_mode_tick_for_enabled_mount(&state_root, &mount);
@@ -1569,18 +1576,24 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
     })
 }
 
-fn mark_mount_live_mode_syncing(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
+fn mark_mount_live_mode_syncing(state_root: &Path, mount_id: &MountId) -> Result<bool, String> {
     let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     let now = live_mode_timestamp();
-    let record = store
+    let Some(record) = store
         .get_mount_live_mode(mount_id)
         .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
-        .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()))
-        .syncing(now);
+    else {
+        return Ok(false);
+    };
+    if !record.enabled {
+        return Ok(false);
+    }
+    let record = record.syncing(now);
     store
         .save_mount_live_mode(record)
-        .map_err(|error| format!("Live Mode could not update its state: {error}"))
+        .map_err(|error| format!("Live Mode could not update its state: {error}"))?;
+    Ok(true)
 }
 
 fn record_mount_live_mode_tick_result(
@@ -1591,10 +1604,15 @@ fn record_mount_live_mode_tick_result(
     let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     let now = live_mode_timestamp();
-    let record = store
+    let Some(record) = store
         .get_mount_live_mode(mount_id)
         .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
-        .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()));
+    else {
+        return Ok(());
+    };
+    if !record.enabled {
+        return Ok(());
+    }
     let record = if report.ok {
         record.active(non_empty_string(report.message.clone()), now.clone(), now)
     } else if live_mode_failure_should_pause(&report.message) {
@@ -8455,18 +8473,19 @@ mod tests {
         live_mode_remote_check_page_budget_for_rate, live_mode_remote_pull_candidates,
         live_mode_remote_pull_scan_is_due_for_key, live_mode_should_reconcile_local_target_for_key,
         live_mode_target, live_mode_tick_from_snapshot, live_mode_wake_generation,
-        load_desktop_activity, mount_has_pending_local_changes, mount_has_unfinished_journals,
-        notion_id_from_url, parse_daemon_build_info_json, pending_changes_from_status,
-        prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
-        pull_error_message, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, record_mount_live_mode_tick_result,
-        refresh_visible_target_from_cache, reset_to_remote_message, sample_live_mode_status,
-        sample_snapshot, screen_bounds_for_anchor_from_monitors, shell_single_quote,
-        should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
-        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
-        validate_mount_root, virtual_projection_prefetch_container_identifiers,
+        load_desktop_activity, mark_mount_live_mode_syncing, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
+        pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        record_mount_live_mode_tick_result, refresh_visible_target_from_cache,
+        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
+        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
+        terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
+        unsupported_notion_locator_url_message, validate_mount_root,
+        virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
         wake_live_mode_runner, write_terminal_cli_path_section,
     };
@@ -9444,6 +9463,73 @@ mod tests {
             .expect("live mode record");
         assert!(!record.enabled);
         assert_eq!(record.state, MountLiveModeState::Error);
+    }
+
+    #[test]
+    fn live_mode_syncing_does_not_reenable_disabled_record() {
+        let temp = TestTempDir::new("live-mode-syncing-disabled");
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp.path().join("notion"),
+            ))
+            .expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1").off("2"))
+            .expect("save disabled live mode");
+        drop(store);
+
+        let should_continue =
+            mark_mount_live_mode_syncing(temp.path(), &mount_id).expect("mark syncing");
+
+        assert!(!should_continue);
+        let store = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(!record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Off);
+    }
+
+    #[test]
+    fn live_mode_tick_result_does_not_reenable_disabled_record() {
+        let temp = TestTempDir::new("live-mode-result-disabled");
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp.path().join("notion"),
+            ))
+            .expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1").off("2"))
+            .expect("save disabled live mode");
+        drop(store);
+
+        record_mount_live_mode_tick_result(
+            temp.path(),
+            &mount_id,
+            &ActionReport {
+                ok: true,
+                message: "Live Mode checked for changes.".to_string(),
+            },
+        )
+        .expect("record disabled result");
+
+        let store = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(!record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Off);
+        assert_eq!(record.last_reason, None);
     }
 
     #[test]
