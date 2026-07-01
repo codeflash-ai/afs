@@ -3512,9 +3512,64 @@ where
         mount_id: job.mount_id.clone(),
         remote_id: remote_id.clone(),
     })?;
+    apply_remote_observation(store, job, observation)
+}
+
+#[doc(hidden)]
+pub fn apply_remote_observation<S>(
+    store: &mut S,
+    job: SyncJob,
+    observation: RemoteObservation,
+) -> locality_core::LocalityResult<FreshnessRuntimeReport>
+where
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
+{
+    let Some(remote_id) = job.remote_id.clone() else {
+        return Err(LocalityError::InvalidState(
+            "remote observation jobs require a remote id".to_string(),
+        ));
+    };
+    if observation.mount_id != job.mount_id || observation.remote_id != remote_id {
+        return Err(LocalityError::InvalidState(format!(
+            "remote observation `{}/{}` does not match job `{}/{}`",
+            observation.mount_id.as_str(),
+            observation.remote_id.as_str(),
+            job.mount_id.as_str(),
+            remote_id.as_str()
+        )));
+    }
+
     let existing = store
         .get_entity(&job.mount_id, &remote_id)
         .map_err(LocalityError::from)?;
+    let existing_freshness = store
+        .get_freshness_state(&job.mount_id, &remote_id)
+        .map_err(LocalityError::from)?;
+    if observation.deleted
+        && existing.as_ref().is_some_and(|entity| {
+            should_auto_delete_unopened_remote_delete(entity, existing_freshness.as_ref())
+        })
+    {
+        store
+            .delete_entity(&job.mount_id, &remote_id)
+            .map_err(LocalityError::from)?;
+        store
+            .delete_freshness_state(&job.mount_id, &remote_id)
+            .map_err(LocalityError::from)?;
+        store
+            .delete_remote_observation(&job.mount_id, &remote_id)
+            .map_err(LocalityError::from)?;
+        return Ok(FreshnessRuntimeReport {
+            job,
+            remote_hint_pending: false,
+            queued_hydrations: Vec::new(),
+            follow_up_jobs: Vec::new(),
+        });
+    }
+
     let remote_hint_pending = observed_remote_version_changed(existing.as_ref(), &observation);
     let observed_at = freshness_timestamp();
     if remote_hint_pending {
@@ -3525,17 +3580,19 @@ where
         .save_remote_observation(remote_observation_record(&observation, &observed_at))
         .map_err(LocalityError::from)?;
 
-    let mut freshness = store
-        .get_freshness_state(&job.mount_id, &remote_id)
-        .map_err(LocalityError::from)?
-        .unwrap_or_else(|| {
-            FreshnessStateRecord::new(job.mount_id.clone(), remote_id.clone(), job.tier.clone())
-        });
+    let mut freshness = existing_freshness.unwrap_or_else(|| {
+        FreshnessStateRecord::new(job.mount_id.clone(), remote_id.clone(), job.tier.clone())
+    });
     if job.tier.is_more_urgent_than(&freshness.tier) {
         freshness.tier = job.tier.clone();
     }
     freshness.last_checked_at = Some(observed_at);
-    freshness.remote_hint_pending = freshness.remote_hint_pending || remote_hint_pending;
+    freshness.remote_hint_pending = next_remote_hint_pending(
+        existing.as_ref(),
+        &observation,
+        freshness.remote_hint_pending,
+        remote_hint_pending,
+    );
     store
         .save_freshness_state(freshness)
         .map_err(LocalityError::from)?;
@@ -3577,6 +3634,46 @@ fn auto_fast_forward_requests_from_observation(
         HydrationState::Hydrated,
         HydrationReason::RemoteFastForward,
     )]
+}
+
+fn should_auto_delete_unopened_remote_delete(
+    entity: &EntityRecord,
+    freshness: Option<&FreshnessStateRecord>,
+) -> bool {
+    matches!(
+        entity.hydration,
+        HydrationState::Virtual | HydrationState::Stub
+    ) && freshness
+        .is_none_or(|state| state.last_opened_at.is_none() && state.last_local_change_at.is_none())
+}
+
+fn next_remote_hint_pending(
+    existing: Option<&EntityRecord>,
+    observation: &RemoteObservation,
+    previous_pending: bool,
+    remote_hint_pending: bool,
+) -> bool {
+    remote_hint_pending
+        || (previous_pending && !observation_matches_synced_version(existing, observation))
+}
+
+fn observation_matches_synced_version(
+    existing: Option<&EntityRecord>,
+    observation: &RemoteObservation,
+) -> bool {
+    if observation.deleted {
+        return false;
+    }
+    match (
+        existing.and_then(EntityRecord::synced_tree_remote_version),
+        observation
+            .remote_version
+            .as_ref()
+            .map(|remote_version| remote_version.as_str()),
+    ) {
+        (Some(synced), Some(observed)) => synced == observed,
+        _ => false,
+    }
 }
 
 fn remote_observation_record(
@@ -3728,15 +3825,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use locality_core::canonical::render_canonical_markdown;
-    use locality_core::freshness::{RemoteObservation, RemoteVersion};
+    use locality_core::freshness::{
+        ChangeHintKind, FreshnessTier, RemoteObservation, RemoteVersion, SyncJob, SyncJobKind,
+    };
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, SourceSpan,
     };
     use locality_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-        ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, InMemoryStateStore,
-        MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+        ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, MountConfig,
+        MountRepository, ProjectionMode, RemoteObservationRepository, ShadowRepository,
+        SqliteStateStore,
     };
 
     use crate::watcher::{FileEvent, FileEventKind};
@@ -4055,6 +4156,194 @@ mod tests {
         assert_eq!(enrollment.state, AutoSaveState::PausedRemoteChanged);
     }
 
+    #[test]
+    fn remote_observation_auto_deletes_unopened_online_only_remote_delete() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Stub)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("entity");
+        store
+            .save_freshness_state(FreshnessStateRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                FreshnessTier::Cold,
+            ))
+            .expect("freshness");
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: mount_id.clone(),
+                remote_id: remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v1")),
+                deleted: true,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        let report =
+            execute_observe_entity_job(&mut store, &connector, observe_job(&mount_id, &remote_id))
+                .expect("observe");
+
+        assert!(!report.remote_hint_pending);
+        assert!(
+            store
+                .get_entity(&mount_id, &remote_id)
+                .expect("get entity")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_freshness_state(&mount_id, &remote_id)
+                .expect("get freshness")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_remote_observation(&mount_id, &remote_id)
+                .expect("get observation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_observation_keeps_opened_online_only_remote_delete_for_review() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Stub)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("entity");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(mount_id.clone(), remote_id.clone(), FreshnessTier::Cold)
+                    .opened_at("now"),
+            )
+            .expect("freshness");
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: mount_id.clone(),
+                remote_id: remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v1")),
+                deleted: true,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        let report =
+            execute_observe_entity_job(&mut store, &connector, observe_job(&mount_id, &remote_id))
+                .expect("observe");
+
+        assert!(report.remote_hint_pending);
+        assert!(
+            store
+                .get_entity(&mount_id, &remote_id)
+                .expect("get entity")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_freshness_state(&mount_id, &remote_id)
+                .expect("get freshness")
+                .expect("freshness")
+                .remote_hint_pending
+        );
+        assert!(
+            store
+                .get_remote_observation(&mount_id, &remote_id)
+                .expect("get observation")
+                .expect("observation")
+                .deleted
+        );
+    }
+
+    #[test]
+    fn restored_remote_observation_clears_stale_deleted_hint_when_version_matches() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("entity");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(mount_id.clone(), remote_id.clone(), FreshnessTier::Warm)
+                    .remote_hint_pending(true),
+            )
+            .expect("freshness");
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: mount_id.clone(),
+                remote_id: remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v1")),
+                deleted: false,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        let report =
+            execute_observe_entity_job(&mut store, &connector, observe_job(&mount_id, &remote_id))
+                .expect("observe");
+
+        assert!(!report.remote_hint_pending);
+        assert!(
+            !store
+                .get_freshness_state(&mount_id, &remote_id)
+                .expect("get freshness")
+                .expect("freshness")
+                .remote_hint_pending
+        );
+        assert!(
+            !store
+                .get_remote_observation(&mount_id, &remote_id)
+                .expect("get observation")
+                .expect("observation")
+                .deleted
+        );
+    }
+
     fn request(
         mount_id: &str,
         container_identifier: &str,
@@ -4067,6 +4356,15 @@ mod tests {
             priority,
             depth,
         }
+    }
+
+    fn observe_job(mount_id: &MountId, remote_id: &RemoteId) -> SyncJob {
+        SyncJob::new(
+            mount_id.clone(),
+            Some(remote_id.clone()),
+            SyncJobKind::ObserveEntity,
+            ChangeHintKind::RemoteMaybeChanged,
+        )
     }
 
     struct RuntimeAutoSaveFixture {

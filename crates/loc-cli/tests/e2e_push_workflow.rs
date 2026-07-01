@@ -12,7 +12,7 @@ use loc_cli::mount::{MountOptions, run_mount};
 use loc_cli::pull::{run_pull, run_pull_with_state_root};
 use loc_cli::push::{PushOptions, run_push_with_daemon, run_push_with_daemon_at_state_root};
 use loc_cli::search::{SearchOptions, notion_id_from_url, run_search};
-use loc_cli::status::{StatusOptions, run_status};
+use loc_cli::status::{StatusOptions, StatusSyncState, run_status};
 use locality_connector::{Connector, ConnectorUndoApplier, FetchRequest};
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::conflict::{
@@ -20,6 +20,9 @@ use locality_core::conflict::{
     has_unresolved_conflict_markers,
 };
 use locality_core::explain::{RemoteChangeAction, RemoteChangeState};
+use locality_core::freshness::{
+    ChangeHintKind, FreshnessTier, RemoteObservation, RemoteVersion, SyncJob, SyncJobKind,
+};
 use locality_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use locality_core::model::{HydrationState, MountId, RemoteId};
 use locality_notion::client::{HttpNotionApi, NotionApi};
@@ -31,11 +34,13 @@ use locality_notion::dto::{
 use locality_notion::media::resolve_media_href_with_content_root;
 use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
-    ConnectionId, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
-    MountConfig, MountRepository, ProjectionMode, VirtualMutationRepository,
+    ConnectionId, EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    VirtualMutationRepository,
 };
 use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationQueue};
 use localityd::reconcile::{DefaultFetchScheduleStrategy, reconcile_scheduled_pull};
+use localityd::runtime::apply_remote_observation;
 use localityd::scheduler::PullScheduler;
 use localityd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, materialize_virtual_fs_item_with_content_root,
@@ -126,6 +131,152 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
         !calls
             .iter()
             .any(|call| matches!(call, WriteCall::Move { .. }))
+    );
+}
+
+#[test]
+fn remote_delete_observation_e2e_removes_unopened_online_only_page() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount");
+
+    let remote_id = RemoteId::new("page-1");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                remote_id.clone(),
+                locality_core::model::EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at("remote-v1"),
+        )
+        .expect("save entity");
+    store
+        .save_freshness_state(FreshnessStateRecord::new(
+            fixture.mount_id.clone(),
+            remote_id.clone(),
+            FreshnessTier::Cold,
+        ))
+        .expect("save freshness");
+
+    apply_remote_observation(
+        &mut store,
+        observe_job(&fixture.mount_id, &remote_id),
+        remote_observation(&fixture.mount_id, &remote_id, true, "remote-v1"),
+    )
+    .expect("apply deleted observation");
+
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &remote_id)
+            .expect("get entity")
+            .is_none(),
+        "unopened online-only deleted pages should disappear without review"
+    );
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status");
+    assert!(status.clean, "{status:#?}");
+    assert_eq!(status.summary.total, 0, "{status:#?}");
+}
+
+#[test]
+fn remote_delete_observation_e2e_review_then_restored_check_clears_status() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::new());
+    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount");
+    run_pull(&mut store, &connector, &fixture.root).expect("initial pull");
+
+    let remote_id = RemoteId::new("page-1");
+    let synced_version = store
+        .get_entity(&fixture.mount_id, &remote_id)
+        .expect("get entity")
+        .expect("entity")
+        .remote_edited_at
+        .expect("synced remote version");
+    apply_remote_observation(
+        &mut store,
+        observe_job(&fixture.mount_id, &remote_id),
+        remote_observation(&fixture.mount_id, &remote_id, true, &synced_version),
+    )
+    .expect("apply deleted observation");
+
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("deleted status");
+    let entry = status.mounts[0].entries.first().expect("status entry");
+    assert_eq!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable);
+    assert!(
+        entry
+            .issues
+            .iter()
+            .any(|issue| issue.code == "remote_deleted"),
+        "{entry:#?}"
+    );
+
+    apply_remote_observation(
+        &mut store,
+        observe_job(&fixture.mount_id, &remote_id),
+        remote_observation(&fixture.mount_id, &remote_id, false, &synced_version),
+    )
+    .expect("apply restored observation");
+
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("restored status");
+    assert!(status.clean, "{status:#?}");
+    let entry = status.mounts[0].entries.first().expect("status entry");
+    assert!(
+        entry
+            .issues
+            .iter()
+            .all(|issue| issue.code != "remote_deleted"),
+        "{entry:#?}"
     );
 }
 
@@ -5846,6 +5997,34 @@ fn replace_mutable_paragraph(api: &Arc<MutableNotionApi>, block_id: &str, text: 
         .find(|block| block.id == block_id)
         .expect("mutable paragraph block");
     *block = paragraph_block(block_id, text);
+}
+
+fn observe_job(mount_id: &MountId, remote_id: &RemoteId) -> SyncJob {
+    SyncJob::new(
+        mount_id.clone(),
+        Some(remote_id.clone()),
+        SyncJobKind::ObserveEntity,
+        ChangeHintKind::RemoteMaybeChanged,
+    )
+}
+
+fn remote_observation(
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+    deleted: bool,
+    remote_version: &str,
+) -> RemoteObservation {
+    RemoteObservation {
+        mount_id: mount_id.clone(),
+        remote_id: remote_id.clone(),
+        kind: locality_core::model::EntityKind::Page,
+        title: "Roadmap".to_string(),
+        parent_remote_id: None,
+        projected_path: PathBuf::from("Roadmap/page.md"),
+        remote_version: Some(RemoteVersion::new(remote_version)),
+        deleted,
+        raw_metadata_json: "{}".to_string(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

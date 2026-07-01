@@ -28,6 +28,7 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  Trash2,
   Zap,
   X,
 } from "lucide-react";
@@ -3909,7 +3910,7 @@ function TrayPopover({
 type FileActionStatus = {
   state: "working" | "success" | "error";
   message: string;
-  action?: "diff" | "push" | "resolve" | "reset" | "live_mode";
+  action?: FileAction | "live_mode";
 };
 
 type FileDetailStatus = {
@@ -3931,6 +3932,48 @@ type MarkdownEditorView = {
   dispatch: (transaction: { changes: { from: number; to: number; insert: string } }) => void;
   destroy: () => void;
 };
+
+function isRemoteDeletedChange(change: PendingChange) {
+  return change.issueCodes.some(
+    (code) => code === "remote_deleted" || code === "remote_deleted_with_local_pending",
+  );
+}
+
+type FileAction = "diff" | "push" | "resolve" | "check" | "reset" | "draft";
+
+function fileActionWorkingMessage(action: FileAction, remoteDeleted: boolean) {
+  switch (action) {
+    case "diff":
+      return "Checking diff...";
+    case "push":
+      return "Pushing this file...";
+    case "check":
+      return "Checking Notion...";
+    case "draft":
+      return "Saving local draft...";
+    case "reset":
+      return remoteDeleted ? "Removing local copy..." : "Resetting to remote...";
+    case "resolve":
+      return "Pulling latest...";
+  }
+}
+
+function fileActionCommand(action: FileAction) {
+  switch (action) {
+    case "diff":
+      return "diff_notion_file";
+    case "push":
+      return "push_notion_file";
+    case "check":
+      return "check_notion_file";
+    case "draft":
+      return "keep_notion_file_as_draft";
+    case "reset":
+      return "reset_notion_file_to_remote";
+    case "resolve":
+      return "pull_notion_file";
+  }
+}
 
 function FileChangeList({
   changes,
@@ -4082,30 +4125,17 @@ function FileChangeList({
     }
   }
 
-  async function runFileAction(change: PendingChange, action: "diff" | "push" | "resolve" | "reset") {
+  async function runFileAction(change: PendingChange, action: FileAction) {
+    const remoteDeleted = isRemoteDeletedChange(change);
     const path = joinMountPath(mountPath, change.localPath);
-    const workingMessage =
-      action === "diff"
-        ? "Checking diff..."
-        : action === "push"
-          ? "Pushing this file..."
-          : action === "reset"
-            ? "Resetting to remote..."
-            : "Pulling latest...";
+    const workingMessage = fileActionWorkingMessage(action, remoteDeleted);
     setActions((current) => ({
       ...current,
       [change.localPath]: { state: "working", message: workingMessage, action },
     }));
 
     try {
-      const command =
-        action === "diff"
-          ? "diff_notion_file"
-          : action === "push"
-            ? "push_notion_file"
-            : action === "reset"
-              ? "reset_notion_file_to_remote"
-              : "pull_notion_file";
+      const command = fileActionCommand(action);
       const args =
         action === "push"
           ? { path, confirmDangerous }
@@ -4202,6 +4232,7 @@ function FileChangeList({
         const actionNeedsReview = Boolean(action?.state === "error" && pushNeedsReview(action.message) && onReview);
         const isSelected = selectedPath === change.localPath;
         const liveMode = liveModeOverrides[change.localPath] ?? change.liveMode;
+        const remoteDeleted = isRemoteDeletedChange(change);
         return (
           <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
             <div className="file-state">
@@ -4269,19 +4300,19 @@ function FileChangeList({
                   onClick={() => void runFileAction(change, "diff")}
                 />
                 <IconButton
-                  label="Pull latest"
+                  label={remoteDeleted ? "Check again" : "Pull latest"}
                   disabled={isWorking}
                   icon={<RefreshCw />}
-                  onClick={() => void runFileAction(change, "resolve")}
+                  onClick={() => void runFileAction(change, remoteDeleted ? "check" : "resolve")}
                 />
                 <IconButton
-                  label="Reset to remote"
+                  label={remoteDeleted ? "Remove local copy" : "Reset to remote"}
                   disabled={isWorking}
-                  icon={<RotateCcw />}
+                  icon={remoteDeleted ? <Trash2 /> : <RotateCcw />}
                   onClick={() => void runFileAction(change, "reset")}
                 />
                 <IconButton
-                  label="Open file"
+                  label={remoteDeleted ? "Open local copy" : "Open file"}
                   disabled={isWorking}
                   icon={<FolderOpen />}
                   onClick={() =>
@@ -4291,9 +4322,23 @@ function FileChangeList({
               </div>
               <PrimaryButton
                 compact
-                icon={isPushingFile ? <Loader2 className="spin-icon" /> : shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
+                icon={
+                  remoteDeleted ? (
+                    <FolderOpen />
+                  ) : isPushingFile ? (
+                    <Loader2 className="spin-icon" />
+                  ) : shouldReviewBeforePush ? (
+                    <ListChecks />
+                  ) : (
+                    <ShieldCheck />
+                  )
+                }
                 disabled={isWorking}
                 onClick={() => {
+                  if (remoteDeleted) {
+                    void runFileAction(change, "draft");
+                    return;
+                  }
                   if (shouldReviewBeforePush) {
                     onReview?.();
                     return;
@@ -4301,7 +4346,7 @@ function FileChangeList({
                   void runFileAction(change, "push");
                 }}
               >
-                {isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review" : "Push"}
+                {remoteDeleted ? "Keep Draft" : isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review" : "Push"}
               </PrimaryButton>
             </div>
             {isSelected && (

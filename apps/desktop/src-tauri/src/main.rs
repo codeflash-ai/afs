@@ -928,6 +928,59 @@ async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
 }
 
 #[tauri::command]
+async fn check_notion_file(app: AppHandle, path: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match queue_observe_target_direct(&target) {
+            Ok(()) => ActionReport {
+                ok: true,
+                message: "Checking Notion for this page.".to_string(),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Check worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
+async fn keep_notion_file_as_draft(app: AppHandle, path: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match keep_target_as_local_draft_direct(&target) {
+            Ok(draft_path) => ActionReport {
+                ok: true,
+                message: format!(
+                    "Kept a local draft at `{}` and removed the deleted Notion page from Locality.",
+                    draft_path.display()
+                ),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Draft worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
 async fn reset_notion_file_to_remote(app: AppHandle, path: String) -> ActionReport {
     let report = match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
@@ -2759,6 +2812,12 @@ fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
     if matches!(entry.state, StatusState::Conflicted) {
         return "conflict".to_string();
     }
+    if status_issue_has_code(entry, "remote_deleted_with_local_pending") {
+        return "remote page deleted while local edits are pending".to_string();
+    }
+    if status_issue_has_code(entry, "remote_deleted") {
+        return "remote page deleted or unavailable".to_string();
+    }
     if matches!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable) {
         return "remote update available".to_string();
     }
@@ -2774,6 +2833,10 @@ fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
         return issue.message.clone();
     }
     "local edits pending review".to_string()
+}
+
+fn status_issue_has_code(entry: &loc_cli::status::StatusEntry, code: &str) -> bool {
+    entry.issues.iter().any(|issue| issue.code == code)
 }
 
 fn status_entry_needs_desktop_attention(entry: &loc_cli::status::StatusEntry) -> bool {
@@ -7507,6 +7570,121 @@ fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
         .map_err(|error| error.message())
 }
 
+fn queue_observe_target_direct(target: &Path) -> Result<(), String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let target = absolute_path(target)?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+    let entity = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| format!("Could not inspect local metadata: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "No Locality file metadata found for `{}`.",
+                target.display()
+            )
+        })?;
+    let request = DaemonRequest::ObserveEntity {
+        mount_id: mount.mount_id.0,
+        remote_id: entity.remote_id.0,
+    };
+    match send_request(&state_root, &request) {
+        Ok(response) if response.ok => Ok(()),
+        Ok(response) => {
+            let message = response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "daemon rejected the freshness check".to_string());
+            Err(format!("Could not check Notion for this page: {message}"))
+        }
+        Err(error) => Err(format!(
+            "Could not reach the Locality daemon to check Notion for this page: {}",
+            error.message()
+        )),
+    }
+}
+
+fn keep_target_as_local_draft_direct(target: &Path) -> Result<PathBuf, String> {
+    let state_root = default_state_root();
+    let target = absolute_path(target)?;
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+    let entity = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| format!("Could not inspect local metadata: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "No Locality file metadata found for `{}`.",
+                target.display()
+            )
+        })?;
+    let source_path = local_draft_source_path(&state_root, &mount, &relative_path, &target)
+        .ok_or_else(|| {
+            format!(
+                "No local draft contents are available for `{}`.",
+                target.display()
+            )
+        })?;
+    let recovery_dir = state_root
+        .join("recovered")
+        .join(&mount.mount_id.0)
+        .join(activity_timestamp().replace(':', "-"));
+    fs::create_dir_all(&recovery_dir).map_err(|error| {
+        format!(
+            "Could not create local draft recovery folder at `{}`: {error}",
+            recovery_dir.display()
+        )
+    })?;
+    let draft_path = copy_preserved_file(Some(&source_path), &recovery_dir, &relative_path)?
+        .ok_or_else(|| {
+            format!(
+                "Could not preserve local draft contents from `{}`.",
+                source_path.display()
+            )
+        })?;
+    fs::write(
+        recovery_dir.join("README.md"),
+        "Locality preserved this file as a local draft after its Notion page was deleted or became unavailable.\n\nReview the draft manually if you want to copy its contents into a new Notion page.\n",
+    )
+    .map_err(|error| {
+        format!(
+            "Could not write local draft recovery README in `{}`: {error}",
+            recovery_dir.display()
+        )
+    })?;
+
+    store
+        .delete_entity(&mount.mount_id, &entity.remote_id)
+        .map_err(|error| format!("Could not remove deleted Notion page metadata: {error}"))?;
+    store
+        .delete_freshness_state(&mount.mount_id, &entity.remote_id)
+        .map_err(|error| format!("Could not clear Notion freshness metadata: {error}"))?;
+    store
+        .delete_remote_observation(&mount.mount_id, &entity.remote_id)
+        .map_err(|error| format!("Could not clear Notion deletion metadata: {error}"))?;
+    if target.exists() {
+        let _ = fs::remove_file(&target);
+    }
+
+    Ok(draft_path)
+}
+
+fn local_draft_source_path(
+    state_root: &Path,
+    mount: &MountConfig,
+    relative_path: &Path,
+    target: &Path,
+) -> Option<PathBuf> {
+    if mount.projection.uses_virtual_filesystem() {
+        return virtual_fs_content_path(state_root, &mount.mount_id, relative_path)
+            .ok()
+            .filter(|path| path.is_file());
+    }
+    target.is_file().then(|| target.to_path_buf())
+}
+
 fn reset_target_to_remote_direct(target: &Path) -> Result<PullReport, String> {
     let state_root = default_state_root();
     let target = absolute_path(target)?;
@@ -8402,6 +8580,38 @@ mod tests {
         assert_eq!(pulled[0].mount_id, MountId::new("notion-main"));
         assert_eq!(pulled[0].remote_id, RemoteId::new("remote-page"));
         assert!(pulled[0].path.ends_with("Teamspace/Remote Page/page.md"));
+    }
+
+    #[test]
+    fn live_mode_tick_pauses_for_remote_deleted_pending_change() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "remote-page".to_string(),
+            title: "Remote Page".to_string(),
+            local_path: "Teamspace/Remote Page/page.md".to_string(),
+            summary: "remote page deleted or unavailable".to_string(),
+            state: "needs_review".to_string(),
+            issue_codes: vec!["remote_deleted".to_string()],
+            live_mode: sample_live_mode_status(true),
+        }];
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            Some(&live_mode_target(
+                "/tmp/Locality/notion/another-page/page.md",
+            )),
+            |_, _| panic!("remote delete should not push"),
+            |_| panic!("remote delete should not use the generic check cursor"),
+            |_| panic!("remote delete should not fast-forward"),
+            |_, _| panic!("remote delete should not merge remote drift"),
+        );
+
+        assert!(!report.ok);
+        assert_eq!(
+            report.message,
+            "Live Mode paused for `Remote Page`: remote page deleted or unavailable."
+        );
     }
 
     #[test]
@@ -9622,6 +9832,24 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].state, "blocked");
         assert!(changes[0].summary.contains("Previous push failed"));
+    }
+
+    #[test]
+    fn pending_changes_describe_remote_deleted_entries() {
+        let status = status_report_with_entry(status_entry(
+            loc_cli::status::StatusState::Clean,
+            loc_cli::status::StatusSyncState::RemoteUpdateAvailable,
+            0,
+            vec![status_issue("remote_deleted", "remote object was deleted")],
+        ));
+
+        let store = InMemoryStateStore::new();
+        let changes = pending_changes_from_status(&store, &status);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].state, "needs_review");
+        assert_eq!(changes[0].summary, "remote page deleted or unavailable");
+        assert_eq!(changes[0].issue_codes, vec!["remote_deleted"]);
     }
 
     #[test]
@@ -11048,6 +11276,8 @@ fn main() {
             push_to_notion,
             push_notion_file,
             pull_notion_file,
+            check_notion_file,
+            keep_notion_file_as_draft,
             reset_notion_file_to_remote,
             live_mode_tick,
             set_mount_live_mode,
