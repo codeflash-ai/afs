@@ -6841,19 +6841,33 @@ fn live_cli_binary_uses_stored_credential_and_pushes_scratch_page() {
             .arg("notion")
             .arg("--json"),
     );
-    assert!(
-        search.value["results"].as_array().is_some_and(|results| {
-            results.iter().any(|result| {
-                compact_notion_id(
-                    result["remote_id"]
-                        .as_str()
-                        .expect("search result remote_id"),
-                ) == compact_notion_id(&scratch.id)
-                    && result["absolute_path"] == page_path.display().to_string()
+    let search_results = search.value["results"].as_array().expect("search results");
+    let found_scratch = search_results.iter().any(|result| {
+        compact_notion_id(
+            result["remote_id"]
+                .as_str()
+                .expect("search result remote_id"),
+        ) == compact_notion_id(&scratch.id)
+            && result["absolute_path"] == page_path.display().to_string()
+    });
+    if !found_scratch {
+        let debug_store =
+            SqliteStateStore::open(fixture.state_root.clone()).expect("open debug search state");
+        let debug_entities = debug_store
+            .list_entities(&fixture.mount_id)
+            .expect("debug list entities")
+            .into_iter()
+            .map(|entity| {
+                format!(
+                    "{}|{}|{}",
+                    entity.title,
+                    entity.path.display(),
+                    compact_notion_id(&entity.remote_id.0)
+                )
             })
-        }),
-        "{search:#?}"
-    );
+            .collect::<Vec<_>>();
+        panic!("{search:#?}\nindexed entities: {debug_entities:#?}");
+    }
 
     let clean_inspect = loc_json_ok(
         loc_command(loc, &fixture.state_root)
