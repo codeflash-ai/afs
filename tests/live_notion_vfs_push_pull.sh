@@ -617,7 +617,7 @@ renamed_child_dir="$parent_dir/$renamed_child_title"
 renamed_child_page="$renamed_child_dir/page.md"
 step="renaming child page directory through FUSE"
 mv "$child_dir" "$renamed_child_dir"
-assert_status_contains "$renamed_child_page" '"local_frontmatter_changed"'
+assert_status_contains "$renamed_child_page" '"pending_virtual_rename"'
 
 step="pushing renamed child page"
 env -u NOTION_TOKEN -u NOTION_AT LOCALITY_DAEMON_DISABLE=1 LOCALITY_STATE_DIR="$state_root" \

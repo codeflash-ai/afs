@@ -38,8 +38,15 @@ jobs:
             echo "::error::Live Notion e2e is required on main but missing secrets: ${missing[*]}"
             exit 1
           fi
+      - name: Seed stored Notion credential
+        run: |
+          secret_ref="connection:notion-default"
+          secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+          mkdir -p "$HOME/.loc/credentials"
+          printf '%s' "$NOTION_TOKEN" > "$HOME/.loc/credentials/$secret_hex"
+          chmod 600 "$HOME/.loc/credentials/$secret_hex"
       - name: Run connector live integrity tests
-        run: cargo test -p locality-notion --test live_integrity -- --ignored --test-threads=1
+        run: env -u NOTION_TOKEN -u NOTION_AT cargo test -p locality-notion --test live_integrity -- --ignored --test-threads=1
 
   mounted-workflow-live:
     name: Notion mounted workflow live e2e
@@ -140,6 +147,18 @@ jobs:
             Write-Host "::error::Live Notion e2e is required on main but missing secrets: $($missing -join ', ')"
             exit 1
           }
+      - name: Seed stored Notion credential
+        shell: pwsh
+        run: |
+          $secretRef = "connection:notion-default"
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($secretRef)
+          $secretHex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+          $credentialDir = Join-Path $HOME ".loc\credentials"
+          New-Item -ItemType Directory -Force -Path $credentialDir | Out-Null
+          Set-Content -LiteralPath (Join-Path $credentialDir $secretHex) -Value $env:NOTION_TOKEN -NoNewline -Encoding utf8
       - name: Run Windows Cloud Files live Notion e2e
         shell: pwsh
-        run: ./tests/windows_cloud_files_live.ps1
+        run: |
+          Remove-Item Env:\NOTION_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:\NOTION_AT -ErrorAction SilentlyContinue
+          ./tests/windows_cloud_files_live.ps1
