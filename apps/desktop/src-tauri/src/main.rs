@@ -1218,6 +1218,10 @@ fn live_mode_tick_blocking_inner() -> ActionReport {
 }
 
 fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> ActionReport {
+    if let Err(message) = live_mode_reconcile_recent_local_targets(state_root, mount) {
+        return ActionReport { ok: false, message };
+    }
+
     match load_desktop_snapshot() {
         Ok(mut snapshot) => {
             let remote_targets = if snapshot.pending_changes.is_empty()
@@ -1238,7 +1242,7 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
             };
             for target in &remote_targets {
                 if live_mode_should_reconcile_local_target(target)
-                    && let Err(message) = live_mode_reconcile_local_target(target)
+                    && let Err(message) = live_mode_reconcile_local_target(target).map(|_| ())
                 {
                     return ActionReport { ok: false, message };
                 }
@@ -1767,6 +1771,112 @@ where
     Ok(candidates)
 }
 
+fn live_mode_reconcile_recent_local_targets(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    let targets = live_mode_local_reconcile_targets_for_mount(
+        &store,
+        mount,
+        live_mode_remote_check_page_budget(),
+    )?;
+    for target in targets {
+        if !live_mode_should_reconcile_local_target(&target) {
+            continue;
+        }
+        let report = live_mode_reconcile_local_target_with_store(&mut store, state_root, &target)?;
+        if report.reconciled > 0 {
+            desktop_log(
+                "info",
+                "live_mode.local_projection_reconciled",
+                format!(
+                    "imported {} visible File Provider edit(s) before Live Mode sync for `{}`",
+                    report.reconciled,
+                    target.path.display()
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn live_mode_local_reconcile_targets_for_mount<S>(
+    store: &S,
+    mount: &MountConfig,
+    limit: usize,
+) -> Result<Vec<LiveModeRemoteTarget>, String>
+where
+    S: EntityRepository + FreshnessStateRepository,
+{
+    live_mode_local_reconcile_targets_for_mount_at(store, mount, limit, live_mode_now_ms())
+}
+
+fn live_mode_local_reconcile_targets_for_mount_at<S>(
+    store: &S,
+    mount: &MountConfig,
+    limit: usize,
+    now_ms: u128,
+) -> Result<Vec<LiveModeRemoteTarget>, String>
+where
+    S: EntityRepository + FreshnessStateRepository,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let access_root = mount_access_root(mount);
+    let freshness_by_remote_id = store
+        .list_freshness_states(&mount.mount_id)
+        .map_err(|error| format!("Live Mode could not inspect file activity: {error}"))?
+        .into_iter()
+        .map(|state| (state.remote_id.clone(), state))
+        .collect::<BTreeMap<_, _>>();
+    let mut candidates = store
+        .list_entities(&mount.mount_id)
+        .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
+        .into_iter()
+        .filter(|entity| {
+            entity.kind == EntityKind::Page && entity.hydration == HydrationState::Hydrated
+        })
+        .filter_map(|entity| {
+            let freshness = freshness_by_remote_id.get(&entity.remote_id);
+            if !live_mode_target_is_recently_active(freshness, now_ms) {
+                return None;
+            }
+            let activity = live_mode_local_activity_sort_value(freshness)?;
+            Some((
+                activity,
+                entity.path.clone(),
+                LiveModeRemoteTarget {
+                    mount_id: mount.mount_id.clone(),
+                    remote_id: entity.remote_id,
+                    path: access_root.join(entity.path),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.truncate(limit);
+    Ok(candidates
+        .into_iter()
+        .map(|(_, _, target)| target)
+        .collect())
+}
+
+fn live_mode_local_activity_sort_value(freshness: Option<&FreshnessStateRecord>) -> Option<u128> {
+    let freshness = freshness?;
+    [
+        freshness.last_local_change_at.as_deref(),
+        freshness.last_opened_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(timestamp_sort_value)
+    .max()
+}
+
 fn live_mode_target_is_recently_active(
     freshness: Option<&FreshnessStateRecord>,
     now_ms: u128,
@@ -1819,7 +1929,9 @@ fn live_mode_now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn live_mode_reconcile_local_target(target: &LiveModeRemoteTarget) -> Result<(), String> {
+fn live_mode_reconcile_local_target(
+    target: &LiveModeRemoteTarget,
+) -> Result<daemon_file_provider::ProjectionReconcileReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
@@ -1830,13 +1942,12 @@ fn live_mode_reconcile_local_target_with_store(
     store: &mut SqliteStateStore,
     state_root: &Path,
     target: &LiveModeRemoteTarget,
-) -> Result<(), String> {
+) -> Result<daemon_file_provider::ProjectionReconcileReport, String> {
     daemon_file_provider::reconcile_newer_macos_file_provider_projection(
         store,
         state_root,
         Some(&target.path),
     )
-    .map(|_| ())
     .map_err(|error| format!("Live Mode could not inspect local File Provider edits: {error}"))
 }
 
@@ -8340,12 +8451,12 @@ mod tests {
         has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
         install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
         is_notion_access_lost_message, is_unsupported_schema_version_message,
-        live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
-        live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
-        live_mode_should_reconcile_local_target_for_key, live_mode_target,
-        live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
-        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
-        parse_daemon_build_info_json, pending_changes_from_status,
+        live_mode_local_reconcile_targets_for_mount_at, live_mode_merge_remote_drift_markdown,
+        live_mode_remote_check_page_budget_for_rate, live_mode_remote_pull_candidates,
+        live_mode_remote_pull_scan_is_due_for_key, live_mode_should_reconcile_local_target_for_key,
+        live_mode_target, live_mode_tick_from_snapshot, live_mode_wake_generation,
+        load_desktop_activity, mount_has_pending_local_changes, mount_has_unfinished_journals,
+        notion_id_from_url, parse_daemon_build_info_json, pending_changes_from_status,
         prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
         pull_error_message, pull_report_message, push_action_message,
         record_current_install_marker, record_desktop_activity, record_mount_live_mode_tick_result,
@@ -8810,6 +8921,91 @@ mod tests {
             live_mode_remote_check_page_budget_for_rate(f64::NAN, Duration::from_secs(5)),
             1
         );
+    }
+
+    #[test]
+    fn live_mode_local_reconcile_targets_recent_active_pages() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion",
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new("recent-page"),
+                    EntityKind::Page,
+                    "Recent",
+                    "Recent/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save recent entity");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new("cold-page"),
+                    EntityKind::Page,
+                    "Cold",
+                    "Cold/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save cold entity");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new("stub-page"),
+                    EntityKind::Page,
+                    "Stub",
+                    "Stub/page.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save stub entity");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new("recent-page"),
+                    FreshnessTier::Hot,
+                )
+                .opened_at("unix_ms:600000"),
+            )
+            .expect("save recent freshness");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new("cold-page"),
+                    FreshnessTier::Cold,
+                )
+                .opened_at("unix_ms:1"),
+            )
+            .expect("save cold freshness");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new("stub-page"),
+                    FreshnessTier::Hot,
+                )
+                .opened_at("unix_ms:600000"),
+            )
+            .expect("save stub freshness");
+
+        let targets = live_mode_local_reconcile_targets_for_mount_at(&store, &mount, 5, 600000)
+            .expect("targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].remote_id, RemoteId::new("recent-page"));
+        assert!(targets[0].path.ends_with("Recent/page.md"));
     }
 
     #[test]
