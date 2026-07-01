@@ -4464,10 +4464,8 @@ fn resolve_mount_target(store: &SqliteStateStore, target: &str) -> Result<MountC
 
     let target_path = absolute_path(Path::new(target))
         .map_err(|error| format!("failed to resolve `{target}`: {error}"))?;
-    mounts
-        .into_iter()
-        .filter(|mount| target_path.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
+    daemon_file_provider::find_mount_for_path(&mounts, &target_path)
+        .map(|(mount, _)| mount.clone())
         .ok_or_else(|| format!("no Locality mount matches `{target}`"))
 }
 
@@ -5868,14 +5866,22 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use std::fs;
     use std::io::Cursor;
     use std::path::Path;
+    #[cfg(target_os = "windows")]
+    use std::path::PathBuf;
+    #[cfg(target_os = "windows")]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
     use clap::error::ErrorKind;
 
     use locality_core::model::MountId;
     use locality_store::{MountConfig, ProjectionMode};
+    #[cfg(target_os = "windows")]
+    use locality_store::{MountRepository, SqliteStateStore};
 
     use crate::diff::{DiffReport, GuardrailOutput};
     use crate::local_oauth::{local_redirect, parse_oauth_callback};
@@ -5891,7 +5897,7 @@ mod tests {
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
         projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
+        prompt_for_push_confirmation, pull_direct_fallback_error, resolve_mount_target,
         should_prompt_for_push_confirmation, should_refresh_notion_url_search,
         spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
     };
@@ -6680,6 +6686,38 @@ mod tests {
         assert_eq!(error.code, "windows_cloud_files_shared_root_in_use");
         assert!(error.message.contains("/tmp/Locality"));
         assert!(error.message.contains("docs-main"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn file_provider_mount_target_resolution_accepts_windows_case_variants() {
+        let temp_root = unique_temp_path("loc-file-provider-target-resolution");
+        let state_root = temp_root.join("state");
+        let mount_root = temp_root.join("LocalityCase").join("notion-main");
+        fs::create_dir_all(&mount_root).expect("create mount root");
+        let stored_root = PathBuf::from(mount_root.display().to_string().to_ascii_lowercase());
+        let mut store = SqliteStateStore::open(state_root).expect("open state");
+        store
+            .save_mount(
+                MountConfig::new(MountId::new("notion-main"), "notion", &stored_root)
+                    .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save mount with differently cased root");
+
+        let resolved = resolve_mount_target(&store, &mount_root.display().to_string())
+            .expect("resolve target by equivalent Windows path");
+
+        assert_eq!(resolved.mount_id, MountId::new("notion-main"));
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 
     #[test]
