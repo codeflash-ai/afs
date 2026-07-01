@@ -872,6 +872,193 @@ fn prepare_push_plans_pending_page_directory_rename_under_parent_scope() {
 }
 
 #[test]
+fn prepare_push_plans_known_page_directory_move_as_move_entity() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("source-parent"),
+            EntityKind::Page,
+            "Source",
+            "Source/page.md",
+        ))
+        .expect("save source parent");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("target-parent"),
+            EntityKind::Page,
+            "Target",
+            "Target/page.md",
+        ))
+        .expect("save target parent");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-child"),
+                EntityKind::Page,
+                "Child",
+                "Source/Child/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save child");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-child"),
+                "Child body.",
+                8,
+                [RemoteId::new("block-child")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "loc:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Child\"\n",
+            ),
+        )
+        .expect("save shadow");
+    let moved_path = fixture.write_raw(
+        "Target/Child/page.md",
+        "---\nloc:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Child\"\n---\nChild body.",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(moved_path), None, &LocalSourceValidator).expect("prepare move");
+    let plan = prepared.pipeline.plan.expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("page-child"),
+            parent_id: RemoteId::new("target-parent"),
+            parent_kind: EntityKind::Page,
+            source_path: PathBuf::from("Target/Child/page.md"),
+        }]
+    );
+}
+
+#[test]
+fn prepare_push_keeps_unknown_remote_id_new_file_validation() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("target-parent"),
+            EntityKind::Page,
+            "Target",
+            "Target/page.md",
+        ))
+        .expect("save target parent");
+    let path = fixture.write_raw(
+        "Target/Unknown/page.md",
+        "---\nloc:\n  id: unknown-page\n  type: page\ntitle: \"Unknown\"\n---\nBody.",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare create");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "create_entity_has_remote_id"
+    );
+}
+
+#[test]
+fn prepare_push_plans_pending_page_directory_cross_parent_rename_as_move_entity() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("source-parent"),
+            EntityKind::Page,
+            "Source",
+            "Source/page.md",
+        ))
+        .expect("save source parent");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("target-parent"),
+            EntityKind::Page,
+            "Target",
+            "Target/page.md",
+        ))
+        .expect("save target parent");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-child"),
+                EntityKind::Page,
+                "Child",
+                "Target/Child/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved child page");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-child"),
+                "Child body.",
+                8,
+                [RemoteId::new("block-child")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "loc:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Child\"\n",
+            ),
+        )
+        .expect("save child shadow");
+    let cache_path = fixture.write_virtual_page(
+        "Target/Child/page.md",
+        "---\nloc:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Child\"\n---\nChild body.",
+    );
+    fs::create_dir_all(fixture.root.join("Target")).expect("visible target dir");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "rename:page-child".to_string(),
+            mutation_kind: VirtualMutationKind::Rename,
+            target_remote_id: Some(RemoteId::new("page-child")),
+            parent_remote_id: Some(RemoteId::new("target-parent")),
+            original_path: Some(PathBuf::from("Source/Child/page.md")),
+            projected_path: PathBuf::from("Target/Child/page.md"),
+            title: "Child".to_string(),
+            content_path: Some(cache_path),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save rename mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Target")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare target scope move");
+    let plan = prepared.pipeline.plan.expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("page-child"),
+            parent_id: RemoteId::new("target-parent"),
+            parent_kind: EntityKind::Page,
+            source_path: PathBuf::from("Target/Child/page.md"),
+        }]
+    );
+}
+
+#[test]
 fn prepare_push_uses_shared_validator_for_direct_and_virtual_creates() {
     let fixture = PrepareFixture::new();
     let validator = RecordingValidator::default();

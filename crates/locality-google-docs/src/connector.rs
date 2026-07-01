@@ -385,6 +385,7 @@ fn plan_changes_only_document_body(plan: &PushPlan, remote_id: &RemoteId) -> boo
                 return false;
             }
             PushOperation::UpdateProperties { entity_id, .. }
+            | PushOperation::MoveEntity { entity_id, .. }
             | PushOperation::ArchiveEntity { entity_id }
                 if entity_id == remote_id =>
             {
@@ -728,7 +729,9 @@ fn apply_plan(
                     entity_id,
                 });
             }
-            PushOperation::MoveBlock { .. } | PushOperation::UpdateMedia { .. } => {
+            PushOperation::MoveBlock { .. }
+            | PushOperation::MoveEntity { .. }
+            | PushOperation::UpdateMedia { .. } => {
                 return Err(LocalityError::Unsupported(
                     "google docs connector cannot apply this operation",
                 ));

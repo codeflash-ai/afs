@@ -72,6 +72,7 @@ impl PushOperationId {
             PushOperation::AppendBlock { parent_id, .. }
             | PushOperation::CreateEntity { parent_id, .. } => parent_id.0.as_str(),
             PushOperation::ArchiveEntity { entity_id }
+            | PushOperation::MoveEntity { entity_id, .. }
             | PushOperation::UpdateProperties { entity_id, .. } => entity_id.0.as_str(),
         };
 
@@ -103,6 +104,12 @@ pub enum JournalApplyEffect {
         operation_id: PushOperationId,
         operation_index: usize,
         block_id: RemoteId,
+    },
+    MovedEntity {
+        operation_id: PushOperationId,
+        operation_index: usize,
+        entity_id: RemoteId,
+        parent_id: RemoteId,
     },
     ArchivedBlock {
         operation_id: PushOperationId,
@@ -170,6 +177,7 @@ fn operation_kind(operation: &PushOperation) -> &'static str {
         PushOperation::ReplaceBlock { .. } => "replace_block",
         PushOperation::AppendBlock { .. } => "append_block",
         PushOperation::MoveBlock { .. } => "move_block",
+        PushOperation::MoveEntity { .. } => "move_entity",
         PushOperation::UpdateMedia { .. } => "update_media",
         PushOperation::ArchiveBlock { .. } => "archive_block",
         PushOperation::ArchiveEntity { .. } => "archive_entity",

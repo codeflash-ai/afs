@@ -263,6 +263,26 @@ pub fn apply_plan(
                     block_id: block_id.clone(),
                 });
             }
+            PushOperation::MoveEntity {
+                entity_id,
+                parent_id,
+                parent_kind,
+                ..
+            } => {
+                api.move_page(entity_id.as_str(), parent_id.as_str(), parent_kind.clone())?;
+                if !changed_remote_ids.contains(entity_id) {
+                    changed_remote_ids.push(entity_id.clone());
+                }
+                if !changed_remote_ids.contains(parent_id) {
+                    changed_remote_ids.push(parent_id.clone());
+                }
+                effects.push(JournalApplyEffect::MovedEntity {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    entity_id: entity_id.clone(),
+                    parent_id: parent_id.clone(),
+                });
+            }
             PushOperation::ArchiveBlock { block_id } => {
                 api.delete_block(block_id.as_str())?;
                 effects.push(JournalApplyEffect::ArchivedBlock {

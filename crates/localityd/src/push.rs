@@ -13,6 +13,7 @@ use locality_connector::{ApplyPlanRequest, ApplyPlanResult, Connector};
 
 use locality_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown,
+    render_canonical_markdown,
 };
 use locality_core::conflict::unresolved_conflict_marker_line;
 use locality_core::diff::property_value_from_frontmatter;
@@ -20,9 +21,9 @@ use locality_core::freshness::RemoteVersion;
 use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::path_projection::{
-    is_page_document_path, page_container_path, page_document_path,
+    is_page_document_path, page_container_path, page_document_path, page_listing_parent_path,
 };
 use locality_core::planner::GuardrailDecision;
 use locality_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
@@ -1468,7 +1469,7 @@ fn prepare_direct_create<S, Validator>(
     validator: &Validator,
 ) -> Result<PreparedPush, PushPrepareError>
 where
-    S: EntityRepository,
+    S: EntityRepository + ShadowRepository,
     Validator: SourcePushValidator + ?Sized,
 {
     let contents = read_to_string(&absolute_path)?;
@@ -1494,6 +1495,25 @@ where
             });
         }
     };
+    if let Some(remote_id) = parsed.remote_id()
+        && let Some(existing) = store
+            .get_entity(&mount.mount_id, remote_id)
+            .map_err(PushPrepareError::Store)?
+    {
+        if existing.kind == EntityKind::Page && is_page_document_path(&relative_path) {
+            return prepare_known_entity_at_new_path(
+                store,
+                job,
+                state_root,
+                absolute_path,
+                mount,
+                relative_path,
+                parent,
+                existing,
+                parsed,
+            );
+        }
+    }
     let schema_validation = validator.validate_create_frontmatter(SourceValidationContext {
         state_root,
         mount: &mount,
@@ -1520,6 +1540,171 @@ where
         shadows: Vec::new(),
         pipeline,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_known_entity_at_new_path<S>(
+    store: &S,
+    job: &PushJob,
+    _state_root: Option<&Path>,
+    absolute_path: PathBuf,
+    mount: MountConfig,
+    relative_path: PathBuf,
+    parent: EntityRecord,
+    entity: EntityRecord,
+    parsed: locality_core::canonical::ParsedCanonicalDocument,
+) -> Result<PreparedPush, PushPrepareError>
+where
+    S: EntityRepository + ShadowRepository,
+{
+    let shadow = store
+        .load_shadow(&mount.mount_id, &entity.remote_id)
+        .map_err(PushPrepareError::Store)?;
+    let mut pipeline = plan_push_pipeline(
+        PushPipelineRequest::new(&relative_path, &parsed, &shadow)
+            .with_approval(PushApproval {
+                assume_yes: job.assume_yes,
+                confirm_dangerous: job.confirm_dangerous,
+            })
+            .read_only(mount.read_only),
+    );
+    let current_parent = existing_page_parent(store, &mount, &entity)?;
+    if parent.kind == EntityKind::Page
+        && current_parent
+            .as_ref()
+            .is_none_or(|current_parent| current_parent.remote_id != parent.remote_id)
+    {
+        prepend_move_entity_operation(
+            &mut pipeline,
+            &entity.remote_id,
+            &parent.remote_id,
+            parent.kind.clone(),
+            &relative_path,
+            current_parent.as_ref().map(|parent| &parent.remote_id),
+            PushApproval {
+                assume_yes: job.assume_yes,
+                confirm_dangerous: job.confirm_dangerous,
+            },
+        );
+    }
+    validate_notion_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
+    validate_google_docs_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
+
+    let mut prepared_entity = entity;
+    prepared_entity.path = relative_path.clone();
+    prepared_entity.title = parsed
+        .frontmatter
+        .title
+        .clone()
+        .unwrap_or_else(|| prepared_entity.title.clone());
+
+    Ok(PreparedPush {
+        absolute_path,
+        mount,
+        entity: prepared_entity,
+        shadows: vec![shadow],
+        pipeline,
+    })
+}
+
+fn existing_page_parent<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+) -> Result<Option<EntityRecord>, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    let parent_path = page_listing_parent_path(&entity.path);
+    if parent_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let parent_page_path = page_document_path(&parent_path);
+    store
+        .find_entity_by_path(&mount.mount_id, &parent_page_path)
+        .map_err(PushPrepareError::Store)
+}
+
+fn page_document_parent_entity<S>(
+    store: &S,
+    mount: &MountConfig,
+    page_path: &Path,
+) -> Result<Option<EntityRecord>, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    let parent_path = page_listing_parent_path(page_path);
+    if parent_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    store
+        .find_entity_by_path(&mount.mount_id, &page_document_path(&parent_path))
+        .map_err(PushPrepareError::Store)
+}
+
+fn prepend_move_entity_operation(
+    pipeline: &mut PushPipelineResult,
+    entity_id: &RemoteId,
+    parent_id: &RemoteId,
+    parent_kind: EntityKind,
+    source_path: &Path,
+    old_parent_id: Option<&RemoteId>,
+    approval: PushApproval,
+) {
+    if !matches!(
+        pipeline.action,
+        PushPipelineAction::Noop
+            | PushPipelineAction::ProceedToApply
+            | PushPipelineAction::ConfirmPlan
+            | PushPipelineAction::ConfirmDangerousPlan
+    ) {
+        return;
+    }
+
+    let move_operation = PushOperation::MoveEntity {
+        entity_id: entity_id.clone(),
+        parent_id: parent_id.clone(),
+        parent_kind,
+        source_path: source_path.to_path_buf(),
+    };
+    let mut affected = vec![entity_id.clone(), parent_id.clone()];
+    if let Some(old_parent_id) = old_parent_id
+        && !affected.contains(old_parent_id)
+    {
+        affected.push(old_parent_id.clone());
+    }
+    let mut operations = vec![move_operation];
+    if let Some(plan) = pipeline.plan.take() {
+        for remote_id in plan.affected_entities {
+            if !affected.contains(&remote_id) {
+                affected.push(remote_id);
+            }
+        }
+        operations.extend(plan.operations);
+    }
+    let plan = PushPlan::new(affected, operations);
+    let guardrail =
+        locality_core::push::evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
+    let action = match &guardrail {
+        GuardrailDecision::Proceed if approval.assume_yes => PushPipelineAction::ProceedToApply,
+        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
+        GuardrailDecision::ConfirmRequired { .. } if approval.confirm_dangerous => {
+            PushPipelineAction::ProceedToApply
+        }
+        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
+    };
+    pipeline.plan = Some(plan);
+    pipeline.guardrail = guardrail;
+    pipeline.action = action;
+    if !pipeline.completed_stages.contains(&PushStage::Diff) {
+        pipeline.completed_stages.push(PushStage::Diff);
+    }
+    if !pipeline
+        .completed_stages
+        .contains(&PushStage::PlanAndConfirm)
+    {
+        pipeline.completed_stages.push(PushStage::PlanAndConfirm);
+    }
 }
 
 fn repair_missing_database_schema_for_target<S, Source>(
@@ -1958,19 +2143,39 @@ where
                 if representative.is_none() {
                     representative = Some(entity);
                 }
-                shadows.push(
-                    store
-                        .load_shadow(&mount.mount_id, &remote_id)
-                        .map_err(PushPrepareError::Store)?,
-                );
-                operations.push(PushOperation::UpdateProperties {
-                    entity_id: remote_id.clone(),
-                    properties: BTreeMap::from([(
-                        "title".to_string(),
-                        locality_core::planner::PropertyValue::String(mutation.title.clone()),
-                    )]),
-                });
+                let shadow = store
+                    .load_shadow(&mount.mount_id, &remote_id)
+                    .map_err(PushPrepareError::Store)?;
+                let title_changed = shadow_title(&shadow)
+                    .as_deref()
+                    .is_none_or(|title| title != mutation.title);
+                shadows.push(shadow);
+                if let Some(parent_remote_id) = mutation.parent_remote_id.clone() {
+                    operations.push(PushOperation::MoveEntity {
+                        entity_id: remote_id.clone(),
+                        parent_id: parent_remote_id,
+                        parent_kind: EntityKind::Page,
+                        source_path: mutation.projected_path.clone(),
+                    });
+                }
+                if title_changed {
+                    operations.push(PushOperation::UpdateProperties {
+                        entity_id: remote_id.clone(),
+                        properties: BTreeMap::from([(
+                            "title".to_string(),
+                            locality_core::planner::PropertyValue::String(mutation.title.clone()),
+                        )]),
+                    });
+                }
                 affected.push(remote_id);
+                if mutation.parent_remote_id.is_some()
+                    && let Some(original_path) = mutation.original_path.as_deref()
+                    && let Some(source_parent) =
+                        page_document_parent_entity(store, &mount, original_path)?
+                    && !affected.contains(&source_parent.remote_id)
+                {
+                    affected.push(source_parent.remote_id);
+                }
             }
         }
     }
@@ -2008,6 +2213,15 @@ where
             ],
         },
     })
+}
+
+fn shadow_title(shadow: &ShadowDocument) -> Option<String> {
+    parse_canonical_markdown(&render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    )))
+    .ok()
+    .and_then(|parsed| parsed.frontmatter.title)
 }
 
 fn create_entity_pipeline(
@@ -2393,6 +2607,77 @@ where
                         .map_err(LocalityError::from)?;
                     reconciled_remote_ids.push(entity_id.clone());
                 }
+                JournalApplyEffect::MovedEntity {
+                    operation_index,
+                    entity_id,
+                    parent_id,
+                    ..
+                } => {
+                    let Some(PushOperation::MoveEntity { source_path, .. }) =
+                        request.plan.operations.get(*operation_index)
+                    else {
+                        continue;
+                    };
+                    let mut entity = self
+                        .store
+                        .get_entity(request.mount_id, entity_id)
+                        .map_err(LocalityError::from)?
+                        .ok_or_else(|| StoreError::EntityMissing {
+                            mount_id: request.mount_id.clone(),
+                            remote_id: entity_id.clone(),
+                        })
+                        .map_err(LocalityError::from)?;
+                    let old_path = entity.path.clone();
+                    entity.path = source_path.clone();
+                    if entity
+                        .hydration
+                        .can_transition_to(&HydrationState::Hydrated)
+                    {
+                        entity.hydration = HydrationState::Hydrated;
+                    }
+                    self.store
+                        .save_entity(entity.clone())
+                        .map_err(LocalityError::from)?;
+                    let path =
+                        projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
+                    let rendered = self.source.fetch_render(
+                        &locality_core::hydration::HydrationRequest::new(
+                            request.mount_id.clone(),
+                            entity_id.clone(),
+                            entity.path.clone(),
+                            HydrationState::Hydrated,
+                            locality_core::hydration::HydrationReason::ExplicitPull,
+                        ),
+                    )?;
+                    let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
+                    accept_post_apply_remote(
+                        self.store,
+                        &mount,
+                        &mut entity,
+                        &path,
+                        &output_root,
+                        rendered,
+                    )?;
+                    record_moved_entity_parent_observation(
+                        self.store,
+                        &mount,
+                        &entity,
+                        parent_id.clone(),
+                    )?;
+                    remove_stale_created_entity_source_path(
+                        self.state_root.as_deref(),
+                        &mount,
+                        &old_path,
+                        &entity.path,
+                    )?;
+                    self.store
+                        .delete_virtual_mutation(
+                            request.mount_id,
+                            &format!("rename:{}", entity_id.0),
+                        )
+                        .map_err(LocalityError::from)?;
+                    reconciled_remote_ids.push(entity_id.clone());
+                }
                 _ => {}
             }
         }
@@ -2532,6 +2817,32 @@ where
         observation = observation.with_remote_version(RemoteVersion::new(remote_edited_at));
     }
 
+    store
+        .save_remote_observation(observation)
+        .map_err(LocalityError::from)
+}
+
+fn record_moved_entity_parent_observation<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    parent_id: RemoteId,
+) -> LocalityResult<()>
+where
+    S: RemoteObservationRepository,
+{
+    let mut observation = RemoteObservationRecord::new(
+        mount.mount_id.clone(),
+        entity.remote_id.clone(),
+        entity.kind.clone(),
+        entity.title.clone(),
+        entity.path.clone(),
+        push_timestamp(),
+    )
+    .with_parent(parent_id);
+    if let Some(remote_edited_at) = entity.synced_tree_remote_version() {
+        observation = observation.with_remote_version(RemoteVersion::new(remote_edited_at));
+    }
     store
         .save_remote_observation(observation)
         .map_err(LocalityError::from)

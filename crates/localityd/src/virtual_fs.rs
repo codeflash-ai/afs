@@ -977,6 +977,8 @@ where
     let new_parent_path = container_path(&mount, &entities, &mutations, new_parent_identifier)?;
 
     if let Some(child_identifier) = identifier.strip_prefix(CHILDREN_PREFIX) {
+        let new_parent_remote_id =
+            create_parent_remote_id(&mount, &entities, new_parent_identifier)?;
         let new_page_dir = new_parent_path.join(new_filename);
         let new_path = page_document_path(&new_page_dir);
         let title = title_from_filename(new_filename);
@@ -994,11 +996,6 @@ where
                 ));
             }
             let old_parent = page_listing_parent_path(&mutation.projected_path);
-            if old_parent != new_parent_path {
-                return Err(LocalityError::Unsupported(
-                    "moving virtual filesystem page directories across parents is not supported yet",
-                ));
-            }
             ensure_virtual_page_directory_available_for_rename(
                 store,
                 mount_id,
@@ -1011,6 +1008,9 @@ where
             rename_cached_page_if_present(&old_path, &new_content_path, &title)?;
             mutation.projected_path = new_path;
             mutation.title = title;
+            if old_parent != new_parent_path {
+                mutation.parent_remote_id = Some(new_parent_remote_id.clone());
+            }
             mutation.content_path = Some(new_content_path);
             mutation.updated_at = now_string();
             store
@@ -1034,11 +1034,6 @@ where
             ));
         }
         let old_parent = page_listing_parent_path(&entity.path);
-        if old_parent != new_parent_path {
-            return Err(LocalityError::Unsupported(
-                "moving virtual filesystem page directories across parents is not supported yet",
-            ));
-        }
         ensure_virtual_page_directory_available_for_rename(
             store,
             mount_id,
@@ -1065,7 +1060,7 @@ where
             local_id: format!("rename:{}", remote_id.0),
             mutation_kind: VirtualMutationKind::Rename,
             target_remote_id: Some(remote_id.clone()),
-            parent_remote_id: None,
+            parent_remote_id: (old_parent != new_parent_path).then(|| new_parent_remote_id.clone()),
             original_path: Some(original_path),
             projected_path: new_path,
             title: entity.title.clone(),
@@ -3840,6 +3835,86 @@ mod tests {
             PathBuf::from("Home/Renamed Child/page.md")
         );
         assert_eq!(mutation.title, "Renamed Child");
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn rename_existing_page_directory_across_parents_records_destination_parent() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-move-existing-dir");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("source-parent"),
+                EntityKind::Page,
+                "Source",
+                "Source/page.md",
+            ))
+            .expect("save source parent");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("target-parent"),
+                EntityKind::Page,
+                "Target",
+                "Target/page.md",
+            ))
+            .expect("save target parent");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("page-child"),
+                    EntityKind::Page,
+                    "Child",
+                    "Source/Child/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save child page");
+        std::fs::create_dir_all(content_root.join("Source/Child")).expect("create cache dir");
+        std::fs::write(
+            content_root.join("Source/Child/page.md"),
+            b"---\nloc:\n  id: page-child\n  type: page\ntitle: \"Child\"\n---\nBody",
+        )
+        .expect("write page cache");
+
+        let moved = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-child",
+            "children:target-parent",
+            "Child",
+        )
+        .expect("move existing virtual page directory");
+
+        assert_eq!(moved.identifier, "children:page-child");
+        assert_eq!(moved.item.path, "Target/Child");
+        assert!(!content_root.join("Source/Child/page.md").exists());
+        assert!(content_root.join("Target/Child/page.md").exists());
+        let mutation = store
+            .get_virtual_mutation(&mount_id, "rename:page-child")
+            .expect("get rename mutation")
+            .expect("rename mutation");
+        assert_eq!(
+            mutation.parent_remote_id,
+            Some(RemoteId::new("target-parent"))
+        );
+        assert_eq!(
+            mutation.original_path,
+            Some(PathBuf::from("Source/Child/page.md"))
+        );
+        assert_eq!(
+            mutation.projected_path,
+            PathBuf::from("Target/Child/page.md")
+        );
 
         let _ = std::fs::remove_dir_all(state_root);
     }

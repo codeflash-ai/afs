@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use locality_core::LocalityError;
-use locality_core::model::RemoteId;
+use locality_core::model::{EntityKind, RemoteId};
 use locality_core::planner::{
     GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary, PropertyValue,
     PushOperation, PushPlan,
@@ -313,6 +313,7 @@ pub struct PlanSummaryOutput {
     pub media_updated: usize,
     pub blocks_archived: usize,
     pub entities_created: usize,
+    pub entities_moved: usize,
     pub entities_archived: usize,
     pub properties_updated: usize,
 }
@@ -327,6 +328,7 @@ impl From<PlanSummary> for PlanSummaryOutput {
             media_updated: value.media_updated,
             blocks_archived: value.blocks_archived,
             entities_created: value.entities_created,
+            entities_moved: value.entities_moved,
             entities_archived: value.entities_archived,
             properties_updated: value.properties_updated,
         }
@@ -352,6 +354,11 @@ pub enum PushOperationOutput {
     MoveBlock {
         block_id: String,
         after: Option<String>,
+    },
+    MoveEntity {
+        entity_id: String,
+        parent_id: String,
+        parent_kind: EntityKind,
     },
     UpdateMedia {
         block_id: String,
@@ -402,6 +409,16 @@ impl From<PushOperation> for PushOperationOutput {
             PushOperation::MoveBlock { block_id, after } => Self::MoveBlock {
                 block_id: block_id.0,
                 after: after.map(|remote_id| remote_id.0),
+            },
+            PushOperation::MoveEntity {
+                entity_id,
+                parent_id,
+                parent_kind,
+                ..
+            } => Self::MoveEntity {
+                entity_id: entity_id.0,
+                parent_id: parent_id.0,
+                parent_kind,
             },
             PushOperation::UpdateMedia {
                 block_id,
