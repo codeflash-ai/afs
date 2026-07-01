@@ -62,6 +62,33 @@ credentials. macOS File Provider e2e is not part of hosted CI; developers should
 run it on local Macs where the signed app/extension and user approval are
 available.
 
+## Live Notion FUSE E2E
+
+The opt-in live FUSE script uses the real `loc`, `localityd`, and
+`locality-fuse` binaries against a real Notion scratch page. It reads
+`NOTION_TOKEN`/`NOTION_AT` when set, otherwise it reads the installed Locality
+credential store under `~/.loc/credentials` for `connection:notion-default`.
+Set `LOCALITY_NOTION_LIVE_CONNECTION_ID` to use another stored Notion
+connection.
+
+```bash
+export LOCALITY_NOTION_LIVE_PARENT_PAGE=<writable-notion-parent-page>
+LOCALITY_LIVE_NOTION_VFS_PUSH_PULL=1 tests/live_notion_vfs_push_pull.sh
+```
+
+When `LOCALITY_NOTION_PAGE_ID` or `NOTION_PAGE_ID` is not set, the script creates
+and archives its own scratch page under `LOCALITY_NOTION_LIVE_PARENT_PAGE`. It
+seeds an isolated test connection through `loc connect notion --token-stdin`,
+then runs the FUSE mount, pull, edit, push, child create, child rename, and child
+delete/archive path with token environment variables removed from `loc` and
+`localityd`.
+
+The `notion-live-e2e` GitHub Actions workflow runs this script on
+`ubuntu-latest` when the live Notion environment is configured. That job seeds
+`~/.loc/credentials` from the `NOTION_TOKEN` secret before invoking the script
+with `NOTION_TOKEN` removed, so the CI path exercises the stored-credential
+product path rather than relying on direct token environment variables.
+
 ### Existing Mount
 
 Build the daemon, CLI, and FUSE helper:

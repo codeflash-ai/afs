@@ -1,27 +1,50 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use loc_cli::connect::{
+    BrokerOAuthConnectOptions, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
+    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID,
+    GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange, NotionOAuthBrokerExchange,
+    run_connect_google_docs_broker_oauth, run_connect_notion_broker_oauth, run_connection_show,
+    run_connections, run_profiles,
+};
 use loc_cli::diff::run_diff;
-use loc_cli::history::{LogOptions, run_log, run_undo_with_applier};
+use loc_cli::history::{LogOptions, UndoOperationOutput, run_log, run_undo_with_applier};
 use loc_cli::inspect::{InspectOptions, run_inspect};
 use loc_cli::mount::{MountOptions, run_mount};
 use loc_cli::pull::{run_pull, run_pull_with_state_root};
 use loc_cli::push::{PushOptions, run_push_with_daemon, run_push_with_daemon_at_state_root};
+use loc_cli::restore::{RestoreOptions, run_restore};
 use loc_cli::search::{SearchOptions, notion_id_from_url, run_search};
 use loc_cli::status::{StatusOptions, run_status};
-use locality_connector::{Connector, ConnectorUndoApplier, FetchRequest};
+use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
+use locality_connector::{
+    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
+    ConnectorCapabilities, ConnectorKind, ConnectorUndoApplier, EnumerateRequest, FetchRequest,
+    NativeEntity, ParsedEntity,
+};
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
     has_unresolved_conflict_markers,
 };
 use locality_core::explain::{RemoteChangeAction, RemoteChangeState};
+use locality_core::freshness::{ChangeHintKind, FreshnessTier, SyncJobKind};
 use locality_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use locality_core::model::{HydrationState, MountId, RemoteId};
+use locality_core::journal::JournalStatus;
+use locality_core::model::{
+    CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
+};
+use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
+use locality_google_docs::{GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential};
 use locality_notion::client::{HttpNotionApi, NotionApi};
 use locality_notion::dto::{
     BlockDto, BlockListDto, DatabaseDto, NotionPageBundle, PageDto, PageListDto, PagePropertyDto,
@@ -29,24 +52,38 @@ use locality_notion::dto::{
     TextRichTextDto,
 };
 use locality_notion::media::resolve_media_href_with_content_root;
+use locality_notion::oauth::{
+    NotionOAuthBrokerCodeExchange, NotionOAuthToken, StoredNotionCredential,
+};
 use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
-    ConnectionId, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
-    MountConfig, MountRepository, ProjectionMode, VirtualMutationRepository,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
+    ConnectionRecord, ConnectionRepository, ConnectorProfileId, ConnectorProfileRecord,
+    ConnectorProfileRepository, CredentialStore, EntityRecord, EntityRepository,
+    FileCredentialStore, FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
+    JournalRepository, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
+    SqliteStateStore, VirtualMutationRepository, open_credential_store,
 };
-use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationQueue};
-use localityd::reconcile::{DefaultFetchScheduleStrategy, reconcile_scheduled_pull};
-use localityd::scheduler::PullScheduler;
+use localityd::execution::PushJob;
+use localityd::hydration::{
+    HydratedEntity, HydrationExecutor, HydrationOutcome, HydrationQueue, HydrationSource,
+};
+use localityd::push::{PushJobAction, execute_auto_save_push_job_with_content_root};
+use localityd::reconcile::{
+    DefaultFetchScheduleStrategy, ScheduledPullSource, reconcile_scheduled_pull,
+};
+use localityd::runtime::workspace_virtual_freshness_jobs;
+use localityd::scheduler::{PullScheduler, PullSchedulerTick};
 use localityd::virtual_fs::{
-    ROOT_CONTAINER_IDENTIFIER, materialize_virtual_fs_item_with_content_root,
-    mount_point_directory_name, mount_point_identifier, refresh_virtual_fs_children,
-    rename_virtual_fs_item, trash_virtual_fs_item, virtual_fs_children_with_content_root,
-    virtual_fs_content_root,
+    ROOT_CONTAINER_IDENTIFIER, commit_virtual_fs_write, create_virtual_fs_file,
+    materialize_virtual_fs_item_with_content_root, mount_point_directory_name,
+    mount_point_identifier, refresh_virtual_fs_children, rename_virtual_fs_item,
+    trash_virtual_fs_item, virtual_fs_children_with_content_root, virtual_fs_content_root,
 };
 use serde_json::{Value, json};
-use std::time::Duration;
 
 const LIVE_PARENT_ENV: &str = "LOCALITY_NOTION_LIVE_PARENT_PAGE";
+const LIVE_CONNECTION_ENV: &str = "LOCALITY_NOTION_LIVE_CONNECTION_ID";
 const TOKEN_ENV: &str = "NOTION_TOKEN";
 
 #[test]
@@ -127,6 +164,607 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
             .iter()
             .any(|call| matches!(call, WriteCall::Move { .. }))
     );
+}
+
+#[test]
+fn pull_materializes_and_repairs_downloaded_media_cache() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let image_bytes = b"locality-e2e-image-bytes".to_vec();
+    let media_server = LocalMediaServer::new(image_bytes.clone(), 2);
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![
+        paragraph_block("block-1", "Media cache page."),
+        media_block(
+            "image-block",
+            "image",
+            media_server.url(),
+            "Local test image",
+        ),
+    ]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount media cache fixture");
+
+    let pull = run_pull(&mut store, &connector, &fixture.root).expect("pull media cache page");
+    assert!(pull.ok, "{pull:#?}");
+    assert_eq!(pull.hydrated, 1, "{pull:#?}");
+
+    let page_path = fixture.page_file();
+    let markdown = fs::read_to_string(&page_path).expect("read media cache page");
+    assert_local_image_markdown(&markdown, "Local test image");
+    let local_image = local_image_path(&fixture.root, &page_path, &markdown, "Local test image");
+    assert_eq!(
+        fs::read(&local_image).expect("read materialized image"),
+        image_bytes
+    );
+    let manifest = fs::read_to_string(fixture.root.join(".loc/media/manifest.json"))
+        .expect("read media manifest");
+    assert!(manifest.contains("image-block"), "{manifest}");
+    assert!(manifest.contains(media_server.url()), "{manifest}");
+
+    fs::remove_file(&local_image).expect("remove materialized image");
+    let repair = run_pull(&mut store, &connector, &fixture.root).expect("repair media cache page");
+    assert!(repair.ok, "{repair:#?}");
+    assert_eq!(
+        fs::read(&local_image).expect("read repaired image"),
+        image_bytes
+    );
+    media_server.assert_served();
+}
+
+#[test]
+fn oversized_local_media_append_fails_without_connector_apply_and_records_failed_journal() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![paragraph_block(
+        "block-1",
+        "Media upload guardrail base.",
+    )]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount oversized media upload guardrail fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull oversized media upload page");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read oversized media page");
+    let media_dir = fixture.root.join(".loc/media/oversized");
+    fs::create_dir_all(&media_dir).expect("create oversized media dir");
+    let large_pdf = media_dir.join("large.pdf");
+    let file = fs::File::create(&large_pdf).expect("create oversized pdf");
+    file.set_len(20 * 1024 * 1024 + 1)
+        .expect("size oversized pdf");
+    drop(file);
+
+    fs::write(
+        &page_path,
+        format!("{original}\n[Oversized PDF]({})\n", large_pdf.display()),
+    )
+    .expect("append oversized media link");
+
+    let diff = run_diff(&store, &page_path).expect("diff oversized media append");
+    let plan = diff.plan.as_ref().expect("oversized media append plan");
+    assert!(diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    assert_eq!(plan.summary.blocks_created, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push oversized media append");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "apply_failed", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("failed"), "{push:#?}");
+    assert!(push.push_id.is_some(), "{push:#?}");
+    assert!(
+        push.message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local media uploads larger than 20MB"),
+        "{push:#?}"
+    );
+    let journals = store.list_journal().expect("journal");
+    assert_eq!(journals.len(), 1, "{journals:#?}");
+    assert!(
+        matches!(
+            &journals[0].status,
+            JournalStatus::Failed(message)
+                if message.contains("local media uploads larger than 20MB")
+        ),
+        "{journals:#?}"
+    );
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "oversized media upload must fail before upload or append: {calls:#?}"
+    );
+}
+
+#[test]
+fn multi_data_source_database_row_create_blocks_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![paragraph_block(
+        "block-1",
+        "Database guardrail root.",
+    )]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount multi-data-source row create guardrail fixture");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database entity");
+    let database_dir = fixture.root.join("Tasks");
+    fs::create_dir_all(&database_dir).expect("create database directory");
+    fs::write(database_dir.join("_schema.yaml"), ambiguous_tasks_schema())
+        .expect("write ambiguous database schema");
+    let new_row_dir = database_dir.join("new-task");
+    fs::create_dir_all(&new_row_dir).expect("create new row directory");
+    let new_row_path = new_row_dir.join("page.md");
+    fs::write(
+        &new_row_path,
+        "---\ntitle: New ambiguous task\nStatus: Todo\n---\n# Notes\n\nCreated under an ambiguous database schema.\n",
+    )
+    .expect("write ambiguous row create");
+
+    let diff = run_diff(&store, &new_row_path).expect("diff ambiguous row create");
+    assert!(!diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_schema_ambiguous_data_source"
+    );
+    assert_eq!(diff.validation[0].file, "Tasks/new-task/page.md");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &new_row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push ambiguous row create");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert!(push.plan.is_none(), "{push:#?}");
+    assert_eq!(
+        push.validation[0].code,
+        "notion_schema_ambiguous_data_source"
+    );
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(
+        store.list_journal().expect("journal").is_empty(),
+        "ambiguous row create must not create a journal entry"
+    );
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "ambiguous row create must block before connector apply: {calls:#?}"
+    );
+    assert!(
+        new_row_path.exists(),
+        "blocked row create should not reconcile or move the draft file"
+    );
+}
+
+#[test]
+fn new_page_create_validation_blocks_before_journaled_apply() {
+    let cases = vec![
+        (
+            "has-remote-id",
+            "Has Remote Id.md",
+            render_canonical_markdown(&CanonicalDocument::new(
+                "loc:\n  id: existing-page\n  type: page\ntitle: Has remote id\n",
+                "New files cannot claim an existing remote page.\n",
+            )),
+            "create_entity_has_remote_id",
+        ),
+        (
+            "type-not-page",
+            "Type Not Page.md",
+            render_canonical_markdown(&CanonicalDocument::new(
+                "loc:\n  type: database\ntitle: Type not page\n",
+                "New files with Locality metadata must be pages.\n",
+            )),
+            "create_entity_type_not_page",
+        ),
+        (
+            "missing-title",
+            "Missing Title.md",
+            render_canonical_markdown(&CanonicalDocument::new(
+                "loc:\n  type: page\n",
+                "New files need a title.\n",
+            )),
+            "create_entity_missing_title",
+        ),
+        (
+            "stub-body",
+            "Stub Body.md",
+            render_canonical_markdown(&CanonicalDocument::new(
+                "title: Stub body\n",
+                format!("{}\n", CanonicalDocument::STUB_MARKER),
+            )),
+            "create_entity_stub_body",
+        ),
+        (
+            "directive",
+            "Directive.md",
+            render_canonical_markdown(&CanonicalDocument::new(
+                "title: Directive\n",
+                "::loc{id=seeded-block type=unsupported kind=\"unsupported\"}\n",
+            )),
+            "create_entity_directive_unsupported",
+        ),
+    ];
+
+    for (name, relative_path, markdown, expected_code) in cases {
+        let fixture = E2eFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let api = Arc::new(MutableNotionApi::with_blocks(vec![paragraph_block(
+            "block-1",
+            "Create validation root.",
+        )]));
+        let connector = NotionConnector::with_api(
+            NotionConfig::default().with_root_page_id(RemoteId::new("page-1")),
+            api.clone(),
+        );
+        mount_virtual_workspace(&fixture, &mut store, "page-1");
+        let content_root = fixture.content_root();
+        hydrate_virtual_root_page(&fixture, &mut store, &connector, &content_root, "page-1");
+        let created = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &fixture.mount_id,
+            "children:page-1",
+            relative_path,
+        )
+        .unwrap_or_else(|error| panic!("record create validation {name}: {error:?}"));
+        commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &fixture.mount_id,
+            &created.identifier,
+            markdown.as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("write create validation {name}: {error:?}"));
+        let page_path = fixture.root.clone();
+
+        let diff = run_diff(&store, &page_path)
+            .unwrap_or_else(|error| panic!("diff create validation {name}: {error:?}"));
+        assert!(!diff.ok, "{name}: {diff:#?}");
+        assert_eq!(diff.action, "fix_validation", "{name}: {diff:#?}");
+        assert!(diff.plan.is_none(), "{name}: {diff:#?}");
+        assert_eq!(diff.validation[0].code, expected_code, "{name}: {diff:#?}");
+
+        let push = run_push_with_daemon_at_state_root(
+            &mut store,
+            &connector,
+            &page_path,
+            PushOptions {
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+            Some(&fixture.state_root),
+        )
+        .unwrap_or_else(|error| panic!("push create validation {name}: {error}"));
+        assert!(!push.ok, "{name}: {push:#?}");
+        assert_eq!(push.action, "fix_validation", "{name}: {push:#?}");
+        assert!(push.plan.is_none(), "{name}: {push:#?}");
+        assert_eq!(push.validation[0].code, expected_code, "{name}: {push:#?}");
+        assert_eq!(push.push_id, None, "{name}: {push:#?}");
+        assert_eq!(push.journal_status, None, "{name}: {push:#?}");
+        assert!(
+            store.list_journal().expect("journal").is_empty(),
+            "{name}: create validation must block before journal creation"
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert!(
+            calls.is_empty(),
+            "{name}: create validation must block before connector apply: {calls:#?}"
+        );
+    }
+}
+
+#[test]
+fn frontmatter_remote_id_mismatch_blocks_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![paragraph_block(
+        "block-1",
+        "Identity validation root.",
+    )]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount frontmatter id mismatch fixture");
+
+    let pull = run_pull(&mut store, &connector, &fixture.root).expect("pull identity page");
+    assert!(pull.ok, "{pull:#?}");
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read identity page");
+    fs::write(&page_path, original.replace("id: page-1", "id: page-2"))
+        .expect("write mismatched identity");
+
+    let diff = run_diff(&store, &page_path).expect("diff mismatched identity");
+    assert!(!diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(diff.validation[0].code, "frontmatter_remote_id_mismatch");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push mismatched identity");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert!(push.plan.is_none(), "{push:#?}");
+    assert_eq!(push.validation[0].code, "frontmatter_remote_id_mismatch");
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(
+        store.list_journal().expect("journal").is_empty(),
+        "frontmatter id mismatch must block before journal creation"
+    );
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "frontmatter id mismatch must block before connector apply: {calls:#?}"
+    );
+}
+
+#[test]
+fn broker_oauth_connect_stores_refresh_handle_without_leaking_secret_material() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let credentials = FileCredentialStore::new(&fixture.state_root);
+    let exchange = FakeBrokerOAuthExchange;
+
+    let report = run_connect_notion_broker_oauth(
+        &mut store,
+        &credentials,
+        BrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("broker-work")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "broker-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/notion/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect broker oauth");
+
+    assert!(report.ok);
+    assert_eq!(report.connection_id, "broker-work");
+    assert_eq!(report.profile_id, DEFAULT_NOTION_OAUTH_PROFILE_ID);
+    assert_eq!(report.auth_kind, "oauth");
+    assert_eq!(report.workspace_name.as_deref(), Some("Locality"));
+
+    let secret = credentials
+        .get("connection:broker-work")
+        .expect("broker oauth credential saved");
+    let stored = serde_json::from_str::<StoredNotionCredential>(&secret).expect("stored oauth");
+    assert_eq!(stored.kind, "oauth");
+    assert_eq!(stored.access_token, "oauth-access-token");
+    assert_eq!(stored.refresh_token, None);
+    assert_eq!(
+        stored.refresh_token_handle.as_deref(),
+        Some("opaque-refresh-handle")
+    );
+    assert_eq!(stored.oauth_client_id.as_deref(), Some("broker-client-id"));
+    assert_eq!(stored.oauth_client_secret, None);
+    assert_eq!(
+        stored.oauth_broker_url.as_deref(),
+        Some("https://auth.example.test")
+    );
+
+    let connection = store
+        .get_connection(&ConnectionId::new("broker-work"))
+        .expect("load broker oauth connection")
+        .expect("broker oauth connection");
+    assert_eq!(connection.secret_ref, "connection:broker-work");
+    assert_eq!(connection.auth_kind, "oauth");
+    assert_eq!(connection.workspace_id.as_deref(), Some("workspace-1"));
+    assert_eq!(
+        connection.profile_id,
+        Some(ConnectorProfileId::new(DEFAULT_NOTION_OAUTH_PROFILE_ID))
+    );
+
+    let profile = store
+        .get_connector_profile(&ConnectorProfileId::new(DEFAULT_NOTION_OAUTH_PROFILE_ID))
+        .expect("load oauth profile")
+        .expect("oauth profile");
+    assert_eq!(profile.connector, "notion");
+    assert_eq!(profile.auth_kind, "oauth");
+
+    let reports = [
+        serde_json::to_string(&report).expect("connect report json"),
+        serde_json::to_string(&run_connections(&store).expect("connections report"))
+            .expect("connections json"),
+        serde_json::to_string(
+            &run_connection_show(&store, ConnectionId::new("broker-work"))
+                .expect("connection show report"),
+        )
+        .expect("connection show json"),
+        serde_json::to_string(&run_profiles(&store).expect("profiles report"))
+            .expect("profiles json"),
+    ];
+    for json in reports {
+        assert!(!json.contains("oauth-access-token"), "{json}");
+        assert!(!json.contains("opaque-refresh-handle"), "{json}");
+        assert!(!json.contains("broker-client-secret"), "{json}");
+        assert!(!json.contains("secret_ref"), "{json}");
+        assert!(!json.contains("connection:broker-work"), "{json}");
+    }
+}
+
+#[test]
+fn google_docs_broker_oauth_connect_stores_refresh_handle_without_leaking_secret_material() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let credentials = FileCredentialStore::new(&fixture.state_root);
+    let exchange = FakeGoogleDocsBrokerOAuthExchange;
+
+    let report = run_connect_google_docs_broker_oauth(
+        &mut store,
+        &credentials,
+        GoogleDocsBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("docs-broker-work")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "google-broker-client-id".to_string(),
+            session: "google-broker-session".to_string(),
+            state: "google-state-1".to_string(),
+            code: "google-oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect google docs broker oauth");
+
+    assert!(report.ok);
+    assert_eq!(report.connection_id, "docs-broker-work");
+    assert_eq!(report.profile_id, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID);
+    assert_eq!(report.connector, "google-docs");
+    assert_eq!(report.auth_kind, "oauth");
+    assert_eq!(report.account_label.as_deref(), Some("user@example.com"));
+    assert_eq!(report.workspace_name.as_deref(), Some("Google Drive"));
+
+    let secret = credentials
+        .get("connection:docs-broker-work")
+        .expect("google docs broker oauth credential saved");
+    let stored =
+        serde_json::from_str::<StoredGoogleDocsCredential>(&secret).expect("stored google oauth");
+    assert_eq!(stored.kind, "oauth");
+    assert_eq!(stored.access_token, "google-oauth-access-token");
+    assert_eq!(
+        stored.refresh_token_handle.as_deref(),
+        Some("google-opaque-refresh-handle")
+    );
+    assert_eq!(
+        stored.oauth_client_id.as_deref(),
+        Some("google-broker-client-id")
+    );
+    assert_eq!(
+        stored.oauth_broker_url.as_deref(),
+        Some("https://auth.example.test")
+    );
+
+    let connection = store
+        .get_connection(&ConnectionId::new("docs-broker-work"))
+        .expect("load google docs broker oauth connection")
+        .expect("google docs broker oauth connection");
+    assert_eq!(connection.secret_ref, "connection:docs-broker-work");
+    assert_eq!(connection.connector, "google-docs");
+    assert_eq!(connection.auth_kind, "oauth");
+    assert_eq!(
+        connection.account_label.as_deref(),
+        Some("user@example.com")
+    );
+    assert_eq!(connection.workspace_id.as_deref(), Some("google-drive"));
+    assert_eq!(
+        connection.profile_id,
+        Some(ConnectorProfileId::new(
+            DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID
+        ))
+    );
+
+    let profile = store
+        .get_connector_profile(&ConnectorProfileId::new(
+            DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
+        ))
+        .expect("load google docs oauth profile")
+        .expect("google docs oauth profile");
+    assert_eq!(profile.connector, "google-docs");
+    assert_eq!(profile.auth_kind, "oauth");
+
+    let reports = [
+        serde_json::to_string(&report).expect("google docs connect report json"),
+        serde_json::to_string(&run_connections(&store).expect("connections report"))
+            .expect("connections json"),
+        serde_json::to_string(
+            &run_connection_show(&store, ConnectionId::new("docs-broker-work"))
+                .expect("connection show report"),
+        )
+        .expect("connection show json"),
+        serde_json::to_string(&run_profiles(&store).expect("profiles report"))
+            .expect("profiles json"),
+    ];
+    for json in reports {
+        assert!(!json.contains("google-oauth-access-token"), "{json}");
+        assert!(!json.contains("google-opaque-refresh-handle"), "{json}");
+        assert!(!json.contains("google-broker-client-secret"), "{json}");
+        assert!(!json.contains("secret_ref"), "{json}");
+        assert!(!json.contains("connection:docs-broker-work"), "{json}");
+    }
 }
 
 #[test]
@@ -253,6 +891,349 @@ fn pull_dirty_page_merges_non_overlapping_blocks_and_conflicts_same_block() {
 }
 
 #[test]
+fn unresolved_pull_conflict_markers_block_push_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![
+        paragraph_block("block-1", "Shared base paragraph."),
+        paragraph_block("block-2", "Unchanged detail paragraph."),
+    ]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount unresolved conflict fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("initial unresolved conflict pull");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read unresolved conflict page");
+    let local_marker = format!("Local unresolved conflict edit {}", unique_suffix());
+    let remote_marker = format!("Remote unresolved conflict edit {}", unique_suffix());
+    fs::write(
+        &page_path,
+        original.replace("Shared base paragraph.", &local_marker),
+    )
+    .expect("write local unresolved conflict edit");
+    replace_mutable_paragraph(&api, "block-1", &remote_marker);
+
+    let pull = run_pull(&mut store, &connector, &page_path).expect("pull unresolved conflict");
+    assert!(!pull.ok, "{pull:#?}");
+    assert_eq!(pull.conflicts.len(), 1, "{pull:#?}");
+    let conflicted = fs::read_to_string(&page_path).expect("read unresolved conflict markers");
+    assert!(conflicted.contains(&local_marker), "{conflicted}");
+    assert!(conflicted.contains(&remote_marker), "{conflicted}");
+    assert!(has_unresolved_conflict_markers(&conflicted), "{conflicted}");
+
+    let diff = run_diff(&store, &page_path).expect("diff unresolved conflict markers");
+    assert!(!diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(diff.validation[0].code, "unresolved_conflict_markers");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push unresolved conflict markers");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "unresolved conflict markers must block before connector apply: {calls:#?}"
+    );
+    drop(calls);
+
+    let remote = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new("page-1"),
+        })
+        .expect("fetch remote after blocked unresolved conflict push");
+    let remote_body = connector
+        .render_native_entity_for_path(&remote, &page_path)
+        .expect("render remote after blocked unresolved conflict push")
+        .document
+        .body;
+    assert!(remote_body.contains(&remote_marker), "{remote_body}");
+    assert!(
+        !remote_body.contains(&local_marker),
+        "blocked unresolved conflict push must not write local marker remotely:\n{remote_body}"
+    );
+}
+
+#[test]
+fn large_archive_plan_requires_confirm_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(
+        (0..12)
+            .map(|index| paragraph_block(&format!("block-{index}"), &format!("Paragraph {index}.")))
+            .collect(),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount large archive fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull large archive page");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read large archive page");
+    let frontmatter_end = original
+        .find("\n---\n")
+        .map(|index| index + "\n---\n".len())
+        .expect("canonical frontmatter terminator");
+    fs::write(&page_path, &original[..frontmatter_end]).expect("remove synced body blocks");
+
+    let diff = run_diff(&store, &page_path).expect("diff large archive plan");
+    assert!(diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "confirm_dangerous_plan", "{diff:#?}");
+    assert_eq!(diff.guardrail.decision, "confirm_required", "{diff:#?}");
+    assert!(
+        diff.guardrail
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("12 blocks or pages would be archived or replaced")),
+        "{diff:#?}"
+    );
+    let plan = diff.plan.as_ref().expect("large archive plan");
+    assert_eq!(plan.summary.blocks_archived, 12, "{plan:#?}");
+
+    let blocked_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push unconfirmed large archive");
+    assert!(!blocked_push.ok, "{blocked_push:#?}");
+    assert_eq!(
+        blocked_push.action, "confirm_dangerous_plan",
+        "{blocked_push:#?}"
+    );
+    assert_eq!(
+        blocked_push.guardrail.decision, "confirm_required",
+        "{blocked_push:#?}"
+    );
+    assert_eq!(blocked_push.journal_status, None, "{blocked_push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert!(
+        api.calls.lock().expect("calls").is_empty(),
+        "unconfirmed large archive must not call connector apply"
+    );
+
+    let confirmed_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+    )
+    .expect("push confirmed large archive");
+    assert!(confirmed_push.ok, "{confirmed_push:#?}");
+    assert_eq!(confirmed_push.action, "reconciled", "{confirmed_push:#?}");
+    assert_eq!(
+        confirmed_push.journal_status.as_deref(),
+        Some("reconciled"),
+        "{confirmed_push:#?}"
+    );
+    assert_eq!(confirmed_push.apply_effect_count, 12, "{confirmed_push:#?}");
+
+    let calls = api.calls.lock().expect("calls");
+    let deleted = calls
+        .iter()
+        .filter(|call| matches!(call, WriteCall::Delete { .. }))
+        .count();
+    assert_eq!(deleted, 12, "{calls:#?}");
+    drop(calls);
+
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after confirmed large archive");
+    assert!(status.clean, "{status:#?}");
+    assert_eq!(status.summary.dirty, 0, "{status:#?}");
+}
+
+#[test]
+fn auto_save_safe_update_reconciles_and_destructive_update_blocks_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(
+        (0..12)
+            .map(|index| {
+                paragraph_block(
+                    &format!("autosave-block-{index}"),
+                    &format!("Auto-save paragraph {index}."),
+                )
+            })
+            .collect(),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount auto-save fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull auto-save page");
+
+    let page_path = fixture.page_file();
+    let relative_path = page_path
+        .strip_prefix(&fixture.root)
+        .expect("page is under mount root")
+        .to_path_buf();
+    store
+        .save_auto_save_enrollment(
+            AutoSaveEnrollmentRecord::new(
+                fixture.mount_id.clone(),
+                relative_path.clone(),
+                AutoSaveOrigin::UserEnabled,
+                "unix_ms:1",
+            )
+            .active("unix_ms:2"),
+        )
+        .expect("save auto-save enrollment");
+
+    let original = fs::read_to_string(&page_path).expect("read auto-save page");
+    assert!(original.contains("Auto-save paragraph 0."), "{original}");
+    let safe_marker = format!("Auto-save safe update {}", unique_suffix());
+    fs::write(
+        &page_path,
+        original.replace("Auto-save paragraph 0.", &safe_marker),
+    )
+    .expect("write auto-save safe edit");
+
+    let safe_report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: page_path.clone(),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &connector,
+        None,
+    )
+    .expect("execute auto-save safe push");
+    assert_eq!(safe_report.action, PushJobAction::Reconciled);
+    assert!(safe_report.error.is_none(), "{safe_report:#?}");
+    assert!(safe_report.push_id.is_some(), "{safe_report:#?}");
+    let active_enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, &relative_path)
+        .expect("load active auto-save enrollment")
+        .expect("active auto-save enrollment");
+    assert_eq!(active_enrollment.state, AutoSaveState::Active);
+    assert_eq!(active_enrollment.remote_id, Some(RemoteId::new("page-1")));
+    assert!(active_enrollment.last_push_id.is_some());
+    let calls_after_safe = api.calls.lock().expect("calls").len();
+    assert!(calls_after_safe > 0, "safe auto-save should write remotely");
+    assert_eq!(store.list_journal().expect("journal").len(), 1);
+
+    let safe_reconciled = fs::read_to_string(&page_path).expect("read safe reconciled page");
+    assert!(safe_reconciled.contains(&safe_marker), "{safe_reconciled}");
+    let frontmatter_end = safe_reconciled
+        .find("\n---\n")
+        .map(|index| index + "\n---\n".len())
+        .expect("canonical frontmatter terminator");
+    fs::write(&page_path, &safe_reconciled[..frontmatter_end])
+        .expect("remove synced body for destructive auto-save edit");
+
+    let blocked_report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: page_path.clone(),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &connector,
+        None,
+    )
+    .expect("execute auto-save destructive push");
+    assert_eq!(blocked_report.action, PushJobAction::NotReady);
+    let blocked_error = blocked_report.error.as_ref().expect("blocked error");
+    assert_eq!(blocked_error.code, "auto_save_blocked");
+    assert!(
+        blocked_error
+            .message
+            .contains("destructive push plan needs explicit review"),
+        "{blocked_report:#?}"
+    );
+    assert_eq!(blocked_report.push_id, None, "{blocked_report:#?}");
+    assert_eq!(blocked_report.journal_status, None, "{blocked_report:#?}");
+    let blocked_enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, &relative_path)
+        .expect("load blocked auto-save enrollment")
+        .expect("blocked auto-save enrollment");
+    assert_eq!(blocked_enrollment.state, AutoSaveState::Blocked);
+    assert!(
+        blocked_enrollment
+            .last_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("destructive push plan needs explicit review"),
+        "{blocked_enrollment:#?}"
+    );
+    assert_eq!(
+        store
+            .list_journal()
+            .expect("journal after blocked auto-save")
+            .len(),
+        1,
+        "blocked auto-save must not create a second journal entry"
+    );
+    assert_eq!(
+        api.calls.lock().expect("calls").len(),
+        calls_after_safe,
+        "blocked auto-save must not call connector apply"
+    );
+}
+
+#[test]
 fn mount_pull_directive_move_pushes_copy_archive_and_status_clean() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -341,18 +1322,1230 @@ fn mount_pull_directive_move_pushes_copy_archive_and_status_clean() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
-fn live_scratch_page_mount_edit_push_verifies_notion() {
-    std::env::var(TOKEN_ENV).expect("NOTION_TOKEN");
-    let parent_page = normalize_notion_id(
-        &std::env::var(LIVE_PARENT_ENV)
-            .unwrap_or_else(|_| panic!("set {LIVE_PARENT_ENV} to a writable page ID or URL")),
+fn notion_table_header_mode_change_blocks_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::new());
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount Notion table header-mode guardrail fixture");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save table page entity");
+
+    let original_body = "|  |  |\n| --- | --- |\n| Old task | Todo |";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        original_body,
+        8,
+        [RemoteId::new("table-1")],
+    )
+    .expect("table shadow");
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: vec![RemoteId::new("row-1")],
+        has_column_header: false,
+        has_row_header: false,
+    };
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save table shadow");
+
+    let edited_body = "| Name | Status |\n| --- | --- |\n| Old task | Todo |";
+    let page_path = fixture.root.join("Roadmap/page.md");
+    fs::create_dir_all(page_path.parent().expect("page parent")).expect("create page parent");
+    fs::write(
+        &page_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            edited_body,
+        )),
+    )
+    .expect("write table header-mode edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff table header-mode edit");
+    assert!(!diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_table_header_mode_change_unsupported"
     );
-    let api = HttpNotionApi::new(NotionConfig::default());
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push table header-mode edit");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert!(push.plan.is_none(), "{push:#?}");
+    assert_eq!(
+        push.validation[0].code,
+        "notion_table_header_mode_change_unsupported"
+    );
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(
+        store.list_journal().expect("journal").is_empty(),
+        "table header-mode validation must block before journal creation"
+    );
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "table header-mode validation must block before connector apply: {calls:#?}"
+    );
+}
+
+#[test]
+fn notion_link_preview_edit_move_delete_block_before_journaled_apply() {
+    let cases = [
+        (
+            "edit",
+            "[Preview](https://example.com/preview)",
+            "[Changed](https://example.com/preview)",
+            0,
+            "notion_link_preview_edit_unsupported",
+        ),
+        (
+            "move",
+            "Intro.\n\n[Preview](https://example.com/preview)",
+            "[Preview](https://example.com/preview)\n\nIntro.",
+            1,
+            "notion_link_preview_move_unsupported",
+        ),
+        (
+            "delete",
+            "Intro.\n\n[Preview](https://example.com/preview)",
+            "Intro.",
+            1,
+            "notion_link_preview_delete_unsupported",
+        ),
+    ];
+
+    for (name, original_body, edited_body, link_preview_index, expected_code) in cases {
+        let fixture = E2eFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let api = Arc::new(MutableNotionApi::new());
+        let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+        run_mount(
+            &mut store,
+            MountOptions {
+                mount_id: fixture.mount_id.clone(),
+                connector: "notion".to_string(),
+                root: fixture.root.clone(),
+                remote_root_id: Some(RemoteId::new("page-1")),
+                connection_id: Some(ConnectionId::new("work")),
+                read_only: false,
+                projection: ProjectionMode::PlainFiles,
+            },
+        )
+        .unwrap_or_else(|error| panic!("mount link_preview {name} guardrail fixture: {error:?}"));
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    RemoteId::new("page-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .unwrap_or_else(|error| panic!("save link_preview {name} page entity: {error}"));
+
+        let native_ids = if link_preview_index == 0 {
+            vec![RemoteId::new("link-preview-1")]
+        } else {
+            vec![
+                RemoteId::new("paragraph-1"),
+                RemoteId::new("link-preview-1"),
+            ]
+        };
+        let mut shadow =
+            ShadowDocument::from_synced_body(RemoteId::new("page-1"), original_body, 8, native_ids)
+                .unwrap_or_else(|error| panic!("link_preview {name} shadow: {error}"));
+        shadow.blocks[link_preview_index].native_kind = Some("link_preview".to_string());
+        store
+            .save_shadow(&fixture.mount_id, shadow)
+            .unwrap_or_else(|error| panic!("save link_preview {name} shadow: {error}"));
+
+        let page_path = fixture.root.join("Roadmap/page.md");
+        fs::create_dir_all(page_path.parent().expect("page parent"))
+            .unwrap_or_else(|error| panic!("create link_preview {name} page parent: {error}"));
+        fs::write(
+            &page_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+                edited_body,
+            )),
+        )
+        .unwrap_or_else(|error| panic!("write link_preview {name} edit: {error}"));
+
+        let diff = run_diff(&store, &page_path)
+            .unwrap_or_else(|error| panic!("diff link_preview {name}: {error:?}"));
+        assert!(!diff.ok, "{name}: {diff:#?}");
+        assert_eq!(diff.action, "fix_validation", "{name}: {diff:#?}");
+        assert!(diff.plan.is_none(), "{name}: {diff:#?}");
+        assert_eq!(diff.validation[0].code, expected_code, "{name}: {diff:#?}");
+
+        let push = run_push_with_daemon(
+            &mut store,
+            &connector,
+            &page_path,
+            PushOptions {
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+        )
+        .unwrap_or_else(|error| panic!("push link_preview {name}: {error}"));
+        assert!(!push.ok, "{name}: {push:#?}");
+        assert_eq!(push.action, "fix_validation", "{name}: {push:#?}");
+        assert!(push.plan.is_none(), "{name}: {push:#?}");
+        assert_eq!(push.validation[0].code, expected_code, "{name}: {push:#?}");
+        assert_eq!(push.push_id, None, "{name}: {push:#?}");
+        assert_eq!(push.journal_status, None, "{name}: {push:#?}");
+        assert!(
+            store.list_journal().expect("journal").is_empty(),
+            "{name}: link_preview validation must block before journal creation"
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert!(
+            calls.is_empty(),
+            "{name}: link_preview validation must block before connector apply: {calls:#?}"
+        );
+    }
+}
+
+#[test]
+fn notion_link_to_page_label_edit_blocks_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::new());
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let target_id = "22222222-2222-2222-2222-222222222222";
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount link-to-page edit guardrail fixture");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save link-to-page parent entity");
+
+    let original_body = "[Linked page](https://www.notion.so/22222222222222222222222222222222)";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        original_body,
+        8,
+        [RemoteId::new("link-to-page-block-1")],
+    )
+    .expect("link-to-page shadow");
+    shadow.blocks[0].native_kind = Some("link_to_page".to_string());
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save link-to-page shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(target_id),
+                EntityKind::Page,
+                "Linked page",
+                "Linked page/page.md",
+            )
+            .with_hydration(HydrationState::Stub),
+        )
+        .expect("save link-to-page target entity");
+
+    let edited_body =
+        "[Edited linked page](https://www.notion.so/22222222222222222222222222222222)";
+    let page_path = fixture.root.join("Roadmap/page.md");
+    fs::create_dir_all(page_path.parent().expect("page parent")).expect("create page parent");
+    fs::write(
+        &page_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            edited_body,
+        )),
+    )
+    .expect("write link-to-page label edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff link-to-page label edit");
+    assert!(!diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_link_to_page_edit_unsupported"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push link-to-page label edit");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert!(push.plan.is_none(), "{push:#?}");
+    assert_eq!(
+        push.validation[0].code,
+        "notion_link_to_page_edit_unsupported"
+    );
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(
+        store.list_journal().expect("journal").is_empty(),
+        "link-to-page validation must block before journal creation"
+    );
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "link-to-page validation must block before connector apply: {calls:#?}"
+    );
+}
+
+#[test]
+fn notion_child_page_link_label_edit_blocks_before_journaled_apply() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::new());
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let child_id = "11111111-1111-1111-1111-111111111111";
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount child-page link edit guardrail fixture");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save parent page entity");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(child_id),
+                EntityKind::Page,
+                "Child Page",
+                "Roadmap/child-page/page.md",
+            )
+            .with_hydration(HydrationState::Stub),
+        )
+        .expect("save child page entity");
+
+    let original_body = "[Child Page](https://www.notion.so/11111111111111111111111111111111)";
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        original_body,
+        8,
+        [RemoteId::new(child_id)],
+    )
+    .expect("child-page link shadow");
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save child-page link shadow");
+
+    let edited_body = "[Edited Child Page](https://www.notion.so/11111111111111111111111111111111)";
+    let page_path = fixture.root.join("Roadmap/page.md");
+    fs::create_dir_all(page_path.parent().expect("page parent")).expect("create page parent");
+    fs::write(
+        &page_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            edited_body,
+        )),
+    )
+    .expect("write child-page link label edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff child-page link label edit");
+    assert!(!diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_child_page_link_edit_unsupported"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push child-page link label edit");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert!(push.plan.is_none(), "{push:#?}");
+    assert_eq!(
+        push.validation[0].code,
+        "notion_child_page_link_edit_unsupported"
+    );
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(
+        store.list_journal().expect("journal").is_empty(),
+        "child-page link validation must block before journal creation"
+    );
+    let calls = api.calls.lock().expect("calls");
+    assert!(
+        calls.is_empty(),
+        "child-page link validation must block before connector apply: {calls:#?}"
+    );
+}
+
+#[test]
+fn google_docs_rendered_inline_object_and_table_guardrails_block_before_journaled_apply() {
+    let image = "![A circle with logo written in the center](https://example.test/circle.png)";
+    let table = "| Pet | Age |\n| --- | --- |\n| Luna | 4 |";
+    let cases = vec![
+        (
+            "inline_object_edit",
+            image.to_string(),
+            "![Edited image](https://example.test/circle.png)".to_string(),
+            0,
+            "google_docs_inline_object",
+            "google_docs_inline_object_edit_unsupported",
+        ),
+        (
+            "inline_object_move",
+            format!("Intro.\n\n{image}"),
+            format!("{image}\n\nIntro."),
+            1,
+            "google_docs_inline_object",
+            "google_docs_inline_object_move_unsupported",
+        ),
+        (
+            "inline_object_delete",
+            format!("{image}\n\n{image}"),
+            image.to_string(),
+            1,
+            "google_docs_inline_object",
+            "google_docs_inline_object_delete_unsupported",
+        ),
+        (
+            "table_edit",
+            table.to_string(),
+            "| Pet | Age |\n| --- | --- |\n| Luna | 5 |".to_string(),
+            0,
+            "google_docs_table",
+            "google_docs_table_edit_unsupported",
+        ),
+        (
+            "table_move",
+            format!("Intro.\n\n{table}"),
+            format!("{table}\n\nIntro."),
+            1,
+            "google_docs_table",
+            "google_docs_table_move_unsupported",
+        ),
+    ];
+
+    for (name, original_body, edited_body, rendered_block_index, native_kind, expected_code) in
+        cases
+    {
+        let fixture = E2eFixture::new();
+        let mount_id = MountId::new("google-docs-main");
+        let mut store = InMemoryStateStore::new();
+        let connector = BlockingGuardrailConnector::default();
+
+        run_mount(
+            &mut store,
+            MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "google-docs".to_string(),
+                root: fixture.root.clone(),
+                remote_root_id: Some(RemoteId::new("workspace-folder-1")),
+                connection_id: Some(ConnectionId::new("google-docs-work")),
+                read_only: false,
+                projection: ProjectionMode::PlainFiles,
+            },
+        )
+        .unwrap_or_else(|error| panic!("mount Google Docs {name} guardrail fixture: {error:?}"));
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("doc-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .unwrap_or_else(|error| panic!("save Google Docs {name} entity: {error}"));
+
+        let native_ids = if rendered_block_index == 0 {
+            vec![RemoteId::new("doc-1:rendered")]
+        } else {
+            vec![
+                RemoteId::new("doc-1:intro"),
+                RemoteId::new("doc-1:rendered"),
+            ]
+        };
+        let mut shadow =
+            ShadowDocument::from_synced_body(RemoteId::new("doc-1"), &original_body, 8, native_ids)
+                .unwrap_or_else(|error| panic!("Google Docs {name} shadow: {error}"));
+        shadow.blocks[rendered_block_index].native_kind = Some(native_kind.to_string());
+        store
+            .save_shadow(&mount_id, shadow)
+            .unwrap_or_else(|error| panic!("save Google Docs {name} shadow: {error}"));
+
+        let page_path = fixture.root.join("Roadmap/page.md");
+        fs::create_dir_all(page_path.parent().expect("page parent"))
+            .unwrap_or_else(|error| panic!("create Google Docs {name} page parent: {error}"));
+        fs::write(
+            &page_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                "loc:\n  id: doc-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+                &edited_body,
+            )),
+        )
+        .unwrap_or_else(|error| panic!("write Google Docs {name} edit: {error}"));
+
+        let diff = run_diff(&store, &page_path)
+            .unwrap_or_else(|error| panic!("diff Google Docs {name}: {error:?}"));
+        assert!(!diff.ok, "{name}: {diff:#?}");
+        assert_eq!(diff.action, "fix_validation", "{name}: {diff:#?}");
+        assert!(diff.plan.is_none(), "{name}: {diff:#?}");
+        assert_eq!(diff.validation[0].code, expected_code, "{name}: {diff:#?}");
+
+        let push = run_push_with_daemon(
+            &mut store,
+            &connector,
+            &page_path,
+            PushOptions {
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+        )
+        .unwrap_or_else(|error| panic!("push Google Docs {name}: {error}"));
+        assert!(!push.ok, "{name}: {push:#?}");
+        assert_eq!(push.action, "fix_validation", "{name}: {push:#?}");
+        assert!(push.plan.is_none(), "{name}: {push:#?}");
+        assert_eq!(push.validation[0].code, expected_code, "{name}: {push:#?}");
+        assert_eq!(push.push_id, None, "{name}: {push:#?}");
+        assert_eq!(push.journal_status, None, "{name}: {push:#?}");
+        assert!(
+            store.list_journal().expect("journal").is_empty(),
+            "{name}: Google Docs validation must block before journal creation"
+        );
+        assert_eq!(
+            connector.concurrency_checks.load(Ordering::Relaxed),
+            0,
+            "{name}: validation must block before connector concurrency checks"
+        );
+        assert_eq!(
+            connector.apply_calls.load(Ordering::Relaxed),
+            0,
+            "{name}: validation must block before connector apply"
+        );
+    }
+}
+
+#[test]
+fn google_docs_frontmatter_and_unsupported_structure_blocks_before_journaled_apply() {
+    let unsupported_directive =
+        "::loc{id=doc-1:unsupported type=google_docs_unsupported kind=\"section_break\"}";
+    let cases = vec![
+        (
+            "invalid_entity_type",
+            "Original paragraph.".to_string(),
+            "Edited paragraph.".to_string(),
+            "loc:\n  id: doc-1\n  type: database\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n"
+                .to_string(),
+            vec![RemoteId::new("doc-1:paragraph")],
+            "google_docs_invalid_entity_type",
+        ),
+        (
+            "unsupported_directive_present",
+            format!("Original paragraph.\n\n{unsupported_directive}\n"),
+            format!("Edited paragraph.\n\n{unsupported_directive}\n"),
+            "loc:\n  id: doc-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n"
+                .to_string(),
+            vec![RemoteId::new("doc-1:paragraph")],
+            "google_docs_unsupported_document_structure",
+        ),
+        (
+            "unsupported_directive_removed",
+            format!("Original paragraph.\n\n{unsupported_directive}\n"),
+            "Edited paragraph.".to_string(),
+            "loc:\n  id: doc-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n"
+                .to_string(),
+            vec![RemoteId::new("doc-1:paragraph")],
+            "google_docs_unsupported_document_structure",
+        ),
+    ];
+
+    for (name, original_body, edited_body, frontmatter, native_ids, expected_code) in cases {
+        let fixture = E2eFixture::new();
+        let mount_id = MountId::new("google-docs-main");
+        let mut store = InMemoryStateStore::new();
+        let connector = BlockingGuardrailConnector::default();
+
+        run_mount(
+            &mut store,
+            MountOptions {
+                mount_id: mount_id.clone(),
+                connector: "google-docs".to_string(),
+                root: fixture.root.clone(),
+                remote_root_id: Some(RemoteId::new("workspace-folder-1")),
+                connection_id: Some(ConnectionId::new("google-docs-work")),
+                read_only: false,
+                projection: ProjectionMode::PlainFiles,
+            },
+        )
+        .unwrap_or_else(|error| panic!("mount Google Docs frontmatter {name}: {error:?}"));
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("doc-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .unwrap_or_else(|error| panic!("save Google Docs frontmatter {name} entity: {error}"));
+
+        let shadow =
+            ShadowDocument::from_synced_body(RemoteId::new("doc-1"), &original_body, 8, native_ids)
+                .unwrap_or_else(|error| panic!("Google Docs frontmatter {name} shadow: {error}"));
+        store
+            .save_shadow(&mount_id, shadow)
+            .unwrap_or_else(|error| panic!("save Google Docs frontmatter {name} shadow: {error}"));
+
+        let page_path = fixture.root.join("Roadmap/page.md");
+        fs::create_dir_all(page_path.parent().expect("page parent")).unwrap_or_else(|error| {
+            panic!("create Google Docs frontmatter {name} parent: {error}")
+        });
+        fs::write(
+            &page_path,
+            render_canonical_markdown(&CanonicalDocument::new(frontmatter, edited_body)),
+        )
+        .unwrap_or_else(|error| panic!("write Google Docs frontmatter {name} edit: {error}"));
+
+        let diff = run_diff(&store, &page_path)
+            .unwrap_or_else(|error| panic!("diff Google Docs frontmatter {name}: {error:?}"));
+        assert!(!diff.ok, "{name}: {diff:#?}");
+        assert_eq!(diff.action, "fix_validation", "{name}: {diff:#?}");
+        assert!(diff.plan.is_none(), "{name}: {diff:#?}");
+        assert_eq!(diff.validation[0].code, expected_code, "{name}: {diff:#?}");
+
+        let push = run_push_with_daemon(
+            &mut store,
+            &connector,
+            &page_path,
+            PushOptions {
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+        )
+        .unwrap_or_else(|error| panic!("push Google Docs frontmatter {name}: {error}"));
+        assert!(!push.ok, "{name}: {push:#?}");
+        assert_eq!(push.action, "fix_validation", "{name}: {push:#?}");
+        assert!(push.plan.is_none(), "{name}: {push:#?}");
+        assert_eq!(push.validation[0].code, expected_code, "{name}: {push:#?}");
+        assert_eq!(push.push_id, None, "{name}: {push:#?}");
+        assert_eq!(push.journal_status, None, "{name}: {push:#?}");
+        assert!(
+            store.list_journal().expect("journal").is_empty(),
+            "{name}: Google Docs frontmatter validation must block before journal creation"
+        );
+        assert_eq!(
+            connector.concurrency_checks.load(Ordering::Relaxed),
+            0,
+            "{name}: validation must block before connector concurrency checks"
+        );
+        assert_eq!(
+            connector.apply_calls.load(Ordering::Relaxed),
+            0,
+            "{name}: validation must block before connector apply"
+        );
+    }
+}
+
+#[test]
+fn virtual_projection_restore_discards_cached_edit_and_status_returns_clean() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![paragraph_block(
+        "block-1",
+        "Virtual restore synced body.",
+    )]));
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(RemoteId::new("page-1")),
+        api,
+    );
+    mount_virtual_workspace(&fixture, &mut store, "page-1");
+    let content_root = fixture.content_root();
+    hydrate_virtual_root_page(&fixture, &mut store, &connector, &content_root, "page-1");
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("get virtual restore entity")
+        .expect("virtual restore entity");
+    let visible_page_path = fixture.root.join(&entity.path);
+    let cache_page_path = content_root.join(&entity.path);
+    let synced = fs::read_to_string(&cache_page_path).expect("read hydrated cache");
+    assert!(synced.contains("Virtual restore synced body."), "{synced}");
+
+    let local_edit = synced.replace(
+        "Virtual restore synced body.",
+        "Virtual restore local cache-only edit.",
+    );
+    fs::write(&cache_page_path, &local_edit).expect("write virtual cache edit");
+    let dirty = run_status(
+        &store,
+        StatusOptions {
+            path: Some(visible_page_path.clone()),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status before virtual restore");
+    assert_eq!(dirty.summary.dirty, 1, "{dirty:#?}");
+
+    let restore = run_restore(
+        &mut store,
+        &visible_page_path,
+        RestoreOptions {
+            force: false,
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("virtual restore");
+    assert!(restore.ok, "{restore:#?}");
+    assert_eq!(restore.action, "restored", "{restore:#?}");
+    assert_eq!(restore.mount_id, fixture.mount_id.as_str(), "{restore:#?}");
+
+    let restored = fs::read_to_string(&cache_page_path).expect("read restored cache");
+    assert!(
+        restored.contains("Virtual restore synced body."),
+        "{restored}"
+    );
+    assert!(
+        !restored.contains("Virtual restore local cache-only edit."),
+        "{restored}"
+    );
+    assert!(
+        !visible_page_path.exists(),
+        "restore for a virtual projection should update the daemon content cache, not create a plain mount file"
+    );
+
+    let clean = run_status(
+        &store,
+        StatusOptions {
+            path: Some(visible_page_path),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after virtual restore");
+    assert!(clean.clean, "{clean:#?}");
+    assert_eq!(clean.summary.dirty, 0, "{clean:#?}");
+}
+
+#[test]
+fn scheduled_pull_large_workspace_stubs_metadata_and_queues_only_root_hydration() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("root-page")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount scheduled pull budget workspace");
+
+    let entries = scheduled_tree_entries(&fixture.mount_id, 32);
+    let source = StaticScheduledPullSource::new(entries);
+    let mounts = store.load_mounts().expect("load mounts");
+    let strategy = DefaultFetchScheduleStrategy;
+    let policy = HydrationPolicy::default();
+    let mut scheduler = PullScheduler::new(Default::default());
+    let tick = scheduler.tick().expect("scheduled pull tick");
+    let mut queue = HydrationQueue::new();
+
+    let report = reconcile_scheduled_pull(
+        &mut store, &mut queue, &mounts, &tick, &source, &strategy, &policy,
+    )
+    .expect("scheduled pull budget reconcile");
+    assert_eq!(source.enumeration_count(), 1);
+    assert_eq!(report.mounts_polled, 1, "{report:#?}");
+    assert_eq!(report.enumerated, 33, "{report:#?}");
+    assert_eq!(report.stubbed, 33, "{report:#?}");
+    assert_eq!(report.queued_hydrations, 1, "{report:#?}");
+
+    let root_stub = fs::read_to_string(fixture.root.join("Root/page.md")).expect("root stub");
+    assert!(
+        root_stub.contains(CanonicalDocument::STUB_MARKER),
+        "{root_stub}"
+    );
+    let child_stub =
+        fs::read_to_string(fixture.root.join("Root/Child 17/page.md")).expect("child stub");
+    assert!(
+        child_stub.contains(CanonicalDocument::STUB_MARKER),
+        "{child_stub}"
+    );
+    assert!(
+        !child_stub.contains("Child 17 body"),
+        "scheduled pull should write metadata stubs without hydrating child page bodies:\n{child_stub}"
+    );
+
+    let mut queued = Vec::new();
+    while let Some(request) = queue.pop_ready() {
+        queued.push(request);
+    }
+    assert_eq!(queued.len(), 1, "{queued:#?}");
+    assert_eq!(queued[0].remote_id, RemoteId::new("root-page"));
+    assert_eq!(queued[0].reason, HydrationReason::Policy);
+
+    let child = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("child-17"))
+        .expect("get scheduled child")
+        .expect("scheduled child");
+    assert_eq!(child.hydration, HydrationState::Stub);
+}
+
+#[test]
+fn scheduled_pull_idle_ticks_do_not_enumerate_or_queue_duplicate_hydrations() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("root-page")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount scheduled pull idle workspace");
+
+    let source = StaticScheduledPullSource::new(scheduled_tree_entries(&fixture.mount_id, 8));
+    let mounts = store.load_mounts().expect("load mounts");
+    let strategy = DefaultFetchScheduleStrategy;
+    let policy = HydrationPolicy::default();
+    let mut scheduler = PullScheduler::new(locality_core::pull::PullSchedulerConfig {
+        active_interval: Duration::from_secs(10),
+        cold_interval: Duration::from_secs(100),
+        ..Default::default()
+    });
+    let mut queue = HydrationQueue::new();
+
+    let initial_tick = scheduler.tick().expect("initial scheduled pull tick");
+    assert!(!initial_tick.is_idle(), "{initial_tick:#?}");
+    let initial_report = reconcile_scheduled_pull(
+        &mut store,
+        &mut queue,
+        &mounts,
+        &initial_tick,
+        &source,
+        &strategy,
+        &policy,
+    )
+    .expect("initial scheduled pull reconcile");
+    assert_eq!(source.enumeration_count(), 1);
+    assert_eq!(initial_report.mounts_polled, 1, "{initial_report:#?}");
+    assert_eq!(initial_report.enumerated, 9, "{initial_report:#?}");
+    assert_eq!(initial_report.queued_hydrations, 1, "{initial_report:#?}");
+    assert_eq!(queue.len(), 1);
+
+    for tick_number in 1..=5 {
+        let idle_tick = scheduler
+            .advance_by(Duration::from_secs(1))
+            .expect("idle scheduled pull tick");
+        assert!(
+            idle_tick.is_idle(),
+            "tick {tick_number} should be idle: {idle_tick:#?}"
+        );
+
+        let idle_report = reconcile_scheduled_pull(
+            &mut store, &mut queue, &mounts, &idle_tick, &source, &strategy, &policy,
+        )
+        .expect("idle scheduled pull reconcile");
+        assert_eq!(source.enumeration_count(), 1);
+        assert_eq!(idle_report.mounts_checked, 1, "{idle_report:#?}");
+        assert_eq!(idle_report.mounts_polled, 0, "{idle_report:#?}");
+        assert_eq!(idle_report.enumerated, 0, "{idle_report:#?}");
+        assert_eq!(idle_report.queued_hydrations, 0, "{idle_report:#?}");
+        assert_eq!(queue.len(), 1, "tick {tick_number}: {idle_report:#?}");
+    }
+
+    let request = queue.pop_ready().expect("queued root hydration");
+    assert_eq!(request.remote_id, RemoteId::new("root-page"));
+    assert_eq!(request.reason, HydrationReason::Policy);
+    assert!(queue.pop_ready().is_none());
+}
+
+#[test]
+fn workspace_virtual_freshness_active_and_cold_ticks_prioritize_hot_work_and_cap_scan_budget() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("mount workspace virtual freshness fixture");
+    let mounts = store
+        .load_mounts()
+        .expect("load workspace freshness mounts");
+    let mount_id = fixture.mount_id.clone();
+
+    save_workspace_freshness_page(
+        &mut store,
+        &mount_id,
+        "dirty-page",
+        "Dirty Page",
+        "Dirty Page/page.md",
+        HydrationState::Dirty,
+    );
+    save_workspace_freshness_page(
+        &mut store,
+        &mount_id,
+        "conflicted-page",
+        "Conflicted Page",
+        "Conflicted Page/page.md",
+        HydrationState::Conflicted,
+    );
+    save_workspace_freshness_page(
+        &mut store,
+        &mount_id,
+        "hot-open-page",
+        "Hot Open Page",
+        "Hot Open Page/page.md",
+        HydrationState::Hydrated,
+    );
+    save_workspace_freshness_page(
+        &mut store,
+        &mount_id,
+        "remote-hint-page",
+        "Remote Hint Page",
+        "Remote Hint Page/page.md",
+        HydrationState::Hydrated,
+    );
+    save_workspace_freshness_page(
+        &mut store,
+        &mount_id,
+        "stub-page",
+        "Stub Page",
+        "Stub Page/page.md",
+        HydrationState::Stub,
+    );
+    save_workspace_freshness_page(
+        &mut store,
+        &mount_id,
+        "virtual-page",
+        "Virtual Page",
+        "Virtual Page/page.md",
+        HydrationState::Virtual,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("hot-open-page"),
+                FreshnessTier::Hot,
+            )
+            .opened_at("unix_ms:18446744073709551615")
+            .checked_at("unix_ms:1"),
+        )
+        .expect("save hot freshness");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("remote-hint-page"),
+                FreshnessTier::Warm,
+            )
+            .remote_hint_pending(true)
+            .checked_at("unix_ms:2"),
+        )
+        .expect("save remote-hint freshness");
+
+    for index in 0..130 {
+        let remote_id = format!("warm-page-{index:03}");
+        save_workspace_freshness_page(
+            &mut store,
+            &mount_id,
+            &remote_id,
+            format!("Warm Page {index:03}"),
+            format!("Warm Page {index:03}/page.md"),
+            HydrationState::Hydrated,
+        );
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    FreshnessTier::Warm,
+                )
+                .checked_at(format!("unix_ms:{}", index + 10)),
+            )
+            .expect("save warm freshness");
+    }
+
+    let active_jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &mounts,
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        },
+    )
+    .expect("active workspace freshness jobs");
+    let active_facts = active_jobs
+        .iter()
+        .map(|job| {
+            (
+                job.remote_id.as_ref().expect("active remote id").clone(),
+                (job.reason.clone(), job.tier.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(active_facts.len(), 4, "{active_jobs:#?}");
+    assert_eq!(
+        active_facts.get(&RemoteId::new("dirty-page")),
+        Some(&(ChangeHintKind::LocalEdited, FreshnessTier::Hot)),
+        "{active_jobs:#?}"
+    );
+    assert_eq!(
+        active_facts.get(&RemoteId::new("conflicted-page")),
+        Some(&(ChangeHintKind::LocalEdited, FreshnessTier::Hot)),
+        "{active_jobs:#?}"
+    );
+    assert_eq!(
+        active_facts.get(&RemoteId::new("hot-open-page")),
+        Some(&(ChangeHintKind::FileOpened, FreshnessTier::Hot)),
+        "{active_jobs:#?}"
+    );
+    assert_eq!(
+        active_facts.get(&RemoteId::new("remote-hint-page")),
+        Some(&(ChangeHintKind::RemoteMaybeChanged, FreshnessTier::Hot)),
+        "{active_jobs:#?}"
+    );
+    assert!(
+        !active_facts.contains_key(&RemoteId::new("stub-page"))
+            && !active_facts.contains_key(&RemoteId::new("virtual-page")),
+        "stub and virtual pages should not consume active freshness budget: {active_jobs:#?}"
+    );
+
+    let cold_jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &mounts,
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+    )
+    .expect("cold workspace freshness jobs");
+    assert_eq!(cold_jobs.len(), 100, "{cold_jobs:#?}");
+    assert!(
+        cold_jobs
+            .iter()
+            .all(|job| job.kind == SyncJobKind::ObserveEntity),
+        "{cold_jobs:#?}"
+    );
+    let cold_ids = cold_jobs
+        .iter()
+        .map(|job| job.remote_id.as_ref().expect("cold remote id").clone())
+        .collect::<Vec<_>>();
+    for expected in [
+        "dirty-page",
+        "conflicted-page",
+        "hot-open-page",
+        "remote-hint-page",
+        "warm-page-000",
+    ] {
+        assert!(
+            cold_ids.contains(&RemoteId::new(expected)),
+            "missing {expected} from bounded cold jobs: {cold_jobs:#?}"
+        );
+    }
+    assert!(
+        !cold_ids.contains(&RemoteId::new("warm-page-129")),
+        "newest warm page should be outside the capped cold budget: {cold_jobs:#?}"
+    );
+    assert!(
+        !cold_ids.contains(&RemoteId::new("stub-page"))
+            && !cold_ids.contains(&RemoteId::new("virtual-page")),
+        "stub and virtual pages should not consume cold freshness budget: {cold_jobs:#?}"
+    );
+}
+
+#[test]
+fn credential_secret_parsing_accepts_plain_token_and_oauth_json() {
+    assert_eq!(
+        notion_access_token_from_secret("secret_plain_token").expect("plain token"),
+        "secret_plain_token"
+    );
+
+    let oauth_secret = json!({
+        "kind": "oauth",
+        "access_token": "secret_oauth_token",
+        "refresh_token": null,
+        "token_type": "bearer",
+        "oauth_client_id": "test-client",
+        "oauth_client_secret": null,
+        "oauth_broker_url": "https://broker.example.test",
+        "workspace_id": "workspace-id",
+        "workspace_name": "Workspace",
+        "bot_id": "bot-id",
+        "refresh_token_handle": "refresh-handle",
+        "acquired_at": 123,
+        "expires_at": null
+    });
+    assert_eq!(
+        notion_access_token_from_secret(&oauth_secret.to_string()).expect("oauth token"),
+        "secret_oauth_token"
+    );
+}
+
+#[test]
+fn live_parent_preflight_rejects_archived_or_trashed_page() {
+    let mut archived = page("archived-parent", "Archived Parent");
+    archived.archived = true;
+    let archived_error = std::panic::catch_unwind(|| {
+        ensure_live_parent_page_is_writable(&archived, "archived-parent");
+    })
+    .expect_err("archived parent should be rejected");
+    let archived_message = panic_payload_message(archived_error);
+    assert!(
+        archived_message.contains(LIVE_PARENT_ENV),
+        "{archived_message}"
+    );
+    assert!(
+        archived_message.contains("archived-parent"),
+        "{archived_message}"
+    );
+    assert!(
+        archived_message.contains("archived or in trash"),
+        "{archived_message}"
+    );
+
+    let mut trashed = page("trashed-parent", "Trashed Parent");
+    trashed.in_trash = true;
+    let trashed_error = std::panic::catch_unwind(|| {
+        ensure_live_parent_page_is_writable(&trashed, "trashed-parent");
+    })
+    .expect_err("trashed parent should be rejected");
+    let trashed_message = panic_payload_message(trashed_error);
+    assert!(
+        trashed_message.contains(LIVE_PARENT_ENV),
+        "{trashed_message}"
+    );
+    assert!(
+        trashed_message.contains("trashed-parent"),
+        "{trashed_message}"
+    );
+    assert!(
+        trashed_message.contains("archived or in trash"),
+        "{trashed_message}"
+    );
+}
+
+#[test]
+fn live_parent_preflight_accepts_active_page() {
+    let active = page("active-parent", "Active Parent");
+    ensure_live_parent_page_is_writable(&active, "active-parent");
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_scratch_page_mount_edit_push_verifies_notion() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let marker = format!("Locality live mounted edit {}", unique_suffix());
     let scratch = cleanup.create_page(
-        &parent_page,
+        &env.parent_page_id,
         &format!("Locality mounted e2e {}", unique_suffix()),
         vec![json!({
             "object": "block",
@@ -372,7 +2565,7 @@ fn live_scratch_page_mount_edit_push_verifies_notion() {
 
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
 
     run_mount(
         &mut store,
@@ -446,10 +2639,535 @@ fn live_scratch_page_mount_edit_push_verifies_notion() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials in ~/.loc credentials and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_cli_binary_uses_stored_credential_and_pushes_scratch_page() {
+    let env = LiveEnv::from_env();
+    let source_connection_id =
+        std::env::var(LIVE_CONNECTION_ENV).unwrap_or_else(|_| "notion-default".to_string());
+    let stored_secret =
+        live_notion_secret_from_default_store(&source_connection_id).expect("stored credential");
+    let access_token =
+        notion_access_token_from_secret(&stored_secret).expect("stored access token");
+    let api = HttpNotionApi::new(NotionConfig::default().with_token(access_token.clone()));
+    let mut cleanup = LiveCleanup::new(api);
+    let marker = format!("Locality live CLI binary edit {}", unique_suffix());
+    let base = "Original paragraph for CLI binary live e2e.";
+    let scratch_title = format!("Locality live CLI binary {}", unique_suffix());
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &scratch_title,
+        vec![paragraph_child(base)],
+    );
+
+    let fixture = E2eFixture::new();
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let connection_id = ConnectionId::new("stored-live-notion");
+    seed_cli_live_connection(&fixture.state_root, &connection_id, &stored_secret);
+
+    let connections =
+        loc_json_ok(loc_command(loc, &fixture.state_root).args(["connections", "--json"]));
+    assert_eq!(connections.value["ok"], true, "{connections:#?}");
+    assert!(
+        !connections.stdout.contains(&access_token),
+        "connections JSON leaked the Notion access token"
+    );
+    assert!(
+        !connections.stdout.contains("secret_ref"),
+        "connections JSON leaked credential storage internals"
+    );
+
+    let profiles = loc_json_ok(loc_command(loc, &fixture.state_root).args(["profiles", "--json"]));
+    assert_eq!(profiles.value["ok"], true, "{profiles:#?}");
+    assert!(
+        profiles.value["profiles"]
+            .as_array()
+            .expect("profiles")
+            .iter()
+            .any(|profile| profile["profile_id"] == DEFAULT_NOTION_PROFILE_ID),
+        "{profiles:#?}"
+    );
+    assert!(
+        !profiles.stdout.contains(&access_token),
+        "profiles JSON leaked the Notion access token"
+    );
+    assert!(
+        !profiles.stdout.contains("secret_ref"),
+        "profiles JSON leaked credential storage internals"
+    );
+
+    let connection_show = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "connection",
+        "show",
+        connection_id.as_str(),
+        "--json",
+    ]));
+    assert_eq!(connection_show.value["ok"], true, "{connection_show:#?}");
+    assert_eq!(
+        connection_show.value["connection"]["connection_id"],
+        connection_id.as_str(),
+        "{connection_show:#?}"
+    );
+    assert_eq!(
+        connection_show.value["connection"]["status"], "active",
+        "{connection_show:#?}"
+    );
+    assert!(
+        !connection_show.stdout.contains(&access_token),
+        "connection show JSON leaked the Notion access token"
+    );
+    assert!(
+        !connection_show.stdout.contains("secret_ref"),
+        "connection show JSON leaked credential storage internals"
+    );
+
+    let mount = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("mount")
+            .arg("notion")
+            .arg(&fixture.root)
+            .arg("--root-page")
+            .arg(&scratch.id)
+            .arg("--connection")
+            .arg(connection_id.as_str())
+            .arg("--mount-id")
+            .arg(fixture.mount_id.as_str())
+            .arg("--projection")
+            .arg("plain-files")
+            .arg("--json"),
+    );
+    assert_eq!(mount.value["ok"], true, "{mount:#?}");
+
+    let pull = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("pull")
+            .arg(&fixture.root)
+            .arg("--json"),
+    );
+    assert_eq!(pull.value["ok"], true, "{pull:#?}");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read CLI-pulled page");
+    assert!(original.contains(base), "{original}");
+
+    let info = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("info")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(info.value["ok"], true, "{info:#?}");
+    assert_eq!(info.value["command"], "info", "{info:#?}");
+    assert_eq!(
+        info.value["mount"]["mount_id"],
+        fixture.mount_id.as_str(),
+        "{info:#?}"
+    );
+    assert_eq!(info.value["subject"]["role"], "page_file", "{info:#?}");
+    assert_eq!(info.value["subject"]["source"], "Notion page", "{info:#?}");
+    assert_eq!(
+        compact_notion_id(
+            info.value["subject"]["entity"]["entity_id"]
+                .as_str()
+                .expect("info entity id")
+        ),
+        compact_notion_id(&scratch.id),
+        "{info:#?}"
+    );
+    assert!(
+        !info.stdout.contains(&access_token),
+        "info JSON leaked the Notion access token"
+    );
+
+    let doctor = loc_json_ok(loc_command(loc, &fixture.state_root).args(["doctor", "--json"]));
+    assert_eq!(doctor.value["ok"], true, "{doctor:#?}");
+    assert_eq!(doctor.value["command"], "doctor", "{doctor:#?}");
+    assert_ne!(doctor.value["status"], "error", "{doctor:#?}");
+    assert!(
+        !doctor.value["findings"]
+            .as_array()
+            .expect("doctor findings")
+            .iter()
+            .any(|finding| finding["severity"] == "error"),
+        "{doctor:#?}"
+    );
+    let doctor_connection = doctor.value["connections"]
+        .as_array()
+        .expect("doctor connections")
+        .iter()
+        .find(|connection| connection["connection_id"] == connection_id.as_str())
+        .expect("doctor connection");
+    assert_eq!(doctor_connection["status"], "active", "{doctor:#?}");
+    assert_eq!(doctor_connection["profile_status"], "ok", "{doctor:#?}");
+    assert_eq!(doctor_connection["credential_status"], "ok", "{doctor:#?}");
+    let doctor_mount = doctor.value["mounts"]
+        .as_array()
+        .expect("doctor mounts")
+        .iter()
+        .find(|mount| mount["mount_id"] == fixture.mount_id.as_str())
+        .expect("doctor mount");
+    assert_eq!(doctor_mount["root_exists"], true, "{doctor:#?}");
+    assert_eq!(
+        doctor_mount["connection_id"],
+        connection_id.as_str(),
+        "{doctor:#?}"
+    );
+    assert!(
+        !doctor.stdout.contains(&access_token),
+        "doctor JSON leaked the Notion access token"
+    );
+
+    let search = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("search")
+            .arg(&scratch_title)
+            .arg("--connector")
+            .arg("notion")
+            .arg("--json"),
+    );
+    assert!(
+        search.value["results"].as_array().is_some_and(|results| {
+            results.iter().any(|result| {
+                compact_notion_id(
+                    result["remote_id"]
+                        .as_str()
+                        .expect("search result remote_id"),
+                ) == compact_notion_id(&scratch.id)
+                    && result["absolute_path"] == page_path.display().to_string()
+            })
+        }),
+        "{search:#?}"
+    );
+
+    let clean_inspect = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("inspect")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(
+        clean_inspect.value["explanation"]["state"], "all_synced",
+        "{clean_inspect:#?}"
+    );
+    assert_eq!(
+        clean_inspect.value["explanation"]["action"], "none",
+        "{clean_inspect:#?}"
+    );
+
+    fs::write(&page_path, original.replace(base, &marker)).expect("write CLI live edit");
+
+    let dirty = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("status")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(dirty.value["clean"], false, "{dirty:#?}");
+
+    let dirty_inspect = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("inspect")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(
+        dirty_inspect.value["explanation"]["state"], "local_changed_only",
+        "{dirty_inspect:#?}"
+    );
+    assert_eq!(
+        dirty_inspect.value["explanation"]["action"], "push_local_changes",
+        "{dirty_inspect:#?}"
+    );
+
+    let diff = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("diff")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(diff.value["action"], "confirm_plan", "{diff:#?}");
+
+    let push = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("push")
+            .arg(&page_path)
+            .arg("-y")
+            .arg("--json"),
+    );
+    assert_eq!(push.value["ok"], true, "{push:#?}");
+    assert_eq!(push.value["action"], "reconciled", "{push:#?}");
+    let push_id = push.value["push_id"]
+        .as_str()
+        .expect("push report push_id")
+        .to_string();
+
+    let clean = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("status")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(clean.value["clean"], true, "{clean:#?}");
+
+    let connector = NotionConnector::new(NotionConfig::default().with_token(access_token.clone()));
+    let pushed_remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(pushed_remote.contains(&marker), "{pushed_remote}");
+
+    let restore_probe = format!("Local restore-only probe {}", unique_suffix());
+    let pushed_local = fs::read_to_string(&page_path).expect("read pushed CLI file");
+    fs::write(&page_path, format!("{pushed_local}\n\n{restore_probe}\n"))
+        .expect("write restore probe");
+    let restore_dirty = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("status")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(restore_dirty.value["clean"], false, "{restore_dirty:#?}");
+
+    let restore = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("restore")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(restore.value["ok"], true, "{restore:#?}");
+    assert_eq!(restore.value["action"], "restored", "{restore:#?}");
+    assert_eq!(
+        restore.value["mount_id"],
+        fixture.mount_id.as_str(),
+        "{restore:#?}"
+    );
+    assert_eq!(
+        compact_notion_id(restore.value["entity_id"].as_str().expect("restore entity")),
+        compact_notion_id(&scratch.id),
+        "{restore:#?}"
+    );
+
+    let restore_clean = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("status")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(restore_clean.value["clean"], true, "{restore_clean:#?}");
+    let restored_from_shadow = fs::read_to_string(&page_path).expect("read restored CLI file");
+    assert!(
+        restored_from_shadow.contains(&marker),
+        "{restored_from_shadow}"
+    );
+    assert!(
+        !restored_from_shadow.contains(&restore_probe),
+        "{restored_from_shadow}"
+    );
+
+    let log = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("log")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    let log_entries = log.value["entries"].as_array().expect("log entries");
+    assert_eq!(log_entries.len(), 1, "{log:#?}");
+    assert_eq!(log_entries[0]["push_id"], push_id, "{log:#?}");
+    assert_eq!(log_entries[0]["status"], "reconciled", "{log:#?}");
+
+    let undo = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("undo")
+            .arg(&push_id)
+            .arg("--json"),
+    );
+    assert_eq!(undo.value["ok"], true, "{undo:#?}");
+    assert_eq!(undo.value["action"], "reverse_applied", "{undo:#?}");
+    assert_eq!(undo.value["status"], "reverted", "{undo:#?}");
+
+    let restored_remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(restored_remote.contains(base), "{restored_remote}");
+    assert!(
+        !restored_remote.contains(&marker),
+        "undo should restore remote content:\n{restored_remote}"
+    );
+    let restored_local = fs::read_to_string(&page_path).expect("read undo-restored CLI file");
+    assert!(restored_local.contains(base), "{restored_local}");
+    assert!(!restored_local.contains(&marker), "{restored_local}");
+
+    let reverted_log = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("log")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(
+        reverted_log.value["entries"][0]["push_id"], push_id,
+        "{reverted_log:#?}"
+    );
+    assert_eq!(
+        reverted_log.value["entries"][0]["status"], "reverted",
+        "{reverted_log:#?}"
+    );
+
+    let disconnect = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "disconnect",
+        connection_id.as_str(),
+        "--json",
+    ]));
+    assert_eq!(disconnect.value["ok"], true, "{disconnect:#?}");
+    assert_eq!(disconnect.value["command"], "disconnect", "{disconnect:#?}");
+    assert_eq!(
+        disconnect.value["connection_id"],
+        connection_id.as_str(),
+        "{disconnect:#?}"
+    );
+    assert_eq!(disconnect.value["status"], "revoked", "{disconnect:#?}");
+    assert!(
+        !disconnect.stdout.contains(&access_token),
+        "disconnect JSON leaked the Notion access token"
+    );
+    assert!(
+        live_notion_secret_from_state_root(&fixture.state_root, connection_id.as_str()).is_err(),
+        "disconnect should delete the stored credential"
+    );
+
+    let revoked_show = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "connection",
+        "show",
+        connection_id.as_str(),
+        "--json",
+    ]));
+    assert_eq!(
+        revoked_show.value["connection"]["status"], "revoked",
+        "{revoked_show:#?}"
+    );
+    assert!(
+        !revoked_show.stdout.contains(&access_token),
+        "revoked connection show JSON leaked the Notion access token"
+    );
+    assert!(
+        !revoked_show.stdout.contains("secret_ref"),
+        "revoked connection show JSON leaked credential storage internals"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials in ~/.loc credentials and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_cli_binary_read_only_mount_blocks_push_without_remote_write() {
+    let env = LiveEnv::from_env();
+    let source_connection_id =
+        std::env::var(LIVE_CONNECTION_ENV).unwrap_or_else(|_| "notion-default".to_string());
+    let stored_secret =
+        live_notion_secret_from_default_store(&source_connection_id).expect("stored credential");
+    let access_token =
+        notion_access_token_from_secret(&stored_secret).expect("stored access token");
+    let api = HttpNotionApi::new(NotionConfig::default().with_token(access_token.clone()));
+    let mut cleanup = LiveCleanup::new(api);
+    let base = "Original paragraph for read-only CLI live e2e.";
+    let marker = format!("Locality read-only blocked edit {}", unique_suffix());
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live read-only CLI {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+
+    let fixture = E2eFixture::new();
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let connection_id = ConnectionId::new("stored-live-notion-read-only");
+    seed_cli_live_connection(&fixture.state_root, &connection_id, &stored_secret);
+
+    let mount = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("mount")
+            .arg("notion")
+            .arg(&fixture.root)
+            .arg("--root-page")
+            .arg(&scratch.id)
+            .arg("--connection")
+            .arg(connection_id.as_str())
+            .arg("--mount-id")
+            .arg(fixture.mount_id.as_str())
+            .arg("--projection")
+            .arg("plain-files")
+            .arg("--read-only")
+            .arg("--json"),
+    );
+    assert_eq!(mount.value["ok"], true, "{mount:#?}");
+    assert_eq!(mount.value["read_only"], true, "{mount:#?}");
+
+    let pull = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("pull")
+            .arg(&fixture.root)
+            .arg("--json"),
+    );
+    assert_eq!(pull.value["ok"], true, "{pull:#?}");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read read-only CLI page");
+    assert!(original.contains(base), "{original}");
+    fs::write(&page_path, original.replace(base, &marker)).expect("write read-only local edit");
+
+    let info = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("info")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(info.value["mount"]["read_only"], true, "{info:#?}");
+
+    let diff = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("diff")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(diff.value["action"], "read_only_blocked", "{diff:#?}");
+    assert_eq!(
+        compact_notion_id(diff.value["entity_id"].as_str().expect("diff entity id")),
+        compact_notion_id(&scratch.id),
+        "{diff:#?}"
+    );
+
+    let push = loc_json_with_exit(
+        loc_command(loc, &fixture.state_root)
+            .arg("push")
+            .arg(&page_path)
+            .arg("-y")
+            .arg("--json"),
+        4,
+    );
+    assert_eq!(push.value["ok"], false, "{push:#?}");
+    assert_eq!(push.value["action"], "read_only_blocked", "{push:#?}");
+    assert_eq!(push.value["push_id"], Value::Null, "{push:#?}");
+    assert_eq!(push.value["journal_status"], Value::Null, "{push:#?}");
+    assert_eq!(push.value["apply_effect_count"], 0, "{push:#?}");
+
+    let connector = NotionConnector::new(NotionConfig::default().with_token(access_token));
+    let remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(remote.contains(base), "{remote}");
+    assert!(
+        !remote.contains(&marker),
+        "read-only push should not mutate Notion:\n{remote}"
+    );
+
+    let log = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("log")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert!(
+        log.value["entries"]
+            .as_array()
+            .expect("read-only log entries")
+            .is_empty(),
+        "{log:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_block_type_replace_pushes_and_reconciles_notion() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let original_text = "Replace block paragraph original.";
     let untouched_text = "Paragraph after replacement should remain.";
@@ -463,7 +3181,7 @@ fn live_block_type_replace_pushes_and_reconciles_notion() {
         ],
     );
     let original_block_id = first_live_child_block_id(&cleanup.api, &scratch.id);
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
 
     fs::write(
@@ -522,10 +3240,10 @@ fn live_block_type_replace_pushes_and_reconciles_notion() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_directive_block_move_pushes_and_reconciles_notion() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let anchor_text = "Move anchor paragraph.";
     let scratch = cleanup.create_page(
@@ -540,7 +3258,7 @@ fn live_directive_block_move_pushes_and_reconciles_notion() {
             }),
         ],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &scratch.id);
     let table_of_contents_id = before
         .as_array()
@@ -621,10 +3339,10 @@ fn live_directive_block_move_pushes_and_reconciles_notion() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_directive_block_move_undo_restores_remote_order() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let anchor_text = "Undo move anchor paragraph.";
     let scratch = cleanup.create_page(
@@ -639,7 +3357,7 @@ fn live_directive_block_move_undo_restores_remote_order() {
             }),
         ],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &scratch.id);
     let table_of_contents_id = before
         .as_array()
@@ -724,10 +3442,10 @@ fn live_directive_block_move_undo_restores_remote_order() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_link_to_page_line_move_preserves_notion_block_type() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let target = cleanup.create_page(
         &env.parent_page_id,
@@ -747,7 +3465,7 @@ fn live_link_to_page_line_move_preserves_notion_block_type() {
             }),
         ],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &source.id);
     let original_link_id = before
         .as_array()
@@ -844,10 +3562,10 @@ fn live_link_to_page_line_move_preserves_notion_block_type() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_link_to_database_line_move_preserves_notion_block_type() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let target = cleanup.create_database(
         &env.parent_page_id,
@@ -872,7 +3590,7 @@ fn live_link_to_database_line_move_preserves_notion_block_type() {
             }),
         ],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &source.id);
     let original_link_id = before
         .as_array()
@@ -969,10 +3687,10 @@ fn live_link_to_database_line_move_preserves_notion_block_type() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_link_to_page_retarget_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let original_target = cleanup.create_page(
         &env.parent_page_id,
@@ -1000,7 +3718,7 @@ fn live_link_to_page_retarget_blocks_before_journaled_apply() {
             "link_to_page": { "type": "page_id", "page_id": original_target.id }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &source.id);
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let link_line = original
@@ -1045,10 +3763,10 @@ fn live_link_to_page_retarget_blocks_before_journaled_apply() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_link_to_database_retarget_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let original_target = cleanup.create_database(
         &env.parent_page_id,
@@ -1076,7 +3794,7 @@ fn live_link_to_database_retarget_blocks_before_journaled_apply() {
             "link_to_page": { "type": "database_id", "database_id": original_target.id }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &source.id);
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let link_line = original
@@ -1121,10 +3839,10 @@ fn live_link_to_database_retarget_blocks_before_journaled_apply() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_notion_link_labeled_like_link_to_page_can_be_edited() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let original_target = cleanup.create_page(
         &env.parent_page_id,
@@ -1150,7 +3868,7 @@ fn live_paragraph_notion_link_labeled_like_link_to_page_can_be_edited() {
             "paragraph": { "rich_text": [linked_text_part("Linked page", &original_url)] }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let original_line = format!("[Linked page]({original_url})");
     assert!(original.contains(&original_line), "{original}");
@@ -1193,10 +3911,10 @@ fn live_paragraph_notion_link_labeled_like_link_to_page_can_be_edited() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_link_with_parentheses_href_can_be_edited() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let href = "https://example.com/docs/foo)";
     let markdown_href = href.replace(')', "\\)");
@@ -1209,7 +3927,7 @@ fn live_paragraph_link_with_parentheses_href_can_be_edited() {
             "paragraph": { "rich_text": [linked_text_part("Paren link", href)] }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let original_line = format!("[Paren link]({markdown_href})");
     assert!(original.contains(&original_line), "{original}");
@@ -1259,17 +3977,17 @@ fn live_paragraph_link_with_parentheses_href_can_be_edited() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_literal_break_tag_edits_preserve_literal_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live literal break tag {}", unique_suffix()),
         vec![paragraph_child("Literal <br> tag")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains("Literal \\<br> tag"),
@@ -1318,17 +4036,17 @@ fn live_paragraph_literal_break_tag_edits_preserve_literal_text() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_literal_underline_tag_edits_preserve_literal_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live literal underline tag {}", unique_suffix()),
         vec![paragraph_child("Literal <u>tag</u>")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains("Literal \\<u>tag\\</u>"),
@@ -1381,17 +4099,17 @@ fn live_paragraph_literal_underline_tag_edits_preserve_literal_text() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_literal_equation_marker_edits_preserve_literal_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live literal equation marker {}", unique_suffix()),
         vec![paragraph_child("Literal $E=mc^2$ text")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains("Literal \\$E=mc^2\\$ text"),
@@ -1452,17 +4170,17 @@ fn live_paragraph_literal_equation_marker_edits_preserve_literal_text() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_literal_explicit_mention_marker_edits_preserve_literal_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live literal mention marker {}", unique_suffix()),
         vec![paragraph_child("Literal @date(2026-06-14) marker")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains("Literal \\@date(2026-06-14) marker"),
@@ -1524,10 +4242,10 @@ fn live_paragraph_literal_explicit_mention_marker_edits_preserve_literal_text() 
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_literal_markdown_inline_marker_edits_preserve_literal_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
@@ -1536,7 +4254,7 @@ fn live_paragraph_literal_markdown_inline_marker_edits_preserve_literal_text() {
             "Literal **bold** _italic_ ~~strike~~ `code` [link](https://example.com)",
         )],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains(
@@ -1613,17 +4331,17 @@ fn live_paragraph_literal_markdown_inline_marker_edits_preserve_literal_text() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_paragraph_literal_block_marker_edits_preserve_paragraph_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live literal block marker {}", unique_suffix()),
         vec![paragraph_child("# Literal heading marker")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains("\\# Literal heading marker"),
@@ -1679,10 +4397,10 @@ fn live_paragraph_literal_block_marker_edits_preserve_paragraph_text() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_table_width_change_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
@@ -1701,7 +4419,7 @@ fn live_table_width_change_blocks_before_journaled_apply() {
             }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &source.id);
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let edited = original
@@ -1738,10 +4456,10 @@ fn live_table_width_change_blocks_before_journaled_apply() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_table_middle_row_delete_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
@@ -1762,7 +4480,7 @@ fn live_table_middle_row_delete_blocks_before_journaled_apply() {
             }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &source.id);
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let beta_row = "\n| Beta | Doing |";
@@ -1796,10 +4514,10 @@ fn live_table_middle_row_delete_blocks_before_journaled_apply() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_table_trailing_row_delete_pushes_and_reconciles() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
@@ -1822,7 +4540,7 @@ fn live_table_trailing_row_delete_pushes_and_reconciles() {
             }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(original.contains("| Drop task | Later |"), "{original}");
     let trailing_newline = if original.ends_with('\n') { "\n" } else { "" };
@@ -1873,10 +4591,10 @@ fn live_table_trailing_row_delete_pushes_and_reconciles() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_child_page_link_move_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let anchor_text = "Anchor before child page.";
     let parent = cleanup.create_page(
@@ -1890,7 +4608,7 @@ fn live_child_page_link_move_blocks_before_journaled_apply() {
         &child_title,
         vec![paragraph_child("Child page body.")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &parent.id);
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &parent.id);
     let child_line = original
@@ -1935,10 +4653,10 @@ fn live_child_page_link_move_blocks_before_journaled_apply() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_child_page_link_delete_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let anchor_text = "Anchor before child page delete.";
     let parent = cleanup.create_page(
@@ -1952,7 +4670,7 @@ fn live_child_page_link_delete_blocks_before_journaled_apply() {
         &child_title,
         vec![paragraph_child("Child page body.")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &parent.id);
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &parent.id);
     let child_line = original
@@ -1999,10 +4717,10 @@ fn live_child_page_link_delete_blocks_before_journaled_apply() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -2019,7 +4737,7 @@ fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
         )],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(scratch.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -2104,17 +4822,17 @@ fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_drift_preflight_blocks_push_before_overwriting_remote() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live drift {}", unique_suffix()),
         vec![paragraph_child("Base body before local and remote drift.")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
     let local_marker = format!("Local pending edit {}", unique_suffix());
     let remote_marker = format!("Remote competing edit {}", unique_suffix());
@@ -2124,8 +4842,12 @@ fn live_drift_preflight_blocks_push_before_overwriting_remote() {
     )
     .expect("write local drift edit");
 
-    std::thread::sleep(Duration::from_millis(1200));
-    append_remote_paragraph(&cleanup.api, &scratch.id, &remote_marker);
+    append_remote_paragraph_and_wait(
+        &cleanup.api,
+        &scratch.id,
+        &remote_marker,
+        "drift preflight remote edit",
+    );
 
     let push = run_push_with_daemon(
         &mut store,
@@ -2155,10 +4877,10 @@ fn live_drift_preflight_blocks_push_before_overwriting_remote() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let base = "Conflict base body before local and remote edits.";
     let scratch = cleanup.create_page(
@@ -2166,7 +4888,7 @@ fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
         &format!("Locality live conflict resolve {}", unique_suffix()),
         vec![paragraph_child(base)],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
     let local_marker = format!("Local conflict edit {}", unique_suffix());
     let remote_marker = format!("Remote conflict edit {}", unique_suffix());
@@ -2175,9 +4897,14 @@ fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
     fs::write(&page_path, original.replace(base, &local_marker))
         .expect("write local conflict edit");
 
-    std::thread::sleep(Duration::from_millis(1200));
     let paragraph_id = first_live_child_block_id(&cleanup.api, &scratch.id);
-    update_remote_paragraph(&cleanup.api, &paragraph_id, &remote_marker);
+    update_remote_paragraph_and_wait(
+        &cleanup.api,
+        &scratch.id,
+        &paragraph_id,
+        &remote_marker,
+        "dirty pull conflict remote edit",
+    );
 
     let pull = run_pull(&mut store, &connector, &page_path).expect("pull conflicted live page");
     assert!(!pull.ok, "{pull:#?}");
@@ -2245,10 +4972,10 @@ fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_macos_file_provider_dirty_pull_conflict_materializes_visible_markers() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let base = "File Provider conflict base body before local and remote edits.";
     let scratch = cleanup.create_page(
@@ -2256,7 +4983,7 @@ fn live_macos_file_provider_dirty_pull_conflict_materializes_visible_markers() {
         &format!("Locality live macOS conflict {}", unique_suffix()),
         vec![paragraph_child(base)],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
     run_mount(
@@ -2292,13 +5019,17 @@ fn live_macos_file_provider_dirty_pull_conflict_materializes_visible_markers() {
     let original = fs::read_to_string(&visible_path).expect("read visible replica");
     let local_marker = format!("Local visible conflict edit {}", unique_suffix());
     let remote_marker = format!("Remote conflict edit {}", unique_suffix());
-    std::thread::sleep(Duration::from_millis(20));
     fs::write(&visible_path, original.replace(base, &local_marker))
         .expect("write missed visible local edit");
 
-    std::thread::sleep(Duration::from_millis(1200));
     let paragraph_id = first_live_child_block_id(&cleanup.api, &scratch.id);
-    update_remote_paragraph(&cleanup.api, &paragraph_id, &remote_marker);
+    update_remote_paragraph_and_wait(
+        &cleanup.api,
+        &scratch.id,
+        &paragraph_id,
+        &remote_marker,
+        "macOS File Provider conflict remote edit",
+    );
 
     let pull = run_pull_with_state_root(
         &mut store,
@@ -2329,10 +5060,10 @@ fn live_macos_file_provider_dirty_pull_conflict_materializes_visible_markers() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_inspect_explains_remote_and_local_drift_without_mutating() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let base = "Inspect base body before drift.";
     let scratch = cleanup.create_page(
@@ -2340,7 +5071,7 @@ fn live_inspect_explains_remote_and_local_drift_without_mutating() {
         &format!("Locality live inspect {}", unique_suffix()),
         vec![paragraph_child(base)],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, store, page_path, original) = pull_live_page(&connector, &scratch.id);
 
     let initial = run_inspect(
@@ -2416,10 +5147,10 @@ fn live_inspect_explains_remote_and_local_drift_without_mutating() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_push_log_and_undo_restores_remote_content() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let base = "Undo base body before push.";
     let scratch = cleanup.create_page(
@@ -2427,7 +5158,7 @@ fn live_push_log_and_undo_restores_remote_content() {
         &format!("Locality live undo {}", unique_suffix()),
         vec![paragraph_child(base)],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
     let pushed_marker = format!("Undo pushed edit {}", unique_suffix());
 
@@ -2492,10 +5223,10 @@ fn live_push_log_and_undo_restores_remote_content() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_undo_archive_restores_paragraph_link_without_link_to_page_promotion() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let target = cleanup.create_page(
         &env.parent_page_id,
@@ -2518,7 +5249,7 @@ fn live_undo_archive_restores_paragraph_link_without_link_to_page_promotion() {
             "paragraph": { "rich_text": [linked_text_part("Linked page", &target_url)] }
         })],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
     let link_line = format!("[Linked page]({target_url})");
     assert!(original.contains(&link_line), "{original}");
@@ -2567,17 +5298,17 @@ fn live_undo_archive_restores_paragraph_link_without_link_to_page_promotion() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live page-dir parent {}", unique_suffix()),
         vec![paragraph_child("Parent body before child page creation.")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, parent_page_path, _markdown) =
         pull_live_page(&connector, &scratch.id);
     let child_title = format!("Locality live page-dir child {}", unique_suffix());
@@ -2630,10 +5361,10 @@ fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_undo_child_page_create_archives_remote_page() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -2642,7 +5373,7 @@ fn live_undo_child_page_create_archives_remote_page() {
             "Parent body before undoing child creation.",
         )],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (_fixture, mut store, parent_page_path, _markdown) =
         pull_live_page(&connector, &scratch.id);
     let child_title = format!("Locality live undo page create child {}", unique_suffix());
@@ -2727,10 +5458,139 @@ fn live_undo_child_page_create_archives_remote_page() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_undo_database_row_create_archives_remote_row() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live undo row create scratch {}", unique_suffix()),
+        Vec::new(),
+    );
+    let database = cleanup.create_database(
+        &scratch.id,
+        &format!("Locality live undo row create database {}", unique_suffix()),
+    );
+
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let connector = NotionConnector::new(live_notion_config());
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live undo database row root page");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live undo database row root");
+
+    let database_dir = fixture.database_dir();
+    let row_title = format!("Locality live undo created row {}", unique_suffix());
+    let new_row_dir = database_dir.join(slug_for_test(&row_title));
+    fs::create_dir_all(&new_row_dir).expect("create undo row directory");
+    let new_row_path = new_row_dir.join("page.md");
+    fs::write(
+        &new_row_path,
+        format!(
+            "---\ntitle: \"{row_title}\"\nNotes: \"Created row before undo\"\nPoints: 34\nStatus: Todo\nDone: false\n---\n# Undo row body\n\nCreated database row before undo.\n"
+        ),
+    )
+    .expect("write live undo database row page");
+
+    let diff = run_diff(&store, &new_row_path).expect("diff undo database row create");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("undo row create plan");
+    assert_eq!(plan.summary.entities_created, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &new_row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push database row create before undo");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("reconciled"));
+    let push_id = push.push_id.clone().expect("push id");
+    let created_row_id = push
+        .changed_remote_ids
+        .iter()
+        .find(|id| *id != &database.id)
+        .expect("created database row id")
+        .clone();
+    cleanup.block_ids.push(created_row_id.clone());
+    let created_row = cleanup
+        .api
+        .retrieve_page(&created_row_id)
+        .expect("retrieve created database row");
+    assert!(
+        !created_row.archived && !created_row.in_trash,
+        "created database row should exist before undo: {created_row:#?}"
+    );
+
+    let log = run_log(
+        &store,
+        LogOptions {
+            path: Some(new_row_path.clone()),
+        },
+    )
+    .expect("log database row create push");
+    assert_eq!(log.entries.len(), 1, "{log:#?}");
+    assert_eq!(log.entries[0].push_id, push_id);
+    assert_eq!(log.entries[0].status, "reconciled");
+    assert_eq!(log.entries[0].apply_effect_count, 1);
+
+    let mut undo_applier = ConnectorUndoApplier::new(&connector);
+    let undo = run_undo_with_applier(&mut store, push_id.clone(), &mut undo_applier)
+        .expect("undo database row create");
+    assert!(undo.ok, "{undo:#?}");
+    assert_eq!(undo.action, "reverse_applied", "{undo:#?}");
+    assert_eq!(undo.status, "reverted");
+    let undo_plan = undo.undo_plan.as_ref().expect("undo plan");
+    assert!(
+        undo_plan.operations.iter().any(|operation| matches!(
+            operation,
+            UndoOperationOutput::ArchiveCreatedEntity { entity_id }
+                if entity_id == &created_row_id
+        )),
+        "{undo:#?}"
+    );
+
+    let archived = cleanup
+        .api
+        .retrieve_page(&created_row_id)
+        .expect("retrieve archived created database row");
+    assert!(
+        archived.archived || archived.in_trash,
+        "undo should archive the created database row: {archived:#?}"
+    );
+    let reverted_log = run_log(
+        &store,
+        LogOptions {
+            path: Some(new_row_path),
+        },
+    )
+    .expect("log reverted database row create push");
+    assert_eq!(reverted_log.entries[0].push_id, push_id);
+    assert_eq!(reverted_log.entries[0].status, "reverted");
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_virtual_page_directory_delete_archives_remote_child_page() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let parent = cleanup.create_page(
         &env.parent_page_id,
@@ -2744,7 +5604,7 @@ fn live_virtual_page_directory_delete_archives_remote_child_page() {
         vec![paragraph_child("Child body before delete.")],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(parent.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -2861,10 +5721,10 @@ fn live_virtual_page_directory_delete_archives_remote_child_page() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_virtual_database_row_directory_delete_archives_remote_row() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let parent = cleanup.create_page(
         &env.parent_page_id,
@@ -2888,7 +5748,7 @@ fn live_virtual_database_row_directory_delete_archives_remote_row() {
         vec![paragraph_child("Row body before virtual delete.")],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(parent.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -3023,10 +5883,10 @@ fn live_virtual_database_row_directory_delete_archives_remote_row() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let parent = cleanup.create_page(
         &env.parent_page_id,
@@ -3040,7 +5900,7 @@ fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
         vec![paragraph_child("Child body before rename.")],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(parent.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -3157,10 +6017,10 @@ fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_database_row_directory_create_pushes_row_and_reconciles() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -3174,7 +6034,7 @@ fn live_database_row_directory_create_pushes_row_and_reconciles() {
 
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     run_mount(
         &mut store,
         MountOptions {
@@ -3266,10 +6126,102 @@ fn live_database_row_directory_create_pushes_row_and_reconciles() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_database_row_invalid_select_option_blocks_before_journaled_apply() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live invalid row scratch {}", unique_suffix()),
+        Vec::new(),
+    );
+    let database = cleanup.create_database(
+        &scratch.id,
+        &format!("Locality live invalid row database {}", unique_suffix()),
+    );
+    let row = cleanup.create_database_row(
+        &database,
+        &format!("Locality live invalid row {}", unique_suffix()),
+        database_row_properties(
+            "Initial validation row notes",
+            "5",
+            "Todo",
+            "Not started",
+            false,
+            "https://example.com/loc-invalid-row",
+            &[],
+            &[],
+        ),
+        vec![paragraph_child("Validation row body.")],
+    );
+
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let connector = NotionConnector::new(live_notion_config());
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live invalid row root page");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live invalid row root page");
+
+    let row_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(row.id.clone()))
+        .expect("get invalid row entity")
+        .expect("invalid row entity");
+    let row_path = fixture.root.join(&row_entity.path);
+    run_pull(&mut store, &connector, &row_path).expect("hydrate live invalid row");
+    let original = fs::read_to_string(&row_path).expect("read invalid row markdown");
+    assert!(original.contains("\"Status\": \"Todo\""), "{original}");
+    let before = live_page_snapshot(&connector, &row.id);
+    fs::write(
+        &row_path,
+        original.replace("\"Status\": \"Todo\"", "\"Status\": \"Blocked\""),
+    )
+    .expect("write invalid select option");
+
+    let diff = run_diff(&store, &row_path).expect("diff invalid select option");
+    assert!(!diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(diff.validation[0].code, "notion_schema_option_unknown");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push invalid select option");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert_eq!(
+        live_page_snapshot(&connector, &row.id),
+        before,
+        "invalid database row option must not mutate Notion"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_remote_fast_forward_updates_clean_file_and_preserves_pending_file() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -3277,7 +6229,7 @@ fn live_remote_fast_forward_updates_clean_file_and_preserves_pending_file() {
         vec![paragraph_child("Fast forward base body.")],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(scratch.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -3333,10 +6285,10 @@ fn live_remote_fast_forward_updates_clean_file_and_preserves_pending_file() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_scheduled_pull_queues_and_applies_remote_fast_forward() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let parent = cleanup.create_page(
         &env.parent_page_id,
@@ -3349,7 +6301,7 @@ fn live_scheduled_pull_queues_and_applies_remote_fast_forward() {
         vec![paragraph_child("Scheduler child base body.")],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(parent.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -3418,9 +6370,13 @@ fn live_scheduled_pull_queues_and_applies_remote_fast_forward() {
         "{hydrated_child}"
     );
 
-    std::thread::sleep(Duration::from_millis(1200));
     let remote_marker = format!("Scheduler remote fast-forward {}", unique_suffix());
-    append_remote_paragraph(&cleanup.api, &child.id, &remote_marker);
+    append_remote_paragraph_and_wait(
+        &cleanup.api,
+        &child.id,
+        &remote_marker,
+        "scheduled pull remote fast-forward",
+    );
     // Notion can report page edit times with coarse precision; keep the test
     // focused on the scheduler path by making the local synced version stale.
     let mut stale_child = store
@@ -3477,10 +6433,127 @@ fn live_scheduled_pull_queues_and_applies_remote_fast_forward() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_scheduled_pull_idle_ticks_do_not_repeat_notion_enumeration_or_queue_duplicates() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live scheduled idle parent {}", unique_suffix()),
+        vec![paragraph_child("Scheduler idle parent body.")],
+    );
+    cleanup.create_page(
+        &parent.id,
+        &format!("Locality live scheduled idle child {}", unique_suffix()),
+        vec![paragraph_child("Scheduler idle child body.")],
+    );
+    let connector = NotionConnector::new(
+        live_notion_config().with_root_page_id(RemoteId::new(parent.id.clone())),
+    );
+    let source = CountingScheduledPullSource::new(&connector);
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(parent.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live scheduled idle workspace");
+    let mounts = store
+        .load_mounts()
+        .expect("load live scheduled idle mounts");
+    let strategy = DefaultFetchScheduleStrategy;
+    let policy = HydrationPolicy::default();
+    let mut scheduler = PullScheduler::new(locality_core::pull::PullSchedulerConfig {
+        active_interval: Duration::from_secs(60),
+        cold_interval: Duration::from_secs(600),
+        ..Default::default()
+    });
+    let mut queue = HydrationQueue::new();
+
+    let initial_tick = scheduler.tick().expect("initial live scheduled idle tick");
+    assert!(!initial_tick.is_idle(), "{initial_tick:#?}");
+    let initial = reconcile_scheduled_pull(
+        &mut store,
+        &mut queue,
+        &mounts,
+        &initial_tick,
+        &source,
+        &strategy,
+        &policy,
+    )
+    .expect("initial live scheduled idle reconcile");
+    assert_eq!(source.enumeration_count(), 1);
+    assert_eq!(initial.mounts_polled, 1, "{initial:#?}");
+    assert!(
+        initial.enumerated >= 2,
+        "scheduled pull should enumerate parent and child: {initial:#?}"
+    );
+    assert_eq!(
+        queue.len(),
+        1,
+        "initial scheduled pull should leave one root hydration queued: {initial:#?}"
+    );
+
+    for tick_number in 1..=5 {
+        let idle_tick = scheduler
+            .advance_by(Duration::from_secs(1))
+            .expect("live scheduled idle subinterval tick");
+        assert!(
+            idle_tick.is_idle(),
+            "tick {tick_number} should be idle: {idle_tick:#?}"
+        );
+        let idle = reconcile_scheduled_pull(
+            &mut store, &mut queue, &mounts, &idle_tick, &source, &strategy, &policy,
+        )
+        .expect("live scheduled idle reconcile");
+        assert_eq!(source.enumeration_count(), 1);
+        assert_eq!(idle.mounts_checked, 1, "{idle:#?}");
+        assert_eq!(idle.mounts_polled, 0, "{idle:#?}");
+        assert_eq!(idle.enumerated, 0, "{idle:#?}");
+        assert_eq!(idle.queued_hydrations, 0, "{idle:#?}");
+        assert_eq!(queue.len(), 1, "tick {tick_number}: {idle:#?}");
+    }
+
+    let due_tick = scheduler
+        .advance_by(Duration::from_secs(55))
+        .expect("live scheduled idle due tick");
+    assert!(!due_tick.is_idle(), "{due_tick:#?}");
+    let due = reconcile_scheduled_pull(
+        &mut store, &mut queue, &mounts, &due_tick, &source, &strategy, &policy,
+    )
+    .expect("live scheduled idle due reconcile");
+    assert_eq!(source.enumeration_count(), 2);
+    assert_eq!(
+        source.schema_count(),
+        0,
+        "page-only scheduled pulls should not fetch database schemas"
+    );
+    assert_eq!(due.mounts_polled, 1, "{due:#?}");
+    assert!(
+        due.enumerated >= 2,
+        "due scheduled pull should enumerate parent and child: {due:#?}"
+    );
+    assert_eq!(
+        queue.len(),
+        1,
+        "due scheduled pull should merge duplicate root hydration work: {due:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -3490,7 +6563,7 @@ fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
         )],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(scratch.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -3531,10 +6604,10 @@ fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -3551,7 +6624,7 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
         )],
     );
     let connector = NotionConnector::new(
-        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+        live_notion_config().with_root_page_id(RemoteId::new(scratch.id.clone())),
     );
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -3653,10 +6726,10 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_diverse_page_read_noop_preserves_notion() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let target = cleanup.create_page(
         &env.parent_page_id,
@@ -3680,7 +6753,7 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
         )],
     );
 
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let before = live_block_snapshot(&connector, &source.id);
     let (_fixture, mut store, page_path, markdown) = pull_live_page(&connector, &source.id);
 
@@ -3751,10 +6824,10 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_code_block_with_embedded_fence_edits_round_trip() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
@@ -3769,7 +6842,7 @@ fn live_code_block_with_embedded_fence_edits_round_trip() {
         })],
     );
 
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let expected_original = "````markdown\nBefore\n```python\nprint('nested')\n```\nAfter\n````";
     assert!(
@@ -3819,10 +6892,10 @@ fn live_code_block_with_embedded_fence_edits_round_trip() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_code_block_ignores_fence_marker_with_trailing_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
@@ -3837,7 +6910,7 @@ fn live_code_block_ignores_fence_marker_with_trailing_text() {
         })],
     );
 
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains("```markdown\nBefore\n```"),
@@ -3889,10 +6962,10 @@ fn live_code_block_ignores_fence_marker_with_trailing_text() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_text_code_fence_alias_pushes_as_plain_text() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let source = cleanup.create_page(
         &env.parent_page_id,
@@ -3907,7 +6980,7 @@ fn live_text_code_fence_alias_pushes_as_plain_text() {
         })],
     );
 
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     assert!(
         original.contains("```plain text\nBefore\n```"),
@@ -3963,10 +7036,10 @@ fn live_text_code_fence_alias_pushes_as_plain_text() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let user_id = cleanup.current_user_id();
     let target = cleanup.create_page(
@@ -3987,7 +7060,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         supported_edit_children(&user_id, &target.id, &linked_database.id),
     );
 
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
     let editable_image_line = markdown_image_line(&original, "Editable image");
     let editable_image_href = markdown_link_href(editable_image_line);
@@ -4138,10 +7211,10 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -4152,7 +7225,7 @@ fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
             "Original local image",
         )],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
     assert_local_image_markdown(&original, "Original local image");
 
@@ -4219,10 +7292,10 @@ fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_local_image_media_edit_with_escaped_caption_uploads_and_reconciles() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -4233,7 +7306,7 @@ fn live_local_image_media_edit_with_escaped_caption_uploads_and_reconciles() {
             "Original escaped image",
         )],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
     assert_local_image_markdown(&original, "Original escaped image");
 
@@ -4300,17 +7373,17 @@ fn live_local_image_media_edit_with_escaped_caption_uploads_and_reconciles() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_local_file_like_media_appends_upload_and_reconcile_local_links() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live local files {}", unique_suffix()),
         vec![paragraph_child("Base body before local file-like uploads.")],
     );
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
     let media_dir = fixture
         .root
@@ -4393,10 +7466,10 @@ fn live_local_file_like_media_appends_upload_and_reconcile_local_links() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(NotionConfig::default());
+    let api = HttpNotionApi::new(live_notion_config());
     let mut cleanup = LiveCleanup::new(api);
     let people_user_id = cleanup.current_user_id();
     let scratch = cleanup.create_page(
@@ -4443,7 +7516,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
 
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(live_notion_config());
     run_mount(
         &mut store,
         MountOptions {
@@ -4774,6 +7847,150 @@ impl Drop for E2eFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
         let _ = fs::remove_dir_all(&self.state_root);
+    }
+}
+
+#[derive(Debug)]
+struct StaticScheduledPullSource {
+    entries: Vec<TreeEntry>,
+    enumeration_count: AtomicU64,
+}
+
+impl StaticScheduledPullSource {
+    fn new(entries: Vec<TreeEntry>) -> Self {
+        Self {
+            entries,
+            enumeration_count: AtomicU64::new(0),
+        }
+    }
+
+    fn enumeration_count(&self) -> u64 {
+        self.enumeration_count.load(Ordering::SeqCst)
+    }
+}
+
+impl ScheduledPullSource for StaticScheduledPullSource {
+    fn enumerate_mount(
+        &self,
+        mount: &MountConfig,
+    ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
+        self.enumeration_count.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .entries
+            .iter()
+            .filter(|entry| entry.mount_id == mount.mount_id)
+            .cloned()
+            .collect())
+    }
+}
+
+#[derive(Debug)]
+struct CountingScheduledPullSource<'a, S: ?Sized> {
+    inner: &'a S,
+    enumeration_count: AtomicU64,
+    schema_count: AtomicU64,
+}
+
+impl<'a, S: ?Sized> CountingScheduledPullSource<'a, S> {
+    fn new(inner: &'a S) -> Self {
+        Self {
+            inner,
+            enumeration_count: AtomicU64::new(0),
+            schema_count: AtomicU64::new(0),
+        }
+    }
+
+    fn enumeration_count(&self) -> u64 {
+        self.enumeration_count.load(Ordering::SeqCst)
+    }
+
+    fn schema_count(&self) -> u64 {
+        self.schema_count.load(Ordering::SeqCst)
+    }
+}
+
+impl<S> ScheduledPullSource for CountingScheduledPullSource<'_, S>
+where
+    S: ScheduledPullSource + ?Sized,
+{
+    fn enumerate_mount(
+        &self,
+        mount: &MountConfig,
+    ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
+        self.enumeration_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.enumerate_mount(mount)
+    }
+
+    fn database_schema_yaml(
+        &self,
+        mount: &MountConfig,
+        remote_id: &RemoteId,
+    ) -> locality_core::LocalityResult<Option<String>> {
+        self.schema_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.database_schema_yaml(mount, remote_id)
+    }
+}
+
+fn save_workspace_freshness_page(
+    store: &mut InMemoryStateStore,
+    mount_id: &MountId,
+    remote_id: &str,
+    title: impl Into<String>,
+    path: impl Into<PathBuf>,
+    hydration: HydrationState,
+) {
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new(remote_id),
+                EntityKind::Page,
+                title,
+                path,
+            )
+            .with_hydration(hydration),
+        )
+        .expect("save workspace freshness entity");
+}
+
+fn scheduled_tree_entries(mount_id: &MountId, child_count: usize) -> Vec<TreeEntry> {
+    let mut entries = Vec::with_capacity(child_count + 1);
+    entries.push(scheduled_page_entry(
+        mount_id,
+        "root-page",
+        "Root",
+        "Root/page.md",
+        "2026-06-10T00:00:00.000Z",
+    ));
+    for number in 1..=child_count {
+        entries.push(scheduled_page_entry(
+            mount_id,
+            &format!("child-{number}"),
+            &format!("Child {number}"),
+            format!("Root/Child {number}/page.md"),
+            &format!("2026-06-10T00:00:{number:02}.000Z"),
+        ));
+    }
+    entries
+}
+
+fn scheduled_page_entry(
+    mount_id: &MountId,
+    remote_id: &str,
+    title: &str,
+    path: impl Into<PathBuf>,
+    remote_edited_at: &str,
+) -> TreeEntry {
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id: RemoteId::new(remote_id),
+        kind: EntityKind::Page,
+        title: title.to_string(),
+        path: path.into(),
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: Some(remote_edited_at.to_string()),
+        stub_frontmatter: None,
     }
 }
 
@@ -5116,6 +8333,192 @@ impl Drop for LiveCleanup {
     }
 }
 
+fn live_notion_config() -> NotionConfig {
+    NotionConfig::default().with_token(live_notion_token())
+}
+
+fn live_notion_token() -> String {
+    if let Ok(token) = std::env::var(TOKEN_ENV) {
+        let token = token.trim();
+        if !token.is_empty() {
+            return token.to_string();
+        }
+    }
+
+    let state_root = locality_platform::default_state_root();
+    let connection_id =
+        std::env::var(LIVE_CONNECTION_ENV).unwrap_or_else(|_| "notion-default".to_string());
+    live_notion_token_from_state_root(&state_root, &connection_id).unwrap_or_else(|error| {
+        panic!(
+            "set {TOKEN_ENV} or store a Notion credential for `{connection_id}` in `{}` ({error})",
+            state_root.join("credentials").display()
+        )
+    })
+}
+
+fn live_notion_token_from_state_root(
+    state_root: &Path,
+    connection_id: &str,
+) -> Result<String, String> {
+    notion_access_token_from_secret(&live_notion_secret_from_state_root(
+        state_root,
+        connection_id,
+    )?)
+}
+
+fn live_notion_secret_from_default_store(connection_id: &str) -> Result<String, String> {
+    live_notion_secret_from_state_root(&locality_platform::default_state_root(), connection_id)
+}
+
+fn live_notion_secret_from_state_root(
+    state_root: &Path,
+    connection_id: &str,
+) -> Result<String, String> {
+    let secret_ref = format!("connection:{connection_id}");
+    let credentials = open_credential_store(state_root);
+    credentials
+        .get(&secret_ref)
+        .map_err(|error| format!("failed to read `{secret_ref}`: {error}"))
+}
+
+fn notion_access_token_from_secret(secret: &str) -> Result<String, String> {
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Err("credential secret is empty".to_string());
+    }
+    if secret.starts_with('{') {
+        let stored = serde_json::from_str::<StoredNotionCredential>(secret)
+            .map_err(|error| format!("stored Notion OAuth credential is invalid: {error}"))?;
+        if stored.access_token.trim().is_empty() {
+            return Err("stored Notion OAuth credential has an empty access token".to_string());
+        }
+        return Ok(stored.access_token);
+    }
+    Ok(secret.to_string())
+}
+
+fn seed_cli_live_connection(state_root: &Path, connection_id: &ConnectionId, stored_secret: &str) {
+    fs::create_dir_all(state_root).expect("create CLI live state root");
+    let secret_ref = format!("connection:{}", connection_id.as_str());
+    let auth_kind = if stored_secret.trim_start().starts_with('{') {
+        "oauth"
+    } else {
+        "token"
+    };
+    let profile_id = ConnectorProfileId::new(if auth_kind == "oauth" {
+        DEFAULT_NOTION_OAUTH_PROFILE_ID
+    } else {
+        DEFAULT_NOTION_PROFILE_ID
+    });
+    let credentials = FileCredentialStore::new(state_root);
+    credentials
+        .put(&secret_ref, stored_secret)
+        .expect("seed CLI live credential");
+
+    let stored_oauth = if auth_kind == "oauth" {
+        Some(
+            serde_json::from_str::<StoredNotionCredential>(stored_secret)
+                .expect("stored Notion OAuth credential"),
+        )
+    } else {
+        None
+    };
+    let now = timestamp_string();
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open CLI live state");
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: "notion".to_string(),
+            display_name: if auth_kind == "oauth" {
+                "Notion OAuth".to_string()
+            } else {
+                "Notion token auth".to_string()
+            },
+            auth_kind: auth_kind.to_string(),
+            scopes: vec![],
+            capabilities_json: notion_capabilities_json_for_live_test(),
+            enabled_actions_json: "[\"read\",\"write\"]".to_string(),
+            connector_version: "notion.v1".to_string(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .expect("seed CLI live connector profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id),
+            connector: "notion".to_string(),
+            display_name: connection_id.as_str().to_string(),
+            account_label: stored_oauth
+                .as_ref()
+                .and_then(|stored| stored.workspace_name.clone()),
+            workspace_id: stored_oauth
+                .as_ref()
+                .and_then(|stored| stored.workspace_id.clone()),
+            workspace_name: stored_oauth
+                .as_ref()
+                .and_then(|stored| stored.workspace_name.clone()),
+            auth_kind: auth_kind.to_string(),
+            secret_ref,
+            scopes: vec![],
+            capabilities_json: notion_capabilities_json_for_live_test(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .expect("seed CLI live connection");
+}
+
+fn notion_capabilities_json_for_live_test() -> String {
+    serde_json::to_string(&ConnectorCapabilities {
+        supports_block_updates: true,
+        supports_databases: true,
+        supports_oauth: true,
+        supports_remote_observation: true,
+        supports_lazy_child_enumeration: true,
+        supports_media_download: true,
+        supports_undo: true,
+        supports_batch_observation: false,
+    })
+    .expect("serialize Notion capabilities")
+}
+
+#[derive(Debug)]
+struct LocJsonOutput {
+    value: Value,
+    stdout: String,
+}
+
+fn loc_command(loc: &str, state_root: &Path) -> Command {
+    let mut command = Command::new(loc);
+    command
+        .env("LOCALITY_STATE_DIR", state_root)
+        .env("LOCALITY_DAEMON_DISABLE", "1")
+        .env_remove(TOKEN_ENV);
+    command
+}
+
+fn loc_json_ok(command: &mut Command) -> LocJsonOutput {
+    loc_json_with_exit(command, 0)
+}
+
+fn loc_json_with_exit(command: &mut Command, expected_code: i32) -> LocJsonOutput {
+    let output = command.output().expect("run loc command");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code().unwrap_or(-1);
+    assert!(
+        code == expected_code,
+        "loc command exited with {code}, expected {expected_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("failed to parse loc JSON: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    LocJsonOutput { value, stdout }
+}
+
 #[derive(Debug)]
 struct LiveEnv {
     parent_page_id: String,
@@ -5123,13 +8526,36 @@ struct LiveEnv {
 
 impl LiveEnv {
     fn from_env() -> Self {
-        std::env::var(TOKEN_ENV).expect("NOTION_TOKEN");
         let parent_page = std::env::var(LIVE_PARENT_ENV)
             .unwrap_or_else(|_| panic!("set {LIVE_PARENT_ENV} to a writable page ID or URL"));
-        Self {
-            parent_page_id: normalize_notion_id(&parent_page),
-        }
+        let parent_page_id = normalize_notion_id(&parent_page);
+        let api = HttpNotionApi::new(live_notion_config());
+        let parent = api.retrieve_page(&parent_page_id).unwrap_or_else(|error| {
+            panic!(
+                "{LIVE_PARENT_ENV} `{parent_page_id}` must point to an accessible writable Notion page; failed to retrieve parent page: {error}"
+            )
+        });
+        ensure_live_parent_page_is_writable(&parent, &parent_page_id);
+        Self { parent_page_id }
     }
+}
+
+fn ensure_live_parent_page_is_writable(parent: &PageDto, parent_page_id: &str) {
+    if parent.archived || parent.in_trash {
+        panic!(
+            "{LIVE_PARENT_ENV} `{parent_page_id}` points to a Notion page that is archived or in trash; choose an active writable parent page"
+        );
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return message.to_string();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 fn pull_live_page(
@@ -5214,6 +8640,11 @@ fn append_remote_paragraph(api: &HttpNotionApi, page_id: &str, text: &str) {
     .expect("append live remote paragraph");
 }
 
+fn append_remote_paragraph_and_wait(api: &HttpNotionApi, page_id: &str, text: &str, context: &str) {
+    append_remote_paragraph(api, page_id, text);
+    wait_for_live_block_text(api, page_id, text, context);
+}
+
 fn first_live_child_block_id(api: &HttpNotionApi, page_id: &str) -> String {
     api.retrieve_block_children(page_id, None)
         .expect("retrieve live child blocks")
@@ -5234,6 +8665,38 @@ fn update_remote_paragraph(api: &HttpNotionApi, block_id: &str, text: &str) {
         }),
     )
     .expect("update live remote paragraph");
+}
+
+fn update_remote_paragraph_and_wait(
+    api: &HttpNotionApi,
+    page_id: &str,
+    block_id: &str,
+    text: &str,
+    context: &str,
+) {
+    update_remote_paragraph(api, block_id, text);
+    wait_for_live_block_text(api, page_id, text, context);
+}
+
+fn wait_for_live_block_text(api: &HttpNotionApi, page_id: &str, text: &str, context: &str) {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut last_snapshot = String::new();
+
+    while Instant::now() < deadline {
+        let children = api
+            .retrieve_block_children(page_id, None)
+            .unwrap_or_else(|error| panic!("{context}: retrieve live child blocks: {error}"));
+        last_snapshot =
+            serde_json::to_string(&children.results).expect("serialize live block snapshot");
+        if last_snapshot.contains(text) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    panic!(
+        "{context}: live page `{page_id}` did not expose expected text `{text}` before timeout; last observed blocks: {last_snapshot}"
+    );
 }
 
 fn diverse_page_children(target_page_id: &str, database_id: &str) -> Vec<Value> {
@@ -5694,6 +9157,138 @@ fn collect_files_into(path: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+struct LocalMediaServer {
+    url: String,
+    expected_requests: usize,
+    handle: JoinHandle<usize>,
+}
+
+impl LocalMediaServer {
+    fn new(bytes: Vec<u8>, expected_requests: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local media server");
+        let url = format!(
+            "http://{}/locality-e2e-image.png",
+            listener.local_addr().expect("local media server addr")
+        );
+        let handle = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking media listener");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            while served < expected_requests && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        serve_local_media_response(stream, &bytes);
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept local media request: {error}"),
+                }
+            }
+            served
+        });
+
+        Self {
+            url,
+            expected_requests,
+            handle,
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn assert_served(self) {
+        let served = self.handle.join().expect("join local media server");
+        assert_eq!(
+            served, self.expected_requests,
+            "local media server should receive every expected download request"
+        );
+    }
+}
+
+fn serve_local_media_response(mut stream: TcpStream, bytes: &[u8]) {
+    let mut request = [0_u8; 1024];
+    let _ = stream.read(&mut request);
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .expect("write media response headers");
+    stream.write_all(bytes).expect("write media response body");
+    stream.flush().expect("flush media response");
+}
+
+struct FakeBrokerOAuthExchange;
+
+impl NotionOAuthBrokerExchange for FakeBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &NotionOAuthBrokerCodeExchange,
+    ) -> Result<NotionOAuthToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/notion/callback"
+        );
+        Ok(NotionOAuthToken {
+            access_token: "oauth-access-token".to_string(),
+            token_type: Some("bearer".to_string()),
+            refresh_token: None,
+            refresh_token_kind: Some("handle".to_string()),
+            refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+            expires_in: Some(3600),
+            bot_id: Some("bot-1".to_string()),
+            workspace_id: Some("workspace-1".to_string()),
+            workspace_name: Some("Locality".to_string()),
+            workspace_icon: None,
+            owner: None,
+            duplicated_template_id: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FakeGoogleDocsBrokerOAuthExchange;
+
+impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "google-docs");
+        assert_eq!(request.session, "google-broker-session");
+        assert_eq!(request.state, "google-state-1");
+        assert_eq!(request.code, "google-oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/google-docs/callback"
+        );
+        Ok(OAuthBrokerToken {
+            access_token: "google-oauth-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(3600),
+            refresh_token_handle: Some("google-opaque-refresh-handle".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("google-drive".to_string()),
+            workspace_name: Some("Google Drive".to_string()),
+            scopes: GOOGLE_DOCS_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct MutableNotionApi {
     page: PageDto,
@@ -5864,6 +9459,97 @@ enum WriteCall {
     },
 }
 
+#[derive(Default)]
+struct BlockingGuardrailConnector {
+    concurrency_checks: AtomicU64,
+    apply_calls: AtomicU64,
+}
+
+impl Connector for BlockingGuardrailConnector {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind("guardrail-test")
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            supports_block_updates: true,
+            supports_databases: false,
+            supports_oauth: false,
+            supports_remote_observation: false,
+            supports_lazy_child_enumeration: false,
+            supports_media_download: false,
+            supports_undo: false,
+            supports_batch_observation: false,
+        }
+    }
+
+    fn enumerate(
+        &self,
+        _request: EnumerateRequest,
+    ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "guardrail test enumerate",
+        ))
+    }
+
+    fn fetch(&self, _request: FetchRequest) -> locality_core::LocalityResult<NativeEntity> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "guardrail test fetch",
+        ))
+    }
+
+    fn render(&self, _entity: &NativeEntity) -> locality_core::LocalityResult<CanonicalDocument> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "guardrail test render",
+        ))
+    }
+
+    fn parse(&self, _document: &CanonicalDocument) -> locality_core::LocalityResult<ParsedEntity> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "guardrail test parse",
+        ))
+    }
+
+    fn check_concurrency(
+        &self,
+        _request: ApplyPlanRequest<'_>,
+    ) -> locality_core::LocalityResult<()> {
+        self.concurrency_checks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn apply(
+        &self,
+        request: ApplyPlanRequest<'_>,
+    ) -> locality_core::LocalityResult<ApplyPlanResult> {
+        self.apply_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(ApplyPlanResult {
+            changed_remote_ids: request.plan.affected_entities.clone(),
+            effects: Vec::new(),
+        })
+    }
+
+    fn apply_undo(
+        &self,
+        _request: ApplyUndoRequest<'_>,
+    ) -> locality_core::LocalityResult<ApplyUndoResult> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "guardrail test undo",
+        ))
+    }
+}
+
+impl HydrationSource for BlockingGuardrailConnector {
+    fn fetch_render(
+        &self,
+        _request: &HydrationRequest,
+    ) -> locality_core::LocalityResult<HydratedEntity> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "guardrail test fetch render",
+        ))
+    }
+}
+
 fn page(id: &str, title: &str) -> PageDto {
     PageDto {
         id: id.to_string(),
@@ -5909,6 +9595,45 @@ fn synced_block(id: &str, source_block_id: &str) -> BlockDto {
         }),
     });
     block
+}
+
+fn media_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = media_child(kind, url, caption);
+    block["id"] = json!(id);
+    serde_json::from_value(block).expect("media block dto")
+}
+
+fn ambiguous_tasks_schema() -> &'static str {
+    r#"loc:
+  type: notion_database_schema
+  database_id: "database-1"
+title: "Tasks"
+data_sources:
+  - id: "source-1"
+    name: "Tasks A"
+    properties:
+      Name:
+        id: "name-a"
+        type: "title"
+      Status:
+        id: "status-a"
+        type: "select"
+        options:
+          - name: "Todo"
+            id: "todo-a"
+  - id: "source-2"
+    name: "Tasks B"
+    properties:
+      Name:
+        id: "name-b"
+        type: "title"
+      Status:
+        id: "status-b"
+        type: "select"
+        options:
+          - name: "Todo"
+            id: "todo-b"
+"#
 }
 
 fn appended_block_from_body(id: &str, body: &Value) -> Option<BlockDto> {
@@ -6166,6 +9891,13 @@ fn unique_suffix() -> String {
         .expect("clock")
         .as_nanos();
     format!("{}-{nanos}", std::process::id())
+}
+
+fn timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn unique_id_prefix() -> String {

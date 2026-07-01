@@ -90,15 +90,24 @@ Those tests cover broad block rendering, supported block edits/appends, media do
 The product-level mounted workflow test uses the same parent page, but exercises the Locality user path instead of only the connector boundary. It creates a scratch page, mounts it as plain files, pulls it locally, edits the Markdown file, verifies `loc status` reports pending changes, pushes the edit, fetches the page from Notion, and archives the scratch page:
 
 ```sh
-export NOTION_TOKEN='secret_...'
 export LOCALITY_NOTION_LIVE_PARENT_PAGE='https://app.notion.com/...'
 cargo test -p loc-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact
 ```
 
+Those workflow tests use `NOTION_TOKEN` when it is set, otherwise they read the
+installed Locality credential store for `connection:notion-default` under
+`~/.loc/credentials` on Linux/dev installs. Set
+`LOCALITY_NOTION_LIVE_CONNECTION_ID` to use a different stored Notion
+connection. The mounted workflow and Linux FUSE live tests preflight
+`LOCALITY_NOTION_LIVE_PARENT_PAGE` and fail before scratch creation if it points
+to an archived, trashed, inaccessible, or non-page Notion object.
+
 GitHub Actions has a manual and `main`-branch `notion-live-e2e` workflow for
 these tests. The workflow should be backed by a disposable Notion
 workspace/account and secrets named `NOTION_TOKEN` and
-`LOCALITY_NOTION_LIVE_PARENT_PAGE`. The Windows job also mounts a live Cloud Files
+`LOCALITY_NOTION_LIVE_PARENT_PAGE`. The mounted workflow and Linux FUSE jobs seed
+the stored credential path from `NOTION_TOKEN` and then run with token
+environment variables removed. The Windows job also mounts a live Cloud Files
 sync root and runs `loc doctor --json` against that live state before exercising
 provider file operations.
 
