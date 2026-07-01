@@ -3494,7 +3494,8 @@ where
         + EntityRepository
         + ShadowRepository
         + FreshnessStateRepository
-        + AutoSaveRepository,
+        + AutoSaveRepository
+        + MountLiveModeRepository,
 {
     let mut runtime_report = FileEventRuntimeReport::default();
     let Some((mount, entity)) = resolve_event_entity(store, &event.path)? else {
@@ -3557,7 +3558,11 @@ fn handle_write_event<S>(
     runtime_report: &mut FileEventRuntimeReport,
 ) -> locality_core::LocalityResult<()>
 where
-    S: EntityRepository + ShadowRepository + FreshnessStateRepository + AutoSaveRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository
+        + MountLiveModeRepository,
 {
     if entity.hydration != HydrationState::Hydrated {
         if matches!(
@@ -4285,6 +4290,25 @@ mod tests {
     }
 
     #[test]
+    fn write_event_queues_auto_push_for_mount_live_mode() {
+        let fixture = RuntimeAutoSaveFixture::new();
+        let mut store = fixture.store_with_mount_live_mode();
+        fixture.write_page("Updated body.");
+
+        let report = execute_file_event(
+            &mut store,
+            FileEvent {
+                path: fixture.page_path.clone(),
+                kind: FileEventKind::Write,
+            },
+        )
+        .expect("file event");
+
+        assert_eq!(report.report.marked_dirty, 1);
+        assert_eq!(report.auto_push_targets, vec![fixture.page_path.clone()]);
+    }
+
+    #[test]
     fn remote_observation_pauses_auto_save_for_external_drift() {
         let fixture = RuntimeAutoSaveFixture::new();
         let mut store = fixture.store();
@@ -4618,6 +4642,29 @@ mod tests {
         }
 
         fn store(&self) -> InMemoryStateStore {
+            let mut store = self.store_without_auto_save();
+            let mut enrollment = AutoSaveEnrollmentRecord::new(
+                self.mount_id.clone(),
+                "Roadmap.md",
+                AutoSaveOrigin::LocalityCreated,
+                "1",
+            );
+            enrollment.remote_id = Some(self.remote_id.clone());
+            store
+                .save_auto_save_enrollment(enrollment)
+                .expect("enrollment");
+            store
+        }
+
+        fn store_with_mount_live_mode(&self) -> InMemoryStateStore {
+            let mut store = self.store_without_auto_save();
+            store
+                .save_mount_live_mode(MountLiveModeRecord::new(self.mount_id.clone(), true, "1"))
+                .expect("live mode");
+            store
+        }
+
+        fn store_without_auto_save(&self) -> InMemoryStateStore {
             let mut store = InMemoryStateStore::new();
             store
                 .save_mount(MountConfig::new(
@@ -4642,16 +4689,6 @@ mod tests {
             store
                 .save_shadow(&self.mount_id, shadow("Original body."))
                 .expect("shadow");
-            let mut enrollment = AutoSaveEnrollmentRecord::new(
-                self.mount_id.clone(),
-                "Roadmap.md",
-                AutoSaveOrigin::LocalityCreated,
-                "1",
-            );
-            enrollment.remote_id = Some(self.remote_id.clone());
-            store
-                .save_auto_save_enrollment(enrollment)
-                .expect("enrollment");
             store
         }
 

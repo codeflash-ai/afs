@@ -9,7 +9,8 @@ use locality_core::journal::JournalStore;
 use locality_core::model::{EntityKind, HydrationState};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig,
-    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    MountRepository, ProjectionMode, RemoteObservationRepository, ShadowRepository,
+    VirtualMutationRepository,
 };
 
 use crate::execution::{
@@ -356,5 +357,8 @@ fn should_hydrate_on_read(entity: &EntityRecord) -> bool {
 }
 
 fn should_watch_mount(mount: &MountConfig) -> bool {
-    !mount.projection.uses_virtual_filesystem()
+    matches!(
+        mount.projection,
+        ProjectionMode::PlainFiles | ProjectionMode::MacosFileProvider
+    )
 }

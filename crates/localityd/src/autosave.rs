@@ -7,6 +7,7 @@ use locality_core::push::{PushPipelineAction, PushPipelineResult};
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveRepository, AutoSaveState, EntityRecord, MountConfig,
+    MountLiveModeRepository,
 };
 
 pub fn auto_save_enabled_for_path<S>(
@@ -44,13 +45,25 @@ pub fn auto_save_target_for_write<S>(
     event_path: &Path,
 ) -> LocalityResult<Option<PathBuf>>
 where
-    S: AutoSaveRepository,
+    S: AutoSaveRepository + MountLiveModeRepository,
 {
-    if auto_save_enabled_for_path(store, &mount.mount_id, &entity.path)?.is_none() {
+    if auto_save_enabled_for_path(store, &mount.mount_id, &entity.path)?.is_none()
+        && !mount_live_mode_enabled_for_write(store, &mount.mount_id)?
+    {
         return Ok(None);
     }
 
     Ok(Some(event_path.to_path_buf()))
+}
+
+fn mount_live_mode_enabled_for_write<S>(store: &S, mount_id: &MountId) -> LocalityResult<bool>
+where
+    S: MountLiveModeRepository,
+{
+    Ok(store
+        .get_mount_live_mode(mount_id)
+        .map_err(LocalityError::from)?
+        .is_some_and(|record| record.enabled))
 }
 
 pub fn auto_save_block_reason(pipeline: &PushPipelineResult) -> Option<String> {

@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use locality_core::{LocalityError, LocalityResult};
-use locality_store::{MountConfig, MountRepository, SqliteStateStore};
+use locality_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
 use serde_json::json;
 
 use crate::DaemonConfig;
@@ -366,7 +366,10 @@ impl DaemonWatchManager {
 }
 
 fn should_watch_mount(mount: &MountConfig) -> bool {
-    !mount.projection.uses_virtual_filesystem()
+    matches!(
+        mount.projection,
+        ProjectionMode::PlainFiles | ProjectionMode::MacosFileProvider
+    )
 }
 
 #[cfg(unix)]
@@ -439,13 +442,14 @@ mod tests {
     }
 
     #[test]
-    fn watch_manager_reload_skips_virtual_projection_mounts() {
+    fn watch_manager_reload_watches_plain_and_macos_mounts_only() {
         let config = test_config("reload-skip-virtual");
         let runtime = DaemonRuntime::spawn(config.clone()).expect("spawn runtime");
         let mut manager =
             DaemonWatchManager::new(&config, runtime.handle()).expect("watch manager");
 
         let plain_root = temp_root("reload-plain-mount");
+        let macos_root = temp_root("reload-macos-mount");
         let virtual_root = temp_root("reload-fuse-mount");
         let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
         store
@@ -457,6 +461,12 @@ mod tests {
             .expect("save plain mount");
         store
             .save_mount(
+                MountConfig::new(MountId::new("notion-macos"), "notion", macos_root.clone())
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save macos mount");
+        store
+            .save_mount(
                 MountConfig::new(MountId::new("notion-fuse"), "notion", virtual_root)
                     .projection(ProjectionMode::LinuxFuse),
             )
@@ -464,12 +474,15 @@ mod tests {
 
         let report = manager.reload_mounts().expect("reload mounts");
 
-        assert_eq!(report.added, 1);
+        assert_eq!(report.added, 2);
         assert_eq!(report.removed, 0);
-        assert_eq!(report.watches.watched_mounts, 1);
+        assert_eq!(report.watches.watched_mounts, 2);
         assert_eq!(
             report.watches.watched_roots,
-            vec![plain_root.display().to_string()]
+            vec![
+                macos_root.display().to_string(),
+                plain_root.display().to_string()
+            ]
         );
         runtime.shutdown();
     }
