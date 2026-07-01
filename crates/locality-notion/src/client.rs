@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use locality_core::model::EntityKind;
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, multipart};
@@ -126,6 +127,15 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
     fn create_page(&self, body: serde_json::Value) -> LocalityResult<PageDto> {
         let _ = body;
         Err(LocalityError::NotImplemented("create Notion page"))
+    }
+    fn move_page(
+        &self,
+        page_id: &str,
+        parent_id: &str,
+        parent_kind: EntityKind,
+    ) -> LocalityResult<PageDto> {
+        let _ = (page_id, parent_id, parent_kind);
+        Err(LocalityError::NotImplemented("move Notion page"))
     }
     fn create_database(&self, body: serde_json::Value) -> LocalityResult<DatabaseDto> {
         let _ = body;
@@ -837,6 +847,32 @@ impl NotionApi for HttpNotionApi {
 
     fn create_page(&self, body: serde_json::Value) -> LocalityResult<PageDto> {
         self.post_json("/v1/pages", body)
+    }
+
+    fn move_page(
+        &self,
+        page_id: &str,
+        parent_id: &str,
+        parent_kind: EntityKind,
+    ) -> LocalityResult<PageDto> {
+        let parent = match parent_kind {
+            EntityKind::Page => json!({
+                "type": "page_id",
+                "page_id": parent_id,
+            }),
+            EntityKind::Database
+            | EntityKind::Directory
+            | EntityKind::Asset
+            | EntityKind::Unknown(_) => {
+                return Err(LocalityError::Unsupported(
+                    "moving Notion pages is currently supported only under page parents",
+                ));
+            }
+        };
+        self.post_json(
+            &format!("/v1/pages/{page_id}/move"),
+            json!({ "parent": parent }),
+        )
     }
 
     fn create_database(&self, body: serde_json::Value) -> LocalityResult<DatabaseDto> {

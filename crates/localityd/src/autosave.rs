@@ -117,6 +117,9 @@ pub fn auto_save_plan_block_reason(plan: &PushPlan) -> Option<String> {
             PushOperation::MoveBlock { .. } => {
                 return Some("block moves require review".to_string());
             }
+            PushOperation::MoveEntity { .. } => {
+                return Some("entity moves require review".to_string());
+            }
             PushOperation::UpdateMedia { .. } => {
                 return Some("media updates require review".to_string());
             }

@@ -2358,6 +2358,9 @@ fn remap_apply_effect_operation_index(
         | JournalApplyEffect::MovedBlock {
             operation_index, ..
         }
+        | JournalApplyEffect::MovedEntity {
+            operation_index, ..
+        }
         | JournalApplyEffect::ArchivedBlock {
             operation_index, ..
         }

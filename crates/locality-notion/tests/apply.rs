@@ -3896,6 +3896,57 @@ fn apply_rejects_legacy_property_update_without_values() {
     assert!(matches!(error, LocalityError::Unsupported(_)));
 }
 
+#[test]
+fn apply_move_entity_calls_notion_move_page_and_journals_effect() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1"), RemoteId::new("target-parent")],
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("page-1"),
+            parent_id: RemoteId::new("target-parent"),
+            parent_kind: EntityKind::Page,
+            source_path: Path::new("Target/page.md").to_path_buf(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply move entity");
+
+    assert_eq!(
+        result.changed_remote_ids,
+        vec![RemoteId::new("page-1"), RemoteId::new("target-parent")]
+    );
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::MovedEntity {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            entity_id: RemoteId::new("page-1"),
+            parent_id: RemoteId::new("target-parent"),
+        }]
+    );
+    assert_eq!(
+        api.writes.lock().expect("writes").as_slice(),
+        [WriteCall::MovePage {
+            page_id: "page-1".to_string(),
+            parent_id: "target-parent".to_string(),
+            parent_kind: EntityKind::Page,
+        }]
+    );
+}
+
 fn operation_ids(push_id: &PushId, plan: &PushPlan) -> Vec<PushOperationId> {
     plan.operations
         .iter()
@@ -4095,6 +4146,16 @@ impl NotionApi for RecordingNotionApi {
     fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
         if page_id == self.page.id {
             Ok(self.page.clone())
+        } else if page_id == "target-parent" {
+            Ok(PageDto {
+                id: "target-parent".to_string(),
+                parent: None,
+                created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                archived: false,
+                in_trash: false,
+                properties: BTreeMap::new(),
+            })
         } else if page_id == "created-page-1" {
             Ok(PageDto {
                 id: "created-page-1".to_string(),
@@ -4179,6 +4240,23 @@ impl NotionApi for RecordingNotionApi {
         })
     }
 
+    fn move_page(
+        &self,
+        page_id: &str,
+        parent_id: &str,
+        parent_kind: EntityKind,
+    ) -> LocalityResult<PageDto> {
+        self.writes
+            .lock()
+            .expect("writes")
+            .push(WriteCall::MovePage {
+                page_id: page_id.to_string(),
+                parent_id: parent_id.to_string(),
+                parent_kind,
+            });
+        Ok(self.page.clone())
+    }
+
     fn update_block(&self, block_id: &str, body: Value) -> LocalityResult<BlockDto> {
         self.writes.lock().expect("writes").push(WriteCall::Update {
             block_id: block_id.to_string(),
@@ -4252,6 +4330,11 @@ enum WriteCall {
     },
     CreatePage {
         body: Value,
+    },
+    MovePage {
+        page_id: String,
+        parent_id: String,
+        parent_kind: EntityKind,
     },
     Update {
         block_id: String,
