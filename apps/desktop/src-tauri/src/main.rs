@@ -265,7 +265,6 @@ struct ActivityItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     occurred_at: Option<String>,
     kind: String,
-    undo_available: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -2541,7 +2540,6 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             when: "Now".to_string(),
             occurred_at: Some(activity_timestamp()),
             kind: "error".to_string(),
-            undo_available: false,
         }],
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
@@ -3270,14 +3268,13 @@ fn activity_from_journals(
         .take(8)
         .map(|journal| {
             let title = journal_title(journal, store);
-            let (detail, undo_available) = journal_detail(journal);
+            let detail = journal_detail(journal);
             ActivityItem {
                 title,
                 detail,
                 when: "Recent".to_string(),
                 occurred_at: journal_activity_timestamp(journal),
                 kind: "push".to_string(),
-                undo_available,
             }
         })
         .collect::<Vec<_>>();
@@ -3291,7 +3288,6 @@ fn activity_from_journals(
             when: "Today".to_string(),
             occurred_at: Some(activity_timestamp()),
             kind: "open".to_string(),
-            undo_available: false,
         });
     }
 
@@ -3313,7 +3309,6 @@ fn record_desktop_activity(
             when: "Recent".to_string(),
             occurred_at: Some(activity_timestamp()),
             kind: kind.to_string(),
-            undo_available: false,
         },
     );
     items.truncate(DESKTOP_ACTIVITY_LIMIT);
@@ -3371,16 +3366,16 @@ fn journal_title(journal: &JournalEntry, store: &SqliteStateStore) -> String {
     }
 }
 
-fn journal_detail(journal: &JournalEntry) -> (String, bool) {
+fn journal_detail(journal: &JournalEntry) -> String {
     let operation_count = journal.plan.operations.len();
     match &journal.status {
-        JournalStatus::Failed(message) => (message.clone(), false),
-        JournalStatus::Prepared => (format!("{operation_count} changes prepared"), false),
-        JournalStatus::Applying => (format!("{operation_count} changes applying"), false),
+        JournalStatus::Failed(message) => message.clone(),
+        JournalStatus::Prepared => format!("{operation_count} changes prepared"),
+        JournalStatus::Applying => format!("{operation_count} changes applying"),
         JournalStatus::Applied | JournalStatus::Reconciled => {
-            (format!("{operation_count} remote changes"), true)
+            format!("{operation_count} remote changes")
         }
-        JournalStatus::Reverted => (format!("{operation_count} changes reverted"), false),
+        JournalStatus::Reverted => format!("{operation_count} changes reverted"),
     }
 }
 
@@ -11330,7 +11325,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.starts_with("unix_ms:"))
         }));
-        assert!(items.iter().all(|item| !item.undo_available));
     }
 
     struct TestTempDir {
@@ -11472,7 +11466,6 @@ fn sample_snapshot() -> DesktopSnapshot {
                 when: "Today".to_string(),
                 occurred_at: Some("unix_ms:1782033300000".to_string()),
                 kind: "push".to_string(),
-                undo_available: true,
             },
             ActivityItem {
                 title: "Located Launch Plan".to_string(),
@@ -11480,7 +11473,6 @@ fn sample_snapshot() -> DesktopSnapshot {
                 when: "Today".to_string(),
                 occurred_at: Some("unix_ms:1782028800000".to_string()),
                 kind: "locate".to_string(),
-                undo_available: false,
             },
             ActivityItem {
                 title: "Connected Notion workspace CodeFlash".to_string(),
@@ -11488,7 +11480,6 @@ fn sample_snapshot() -> DesktopSnapshot {
                 when: "Earlier".to_string(),
                 occurred_at: Some("unix_ms:1781942400000".to_string()),
                 kind: "connect".to_string(),
-                undo_available: false,
             },
         ],
         suggestions: vec![ConnectorSuggestion {

@@ -764,17 +764,13 @@ Activity item details:
 - action type;
 - file or workspace name;
 - result;
-- time;
-- undo availability when supported.
+- time.
 
-Undo-capable item:
-
-```text
-Pushed Roadmap 2026 to Notion
-2 block edits
-
-[ Undo Push ]
-```
+Activity is read-only history in the normal desktop UI. Do not show an undo
+button here unless the item carries a specific journal id, the app can preview
+the reverse plan, and the user can confirm the remote write. Until then, undo
+belongs in CLI/history recovery or a dedicated push-history flow, not passive
+activity.
 
 Failed item:
 

@@ -112,7 +112,6 @@ type ActivityItem = {
   when: string;
   occurredAt?: string | null;
   kind: string;
-  undoAvailable: boolean;
 };
 
 type DebugQueueStatus = {
@@ -355,7 +354,6 @@ const sampleSnapshot: DesktopSnapshot = {
       when: "Today",
       occurredAt: "unix_ms:1782033300000",
       kind: "push",
-      undoAvailable: true,
     },
     {
       title: "Located Launch Plan",
@@ -363,7 +361,6 @@ const sampleSnapshot: DesktopSnapshot = {
       when: "Today",
       occurredAt: "unix_ms:1782028800000",
       kind: "locate",
-      undoAvailable: false,
     },
     {
       title: "Connected Notion workspace CodeFlash",
@@ -371,7 +368,6 @@ const sampleSnapshot: DesktopSnapshot = {
       when: "Earlier",
       occurredAt: "unix_ms:1781942400000",
       kind: "connect",
-      undoAvailable: false,
     },
   ],
   suggestions: [
@@ -3109,11 +3105,6 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
                   <h3>{item.title}</h3>
                   <p>{item.detail}</p>
                 </div>
-                {item.undoAvailable && (
-                  <SecondaryButton compact icon={<RotateCcw />}>
-                    Undo Push
-                  </SecondaryButton>
-                )}
               </article>
             ))}
           </section>
