@@ -64,6 +64,17 @@ pub fn apply_plan(
     request: ApplyPlanRequest<'_>,
 ) -> LocalityResult<ApplyPlanResult> {
     validate_operation_ids(&request)?;
+    check_concurrency(
+        api,
+        ApplyPlanRequest {
+            push_id: request.push_id,
+            mount_id: request.mount_id,
+            plan: request.plan,
+            operation_ids: request.operation_ids,
+            remote_preconditions: request.remote_preconditions,
+            local_root: request.local_root,
+        },
+    )?;
     let create_parent_ids = create_parent_ids(&request.plan.operations);
     let bundles = fetch_affected_bundles(api, &request.plan.affected_entities, &create_parent_ids)?;
     let current_blocks = block_map(&bundles);

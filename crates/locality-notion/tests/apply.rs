@@ -1301,6 +1301,40 @@ fn check_concurrency_rejects_remote_timestamp_mismatch() {
 }
 
 #[test]
+fn apply_rejects_stale_remote_precondition_without_writing() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T01:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "Second client body.".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+    let preconditions = vec![RemotePrecondition {
+        remote_id: RemoteId::new("page-1"),
+        remote_edited_at: Some("2026-06-10T00:00:00.000Z".to_string()),
+    }];
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &preconditions,
+            local_root: None,
+        })
+        .expect_err("stale remote");
+
+    assert!(matches!(error, LocalityError::Guardrail(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
 fn check_concurrency_uses_database_metadata_for_row_create_parent() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
