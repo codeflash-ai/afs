@@ -1222,7 +1222,14 @@ impl RuntimeState {
                 Ok(RuntimeMessage::Request {
                     request,
                     respond_to,
-                }) => self.handle_request(request, respond_to),
+                }) => {
+                    if matches!(
+                        self.handle_request(request, respond_to),
+                        RuntimeLoopDecision::Stop
+                    ) {
+                        break;
+                    }
+                }
                 Ok(RuntimeMessage::FileEvent(event)) => self.handle_file_event(event),
                 Ok(RuntimeMessage::Status { respond_to }) => {
                     let _ = respond_to.send(self.status());
@@ -1235,7 +1242,11 @@ impl RuntimeState {
         }
     }
 
-    fn handle_request(&mut self, request: DaemonRequest, respond_to: Sender<DaemonResponse>) {
+    fn handle_request(
+        &mut self,
+        request: DaemonRequest,
+        respond_to: Sender<DaemonResponse>,
+    ) -> RuntimeLoopDecision {
         match request {
             DaemonRequest::Ping => {
                 let _ = respond_to.send(DaemonResponse::ok(json!({ "status": "ok" })));
@@ -1256,7 +1267,7 @@ impl RuntimeState {
                 let _ = respond_to.send(DaemonResponse::ok(json!({
                     "status": "shutting_down"
                 })));
-                let _ = self.sender.send(RuntimeMessage::Shutdown);
+                return RuntimeLoopDecision::Stop;
             }
             DaemonRequest::Pull { path } => {
                 self.pending_requests
@@ -1509,6 +1520,7 @@ impl RuntimeState {
                 self.maybe_start_next_job();
             }
         }
+        RuntimeLoopDecision::Continue
     }
 
     fn handle_file_event(&mut self, event: FileEvent) {
@@ -3240,6 +3252,11 @@ enum RuntimeMessage {
     PrimeVirtualMounts,
     JobFinished(JobCompletion),
     Shutdown,
+}
+
+enum RuntimeLoopDecision {
+    Continue,
+    Stop,
 }
 
 enum MutatingRequest {
