@@ -24,6 +24,38 @@ fn explain_reports_all_synced_when_local_and_remote_match_shadow() {
 }
 
 #[test]
+fn explain_ignores_local_sync_metadata_after_successful_push() {
+    let shadow = shadow_with_frontmatter("Base body.", frontmatter_with_sync_metadata("05"));
+    let local = CanonicalDocument::new(
+        frontmatter_with_sync_metadata("15"),
+        markdown_body("Base body."),
+    );
+    let remote = CanonicalDocument::new(
+        frontmatter_with_sync_metadata("05"),
+        markdown_body("Base body."),
+    );
+
+    let explanation = explain_remote_change(
+        &shadow,
+        RemoteChangeInput::available(&local, 7),
+        RemoteChangeInput::available(&remote, 7),
+    );
+
+    assert_eq!(explanation.state, RemoteChangeState::AllSynced);
+    assert_eq!(explanation.action, RemoteChangeAction::None);
+    assert!(!explanation.local.changed);
+    assert!(
+        explanation
+            .local
+            .plan
+            .as_ref()
+            .expect("local plan")
+            .operations
+            .is_empty()
+    );
+}
+
+#[test]
 fn explain_reports_remote_changed_only_as_safe_to_fast_forward() {
     let shadow = shadow("Base body.");
     let local = document("Base body.");
@@ -107,6 +139,10 @@ fn document(body: &str) -> CanonicalDocument {
 }
 
 fn shadow(body: &str) -> ShadowDocument {
+    shadow_with_frontmatter(body, frontmatter())
+}
+
+fn shadow_with_frontmatter(body: &str, frontmatter: String) -> ShadowDocument {
     ShadowDocument::from_synced_body(
         RemoteId::new("page-1"),
         markdown_body(body),
@@ -114,11 +150,17 @@ fn shadow(body: &str) -> ShadowDocument {
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
     )
     .expect("shadow")
-    .with_frontmatter(frontmatter())
+    .with_frontmatter(frontmatter)
 }
 
 fn frontmatter() -> String {
     "loc:\n  id: page-1\n  type: page\ntitle: Roadmap\n".to_string()
+}
+
+fn frontmatter_with_sync_metadata(suffix: &str) -> String {
+    format!(
+        "loc:\n  id: page-1\n  type: page\n  synced_at: 2026-07-01T07:{suffix}:00.000Z\n  remote_edited_at: 2026-07-01T07:{suffix}:00.000Z\ntitle: Roadmap\n"
+    )
 }
 
 fn markdown_body(body: &str) -> String {

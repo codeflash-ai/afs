@@ -1524,8 +1524,12 @@ impl RuntimeState {
     }
 
     fn handle_file_event(&mut self, event: FileEvent) {
+        eprintln!(
+            "localityd local file event queued immediately for `{}`",
+            event.path.display()
+        );
         self.pending_requests
-            .push_back(MutatingRequest::FileEvent { event });
+            .push_front(MutatingRequest::FileEvent { event });
         self.maybe_start_next_job();
     }
 
@@ -1556,14 +1560,25 @@ impl RuntimeState {
             } => {
                 let _ = respond_to.send(response);
             }
-            JobCompletion::AutoPush { response } => {
-                if !response.ok {
+            JobCompletion::AutoPush {
+                target_path,
+                response,
+            } => {
+                if response.ok {
+                    eprintln!(
+                        "localityd auto-save push completed for `{}`",
+                        target_path.display()
+                    );
+                } else {
                     let message = response
                         .error
                         .as_ref()
                         .map(|error| error.message.as_str())
                         .unwrap_or("unknown error");
-                    eprintln!("localityd auto-save push failed: {message}");
+                    eprintln!(
+                        "localityd auto-save push failed for `{}`: {message}",
+                        target_path.display()
+                    );
                 }
             }
             JobCompletion::Response {
@@ -1854,7 +1869,11 @@ impl RuntimeState {
     }
 
     fn queue_auto_push(&mut self, target_path: PathBuf) {
-        self.pending_requests.push_back(MutatingRequest::AutoPush {
+        eprintln!(
+            "localityd auto-save push queued immediately for `{}`",
+            target_path.display()
+        );
+        self.pending_requests.push_front(MutatingRequest::AutoPush {
             job: auto_push_job(target_path),
         });
         self.maybe_start_next_job();
@@ -2976,9 +2995,17 @@ fn run_job(
             response: runner.run_push(state_root, job),
             respond_to,
         },
-        MutatingJob::Request(MutatingRequest::AutoPush { job }) => JobCompletion::AutoPush {
-            response: runner.run_auto_push(state_root, job),
-        },
+        MutatingJob::Request(MutatingRequest::AutoPush { job }) => {
+            let target_path = job.target_path.clone();
+            eprintln!(
+                "localityd auto-save push started for `{}`",
+                target_path.display()
+            );
+            JobCompletion::AutoPush {
+                target_path,
+                response: runner.run_auto_push(state_root, job),
+            }
+        }
         MutatingJob::Request(MutatingRequest::FileEvent { event }) => {
             JobCompletion::FileEvent(runner.run_file_event(state_root, event))
         }
@@ -3432,6 +3459,7 @@ enum JobCompletion {
         respond_to: Sender<DaemonResponse>,
     },
     AutoPush {
+        target_path: PathBuf,
         response: DaemonResponse,
     },
     Response {

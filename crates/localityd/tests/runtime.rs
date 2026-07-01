@@ -1772,6 +1772,81 @@ fn runtime_queues_auto_push_for_enrolled_virtual_write() {
 }
 
 #[test]
+fn runtime_prioritizes_auto_push_from_virtual_write_over_older_pending_requests() {
+    let config = relay_config("virtual-write-auto-push-priority");
+    let mount_root = temp_root("virtual-write-auto-push-priority-root");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(MountId::new("notion-main"), "notion", mount_root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        MountId::new("notion-main"),
+        "Roadmap.md",
+        AutoSaveOrigin::LocalityCreated,
+        "now",
+    );
+    enrollment.remote_id = Some(RemoteId::new("page-1"));
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save enrollment");
+    drop(store);
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (order_tx, order_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BlockingVirtualWriteAutoPushRunner {
+            started: started_tx,
+            order_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+
+    let write_handle = runtime.handle();
+    let write_thread = thread::spawn(move || {
+        write_handle.request(DaemonRequest::VirtualFsCommitWrite {
+            mount_id: "notion-main".to_string(),
+            identifier: "page-1".to_string(),
+            contents_base64: "ZWRpdGVk".to_string(),
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("virtual write started");
+
+    let pull_handle = runtime.handle();
+    let pull_thread = thread::spawn(move || {
+        pull_handle.request(DaemonRequest::Pull {
+            path: PathBuf::from("Roadmap.md"),
+        })
+    });
+    wait_until_pending_requests(&runtime.handle(), 1);
+
+    release_blocked_runner(&release);
+    assert!(write_thread.join().expect("write thread").ok);
+
+    assert_eq!(
+        order_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first queued job"),
+        "auto_push:Roadmap.md"
+    );
+    assert_eq!(
+        order_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second queued job"),
+        "pull:Roadmap.md"
+    );
+    assert!(pull_thread.join().expect("pull thread").ok);
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_queues_remote_fast_forward_from_freshness_report() {
     let config = relay_config("remote-fast-forward");
     let mount_root = temp_root("remote-fast-forward-mount");
@@ -2800,6 +2875,12 @@ struct VirtualWriteAutoPushRunner {
     push_tx: mpsc::Sender<PushJob>,
 }
 
+struct BlockingVirtualWriteAutoPushRunner {
+    started: mpsc::Sender<()>,
+    order_tx: mpsc::Sender<String>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
 struct AutoFastForwardRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
 }
@@ -3228,6 +3309,75 @@ impl RuntimeJobRunner for VirtualWriteAutoPushRunner {
     }
 }
 
+impl RuntimeJobRunner for BlockingVirtualWriteAutoPushRunner {
+    fn run_pull(&self, _state_root: PathBuf, path: PathBuf) -> DaemonResponse {
+        self.order_tx
+            .send(format!("pull:{}", path.display()))
+            .expect("send pull order");
+        DaemonResponse::ok(json!({ "command": "pull" }))
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_auto_push(&self, _state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        let filename = job
+            .target_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unknown>");
+        self.order_tx
+            .send(format!("auto_push:{filename}"))
+            .expect("send auto-push order");
+        DaemonResponse::ok(json!({ "command": "auto_push" }))
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        Err(LocalityError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_commit_write(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+        _contents_base64: String,
+    ) -> DaemonResponse {
+        self.started.send(()).expect("notify started");
+        let (lock, condvar) = &*self.release;
+        let mut released = lock.lock().expect("lock release");
+        while !*released {
+            released = condvar.wait(released).expect("wait release");
+        }
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "identifier": identifier,
+            "remote_id": "page-1",
+            "path": "Roadmap.md",
+            "bytes_written": 6,
+            "hydration": "dirty"
+        }))
+    }
+}
+
 impl RuntimeJobRunner for AutoFastForwardRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
@@ -3554,6 +3704,16 @@ fn release_blocked_runner(release: &Arc<(Mutex<bool>, Condvar)>) {
     let mut released = lock.lock().expect("lock release");
     *released = true;
     condvar.notify_all();
+}
+
+fn wait_until_pending_requests(handle: &DaemonRuntimeHandle, minimum: usize) {
+    for _ in 0..20 {
+        if handle.status().expect("runtime status").pending_requests >= minimum {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("runtime did not queue {minimum} pending request(s)");
 }
 
 fn min_position<const N: usize>(

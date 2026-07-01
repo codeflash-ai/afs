@@ -1219,7 +1219,7 @@ fn live_mode_tick_blocking_inner() -> ActionReport {
 
 fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> ActionReport {
     match load_desktop_snapshot() {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
             let remote_targets = if snapshot.pending_changes.is_empty()
                 && live_mode_remote_pull_scan_is_due(mount)
             {
@@ -1243,16 +1243,60 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
                     return ActionReport { ok: false, message };
                 }
             }
+            if !remote_targets.is_empty() {
+                snapshot = match load_desktop_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(message) => {
+                        return ActionReport {
+                            ok: false,
+                            message: format!(
+                                "Live Mode could not re-check local changes before remote work: {message}"
+                            ),
+                        };
+                    }
+                };
+            }
 
             live_mode_tick_from_snapshot(
                 &snapshot,
                 &remote_targets,
                 |_change, target| {
-                    let push_report = push_target_direct(target, false)?;
-                    if push_report_exit_code(&push_report) == 0 {
-                        Ok(())
-                    } else {
-                        Err(push_report_message(&push_report))
+                    desktop_log(
+                        "info",
+                        "live_mode.local_push_started",
+                        format!("pushing `{}` from Live Mode", target.display()),
+                    );
+                    let started = Instant::now();
+                    match push_target_direct(target, false) {
+                        Ok(push_report) if push_report_exit_code(&push_report) == 0 => {
+                            desktop_log(
+                                "info",
+                                "live_mode.local_push_completed",
+                                format!(
+                                    "pushed `{}` from Live Mode in {} ms",
+                                    target.display(),
+                                    started.elapsed().as_millis()
+                                ),
+                            );
+                            Ok(())
+                        }
+                        Ok(push_report) => {
+                            let message = push_report_message(&push_report);
+                            desktop_log(
+                                "warn",
+                                "live_mode.local_push_failed",
+                                format!("push failed for `{}`: {message}", target.display()),
+                            );
+                            Err(message)
+                        }
+                        Err(message) => {
+                            desktop_log(
+                                "warn",
+                                "live_mode.local_push_failed",
+                                format!("push failed for `{}`: {message}", target.display()),
+                            );
+                            Err(message)
+                        }
                     }
                 },
                 live_mode_queue_remote_observe,
@@ -4213,13 +4257,18 @@ fn state_event_actions(
     for path in &event.paths {
         actions.refresh_surfaces |=
             state_event_path_requires_refresh(path, state_root, content_roots);
-        actions.wake_live_mode |= state_event_path_wakes_live_mode(path, state_root);
+        actions.wake_live_mode |= state_event_path_wakes_live_mode(path, state_root, content_roots);
     }
     actions
 }
 
-fn state_event_path_wakes_live_mode(path: &Path, state_root: &Path) -> bool {
+fn state_event_path_wakes_live_mode(
+    path: &Path,
+    state_root: &Path,
+    content_roots: &[PathBuf],
+) -> bool {
     is_live_mode_state_change_signal_path(path, state_root)
+        || state_event_path_is_virtual_content_change(path, state_root, content_roots)
 }
 
 fn state_event_path_requires_refresh(
@@ -4227,8 +4276,8 @@ fn state_event_path_requires_refresh(
     state_root: &Path,
     content_roots: &[PathBuf],
 ) -> bool {
-    if content_roots.iter().any(|root| path.starts_with(root)) {
-        return !is_virtual_content_temp_path(path);
+    if state_event_path_is_virtual_content_change(path, state_root, content_roots) {
+        return true;
     }
 
     let Ok(relative) = path.strip_prefix(state_root) else {
@@ -4255,6 +4304,24 @@ fn state_event_path_requires_refresh(
         },
         _ => false,
     }
+}
+
+fn state_event_path_is_virtual_content_change(
+    path: &Path,
+    state_root: &Path,
+    content_roots: &[PathBuf],
+) -> bool {
+    if content_roots.iter().any(|root| path.starts_with(root)) {
+        return !is_virtual_content_temp_path(path);
+    }
+
+    let Ok(relative) = path.strip_prefix(state_root) else {
+        return false;
+    };
+    matches!(
+        relative.components().next(),
+        Some(std::path::Component::Normal(component)) if component.to_str() == Some("content")
+    ) && !is_virtual_content_temp_path(relative)
 }
 
 fn is_virtual_content_temp_path(path: &Path) -> bool {
@@ -10860,7 +10927,7 @@ mod tests {
             state_root.join("state.sqlite3-shm"),
         ] {
             assert!(
-                !state_event_path_wakes_live_mode(&path, &state_root),
+                !state_event_path_wakes_live_mode(&path, &state_root, &content_roots),
                 "{} should not wake Live Mode",
                 path.display()
             );
@@ -10873,7 +10940,8 @@ mod tests {
 
         assert!(state_event_path_wakes_live_mode(
             &state_root.join(LIVE_MODE_STATE_CHANGE_SIGNAL_FILE),
-            &state_root
+            &state_root,
+            &content_roots
         ));
         assert!(state_event_path_requires_refresh(
             &state_root.join(LIVE_MODE_STATE_CHANGE_SIGNAL_FILE),
@@ -10895,6 +10963,11 @@ mod tests {
             &content_roots
         ));
         assert!(state_event_path_requires_refresh(
+            &content_root.join("notion-main/files/Roadmap/page.md"),
+            &state_root,
+            &content_roots
+        ));
+        assert!(state_event_path_wakes_live_mode(
             &content_root.join("notion-main/files/Roadmap/page.md"),
             &state_root,
             &content_roots
