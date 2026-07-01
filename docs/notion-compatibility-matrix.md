@@ -36,7 +36,7 @@ Support terms:
 | Heading 3 | Read/write | `### Heading` |  |
 | Heading 4 | Read/write | `#### Heading` |  |
 | Bulleted list item | Read/write | `- item` | One Notion block per Markdown list item. |
-| Numbered list item | Read/write | `1. item` | One Notion block per Markdown numbered item. |
+| Numbered list item | Read/write | `1. item`, `2. item` | One Notion block per Markdown numbered item; consecutive items render with visible sequential markers. |
 | To-do | Read/write | `- [ ] task` / `- [x] task` | Checkbox state round-trips through Markdown task syntax. |
 | Quote | Read/write | `> quote` |  |
 | Callout | Read/write | `> [!NOTE] ...` | Text content is writable. Emoji/color presentation is not the main edit surface yet. |

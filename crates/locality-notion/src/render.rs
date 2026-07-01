@@ -120,7 +120,17 @@ struct RenderedBlock {
 enum RenderedBlockSpacing {
     #[default]
     Normal,
-    ListItem,
+    BulletedListItem,
+    NumberedListItem,
+}
+
+impl RenderedBlockSpacing {
+    fn is_list_item(self) -> bool {
+        matches!(
+            self,
+            RenderedBlockSpacing::BulletedListItem | RenderedBlockSpacing::NumberedListItem
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -138,12 +148,17 @@ fn render_markdown_body(blocks: &[RenderedBlock]) -> String {
     let mut body = String::new();
     let mut previous_non_empty: Option<&RenderedBlock> = None;
     let mut pending_empty_blocks = 0;
+    let mut numbered_list_index = 0;
 
     for block in blocks {
         if block.markdown.is_empty() {
             pending_empty_blocks += 1;
             continue;
         }
+
+        let continues_numbered_list = previous_non_empty.is_some_and(|previous| {
+            pending_empty_blocks == 0 && previous.spacing == RenderedBlockSpacing::NumberedListItem
+        });
 
         if let Some(previous) = previous_non_empty {
             if pending_empty_blocks == 0 && should_tight_join(previous, block) {
@@ -154,7 +169,20 @@ fn render_markdown_body(blocks: &[RenderedBlock]) -> String {
                 body.push_str(&"\n".repeat(pending_empty_blocks + 1));
             }
         }
-        body.push_str(&block.markdown);
+        if block.spacing == RenderedBlockSpacing::NumberedListItem {
+            if continues_numbered_list {
+                numbered_list_index += 1;
+            } else {
+                numbered_list_index = 1;
+            }
+            body.push_str(&renumbered_numbered_list_item(
+                &block.markdown,
+                numbered_list_index,
+            ));
+        } else {
+            numbered_list_index = 0;
+            body.push_str(&block.markdown);
+        }
         previous_non_empty = Some(block);
         pending_empty_blocks = 0;
     }
@@ -167,8 +195,19 @@ fn render_markdown_body(blocks: &[RenderedBlock]) -> String {
 }
 
 fn should_tight_join(previous: &RenderedBlock, next: &RenderedBlock) -> bool {
-    previous.spacing == RenderedBlockSpacing::ListItem
-        && next.spacing == RenderedBlockSpacing::ListItem
+    previous.spacing.is_list_item() && next.spacing.is_list_item()
+}
+
+fn renumbered_numbered_list_item(markdown: &str, ordinal: usize) -> String {
+    let marker_start = markdown
+        .char_indices()
+        .find_map(|(index, ch)| (ch != ' ').then_some(index))
+        .unwrap_or(markdown.len());
+    let (indent, rest) = markdown.split_at(marker_start);
+
+    rest.strip_prefix("1. ")
+        .map(|text| format!("{indent}{ordinal}. {text}"))
+        .unwrap_or_else(|| markdown.to_string())
 }
 
 fn render_block_trees(
@@ -239,12 +278,14 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
             block.bulleted_list_item.as_ref(),
             |text| format!("- {text}"),
             "bulleted_list_item",
+            RenderedBlockSpacing::BulletedListItem,
         ),
         "numbered_list_item" => list_item_block(
             block,
             block.numbered_list_item.as_ref(),
             |text| format!("1. {text}"),
             "numbered_list_item",
+            RenderedBlockSpacing::NumberedListItem,
         ),
         "to_do" => match &block.to_do {
             Some(to_do) => {
@@ -253,7 +294,11 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
                 if text.trim().is_empty() {
                     directive_block(block, "empty_to_do", None)
                 } else {
-                    list_item_rendered_block(format!("- [{marker}] {text}"), shadow_id)
+                    list_item_rendered_block(
+                        format!("- [{marker}] {text}"),
+                        shadow_id,
+                        RenderedBlockSpacing::BulletedListItem,
+                    )
                 }
             }
             None => directive_block(block, "malformed_to_do", None),
@@ -376,10 +421,11 @@ fn list_item_block(
     content: Option<&RichTextBlockDto>,
     render: impl FnOnce(&str) -> String,
     empty_directive_type: &str,
+    spacing: RenderedBlockSpacing,
 ) -> RenderedBlock {
     let mut block = rich_text_block(block, content, render, empty_directive_type);
     if block.shadow_id.is_some() {
-        block.spacing = RenderedBlockSpacing::ListItem;
+        block.spacing = spacing;
     }
     block
 }
@@ -579,9 +625,13 @@ fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBloc
     }
 }
 
-fn list_item_rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBlock {
+fn list_item_rendered_block(
+    markdown: String,
+    shadow_id: Option<RemoteId>,
+    spacing: RenderedBlockSpacing,
+) -> RenderedBlock {
     let mut block = rendered_block(markdown, shadow_id);
-    block.spacing = RenderedBlockSpacing::ListItem;
+    block.spacing = spacing;
     block
 }
 
