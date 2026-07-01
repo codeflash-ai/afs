@@ -6,7 +6,9 @@
 //! responsive during network I/O.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -14,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locality_connector::{Connector, ObserveRequest};
 use locality_core::LocalityError;
 use locality_core::canonical::parse_canonical_markdown;
@@ -61,9 +64,9 @@ use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
-    MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
-    create_virtual_fs_directory, create_virtual_fs_file,
-    materialize_virtual_fs_guidance_with_content_root,
+    MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind,
+    VirtualFsRefreshChildrenReport, commit_virtual_fs_write, create_virtual_fs_directory,
+    create_virtual_fs_file, materialize_virtual_fs_guidance_with_content_root,
     materialize_virtual_fs_item_with_content_root, mount_point_identifier,
     refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
     virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
@@ -272,7 +275,7 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         _state_root: PathBuf,
         _mount_id: String,
         _container_identifier: String,
-    ) -> locality_core::LocalityResult<usize> {
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
         Err(LocalityError::Unsupported(
             "runtime runner does not handle virtual filesystem child refresh",
         ))
@@ -636,12 +639,12 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         state_root: PathBuf,
         mount_id: String,
         container_identifier: String,
-    ) -> locality_core::LocalityResult<usize> {
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
         let mut store = SqliteStateStore::open(state_root.clone()).map_err(LocalityError::from)?;
         let mount_id = MountId::new(mount_id);
         ensure_virtual_fs_mount(&store, &mount_id)?;
         if !virtual_fs_children_refresh_needed(&store, &mount_id, &container_identifier)? {
-            return Ok(0);
+            return Ok(VirtualFsRefreshChildrenReport::default());
         }
         let credentials = open_credential_store(&state_root);
         let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
@@ -1602,8 +1605,11 @@ impl RuntimeState {
                 priority,
                 result,
             } => match result {
-                Ok(_) => {
+                Ok(report) => {
                     self.mark_child_refresh_completed(&mount_id, &container_identifier, priority);
+                    if report.changed {
+                        self.signal_macos_file_provider_container(&mount_id, &container_identifier);
+                    }
                     self.queue_child_refresh_descendants(
                         &mount_id,
                         &container_identifier,
@@ -1683,6 +1689,36 @@ impl RuntimeState {
         }
 
         self.maybe_start_next_job();
+    }
+
+    fn signal_macos_file_provider_container(&self, mount_id: &str, container_identifier: &str) {
+        let store = match SqliteStateStore::open(self.config.state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "localityd failed to open state for macOS File Provider invalidation: {error}"
+                );
+                return;
+            }
+        };
+        let mount = match store.get_mount(&MountId::new(mount_id.to_string())) {
+            Ok(Some(mount)) => mount,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!(
+                    "localityd failed to inspect mount for macOS File Provider invalidation: {error}"
+                );
+                return;
+            }
+        };
+        if mount.projection != ProjectionMode::MacosFileProvider {
+            return;
+        }
+        if let Err(error) = signal_macos_file_provider_enumerator(mount_id, container_identifier) {
+            eprintln!(
+                "localityd failed to signal macOS File Provider for `{mount_id}:{container_identifier}`: {error}"
+            );
+        }
     }
 
     fn handle_timeout(&mut self) {
@@ -2496,6 +2532,95 @@ fn child_refresh_priority_label(priority: ChildRefreshPriority) -> &'static str 
         ChildRefreshPriority::Background => "background",
         ChildRefreshPriority::Interactive => "interactive",
     }
+}
+
+fn signal_macos_file_provider_enumerator(
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<(), String> {
+    signal_macos_file_provider_enumerator_impl(mount_id, container_identifier)
+}
+
+#[cfg(target_os = "macos")]
+fn signal_macos_file_provider_enumerator_impl(
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<(), String> {
+    let Some(helper) = macos_file_provider_helper_path() else {
+        return Err("locality-file-providerctl was not found".to_string());
+    };
+    let identifier = if container_identifier == ROOT_CONTAINER_IDENTIFIER {
+        ROOT_CONTAINER_IDENTIFIER.to_string()
+    } else {
+        shared_domain_item_identifier(mount_id, container_identifier)
+    };
+    let output = Command::new(&helper)
+        .arg("signal")
+        .arg("--mount-id")
+        .arg(file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+        .arg("--identifier")
+        .arg(&identifier)
+        .arg("--json")
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = serde_json::from_str::<Value>(&stdout)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.is_empty())
+        .or_else(|| (!stderr.is_empty()).then_some(stderr))
+        .or_else(|| (!stdout.is_empty()).then_some(stdout))
+        .unwrap_or_else(|| format!("locality-file-providerctl exited with {}", output.status));
+    Err(message)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn signal_macos_file_provider_enumerator_impl(
+    _mount_id: &str,
+    _container_identifier: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn shared_domain_item_identifier(mount_id: &str, daemon_identifier: &str) -> String {
+    format!(
+        "m:{}:{}",
+        URL_SAFE_NO_PAD.encode(mount_id),
+        URL_SAFE_NO_PAD.encode(daemon_identifier)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_helper_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("LOCALITY_FILE_PROVIDERCTL") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        candidates.push(dir.join("locality-file-providerctl"));
+    }
+    candidates.push(PathBuf::from(
+        "/Applications/Locality.app/Contents/MacOS/locality-file-providerctl",
+    ));
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3473,7 +3598,7 @@ enum JobCompletion {
         container_identifier: String,
         depth: u32,
         priority: ChildRefreshPriority,
-        result: locality_core::LocalityResult<usize>,
+        result: locality_core::LocalityResult<VirtualFsRefreshChildrenReport>,
     },
     ScheduledPull(locality_core::LocalityResult<ScheduledPullRuntimeReport>),
     Hydration {

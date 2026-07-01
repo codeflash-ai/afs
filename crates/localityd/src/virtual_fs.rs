@@ -239,6 +239,12 @@ pub struct VirtualFsMaterializeReport {
     pub hydration: HydrationState,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VirtualFsRefreshChildrenReport {
+    pub saved: usize,
+    pub changed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualFsWriteReport {
     pub mount_id: String,
@@ -439,7 +445,7 @@ pub fn refresh_virtual_fs_children<S, C>(
     connector: &C,
     mount_id: &MountId,
     container_identifier: &str,
-) -> LocalityResult<usize>
+) -> LocalityResult<VirtualFsRefreshChildrenReport>
 where
     S: MountRepository + EntityRepository,
     C: Connector + ?Sized,
@@ -450,7 +456,7 @@ where
 
     let Some(container) = child_container_for_identifier(&mount, &entities, container_identifier)?
     else {
-        return Ok(0);
+        return Ok(VirtualFsRefreshChildrenReport::default());
     };
 
     let result = connector.list_children(ListChildrenRequest {
@@ -460,16 +466,20 @@ where
     })?;
 
     let mut saved = 0;
+    let mut changed = false;
     for entry in result.entries {
         let existing = store
             .get_entity(&entry.mount_id, &entry.remote_id)
             .map_err(LocalityError::from)?;
         let record = refreshed_entity_record(entry, existing.as_ref());
+        if existing.as_ref() != Some(&record) {
+            changed = true;
+        }
         store.save_entity(record).map_err(LocalityError::from)?;
         saved += 1;
     }
 
-    Ok(saved)
+    Ok(VirtualFsRefreshChildrenReport { saved, changed })
 }
 
 pub fn virtual_fs_children_refresh_needed<S>(
@@ -2912,7 +2922,8 @@ mod tests {
         let saved =
             refresh_virtual_fs_children(&mut store, &connector, &mount_id, &mount_point_root)
                 .expect("refresh children");
-        assert_eq!(saved, 1);
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
 
         let report = virtual_fs_children(&store, &mount_id, &mount_point_root)
             .expect("mount point children");
@@ -2938,7 +2949,8 @@ mod tests {
         let saved =
             refresh_virtual_fs_children(&mut store, &connector, &mount_id, &mount_point_root)
                 .expect("refresh cached children");
-        assert_eq!(saved, 2);
+        assert_eq!(saved.saved, 2);
+        assert!(saved.changed);
 
         let report = virtual_fs_children(&store, &mount_id, &mount_point_root)
             .expect("updated mount point children");
@@ -2990,7 +3002,8 @@ mod tests {
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
             .expect("refresh database rows");
 
-        assert_eq!(saved, 1);
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
         let row = store
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
@@ -3052,7 +3065,8 @@ mod tests {
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
             .expect("refresh database rows");
 
-        assert_eq!(saved, 1);
+        assert_eq!(saved.saved, 1);
+        assert_eq!(saved.changed, false);
         let row = store
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
@@ -3108,7 +3122,8 @@ mod tests {
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
             .expect("refresh database rows");
 
-        assert_eq!(saved, 1);
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
         let row = store
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")

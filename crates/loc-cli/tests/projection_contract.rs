@@ -78,7 +78,8 @@ fn virtual_projection_modes_share_browse_hydrate_write_contract() {
             "children:page-home",
         )
         .expect("refresh page children");
-        assert_eq!(refreshed, 1, "{projection:?}");
+        assert_eq!(refreshed.saved, 1, "{projection:?}");
+        assert!(refreshed.changed, "{projection:?}");
 
         let home_children = virtual_fs_children_with_content_root(
             &store,

@@ -103,11 +103,11 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
             .expect("check child refresh"),
         "opening a page directory with no known children should ask the source for metadata"
     );
-    assert_eq!(
+    let refreshed =
         refresh_virtual_fs_children(&mut store, &source, &fixture.mount_id, parent_container)
-            .expect("refresh child metadata"),
-        1
-    );
+            .expect("refresh child metadata");
+    assert_eq!(refreshed.saved, 1);
+    assert!(refreshed.changed);
     source.assert_listed_once(ChildContainer::PageChildren(RemoteId::new("page-1")));
 
     let page_children = virtual_fs_children_with_content_root(

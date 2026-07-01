@@ -617,11 +617,11 @@ mod tests {
             _state_root: PathBuf,
             mount_id: String,
             container_identifier: String,
-        ) -> LocalityResult<usize> {
+        ) -> LocalityResult<crate::virtual_fs::VirtualFsRefreshChildrenReport> {
             self.refresh_tx
                 .send((mount_id, container_identifier))
                 .expect("send refresh request");
-            Ok(0)
+            Ok(crate::virtual_fs::VirtualFsRefreshChildrenReport::default())
         }
     }
 

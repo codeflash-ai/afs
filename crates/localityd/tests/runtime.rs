@@ -30,7 +30,8 @@ use localityd::runtime::{
 };
 use localityd::scheduler::PullSchedulerTick;
 use localityd::virtual_fs::{
-    ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, virtual_fs_content_root,
+    ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, VirtualFsRefreshChildrenReport,
+    virtual_fs_content_root,
 };
 use localityd::watcher::{FileEvent, FileEventKind};
 use serde_json::json;
@@ -2425,7 +2426,7 @@ impl ScriptedSchedulerState {
         &self,
         state_root: PathBuf,
         container_identifier: &str,
-    ) -> LocalityResult<usize> {
+    ) -> LocalityResult<VirtualFsRefreshChildrenReport> {
         let entries = match container_identifier {
             "mount:notion-main" => vec![
                 EntityRecord::new(
@@ -2466,13 +2467,16 @@ impl ScriptedSchedulerState {
         &self,
         state_root: PathBuf,
         entries: Vec<EntityRecord>,
-    ) -> LocalityResult<usize> {
+    ) -> LocalityResult<VirtualFsRefreshChildrenReport> {
         let saved = entries.len();
         let mut store = SqliteStateStore::open(state_root).map_err(LocalityError::from)?;
         for entry in entries {
             store.save_entity(entry).map_err(LocalityError::from)?;
         }
-        Ok(saved)
+        Ok(VirtualFsRefreshChildrenReport {
+            saved,
+            changed: saved > 0,
+        })
     }
 }
 
@@ -2518,7 +2522,7 @@ impl RuntimeJobRunner for ScriptedSchedulerRunner {
         state_root: PathBuf,
         _mount_id: String,
         container_identifier: String,
-    ) -> LocalityResult<usize> {
+    ) -> LocalityResult<VirtualFsRefreshChildrenReport> {
         self.state.start_blocking(
             SchedulerOpKind::RefreshChildren,
             container_identifier.clone(),
@@ -2670,11 +2674,11 @@ impl RuntimeJobRunner for BlockingVirtualFsRunner {
         _state_root: PathBuf,
         mount_id: String,
         container_identifier: String,
-    ) -> locality_core::LocalityResult<usize> {
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
         self.refresh_tx
             .send((mount_id, container_identifier))
             .expect("notify refresh");
-        Ok(0)
+        Ok(VirtualFsRefreshChildrenReport::default())
     }
 }
 
@@ -2713,7 +2717,7 @@ impl RuntimeJobRunner for BlockingBackgroundRefreshRunner {
         _state_root: PathBuf,
         mount_id: String,
         container_identifier: String,
-    ) -> locality_core::LocalityResult<usize> {
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
         self.background_tx
             .send((mount_id, container_identifier))
             .expect("notify background refresh");
@@ -2722,7 +2726,7 @@ impl RuntimeJobRunner for BlockingBackgroundRefreshRunner {
         while !*released {
             released = condvar.wait(released).expect("wait release");
         }
-        Ok(0)
+        Ok(VirtualFsRefreshChildrenReport::default())
     }
 
     fn run_virtual_fs_children(
@@ -2976,11 +2980,11 @@ impl RuntimeJobRunner for RefreshRecordingRunner {
         _state_root: PathBuf,
         mount_id: String,
         container_identifier: String,
-    ) -> locality_core::LocalityResult<usize> {
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
         self.refresh_tx
             .send((mount_id, container_identifier))
             .expect("send refresh");
-        Ok(0)
+        Ok(VirtualFsRefreshChildrenReport::default())
     }
 }
 
@@ -3019,7 +3023,7 @@ impl RuntimeJobRunner for BreadthFirstRefreshRunner {
         state_root: PathBuf,
         mount_id: String,
         container_identifier: String,
-    ) -> locality_core::LocalityResult<usize> {
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
         self.refresh_tx
             .send((mount_id.clone(), container_identifier.clone()))
             .expect("send refresh");
@@ -3062,7 +3066,10 @@ impl RuntimeJobRunner for BreadthFirstRefreshRunner {
         for entry in entries {
             store.save_entity(entry).map_err(LocalityError::from)?;
         }
-        Ok(saved)
+        Ok(VirtualFsRefreshChildrenReport {
+            saved,
+            changed: saved > 0,
+        })
     }
 }
 
@@ -3491,11 +3498,11 @@ impl RuntimeJobRunner for DiscoveryHintRunner {
         _state_root: PathBuf,
         mount_id: String,
         container_identifier: String,
-    ) -> locality_core::LocalityResult<usize> {
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
         self.refresh_tx
             .send((mount_id, container_identifier))
             .expect("send child refresh");
-        Ok(0)
+        Ok(VirtualFsRefreshChildrenReport::default())
     }
 }
 

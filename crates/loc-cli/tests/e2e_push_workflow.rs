@@ -8959,11 +8959,11 @@ fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
     );
 
     let mount_point_root = fixture.virtual_root_identifier();
-    assert_eq!(
+    let refreshed =
         refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
-            .expect("refresh mount point root metadata"),
-        1
-    );
+            .expect("refresh mount point root metadata");
+    assert_eq!(refreshed.saved, 1);
+    assert!(refreshed.changed);
     let mount_point_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
@@ -8980,16 +8980,15 @@ fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
         "listing the mount point root must not hydrate the root page body"
     );
 
-    assert_eq!(
-        refresh_virtual_fs_children(
-            &mut store,
-            &connector,
-            &fixture.mount_id,
-            &scratch_folder.identifier,
-        )
-        .expect("refresh page children metadata"),
-        1
-    );
+    let refreshed = refresh_virtual_fs_children(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &scratch_folder.identifier,
+    )
+    .expect("refresh page children metadata");
+    assert_eq!(refreshed.saved, 1);
+    assert!(refreshed.changed);
     let nested_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
