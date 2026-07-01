@@ -35,7 +35,7 @@ Sources used for the baseline:
 | `heading_3` | Native Markdown | Yes | fixture, live | `###` heading. |
 | `heading_4` | Native Markdown | Yes | fixture, live | `####` heading. |
 | `bulleted_list_item` | Native Markdown | Yes | fixture, live | One Notion block per list item. |
-| `numbered_list_item` | Native Markdown | Yes | fixture, live | One Notion block per list item. |
+| `numbered_list_item` | Native Markdown | Yes | fixture, live | One Notion block per list item; consecutive items render as `1.`, `2.`, etc. |
 | `to_do` | Native Markdown checkbox | Yes | fixture, live | Checked state round-trips through `- [ ]` / `- [x]`. |
 | `quote` | Native Markdown quote | Yes | fixture, live | `>` quote. |
 | `callout` | Native Markdown callout | Yes | fixture, live read | `> [!NOTE]` callouts update and append as Notion callout blocks. |

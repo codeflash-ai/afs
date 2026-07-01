@@ -191,7 +191,7 @@ fn render_consecutive_list_blocks_as_tight_markdown_list() {
 
     assert_eq!(
         rendered.document.body,
-        "Intro.\n\n- First bullet\n- Second bullet\n- [ ] First task\n- [x] Done task\n1. First number\n1. Second number\n\nAfter.\n"
+        "Intro.\n\n- First bullet\n- Second bullet\n- [ ] First task\n- [x] Done task\n1. First number\n2. Second number\n\nAfter.\n"
     );
     assert_eq!(
         rendered
