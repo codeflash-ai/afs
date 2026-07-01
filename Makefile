@@ -146,6 +146,25 @@ test-rust: ## Run all Rust workspace tests.
 test-linux-fuse: ## Run the optional Linux FUSE smoke test when enabled by env vars.
 	tests/linux_fuse_smoke.sh
 
+.PHONY: test-simulation
+test-simulation: ## Run deterministic randomized sync simulation smoke tests.
+	$(CARGO) test -p locality-core --test simulation_harness
+	$(CARGO) test -p localityd --test simulation -- --test-threads=1
+
+.PHONY: test-simulation-nightly
+test-simulation-nightly: ## Run ignored heavy randomized sync simulation tests.
+	LOCALITY_SIMULATION_PROFILE=nightly $(CARGO) test -p localityd --test simulation -- --ignored --test-threads=1
+
+.PHONY: test-simulation-live-notion
+test-simulation-live-notion: ## Run live Notion reliability e2e against scratch content.
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_seeded_reliability_sequence_push_drift_conflict_converges_notion -- --ignored --exact --test-threads=1
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_multi_seed_reliability_sequences_converge_notion -- --ignored --exact --test-threads=1
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_stress_repeated_push_reopen_status_noop_converges_notion -- --ignored --exact --test-threads=1
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_stress_repeated_drift_conflict_recovery_converges_notion -- --ignored --exact --test-threads=1
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_validation_failure_blocks_before_journal_and_remote_write -- --ignored --exact --test-threads=1
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_sqlite_restart_preserves_reconciled_journal_and_clean_status -- --ignored --exact --test-threads=1
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_remote_fast_forward_updates_clean_file_and_preserves_pending_file -- --ignored --exact --test-threads=1
+
 .PHONY: test-linux-publish-config
 test-linux-publish-config: ## Validate Linux package publish configuration.
 	tests/linux_publish_config.sh

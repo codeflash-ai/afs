@@ -9169,6 +9169,607 @@ fn live_dirty_pull_conflict_can_be_resolved_and_pushed() {
     assert!(clean_status.clean, "{clean_status:#?}");
 }
 
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_seeded_reliability_sequence_push_drift_conflict_converges_notion() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let connector = NotionConnector::new(live_notion_config());
+
+    let push_base = "Live reliability sequence base body.";
+    let push_page = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live reliability push {}", unique_suffix()),
+        vec![paragraph_child(push_base)],
+    );
+    let (_push_fixture, mut push_store, push_page_path, push_original) =
+        pull_live_page(&connector, &push_page.id);
+    let pushed_marker = format!("Live reliability pushed {}", unique_suffix());
+    fs::write(
+        &push_page_path,
+        push_original.replace(push_base, &pushed_marker),
+    )
+    .expect("write live reliability push edit");
+    let push = run_push_with_daemon(
+        &mut push_store,
+        &connector,
+        &push_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live reliability edit");
+    assert!(push.ok, "{push:#?}");
+    assert_latest_live_journal_status(&push_store, JournalStatus::Reconciled);
+    let pushed_remote = render_live_page(&connector, &push_page.id, &push_page_path);
+    assert!(pushed_remote.contains(&pushed_marker), "{pushed_remote}");
+
+    let drift_local_marker = format!("Live reliability local drift {}", unique_suffix());
+    let drift_remote_marker = format!("Live reliability remote drift {}", unique_suffix());
+    let drift_local = fs::read_to_string(&push_page_path).expect("read pushed page");
+    fs::write(
+        &push_page_path,
+        format!("{drift_local}\n\n{drift_local_marker}\n"),
+    )
+    .expect("write live reliability drift edit");
+    append_remote_paragraph_and_wait(
+        &cleanup.api,
+        &push_page.id,
+        &drift_remote_marker,
+        "live reliability drift remote edit",
+    );
+    let drift_push = run_push_with_daemon(
+        &mut push_store,
+        &connector,
+        &push_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push drifted live reliability page");
+    assert!(!drift_push.ok, "{drift_push:#?}");
+    assert_eq!(drift_push.action, "apply_failed", "{drift_push:#?}");
+    assert_latest_live_journal_status(&push_store, JournalStatus::Reverted);
+    let drift_remote = render_live_page(&connector, &push_page.id, &push_page_path);
+    assert!(
+        drift_remote.contains(&drift_remote_marker),
+        "{drift_remote}"
+    );
+    assert!(
+        !drift_remote.contains(&drift_local_marker),
+        "blocked drift push must not overwrite remote content:\n{drift_remote}"
+    );
+
+    let conflict_base = "Live reliability conflict base.";
+    let conflict_page = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live reliability conflict {}", unique_suffix()),
+        vec![paragraph_child(conflict_base)],
+    );
+    let (_conflict_fixture, mut conflict_store, conflict_page_path, conflict_original) =
+        pull_live_page(&connector, &conflict_page.id);
+    let conflict_local_marker = format!("Live reliability local conflict {}", unique_suffix());
+    let conflict_remote_marker = format!("Live reliability remote conflict {}", unique_suffix());
+    let conflict_resolved_marker =
+        format!("Live reliability resolved conflict {}", unique_suffix());
+    fs::write(
+        &conflict_page_path,
+        conflict_original.replace(conflict_base, &conflict_local_marker),
+    )
+    .expect("write live reliability conflict edit");
+    let paragraph_id = first_live_child_block_id(&cleanup.api, &conflict_page.id);
+    update_remote_paragraph_and_wait(
+        &cleanup.api,
+        &conflict_page.id,
+        &paragraph_id,
+        &conflict_remote_marker,
+        "live reliability conflict remote edit",
+    );
+    let conflict_pull =
+        run_pull(&mut conflict_store, &connector, &conflict_page_path).expect("pull conflict");
+    assert!(!conflict_pull.ok, "{conflict_pull:#?}");
+    assert_eq!(conflict_pull.conflicts.len(), 1, "{conflict_pull:#?}");
+    let conflicted = fs::read_to_string(&conflict_page_path).expect("read conflict markers");
+    assert!(conflicted.contains(&conflict_local_marker), "{conflicted}");
+    assert!(conflicted.contains(&conflict_remote_marker), "{conflicted}");
+    assert!(has_unresolved_conflict_markers(&conflicted), "{conflicted}");
+
+    fs::write(
+        &conflict_page_path,
+        conflict_original.replace(conflict_base, &conflict_resolved_marker),
+    )
+    .expect("write live reliability resolved conflict");
+    let resolved_push = run_push_with_daemon(
+        &mut conflict_store,
+        &connector,
+        &conflict_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live reliability resolved conflict");
+    assert!(resolved_push.ok, "{resolved_push:#?}");
+    assert_latest_live_journal_status(&conflict_store, JournalStatus::Reconciled);
+    let resolved_remote = render_live_page(&connector, &conflict_page.id, &conflict_page_path);
+    assert!(
+        resolved_remote.contains(&conflict_resolved_marker),
+        "{resolved_remote}"
+    );
+    assert!(
+        !resolved_remote.contains(&conflict_local_marker),
+        "{resolved_remote}"
+    );
+    assert!(
+        !resolved_remote.contains(&conflict_remote_marker),
+        "{resolved_remote}"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_multi_seed_reliability_sequences_converge_notion() {
+    for seed_label in ["seed-a", "seed-b"] {
+        run_live_seeded_push_drift_conflict_sequence(seed_label);
+    }
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_stress_repeated_push_reopen_status_noop_converges_notion() {
+    run_live_repeated_push_reopen_stress(6);
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_stress_repeated_drift_conflict_recovery_converges_notion() {
+    run_live_repeated_conflict_recovery_stress(3);
+}
+
+fn run_live_seeded_push_drift_conflict_sequence(seed_label: &str) {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let connector = NotionConnector::new(live_notion_config());
+
+    let base = format!("Live multi-seed reliability base {seed_label}.");
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!(
+            "Locality live multi-seed reliability {seed_label} {}",
+            unique_suffix()
+        ),
+        vec![paragraph_child(&base)],
+    );
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+
+    let pushed_marker = format!("Live multi-seed pushed {seed_label} {}", unique_suffix());
+    fs::write(&page_path, original.replace(&base, &pushed_marker))
+        .expect("write multi-seed push edit");
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push multi-seed live edit");
+    assert!(push.ok, "{push:#?}");
+    assert_latest_live_journal_status(&store, JournalStatus::Reconciled);
+
+    let local_marker = format!(
+        "Live multi-seed local drift {seed_label} {}",
+        unique_suffix()
+    );
+    let remote_marker = format!(
+        "Live multi-seed remote drift {seed_label} {}",
+        unique_suffix()
+    );
+    let pushed_local = fs::read_to_string(&page_path).expect("read multi-seed pushed page");
+    fs::write(&page_path, format!("{pushed_local}\n\n{local_marker}\n"))
+        .expect("write multi-seed local drift");
+    append_remote_paragraph_and_wait(
+        &cleanup.api,
+        &scratch.id,
+        &remote_marker,
+        "multi-seed reliability remote drift",
+    );
+    let blocked_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push multi-seed drifted page");
+    assert!(!blocked_push.ok, "{blocked_push:#?}");
+    assert_eq!(blocked_push.action, "apply_failed", "{blocked_push:#?}");
+    assert_latest_live_journal_status(&store, JournalStatus::Reverted);
+
+    let pull = run_pull(&mut store, &connector, &page_path).expect("pull multi-seed conflict");
+    assert!(!pull.ok, "{pull:#?}");
+    assert_eq!(pull.conflicts.len(), 1, "{pull:#?}");
+    let conflicted = fs::read_to_string(&page_path).expect("read multi-seed conflict");
+    assert!(conflicted.contains(&local_marker), "{conflicted}");
+    assert!(conflicted.contains(&remote_marker), "{conflicted}");
+    assert!(has_unresolved_conflict_markers(&conflicted), "{conflicted}");
+
+    let resolved_marker = format!(
+        "Live multi-seed resolved conflict {seed_label} {}",
+        unique_suffix()
+    );
+    fs::write(&page_path, format!("{pushed_local}\n\n{resolved_marker}\n"))
+        .expect("write multi-seed resolved conflict");
+    let resolved_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push multi-seed resolved page");
+    assert!(resolved_push.ok, "{resolved_push:#?}");
+    assert_latest_live_journal_status(&store, JournalStatus::Reconciled);
+    let remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(remote.contains(&resolved_marker), "{remote}");
+    assert!(!remote.contains(&local_marker), "{remote}");
+    assert!(!remote.contains(&remote_marker), "{remote}");
+}
+
+fn run_live_repeated_push_reopen_stress(rounds: usize) {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let connector = NotionConnector::new(live_notion_config());
+    let base = format!("Live stress repeated push base {}.", unique_suffix());
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live stress repeated push {}", unique_suffix()),
+        vec![paragraph_child(&base)],
+    );
+    let fixture = E2eFixture::new();
+    let mut store =
+        SqliteStateStore::open(fixture.state_root.clone()).expect("open live stress store");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live stress page");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live stress page");
+    let page_path = fixture.page_file();
+    let mut expected_markers = Vec::new();
+
+    for round in 0..rounds {
+        let marker = format!("Live stress push round {round} {}", unique_suffix());
+        let current = fs::read_to_string(&page_path).expect("read live stress page");
+        fs::write(&page_path, format!("{current}\n\n{marker}\n"))
+            .expect("write live stress local edit");
+
+        let dirty_status = run_status(
+            &store,
+            StatusOptions {
+                path: Some(page_path.clone()),
+                ..StatusOptions::default()
+            },
+        )
+        .expect("dirty status before live stress push");
+        assert!(!dirty_status.clean, "{dirty_status:#?}");
+        assert_eq!(dirty_status.summary.dirty, 1, "{dirty_status:#?}");
+
+        let push = run_push_with_daemon(
+            &mut store,
+            &connector,
+            &page_path,
+            PushOptions {
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+        )
+        .expect("push live stress edit");
+        assert!(push.ok, "{push:#?}");
+        assert_eq!(push.action, "reconciled", "{push:#?}");
+        assert_latest_persisted_journal_status(&store, JournalStatus::Reconciled);
+        expected_markers.push(marker.clone());
+
+        drop(store);
+        store = SqliteStateStore::open(fixture.state_root.clone())
+            .expect("reopen live stress store after push");
+        assert_latest_persisted_journal_status(&store, JournalStatus::Reconciled);
+        let reopened_status = run_status(
+            &store,
+            StatusOptions {
+                path: Some(page_path.clone()),
+                ..StatusOptions::default()
+            },
+        )
+        .expect("clean status after live stress reopen");
+        assert!(reopened_status.clean, "{reopened_status:#?}");
+
+        let remote = render_live_page(&connector, &scratch.id, &page_path);
+        for expected in &expected_markers {
+            assert!(remote.contains(expected), "{remote}");
+        }
+
+        let noop_pull =
+            run_pull(&mut store, &connector, &page_path).expect("no-op pull after stress push");
+        assert!(noop_pull.ok, "{noop_pull:#?}");
+        let noop_status = run_status(
+            &store,
+            StatusOptions {
+                path: Some(page_path.clone()),
+                ..StatusOptions::default()
+            },
+        )
+        .expect("clean status after no-op live stress pull");
+        assert!(noop_status.clean, "{noop_status:#?}");
+    }
+
+    assert_journal_count_at_least(&store, rounds);
+}
+
+fn run_live_repeated_conflict_recovery_stress(rounds: usize) {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let connector = NotionConnector::new(live_notion_config());
+    let base = format!("Live stress conflict recovery base {}.", unique_suffix());
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live stress conflict recovery {}", unique_suffix()),
+        vec![paragraph_child(&base)],
+    );
+    let fixture = E2eFixture::new();
+    let mut store =
+        SqliteStateStore::open(fixture.state_root.clone()).expect("open live conflict store");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live conflict stress page");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live conflict stress page");
+    let page_path = fixture.page_file();
+    let mut resolved_markers = Vec::new();
+    let mut rejected_local_markers = Vec::new();
+    let mut rejected_remote_markers = Vec::new();
+
+    for round in 0..rounds {
+        let clean_local = fs::read_to_string(&page_path).expect("read clean conflict stress page");
+        let local_marker = format!(
+            "Live stress local conflict round {round} {}",
+            unique_suffix()
+        );
+        let remote_marker = format!(
+            "Live stress remote conflict round {round} {}",
+            unique_suffix()
+        );
+        fs::write(&page_path, format!("{clean_local}\n\n{local_marker}\n"))
+            .expect("write live conflict stress local edit");
+        append_remote_paragraph_and_wait(
+            &cleanup.api,
+            &scratch.id,
+            &remote_marker,
+            "live conflict stress remote drift",
+        );
+
+        let blocked_push = run_push_with_daemon(
+            &mut store,
+            &connector,
+            &page_path,
+            PushOptions {
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+        )
+        .expect("push drifted live conflict stress page");
+        assert!(!blocked_push.ok, "{blocked_push:#?}");
+        assert_eq!(blocked_push.action, "apply_failed", "{blocked_push:#?}");
+        assert_latest_persisted_journal_status(&store, JournalStatus::Reverted);
+        let drifted_remote = render_live_page(&connector, &scratch.id, &page_path);
+        assert!(drifted_remote.contains(&remote_marker), "{drifted_remote}");
+        assert!(
+            !drifted_remote.contains(&local_marker),
+            "blocked live stress push must not overwrite remote content:\n{drifted_remote}"
+        );
+
+        let pull = run_pull(&mut store, &connector, &page_path)
+            .expect("pull live conflict stress conflict");
+        assert!(!pull.ok, "{pull:#?}");
+        assert_eq!(pull.conflicts.len(), 1, "{pull:#?}");
+        let conflicted = fs::read_to_string(&page_path).expect("read live conflict stress markers");
+        assert!(conflicted.contains(&local_marker), "{conflicted}");
+        assert!(conflicted.contains(&remote_marker), "{conflicted}");
+        assert!(has_unresolved_conflict_markers(&conflicted), "{conflicted}");
+
+        let resolved_marker = format!(
+            "Live stress resolved conflict round {round} {}",
+            unique_suffix()
+        );
+        fs::write(&page_path, format!("{clean_local}\n\n{resolved_marker}\n"))
+            .expect("write live conflict stress resolution");
+        let resolved_push = run_push_with_daemon(
+            &mut store,
+            &connector,
+            &page_path,
+            PushOptions {
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+        )
+        .expect("push live conflict stress resolution");
+        assert!(resolved_push.ok, "{resolved_push:#?}");
+        assert_eq!(resolved_push.action, "reconciled", "{resolved_push:#?}");
+        assert_latest_persisted_journal_status(&store, JournalStatus::Reconciled);
+
+        resolved_markers.push(resolved_marker);
+        rejected_local_markers.push(local_marker);
+        rejected_remote_markers.push(remote_marker);
+        let remote = render_live_page(&connector, &scratch.id, &page_path);
+        for expected in &resolved_markers {
+            assert!(remote.contains(expected), "{remote}");
+        }
+        for rejected in rejected_local_markers
+            .iter()
+            .chain(rejected_remote_markers.iter())
+        {
+            assert!(!remote.contains(rejected), "{remote}");
+        }
+
+        drop(store);
+        store = SqliteStateStore::open(fixture.state_root.clone())
+            .expect("reopen live conflict stress store");
+        assert_latest_persisted_journal_status(&store, JournalStatus::Reconciled);
+        let clean_status = run_status(
+            &store,
+            StatusOptions {
+                path: Some(page_path.clone()),
+                ..StatusOptions::default()
+            },
+        )
+        .expect("clean status after live conflict stress resolution");
+        assert!(clean_status.clean, "{clean_status:#?}");
+    }
+
+    assert_journal_count_at_least(&store, rounds * 2);
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_validation_failure_blocks_before_journal_and_remote_write() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let connector = NotionConnector::new(live_notion_config());
+    let base = "Live validation guardrail base.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live validation guardrail {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let poisoned = replace_line_with_prefix(
+        original.clone(),
+        "  id:",
+        "  id: definitely-not-the-live-page",
+    );
+    assert_ne!(
+        poisoned, original,
+        "expected live frontmatter id replacement"
+    );
+    fs::write(&page_path, poisoned).expect("write invalid live frontmatter");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push invalid live frontmatter");
+
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.pipeline_action, "fix_validation", "{push:#?}");
+    assert!(push.push_id.is_none(), "{push:#?}");
+    assert!(push.journal_status.is_none(), "{push:#?}");
+    assert_no_live_journals_written(&store);
+    let remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(remote.contains(base), "{remote}");
+    assert!(
+        !remote.contains("definitely-not-the-live-page"),
+        "invalid local metadata must not be written remotely:\n{remote}"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_sqlite_restart_preserves_reconciled_journal_and_clean_status() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let connector = NotionConnector::new(live_notion_config());
+    let base = "Live restart journal base.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live restart journal {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+    let fixture = E2eFixture::new();
+    let mut store =
+        SqliteStateStore::open(fixture.state_root.clone()).expect("open live restart store");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(scratch.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live restart page");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live restart page");
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read live restart page");
+    let marker = format!("Live restart journal pushed {}", unique_suffix());
+    fs::write(&page_path, original.replace(base, &marker)).expect("write restart push edit");
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live restart page");
+    assert!(push.ok, "{push:#?}");
+    drop(store);
+
+    let reopened =
+        SqliteStateStore::open(fixture.state_root.clone()).expect("reopen live restart store");
+    assert_latest_persisted_journal_status(&reopened, JournalStatus::Reconciled);
+    let status = run_status(
+        &reopened,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after live restart");
+    assert!(status.clean, "{status:#?}");
+    let remote = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(remote.contains(&marker), "{remote}");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
@@ -12561,6 +13162,46 @@ fn assert_status_issue(
     assert!(
         entry.issues.iter().any(|issue| issue.code == code),
         "{context}: missing issue {code} for {path}: {entry:#?}"
+    );
+}
+
+fn assert_latest_live_journal_status(store: &InMemoryStateStore, expected: JournalStatus) {
+    assert_latest_persisted_journal_status(store, expected);
+}
+
+fn assert_latest_persisted_journal_status<S>(store: &S, expected: JournalStatus)
+where
+    S: JournalRepository,
+{
+    let journals = store
+        .list_journal()
+        .expect("list live reliability journals");
+    let latest = journals.last().unwrap_or_else(|| {
+        panic!("expected at least one live reliability journal, got {journals:#?}")
+    });
+    assert_eq!(latest.status, expected, "latest journal: {latest:#?}");
+}
+
+fn assert_journal_count_at_least<S>(store: &S, minimum: usize)
+where
+    S: JournalRepository,
+{
+    let journals = store
+        .list_journal()
+        .expect("list live stress reliability journals");
+    assert!(
+        journals.len() >= minimum,
+        "expected at least {minimum} journals, got {journals:#?}"
+    );
+}
+
+fn assert_no_live_journals_written(store: &InMemoryStateStore) {
+    let journals = store
+        .list_journal()
+        .expect("list live reliability journals");
+    assert!(
+        journals.is_empty(),
+        "expected validation to block before journal, got {journals:#?}"
     );
 }
 
