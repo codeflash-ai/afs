@@ -304,6 +304,12 @@ desktop-file-manager workflow where a draft page directory is created under one
 mounted Notion parent, moved to another mounted parent before push, and then
 created remotely under the final parent only.
 
+`live_page_directory_create_push_then_move_pushes_under_final_parent` is an
+ignored expected-behavior regression for the next workflow in the same family:
+the page is first pushed under the source parent, then moved under a different
+mounted parent before a second push. The test currently exposes that pushed
+page-directory moves across parents are blocked before remote apply.
+
 `live_validation_failure_blocks_before_journal_and_remote_write`,
 `live_sqlite_restart_preserves_reconciled_journal_and_clean_status`, and the
 existing `live_remote_fast_forward_updates_clean_file_and_preserves_pending_file`

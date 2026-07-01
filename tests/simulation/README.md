@@ -64,6 +64,11 @@ The live tests create scratch pages under the configured parent and cover:
 - remote fast-forward of clean virtual content while preserving pending local
   content.
 
+An additional ignored expected-behavior regression,
+`live_page_directory_create_push_then_move_pushes_under_final_parent`, captures
+the currently unsupported case where a page is pushed under one parent and then
+moved under another parent before a second push.
+
 Scratch content is archived during cleanup.
 
 ## Replaying Failures

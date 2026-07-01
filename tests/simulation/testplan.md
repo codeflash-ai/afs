@@ -74,6 +74,13 @@ Draft PR:
   - Moves the draft directory under another mounted parent before push.
   - Verifies the created remote Notion page is parented by the final target
     parent only, and local status is clean after reconcile.
+- `live_page_directory_create_push_then_move_pushes_under_final_parent`
+  - Ignored expected-behavior regression.
+  - Creates and pushes a page under one mounted parent, moves the reconciled
+    page directory under another parent, and expects the second push to reflect
+    the final parent remotely.
+  - Currently fails before remote apply with `create_entity_has_remote_id`,
+    showing pushed page-directory cross-parent moves are not implemented yet.
 - `live_validation_failure_blocks_before_journal_and_remote_write`
   - Corrupts Locality frontmatter.
   - Verifies validation stops before journal creation or remote mutation.
@@ -133,7 +140,10 @@ These are still worth adding for higher confidence:
   edited and pushed in mixed order;
 - live Notion remote deletion or archive racing against local dirty edits;
 - durable restart checks in the middle of a pending conflict, before resolution;
-- macOS File Provider equivalent of create-then-move page workflow;
+- support and green coverage for moving already-pushed page directories across
+  mounted parents;
+- macOS File Provider equivalent of create-then-move and post-push-move page
+  workflows;
 - daemon Live Mode e2e where the background loop observes the same
   create-then-move workflow without a manual `loc push`.
 
