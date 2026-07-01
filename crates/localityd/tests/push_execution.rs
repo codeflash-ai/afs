@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -17,6 +19,12 @@ use locality_core::planner::{PushOperation, PushOperationKind};
 use locality_core::push::PushExecutionAction;
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
+use locality_notion::client::NotionApi;
+use locality_notion::dto::{
+    BlockDto, BlockListDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
+    RichTextBlockDto, RichTextDto, TextRichTextDto,
+};
+use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, EntityRecord,
     EntityRepository, InMemoryStateStore, JournalRepository, MountConfig, MountRepository,
@@ -32,6 +40,7 @@ use localityd::scheduler::PullScheduler;
 use localityd::supervisor::DaemonSupervisor;
 use localityd::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 use localityd::watcher::FileWatcher;
+use serde_json::Value;
 
 #[test]
 fn daemon_push_job_reports_not_ready_for_noop_without_touching_journal() {
@@ -214,6 +223,61 @@ fn daemon_push_job_blocks_when_remote_tree_content_changed_before_apply() {
     let journal = supervisor.store().list_journal().expect("journal");
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].status, JournalStatus::Reverted);
+}
+
+#[test]
+fn daemon_push_job_rejects_second_state_push_after_first_state_wins_race() {
+    let first = PushFixture::new();
+    let second = PushFixture::new();
+    let mut first_store = first.store("Old body.");
+    let mut second_store = second.store("Old body.");
+    first_store
+        .save_shadow(
+            &first.mount_id,
+            notion_shadow("page-1", "Old body.", "2026-06-10T00:00:00Z"),
+        )
+        .expect("save first notion shadow");
+    second_store
+        .save_shadow(
+            &second.mount_id,
+            notion_shadow("page-1", "Old body.", "2026-06-10T00:00:00Z"),
+        )
+        .expect("save second notion shadow");
+    first.write_page("First client body.");
+    second.write_page("Second client body.");
+    let api = Arc::new(RacyNotionApi::new("Old body.", "2026-06-10T00:00:00Z"));
+    let second_api = api.clone();
+    let second_job = second.push_job(true);
+
+    let second_push = std::thread::spawn(move || {
+        let connector = NotionConnector::with_api(NotionConfig::default(), second_api);
+        execute_push_job_with_content_root(&mut second_store, second_job, &connector, None)
+    });
+    api.wait_until_second_state_preflight_read();
+
+    let first_connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let first_report = execute_push_job_with_content_root(
+        &mut first_store,
+        first.push_job(true),
+        &first_connector,
+        None,
+    )
+    .expect("first push");
+    assert_eq!(first_report.action, PushJobAction::Reconciled);
+    assert_eq!(api.remote_body(), "First client body.");
+
+    api.release_second_state_preflight_read();
+    let second_report = second_push
+        .join()
+        .expect("second push thread")
+        .expect("second push");
+
+    assert_eq!(second_report.action, PushJobAction::Failed);
+    assert_eq!(api.write_count(), 1);
+    assert_eq!(api.remote_body(), "First client body.");
+    let error = second_report.error.as_ref().expect("error");
+    assert_eq!(error.code, "guardrail");
+    assert!(error.message.contains("changed since last sync"));
 }
 
 #[test]
@@ -1168,6 +1232,252 @@ fn rendered_entity(remote_id: &str, plain_body: &str) -> HydratedEntity {
         remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
         assets: Vec::new(),
     }
+}
+
+#[derive(Debug)]
+struct RacyNotionApi {
+    remote: Mutex<RacyNotionRemote>,
+    writes: Mutex<Vec<String>>,
+    preflight_gate: PreflightGate,
+}
+
+#[derive(Debug)]
+struct RacyNotionRemote {
+    body: String,
+    version: String,
+}
+
+impl RacyNotionApi {
+    fn new(body: &str, version: &str) -> Self {
+        Self {
+            remote: Mutex::new(RacyNotionRemote {
+                body: body.to_string(),
+                version: version.to_string(),
+            }),
+            writes: Mutex::new(Vec::new()),
+            preflight_gate: PreflightGate::new(),
+        }
+    }
+
+    fn write_count(&self) -> usize {
+        self.writes.lock().expect("writes").len()
+    }
+
+    fn remote_body(&self) -> String {
+        self.remote.lock().expect("remote").body.clone()
+    }
+
+    fn wait_until_second_state_preflight_read(&self) {
+        self.preflight_gate.wait_until_blocked();
+    }
+
+    fn release_second_state_preflight_read(&self) {
+        self.preflight_gate.release();
+    }
+}
+
+#[derive(Debug)]
+struct PreflightGate {
+    state: Mutex<PreflightGateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+struct PreflightGateState {
+    should_block_next_children_read: bool,
+    blocked: bool,
+    released: bool,
+}
+
+impl PreflightGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PreflightGateState {
+                should_block_next_children_read: true,
+                blocked: false,
+                released: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn block_if_first_preflight_read(&self) {
+        let mut state = self.state.lock().expect("preflight gate");
+        if !state.should_block_next_children_read {
+            return;
+        }
+        state.should_block_next_children_read = false;
+        state.blocked = true;
+        self.changed.notify_all();
+        while !state.released {
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, Duration::from_secs(5))
+                .expect("preflight gate wait");
+            assert!(
+                !timeout.timed_out(),
+                "timed out waiting to release preflight gate"
+            );
+            state = next;
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let mut state = self.state.lock().expect("preflight gate");
+        while !state.blocked {
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, Duration::from_secs(5))
+                .expect("preflight gate wait");
+            assert!(
+                !timeout.timed_out(),
+                "timed out waiting for second state preflight"
+            );
+            state = next;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("preflight gate");
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+impl NotionApi for RacyNotionApi {
+    fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
+        if page_id != "page-1" {
+            return Err(LocalityError::InvalidState(format!(
+                "missing page {page_id}"
+            )));
+        }
+        let remote = self.remote.lock().expect("remote");
+        Ok(notion_page(&remote.version))
+    }
+
+    fn retrieve_block_children(
+        &self,
+        block_id: &str,
+        start_cursor: Option<&str>,
+    ) -> LocalityResult<BlockListDto> {
+        if block_id != "page-1" || start_cursor.is_some() {
+            return Ok(PaginatedListDto::default());
+        }
+        let remote = self.remote.lock().expect("remote");
+        let body = remote.body.clone();
+        let results = vec![
+            notion_heading_block("heading-1", "Roadmap"),
+            notion_paragraph_block("paragraph-1", &body),
+        ];
+        drop(remote);
+        self.preflight_gate.block_if_first_preflight_read();
+        Ok(PaginatedListDto {
+            results,
+            next_cursor: None,
+            has_more: false,
+        })
+    }
+
+    fn search_pages(&self, _start_cursor: Option<&str>) -> LocalityResult<PageListDto> {
+        let remote = self.remote.lock().expect("remote");
+        Ok(PaginatedListDto {
+            results: vec![notion_page(&remote.version)],
+            next_cursor: None,
+            has_more: false,
+        })
+    }
+
+    fn update_block(&self, block_id: &str, body: Value) -> LocalityResult<BlockDto> {
+        self.writes
+            .lock()
+            .expect("writes")
+            .push(block_id.to_string());
+        let text = body
+            .pointer("/paragraph/rich_text/0/text/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mut remote = self.remote.lock().expect("remote");
+        remote.body = text.clone();
+        remote.version = "2026-06-10T00:00:01Z".to_string();
+        Ok(notion_paragraph_block(block_id, &text))
+    }
+
+    fn append_block_children(&self, _block_id: &str, _body: Value) -> LocalityResult<BlockListDto> {
+        Err(LocalityError::InvalidState(
+            "unexpected append in racy Notion fixture".to_string(),
+        ))
+    }
+
+    fn delete_block(&self, _block_id: &str) -> LocalityResult<BlockDto> {
+        Err(LocalityError::InvalidState(
+            "unexpected delete in racy Notion fixture".to_string(),
+        ))
+    }
+}
+
+fn notion_shadow(remote_id: &str, body: &str, remote_edited_at: &str) -> ShadowDocument {
+    shadow(remote_id, body).with_frontmatter(format!(
+        "loc:\n  id: {remote_id}\n  type: page\n  synced_at: {remote_edited_at}\n  remote_edited_at: {remote_edited_at}\ntitle: Roadmap\n"
+    ))
+}
+
+fn notion_page(version: &str) -> PageDto {
+    PageDto {
+        id: "page-1".to_string(),
+        parent: None,
+        created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+        last_edited_time: Some(version.to_string()),
+        archived: false,
+        in_trash: false,
+        properties: BTreeMap::from([(
+            "Name".to_string(),
+            PagePropertyDto {
+                kind: "title".to_string(),
+                title: notion_rich_text("Roadmap"),
+                ..Default::default()
+            },
+        )]),
+    }
+}
+
+fn notion_heading_block(id: &str, text: &str) -> BlockDto {
+    let mut block = notion_block(id, "heading_1");
+    block.heading_1 = Some(notion_rich_text_block(text));
+    block
+}
+
+fn notion_paragraph_block(id: &str, text: &str) -> BlockDto {
+    let mut block = notion_block(id, "paragraph");
+    block.paragraph = Some(notion_rich_text_block(text));
+    block
+}
+
+fn notion_block(id: &str, kind: &str) -> BlockDto {
+    BlockDto {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        ..Default::default()
+    }
+}
+
+fn notion_rich_text_block(text: &str) -> RichTextBlockDto {
+    RichTextBlockDto {
+        rich_text: notion_rich_text(text),
+        color: None,
+    }
+}
+
+fn notion_rich_text(text: &str) -> Vec<RichTextDto> {
+    vec![RichTextDto {
+        kind: "text".to_string(),
+        text: Some(TextRichTextDto {
+            content: text.to_string(),
+            link: None,
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }]
 }
 
 fn shadow(remote_id: &str, body: &str) -> ShadowDocument {
