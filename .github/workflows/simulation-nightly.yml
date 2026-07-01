@@ -1,0 +1,28 @@
+name: simulation-nightly
+
+on:
+  schedule:
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulation-nightly
+  cancel-in-progress: false
+
+jobs:
+  reliability-simulation:
+    name: Randomized sync reliability simulation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LOCALITY_SIMULATION_PROFILE: nightly
+      LOCALITY_SIMULATION_SEEDS: "128"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run heavy simulation profile
+        run: cargo test -p localityd --test simulation -- --ignored --test-threads=1

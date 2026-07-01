@@ -23,6 +23,8 @@ pub mod planner;
 pub mod pull;
 pub mod push;
 pub mod shadow;
+#[doc(hidden)]
+pub mod simulation_harness;
 pub mod sync;
 pub mod undo;
 pub mod validation;

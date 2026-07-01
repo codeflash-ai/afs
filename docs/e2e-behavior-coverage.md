@@ -270,6 +270,54 @@ Coverage labels:
 | Google Docs connector | Local workflow plus guardrails | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs for workspace-folder enumeration, online-only stubs, explicit hydration, local Markdown document create, supported text edit push, journal/reconcile/status-clean behavior, and mounted Markdown guardrails for rendered inline objects, tables, invalid Locality frontmatter, and unsupported document-structure directives before journal/apply. Live Google Docs read/write and OAuth broker smoke remain open. |
 | Packaging/notarization | Manual/publish covered | `make publish` validates signing, stapling, and DMG integrity outside CI. |
 
+## Randomized Reliability Simulation
+
+`crates/locality-core/tests/simulation_harness.rs` and
+`crates/localityd/tests/simulation.rs` add seeded randomized local simulation
+coverage across local edits, remote edits, hydration/pull, validation blocking,
+journaled push execution, crash/retry points, and final convergence. The fast
+profile runs with `make test-simulation`; the heavy ignored profile runs from
+`.github/workflows/simulation-nightly.yml` and can be replayed locally with
+`LOCALITY_SIMULATION_SEEDS=128 make test-simulation-nightly`.
+
+`crates/loc-cli/tests/e2e_push_workflow.rs::live_seeded_reliability_sequence_push_drift_conflict_converges_notion`
+and `live_multi_seed_reliability_sequences_converge_notion` are the live Notion
+equivalents for the highest-risk randomized simulation invariants. They create
+disposable scratch pages, manipulate real Notion content, verify local push
+convergence, verify remote drift blocks overwrite before apply, materialize
+dirty-pull conflicts, resolve them, push the resolutions, and check journal
+terminal states.
+
+`live_stress_repeated_push_reopen_status_noop_converges_notion` and
+`live_stress_repeated_drift_conflict_recovery_converges_notion` extend those
+checks into repeated live stress loops. They reuse the real Notion connector,
+SQLite state, mounted Markdown, push/pull/status paths, durable state reopen,
+journal terminal-state assertions, remote rendering checks, and cleanup of
+scratch pages. The first loop verifies repeated local edits converge and remain
+clean across reopen and no-op pull. The second loop repeatedly forces remote
+drift against dirty local edits, verifies blocked pushes do not overwrite
+Notion, materializes conflicts, resolves them, pushes the resolution, and
+starts the next cycle from a clean durable state.
+
+`live_page_directory_create_then_move_pushes_under_final_parent` covers a
+desktop-file-manager workflow where a draft page directory is created under one
+mounted Notion parent, moved to another mounted parent before push, and then
+created remotely under the final parent only.
+
+`live_page_directory_create_push_then_move_pushes_under_final_parent` is an
+ignored expected-behavior regression for the next workflow in the same family:
+the page is first pushed under the source parent, then moved under a different
+mounted parent before a second push. The test currently exposes that pushed
+page-directory moves across parents are blocked before remote apply.
+
+`live_validation_failure_blocks_before_journal_and_remote_write`,
+`live_sqlite_restart_preserves_reconciled_journal_and_clean_status`, and the
+existing `live_remote_fast_forward_updates_clean_file_and_preserves_pending_file`
+cover validation-before-journal, durable restart/replay, and hydration
+fast-forward/pending-local protection against real Notion. These tests are
+included in the existing `notion-live-e2e` mounted workflow because they use the
+`live_` test prefix.
+
 ## Remaining Recommended Live E2E Additions
 
 Implemented in `crates/loc-cli/tests/e2e_push_workflow.rs`: live lazy virtual
