@@ -62,6 +62,7 @@ use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::media::{render_document_with_absolute_media_hrefs, replace_hydrated_media_manifest};
+use crate::projection_state;
 use crate::shadow_match::shadows_match;
 use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext, source_descriptor,
@@ -108,6 +109,11 @@ where
     if let Some(state_root) = state_root {
         file_provider::reconcile_visible_projection(store, state_root, Some(&job.target_path))?;
     }
+    projection_state::reconcile_projection_state_for_target(
+        store,
+        state_root,
+        Some(&job.target_path),
+    )?;
     repair_missing_database_schema_for_target(store, source, &job.target_path, state_root)?;
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     execute_prepared_push(store, source, prepared, state_root)
@@ -138,6 +144,11 @@ where
     if let Some(state_root) = state_root {
         file_provider::reconcile_visible_projection(store, state_root, Some(&job.target_path))?;
     }
+    projection_state::reconcile_projection_state_for_target(
+        store,
+        state_root,
+        Some(&job.target_path),
+    )?;
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     let relative_path = auto_save_relative_path(&prepared);
 
@@ -1289,30 +1300,38 @@ where
         .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
         .map_err(PushPrepareError::Store)?
     {
-        match pending.mutation_kind {
-            VirtualMutationKind::Create => {
-                return prepare_pending_create(
-                    store,
-                    job,
-                    state_root,
-                    absolute_path,
-                    mount,
-                    pending,
-                    validator,
-                );
+        if pending.mutation_kind != VirtualMutationKind::Create
+            || projection_state::redundant_pending_create_entity(
+                store, state_root, &mount, &pending,
+            )
+            .map_err(PushPrepareError::Core)?
+            .is_none()
+        {
+            match pending.mutation_kind {
+                VirtualMutationKind::Create => {
+                    return prepare_pending_create(
+                        store,
+                        job,
+                        state_root,
+                        absolute_path,
+                        mount,
+                        pending,
+                        validator,
+                    );
+                }
+                VirtualMutationKind::Delete => {
+                    return prepare_pending_scope(
+                        store,
+                        job,
+                        state_root,
+                        absolute_path,
+                        mount,
+                        relative_path,
+                        validator,
+                    );
+                }
+                VirtualMutationKind::Rename => {}
             }
-            VirtualMutationKind::Delete => {
-                return prepare_pending_scope(
-                    store,
-                    job,
-                    state_root,
-                    absolute_path,
-                    mount,
-                    relative_path,
-                    validator,
-                );
-            }
-            VirtualMutationKind::Rename => {}
         }
     }
     if absolute_path.is_dir()

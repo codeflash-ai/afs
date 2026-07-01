@@ -971,6 +971,59 @@ fn status_reports_pending_virtual_creates_and_deletes() {
 }
 
 #[test]
+fn status_suppresses_redundant_pending_create_when_identity_matches_tracked_entity() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:stale-create",
+            VirtualMutationKind::Create,
+            None,
+            "Roadmap.md",
+            "Roadmap",
+        ))
+        .expect("save redundant pending create");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.join("Roadmap.md")),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean, "{report:#?}");
+    assert_eq!(report.summary.total, 1, "{report:#?}");
+    assert_eq!(report.summary.pending_local_changes, 0, "{report:#?}");
+    assert_eq!(
+        report.mounts[0]
+            .entries
+            .iter()
+            .filter(|entry| entry.path == "Roadmap.md")
+            .count(),
+        1,
+        "{report:#?}"
+    );
+    assert!(
+        !report.mounts[0].entries.iter().any(|entry| entry
+            .issues
+            .iter()
+            .any(|issue| issue.code == "pending_virtual_create")),
+        "{report:#?}"
+    );
+}
+
+#[test]
 fn status_reports_remote_update_available_for_clean_file() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();

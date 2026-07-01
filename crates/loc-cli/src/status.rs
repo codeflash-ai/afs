@@ -24,6 +24,7 @@ use locality_store::{
     VirtualMutationRepository,
 };
 use localityd::file_provider as daemon_file_provider;
+use localityd::projection_state;
 use localityd::virtual_fs::{
     virtual_fs_content_path, virtual_fs_content_root, virtual_projection_root,
 };
@@ -326,6 +327,25 @@ where
     for scope in scopes {
         let facts = MountStatusFacts::load(store, &scope.mount.mount_id);
         let mutations = scoped_virtual_mutations(store, &scope)?;
+        let redundant_virtual_creates = mutations
+            .iter()
+            .filter(|mutation| {
+                projection_state::redundant_pending_create_entity(
+                    store,
+                    Some(&state_root),
+                    &scope.mount,
+                    mutation,
+                )
+                .ok()
+                .flatten()
+                .is_some()
+            })
+            .map(|mutation| mutation.local_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mutations = mutations
+            .into_iter()
+            .filter(|mutation| !redundant_virtual_creates.contains(&mutation.local_id))
+            .collect::<Vec<_>>();
         let hidden_by_virtual_mutation = mutations
             .iter()
             .filter(|mutation| {

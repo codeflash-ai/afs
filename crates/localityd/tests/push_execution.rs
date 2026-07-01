@@ -487,6 +487,91 @@ fn daemon_push_job_reads_explicit_pending_virtual_create_from_projected_path() {
 }
 
 #[test]
+fn daemon_push_reconciles_redundant_pending_create_before_planning_existing_page() {
+    let fixture = PushFixture::new();
+    let source_path = PathBuf::from("Roadmap/Draft/page.md");
+    let page_path = fixture.root.join(&source_path);
+    fs::create_dir_all(page_path.parent().expect("page parent")).expect("page parent");
+    let document = CanonicalDocument::new(
+        "loc:\n  id: page-2\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Draft\n",
+        markdown_body("New body."),
+    );
+    fs::write(&page_path, render_canonical_markdown(&document)).expect("write page");
+
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            fixture.remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap/page.md",
+        ))
+        .expect("save parent page");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-2"),
+                EntityKind::Page,
+                "Draft",
+                source_path.clone(),
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save tracked page");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-2", "Old body."))
+        .expect("save shadow");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:stale-create",
+            VirtualMutationKind::Create,
+            None,
+            Some(fixture.remote_id.clone()),
+            "Roadmap/Draft/page.md",
+            Some(page_path.clone()),
+        ))
+        .expect("save stale pending create");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: page_path,
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &FakePushSource::default(),
+        None,
+    )
+    .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    let plan = report.pipeline.plan.expect("plan");
+    assert!(matches!(
+        plan.operations.as_slice(),
+        [PushOperation::UpdateBlock { block_id, content }]
+            if block_id == &RemoteId::new("paragraph-1") && content == "New body."
+    ));
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "local:stale-create")
+            .expect("load stale mutation")
+            .is_none(),
+        "reconciliation should clear the redundant pending create"
+    );
+}
+
+#[test]
 fn auto_save_push_applies_pending_virtual_create_and_tracks_created_remote() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
