@@ -6929,6 +6929,7 @@ fn repair_macos_file_provider_mount_root(mount: &mut MountConfig) -> Result<(), 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn macos_file_provider_repaired_mount_root(mount: &MountConfig, provider_root: &Path) -> PathBuf {
     provider_root.join(mount_point_directory_name(mount))
 }
@@ -9960,6 +9961,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_file_provider_mount_root_repair_uses_visible_mount_point_name() {
         let mount = MountConfig::new(
