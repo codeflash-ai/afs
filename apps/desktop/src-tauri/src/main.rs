@@ -4205,8 +4205,37 @@ fn reset_platform_projection_state() {
                 ),
             );
         }
+        clear_macos_file_provider_cloud_storage_roots();
     }
     stop_windows_cloud_files_provider_supervisor();
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_file_provider_cloud_storage_roots() {
+    for root in macos_locality_cloud_storage_reset_roots() {
+        if !root.exists() {
+            continue;
+        }
+        if let Err(error) = remove_path_if_exists(&root) {
+            desktop_log(
+                "warn",
+                "reset.file_provider_root_remove_failed",
+                format!(
+                    "could not remove stale macOS File Provider root `{}` during local state reset: {error}",
+                    root.display()
+                ),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_locality_cloud_storage_reset_roots() -> Vec<PathBuf> {
+    let cloud_storage = macos_cloud_storage_dir();
+    dedupe_path_list(vec![
+        cloud_storage.join("Locality"),
+        cloud_storage.join("Locality-Locality"),
+    ])
 }
 
 fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
@@ -9978,6 +10007,15 @@ mod tests {
             ),
             PathBuf::from("/Users/test/Library/CloudStorage/Locality-Locality/notion")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_reset_targets_known_locality_roots() {
+        let roots = super::macos_locality_cloud_storage_reset_roots();
+
+        assert!(roots.iter().any(|root| root.ends_with("Locality")));
+        assert!(roots.iter().any(|root| root.ends_with("Locality-Locality")));
     }
 
     #[cfg(target_os = "linux")]
