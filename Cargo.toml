@@ -16,7 +16,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-license = "TBD"
+license = "Apache-2.0"
 repository = "TBD"
 rust-version = "1.96"
 
