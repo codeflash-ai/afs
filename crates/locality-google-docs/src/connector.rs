@@ -313,29 +313,7 @@ impl Connector for GoogleDocsConnector {
     }
 
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
-        for precondition in request.remote_preconditions {
-            let Some(expected) = &precondition.remote_edited_at else {
-                continue;
-            };
-            let current = self.remote_version(&precondition.remote_id)?;
-            if expected == current.as_str() {
-                continue;
-            }
-            if docs_revision_matches(expected, current.as_str())
-                && plan_changes_only_document_body(request.plan, &precondition.remote_id)
-            {
-                continue;
-            }
-            return Err(LocalityError::Conflict(
-                locality_core::conflict::ConflictSummary {
-                    remote_id: precondition.remote_id.clone(),
-                    path: PathBuf::from(precondition.remote_id.as_str()),
-                    remote_path: PathBuf::from(precondition.remote_id.as_str()),
-                    reason: locality_core::conflict::ConflictReason::RemoteMovedDuringPush,
-                },
-            ));
-        }
-        Ok(())
+        check_remote_preconditions(self.drive.as_ref(), self.docs.as_ref(), &request)
     }
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
@@ -413,16 +391,50 @@ impl GoogleDocsConnector {
             )
         })
     }
+}
 
-    fn remote_version(&self, remote_id: &RemoteId) -> LocalityResult<String> {
-        let file = self.drive.get_file(remote_id.as_str())?;
-        let revision = if file.is_google_doc() {
-            self.docs.get_document(remote_id.as_str())?.revision_id
-        } else {
-            None
+fn check_remote_preconditions(
+    drive: &dyn GoogleDriveApi,
+    docs: &dyn GoogleDocsApi,
+    request: &ApplyPlanRequest<'_>,
+) -> LocalityResult<()> {
+    for precondition in request.remote_preconditions {
+        let Some(expected) = &precondition.remote_edited_at else {
+            continue;
         };
-        Ok(combined_remote_version(&file, revision.as_deref()))
+        let current = remote_version_from_apis(drive, docs, &precondition.remote_id)?;
+        if expected == current.as_str() {
+            continue;
+        }
+        if docs_revision_matches(expected, current.as_str())
+            && plan_changes_only_document_body(request.plan, &precondition.remote_id)
+        {
+            continue;
+        }
+        return Err(LocalityError::Conflict(
+            locality_core::conflict::ConflictSummary {
+                remote_id: precondition.remote_id.clone(),
+                path: PathBuf::from(precondition.remote_id.as_str()),
+                remote_path: PathBuf::from(precondition.remote_id.as_str()),
+                reason: locality_core::conflict::ConflictReason::RemoteMovedDuringPush,
+            },
+        ));
     }
+    Ok(())
+}
+
+fn remote_version_from_apis(
+    drive: &dyn GoogleDriveApi,
+    docs: &dyn GoogleDocsApi,
+    remote_id: &RemoteId,
+) -> LocalityResult<String> {
+    let file = drive.get_file(remote_id.as_str())?;
+    let revision = if file.is_google_doc() {
+        docs.get_document(remote_id.as_str())?.revision_id
+    } else {
+        None
+    };
+    Ok(combined_remote_version(&file, revision.as_deref()))
 }
 
 fn enumerate_drive_tree(
@@ -522,6 +534,7 @@ fn apply_plan(
     docs: &dyn GoogleDocsApi,
     request: ApplyPlanRequest<'_>,
 ) -> LocalityResult<ApplyPlanResult> {
+    check_remote_preconditions(drive, docs, &request)?;
     let mut changed = BTreeSet::new();
     let mut effects = Vec::new();
     let mut append_offsets: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
@@ -3251,6 +3264,49 @@ mod tests {
                 local_root: None,
             })
             .expect("drive-only version drift should not block body push");
+    }
+
+    #[test]
+    fn apply_rejects_stale_docs_revision_precondition_without_writing() {
+        let drive = Arc::new(FakeDrive::default().with_file(doc_file(
+            "doc-1",
+            "Launch Brief",
+            "workspace",
+        )));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-2",
+            "Hello\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:7"),
+                content: "Second client body".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+        let preconditions = vec![RemotePrecondition {
+            remote_id: RemoteId::new("doc-1"),
+            remote_edited_at: Some("drive:7:2026-06-25T10:00:00.000Z|docs:rev-1".to_string()),
+        }];
+
+        let error = connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &preconditions,
+                local_root: None,
+            })
+            .expect_err("stale remote");
+
+        assert!(matches!(error, locality_core::LocalityError::Conflict(_)));
+        assert!(docs.last_batch.lock().unwrap().is_none());
     }
 
     #[test]
