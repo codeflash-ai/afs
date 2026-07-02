@@ -524,6 +524,52 @@ fn diff_database_directory_plans_pending_virtual_delete_under_scope() {
 }
 
 #[test]
+fn diff_ignores_stale_pending_virtual_delete_when_visible_file_identity_matches() {
+    let fixture = DiffFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save page");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
+        .expect("save shadow");
+    store
+        .save_virtual_mutation(virtual_delete_mutation(
+            &fixture.mount_id,
+            "delete:page-1",
+            "page-1",
+            "Roadmap/page.md",
+        ))
+        .expect("save virtual delete");
+    let path = fixture.write_page("Roadmap/page.md", "# Roadmap\n\nChanged paragraph.");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let plan = report.plan.expect("plan");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "confirm_plan");
+    assert_eq!(plan.summary.entities_archived, 0);
+    assert_eq!(plan.summary.blocks_updated, 1);
+    assert_eq!(plan.operations[0].operation_type(), "update_block");
+}
+
+#[test]
 fn diff_rejects_new_database_row_property_outside_schema() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();

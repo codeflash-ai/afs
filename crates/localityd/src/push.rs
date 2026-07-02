@@ -1319,6 +1319,8 @@ where
                         validator,
                     );
                 }
+                VirtualMutationKind::Delete
+                    if projection_state::stale_pending_delete_target_present(&mount, &pending) => {}
                 VirtualMutationKind::Delete => {
                     return prepare_pending_scope(
                         store,

@@ -42,6 +42,7 @@ pub struct ProjectionStateDiagnostic {
 pub enum ProjectionStateRepairKind {
     ClearRedundantPendingCreate,
     ClearOrphanPendingDelete,
+    ClearStalePendingDelete,
     ClearRedundantPendingRename,
 }
 
@@ -321,9 +322,10 @@ fn plan_lossless_repairs(
                 let Some(remote_id) = mutation.target_remote_id.as_ref() else {
                     continue;
                 };
-                if !facts.entities_by_id.contains_key(remote_id)
-                    && !plan.has_conflict_for_local_id(&mutation.local_id)
-                {
+                if plan.has_conflict_for_local_id(&mutation.local_id) {
+                    continue;
+                }
+                if !facts.entities_by_id.contains_key(remote_id) {
                     plan.push_repair(
                         ProjectionStateRepair {
                             mount_id: mount.mount_id.clone(),
@@ -337,6 +339,23 @@ fn plan_lossless_repairs(
                             message: "pending delete target is already absent from local state"
                                 .to_string(),
                             repair: Some(ProjectionStateRepairKind::ClearOrphanPendingDelete),
+                        },
+                    );
+                } else if stale_pending_delete_target_present(mount, mutation) {
+                    plan.push_repair(
+                        ProjectionStateRepair {
+                            mount_id: mount.mount_id.clone(),
+                            local_id: mutation.local_id.clone(),
+                        },
+                        ProjectionStateDiagnostic {
+                            code: "stale_pending_delete".to_string(),
+                            path: mutation.projected_path.clone(),
+                            local_id: Some(mutation.local_id.clone()),
+                            remote_id: Some(remote_id.0.clone()),
+                            message:
+                                "pending delete target is still present with matching identity"
+                                    .to_string(),
+                            repair: Some(ProjectionStateRepairKind::ClearStalePendingDelete),
                         },
                     );
                 }
@@ -668,6 +687,23 @@ fn pending_create_identity(
     }
 }
 
+pub(crate) fn stale_pending_delete_target_present(
+    mount: &MountConfig,
+    mutation: &VirtualMutationRecord,
+) -> bool {
+    let Some(remote_id) = mutation.target_remote_id.as_ref() else {
+        return false;
+    };
+    let path = mount.root.join(&mutation.projected_path);
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(parsed) = parse_canonical_markdown(&contents) else {
+        return false;
+    };
+    parsed.remote_id().is_some_and(|id| id == remote_id)
+}
+
 fn report_from_plan(plan: &ProjectionStatePlan, repaired: usize) -> ProjectionStateReconcileReport {
     ProjectionStateReconcileReport {
         checked: plan.checked,
@@ -827,6 +863,40 @@ mod tests {
         assert!(
             store
                 .get_virtual_mutation(&fixture.mount_id, "delete:missing-page")
+                .expect("load mutation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repair_clears_pending_delete_when_visible_file_identity_matches_tracked_entity() {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        fixture.entity(&mut store, "page-1", "Roadmap/page.md");
+        fixture.write_file(
+            "Roadmap/page.md",
+            canonical_markdown("page-1", "Roadmap", "Edited body."),
+        );
+        store
+            .save_virtual_mutation(fixture.pending_delete(
+                "delete:page-1",
+                "Roadmap/page.md",
+                "page-1",
+            ))
+            .expect("save mutation");
+
+        let report = reconcile_projection_state_for_target(
+            &mut store,
+            Some(&fixture.state_root),
+            Some(&fixture.root.join("Roadmap/page.md")),
+        )
+        .expect("reconcile state");
+
+        assert_eq!(report.repaired, 1, "{report:#?}");
+        assert_eq!(report.conflicts, 0, "{report:#?}");
+        assert!(
+            store
+                .get_virtual_mutation(&fixture.mount_id, "delete:page-1")
                 .expect("load mutation")
                 .is_none()
         );
