@@ -70,7 +70,7 @@ use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
-    select_push_targets,
+    run_push_with_state_root, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::search::{SearchError, SearchOptions, SearchReport, notion_id_from_url, run_search};
@@ -2980,6 +2980,10 @@ impl PushCommandError {
             locality_error_exit_code(&error),
         )
     }
+
+    fn from_diff(error: DiffError) -> Self {
+        Self::new(error.code(), error.message(), diff_error_exit_code(&error))
+    }
 }
 
 #[derive(Serialize)]
@@ -3025,6 +3029,14 @@ fn run_push_target_command(
     target_path: PathBuf,
     options: PushOptions,
 ) -> Result<PushReport, PushCommandError> {
+    let preview = run_push_with_state_root(store, &target_path, options.clone(), Some(state_root))
+        .map_err(PushCommandError::from_diff)?;
+    if preview.pipeline_action != "proceed_to_apply" {
+        return Ok(preview);
+    }
+
+    verify_daemon_push_plan_matches_cli_preview(state_root, &target_path, &preview)?;
+
     match run_daemon_report::<PushJobReport>(
         state_root,
         &DaemonRequest::Push {
@@ -3058,6 +3070,56 @@ fn run_push_target_command(
         .map_err(PushCommandError::from_connector)?;
     run_push_with_daemon_at_state_root(store, &connector, target_path, options, Some(state_root))
         .map_err(PushCommandError::from_loc)
+}
+
+fn verify_daemon_push_plan_matches_cli_preview(
+    state_root: &Path,
+    target_path: &Path,
+    cli_preview: &PushReport,
+) -> Result<(), PushCommandError> {
+    match run_daemon_report::<PushJobReport>(
+        state_root,
+        &DaemonRequest::Push {
+            path: target_path.to_path_buf(),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+    ) {
+        DaemonReport::Report(report) => {
+            let daemon_preview = PushReport::from_daemon(report);
+            if push_preview_plan_matches(cli_preview, &daemon_preview) {
+                Ok(())
+            } else {
+                Err(PushCommandError::new(
+                    "daemon_plan_mismatch",
+                    "daemon push plan differs from the CLI diff plan; restart localityd so push uses the same planner as diff",
+                    EXIT_INTERNAL,
+                ))
+            }
+        }
+        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => Err(PushCommandError::new(
+            "daemon_timeout",
+            format!(
+                "localityd did not respond within {}ms while verifying the push plan; refusing direct fallback to avoid racing daemon writes",
+                daemon_mutating_request_timeout().as_millis()
+            ),
+            EXIT_INTERNAL,
+        )),
+        DaemonReport::Unavailable(reason) => {
+            warn_daemon_fallback("push", reason);
+            Ok(())
+        }
+        DaemonReport::Error(error) => Err(PushCommandError {
+            payload: CommandError::new("push", error.code, error.message),
+            exit_code: error.exit_code,
+        }),
+    }
+}
+
+fn push_preview_plan_matches(cli_preview: &PushReport, daemon_preview: &PushReport) -> bool {
+    cli_preview.validation == daemon_preview.validation
+        && cli_preview.plan == daemon_preview.plan
+        && cli_preview.guardrail == daemon_preview.guardrail
 }
 
 fn should_prompt_for_push_confirmation(

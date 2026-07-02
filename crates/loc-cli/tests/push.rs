@@ -1,8 +1,13 @@
 use std::cell::Cell;
 use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use loc_cli::push::{
     PushOptions, push_report_exit_code, run_push, run_push_with_daemon,
@@ -21,15 +26,22 @@ use locality_core::journal::JournalApplyEffect;
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
+use locality_core::planner::{GuardrailDecision, PushOperation, PushPlan};
+use locality_core::push::{PushPipelineAction, PushPipelineResult, PushStage};
 use locality_core::shadow::ShadowDocument;
+use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
     MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
+use localityd::execution::PushJobReport;
 use localityd::hydration::{HydratedEntity, HydrationSource};
+use localityd::ipc::{DaemonRequest, DaemonResponse};
+use localityd::push::PushJobAction;
 use localityd::virtual_fs::{virtual_fs_content_path, virtual_projection_mount_point};
+use serde_json::Value;
 
 #[test]
 fn push_noop_succeeds_without_apply() {
@@ -646,6 +658,119 @@ fn push_directory_targets_only_pending_page_changes_under_scope() {
     assert!(outside_path.exists());
 }
 
+#[test]
+fn push_json_preview_uses_cli_diff_plan_when_running_daemon_has_stale_planner() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite");
+    seed_store(&mut store, &fixture, false);
+    let shadow_body = "# Roadmap\n\nIntro paragraph.\n\n```markdown\n---\n```\n\n# Focus\n\n---\n\nTail paragraph.";
+    let edited_body = "# Roadmap\n\nIntro paragraph.\n\ntemp\n\n```markdown\n---\n```\n\n# Focus\n\n---\n\nTail paragraph.";
+    store
+        .save_shadow(&fixture.mount_id, shadow_with_ids(shadow_body, 6))
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", edited_body);
+    let stale_report = stale_daemon_push_report(&path, &fixture.mount_id);
+    let (tcp_addr, daemon_requests) = start_fake_push_daemon(stale_report);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .env("LOCALITY_DAEMON_TCP_ADDR", tcp_addr)
+        .env_remove("LOCALITY_DAEMON_DISABLE")
+        .arg("push")
+        .arg(&path)
+        .arg("--json")
+        .output()
+        .expect("run loc push");
+    assert!(
+        !output.status.success(),
+        "confirmation-required preview should use a non-zero exit code"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse loc push JSON: {error}\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+
+    assert_eq!(value["via"], "cli");
+    assert_eq!(value["action"], "confirm_plan");
+    assert_eq!(value["plan"]["summary"]["blocks_created"], 1);
+    assert_eq!(value["plan"]["summary"]["blocks_replaced"], 0);
+    assert_eq!(value["plan"]["summary"]["blocks_archived"], 0);
+    assert_eq!(value["plan"]["operations"][0]["type"], "append_block");
+    assert_eq!(value["plan"]["operations"][0]["content"], "temp");
+    assert!(
+        daemon_requests
+            .recv_timeout(Duration::from_secs(2))
+            .is_err(),
+        "push preview should not ask the daemon to plan"
+    );
+}
+
+#[test]
+fn approved_push_refuses_stale_daemon_plan_before_apply() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite");
+    seed_store(&mut store, &fixture, false);
+    let shadow_body = "# Roadmap\n\nIntro paragraph.\n\n```markdown\n---\n```\n\n# Focus\n\n---\n\nTail paragraph.";
+    let edited_body = "# Roadmap\n\nIntro paragraph.\n\ntemp\n\n```markdown\n---\n```\n\n# Focus\n\n---\n\nTail paragraph.";
+    store
+        .save_shadow(&fixture.mount_id, shadow_with_ids(shadow_body, 6))
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", edited_body);
+    let stale_report = stale_daemon_push_report(&path, &fixture.mount_id);
+    let (tcp_addr, daemon_requests) = start_fake_push_daemon(stale_report);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .env("LOCALITY_DAEMON_TCP_ADDR", tcp_addr)
+        .env_remove("LOCALITY_DAEMON_DISABLE")
+        .arg("push")
+        .arg(&path)
+        .arg("-y")
+        .arg("--json")
+        .output()
+        .expect("run loc push");
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse loc push JSON: {error}\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+
+    assert_eq!(value["command"], "push");
+    assert_eq!(value["code"], "daemon_plan_mismatch");
+    assert!(
+        value["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("daemon push plan differs"))
+    );
+    let request = daemon_requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("approved push should ask daemon for a non-mutating preview");
+    match request {
+        DaemonRequest::Push {
+            assume_yes,
+            confirm_dangerous,
+            ..
+        } => {
+            assert!(!assume_yes, "daemon preview must not be approved");
+            assert!(
+                !confirm_dangerous,
+                "daemon preview must not confirm dangerous plans"
+            );
+        }
+        request => panic!("unexpected daemon request {request:?}"),
+    }
+}
+
 struct PushFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -898,6 +1023,97 @@ fn shadow_with_blocks(body: &str) -> ShadowDocument {
         ],
     )
     .expect("shadow")
+}
+
+fn shadow_with_ids(body: &str, count: usize) -> ShadowDocument {
+    let block_ids = (0..count)
+        .map(|index| RemoteId::new(format!("block-{index}")))
+        .collect::<Vec<_>>();
+    ShadowDocument::from_synced_body(RemoteId::new("page-1"), body, 9, block_ids).expect("shadow")
+}
+
+fn stale_daemon_push_report(path: &Path, mount_id: &MountId) -> PushJobReport {
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::ReplaceBlock {
+                block_id: RemoteId::new("block-1"),
+                content: "temp".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("block-1")),
+                content: "```markdown\n---\n```".to_string(),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("block-2"),
+            },
+        ],
+    );
+    PushJobReport {
+        target_path: path.to_path_buf(),
+        mount_id: mount_id.clone(),
+        entity_id: RemoteId::new("page-1"),
+        pipeline: PushPipelineResult {
+            validation: ValidationReport::clean(),
+            plan: Some(plan),
+            guardrail: GuardrailDecision::Proceed,
+            action: PushPipelineAction::ConfirmPlan,
+            completed_stages: vec![
+                PushStage::ParseAndValidate,
+                PushStage::Diff,
+                PushStage::PlanAndConfirm,
+            ],
+        },
+        action: PushJobAction::NotReady,
+        execution: None,
+        push_id: None,
+        journal_status: None,
+        error: None,
+    }
+}
+
+fn start_fake_push_daemon(report: PushJobReport) -> (String, mpsc::Receiver<DaemonRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    listener
+        .set_nonblocking(true)
+        .expect("fake daemon nonblocking");
+    let addr = listener.local_addr().expect("fake daemon addr").to_string();
+    let (requests_tx, requests_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("fake daemon blocking client stream");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .expect("fake daemon request read timeout");
+                    let mut line = String::new();
+                    let mut reader =
+                        BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                    reader.read_line(&mut line).expect("read daemon request");
+                    let request: DaemonRequest =
+                        serde_json::from_str(&line).expect("decode daemon request");
+                    let _ = requests_tx.send(request);
+                    let response = DaemonResponse::ok(report);
+                    localityd::ipc::write_response(&mut stream, &response)
+                        .expect("write daemon response");
+                    return;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake daemon accept failed: {error}"),
+            }
+        }
+    });
+    (addr, requests_rx)
 }
 
 fn large_shadow() -> ShadowDocument {
