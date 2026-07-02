@@ -77,7 +77,8 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
       return LocalityEnumerator(
         client: client,
         domainId: domain.identifier.rawValue,
-        includeMountRootChildren: true
+        includeMountRootChildren: true,
+        expireChangeAnchor: true
       )
     }
     if isSharedDomain && containerItemIdentifier == .rootContainer {
