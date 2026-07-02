@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::diff::{
     DiffError, GuardrailOutput, PreviewOptions, PushOperationOutput, PushPlanOutput,
-    ValidationIssueOutput, action_name, run_preview, unsupported_action_fields,
+    ValidationIssueOutput, action_name, run_preview_with_state_root, unsupported_action_fields,
 };
 use crate::status::{StatusError, StatusOptions, StatusState, run_status};
 
@@ -34,13 +34,26 @@ pub fn run_push<S>(
 where
     S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
-    let preview = run_preview(
+    run_push_with_state_root(store, target_path, options, None)
+}
+
+pub fn run_push_with_state_root<S>(
+    store: &S,
+    target_path: impl AsRef<Path>,
+    options: PushOptions,
+    state_root: Option<&Path>,
+) -> Result<PushReport, DiffError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+{
+    let preview = run_preview_with_state_root(
         store,
         target_path,
         PreviewOptions::new("push").with_approval(PushApproval {
             assume_yes: options.assume_yes,
             confirm_dangerous: options.confirm_dangerous,
         }),
+        state_root,
     )?;
 
     Ok(PushReport::from_preview(preview))
