@@ -726,7 +726,6 @@ async fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(|| {
         let state_root = default_state_root();
         ensure_virtual_projection_domains_for_state(&state_root)
-            .and_then(|_| repair_macos_file_provider_mount_roots(&state_root))
             .and_then(|_| ensure_daemon_running(&state_root))
             .and_then(|_| reload_daemon_mounts(&state_root))
             .and_then(|_| ensure_virtual_projection_runtimes_for_state(&state_root))
@@ -4205,37 +4204,8 @@ fn reset_platform_projection_state() {
                 ),
             );
         }
-        clear_macos_file_provider_cloud_storage_roots();
     }
     stop_windows_cloud_files_provider_supervisor();
-}
-
-#[cfg(target_os = "macos")]
-fn clear_macos_file_provider_cloud_storage_roots() {
-    for root in macos_locality_cloud_storage_reset_roots() {
-        if !root.exists() {
-            continue;
-        }
-        if let Err(error) = remove_path_if_exists(&root) {
-            desktop_log(
-                "warn",
-                "reset.file_provider_root_remove_failed",
-                format!(
-                    "could not remove stale macOS File Provider root `{}` during local state reset: {error}",
-                    root.display()
-                ),
-            );
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_locality_cloud_storage_reset_roots() -> Vec<PathBuf> {
-    let cloud_storage = macos_cloud_storage_dir();
-    dedupe_path_list(vec![
-        cloud_storage.join("Locality"),
-        cloud_storage.join("Locality-Locality"),
-    ])
 }
 
 fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
@@ -6892,77 +6862,6 @@ fn ensure_macos_file_provider_domain_available() -> Result<(), String> {
     Ok(())
 }
 
-fn repair_macos_file_provider_mount_roots(state_root: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut store = SqliteStateStore::open(state_root.to_path_buf())
-            .map_err(|error| format!("Could not open Locality state: {error}"))?;
-        let mounts = store
-            .load_mounts()
-            .map_err(|error| format!("Could not load mounts: {error}"))?;
-        for mut mount in mounts {
-            let original = mount.root.clone();
-            repair_macos_file_provider_mount_root(&mut mount)?;
-            if mount.root != original {
-                store.save_mount(mount).map_err(|error| {
-                    format!("Could not repair macOS File Provider mount root: {error}")
-                })?;
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state_root;
-    }
-
-    Ok(())
-}
-
-fn repair_macos_file_provider_mount_root(mount: &mut MountConfig) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        if mount.projection != ProjectionMode::MacosFileProvider {
-            return Ok(());
-        }
-        let provider_root =
-            macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
-                .map_err(|error| {
-                    format!(
-                        "Could not resolve macOS File Provider domain `{}`: {}",
-                        localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
-                        error.message()
-                    )
-                })?;
-        let repaired = macos_file_provider_repaired_mount_root(mount, &provider_root);
-        if mount.root != repaired {
-            desktop_log(
-                "info",
-                "file_provider.mount_root_repaired",
-                format!(
-                    "updated macOS File Provider mount `{}` root from `{}` to `{}`",
-                    mount.mount_id.0,
-                    mount.root.display(),
-                    repaired.display()
-                ),
-            );
-            mount.root = repaired;
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = mount;
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_file_provider_repaired_mount_root(mount: &MountConfig, provider_root: &Path) -> PathBuf {
-    provider_root.join(mount_point_directory_name(mount))
-}
-
 #[cfg(target_os = "windows")]
 #[derive(Default)]
 struct WindowsCloudFilesProviderSupervisor;
@@ -7542,7 +7441,6 @@ fn refresh_notion_mount_after_connect(
 
     mount.connection_id = Some(connection_id);
     ensure_virtual_projection_domain_available(&mount.projection)?;
-    repair_macos_file_provider_mount_root(&mut mount)?;
     store
         .save_mount(mount.clone())
         .map_err(|error| format!("Could not update Notion mount connection: {error}"))?;
@@ -9990,6 +9888,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_file_provider_mount_root_repair_uses_visible_mount_point_name() {
@@ -10018,6 +9917,8 @@ mod tests {
         assert!(roots.iter().any(|root| root.ends_with("Locality-Locality")));
     }
 
+=======
+>>>>>>> a0d678b (Avoid mutating macOS File Provider storage)
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_mount_summary_without_mount_reports_linux_fuse_projection() {
