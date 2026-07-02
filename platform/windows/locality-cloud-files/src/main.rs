@@ -1886,6 +1886,13 @@ fn handle_local_remove_like_path(
     if !path_is_under_sync_root(context, &path) || same_cloud_path(&path, &context.sync_root) {
         return Ok(());
     }
+    if cloud_path_still_exists_after_remove_settle(&path) {
+        trace_cloud_files(format!(
+            "local remove skipped path=`{}` reason=path_still_exists",
+            path.display()
+        ));
+        return Ok(());
+    }
     let Some(identifier) = identity_for_path(context, &path)? else {
         trace_cloud_files(format!(
             "local remove skipped path=`{}` reason=no_identity",
@@ -1912,6 +1919,12 @@ fn handle_local_remove_like_path(
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn cloud_path_still_exists_after_remove_settle(path: &Path) -> bool {
+    std::thread::sleep(LOCAL_DIRTY_SCAN_SETTLE);
+    std::fs::metadata(path).is_ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -2631,6 +2644,16 @@ unsafe fn handle_rename(
         identifier = refreshed;
     }
     if !target_in_scope {
+        if let Some(source_path) = source_path.as_deref()
+            && cloud_path_still_exists_after_remove_settle(source_path)
+        {
+            trace_cloud_files(format!(
+                "rename-out skipped path=`{}` reason=path_still_exists",
+                source_path.display()
+            ));
+            context.remember_path_identity(source_path, &identifier);
+            return Ok(());
+        }
         context.trash(&identifier)?;
         if let Some(source_path) = source_path.as_deref() {
             context.forget_path_identities(source_path);
@@ -2689,6 +2712,16 @@ unsafe fn handle_delete(
         && let Some(refreshed) = daemon_identity_for_path(context, path)?
     {
         identifier = refreshed;
+    }
+    if let Some(path) = path.as_deref()
+        && cloud_path_still_exists_after_remove_settle(path)
+    {
+        trace_cloud_files(format!(
+            "delete skipped path=`{}` reason=path_still_exists",
+            path.display()
+        ));
+        context.remember_path_identity(path, &identifier);
+        return Ok(());
     }
     match context.trash(&identifier) {
         Ok(_) => {
@@ -4367,6 +4400,40 @@ mod tests {
             identity_for_path(&context, page).expect("identity"),
             Some("local:123".to_string())
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_remove_event_for_existing_file_does_not_trash() {
+        let temp = std::env::temp_dir().join(format!(
+            "locality-cloud-files-remove-existing-{}",
+            std::process::id()
+        ));
+        let sync_root = temp.join("Locality").join("Notion");
+        let state_dir = temp.join("state");
+        let page = sync_root.join("Draft").join("page.md");
+        std::fs::create_dir_all(page.parent().expect("page parent")).expect("create page parent");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::write(&page, b"edited").expect("write page");
+        let context = ProviderContext {
+            legacy_mount_id: Some("notion-main".to_string()),
+            sync_root: sync_root.clone(),
+            projection_root: sync_root,
+            state_dir,
+            identity_index: Default::default(),
+            local_file_index: Default::default(),
+        };
+        context.remember_path_identity(&page, "page-1");
+
+        handle_local_remove_like_path(&context, &page)
+            .expect("existing file should be ignored, not trashed");
+
+        assert_eq!(
+            context.cached_path_identity(&page).as_deref(),
+            Some("page-1")
+        );
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[cfg(target_os = "windows")]
