@@ -32,6 +32,7 @@ private enum Command {
   case register(mountId: String, displayName: String)
   case open(mountId: String)
   case signal(mountId: String, identifier: String)
+  case reimport(mountId: String, identifier: String)
   case unregister(mountId: String)
   case list
   case reset
@@ -58,6 +59,11 @@ private enum Command {
       let identifier = value(args, "--identifier") ?? "root"
       try validateDomainIdentifier(mountId)
       return .signal(mountId: mountId, identifier: identifier)
+    case "reimport":
+      let mountId = try requiredValue(args, "--mount-id")
+      let identifier = value(args, "--identifier") ?? "root"
+      try validateDomainIdentifier(mountId)
+      return .reimport(mountId: mountId, identifier: identifier)
     case "unregister":
       let mountId = try requiredValue(args, "--mount-id")
       try validateDomainIdentifier(mountId)
@@ -168,6 +174,27 @@ private enum Command {
         domains: nil,
         url: nil,
         message: "signaled \(mountId):\(identifier)"
+      )
+    case .reimport(let mountId, let identifier):
+      guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
+        throw UsageError("File Provider domain \(mountId) is not registered")
+      }
+      guard let manager = NSFileProviderManager(for: domain) else {
+        throw UsageError("No File Provider manager is available for domain \(mountId)")
+      }
+      try waitForVoid { completion in
+        manager.reimportItems(
+          below: fileProviderItemIdentifier(identifier),
+          completionHandler: completion
+        )
+      }
+      return FileProviderCtlReport(
+        ok: true,
+        action: "reimport",
+        domain: DomainReport(domain),
+        domains: nil,
+        url: nil,
+        message: "reimported \(mountId):\(identifier)"
       )
     case .unregister(let mountId):
       let domain = NSFileProviderDomain(

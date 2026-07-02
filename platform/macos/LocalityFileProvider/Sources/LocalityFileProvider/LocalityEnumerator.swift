@@ -46,32 +46,8 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderEnumerationObserver,
         startingAt page: NSFileProviderPage
     ) {
-        guard let client else {
-            observer.didEnumerate([])
-            observer.finishEnumerating(upTo: nil)
-            return
-        }
-
         do {
-            let items: [LocalityFileProviderItem]
-            if let domainId {
-                let response = try client.domainChildren(domainId: domainId)
-                items = response.children.map { child in
-                    LocalityFileProviderItem(metadata: child.item.namespaced(for: child.mountId))
-                }
-            } else if let mountId, let containerIdentifier {
-                let response = try client.children(
-                    mountId: mountId,
-                    containerIdentifier: containerIdentifier
-                )
-                items = response.children.map { child in
-                    let metadata = namespaceMountId.map { child.namespaced(for: $0) } ?? child
-                    return LocalityFileProviderItem(metadata: metadata)
-                }
-            } else {
-                items = []
-            }
-            observer.didEnumerate(items)
+            observer.didEnumerate(try currentItems())
             observer.finishEnumerating(upTo: nil)
         } catch {
             observer.finishEnumeratingWithError(agentFSFileProviderError(error))
@@ -81,25 +57,48 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
     func currentSyncAnchor(
         completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void
     ) {
-        completionHandler(NSFileProviderSyncAnchor(Data()))
+        completionHandler(currentSyncAnchor())
     }
 
     func enumerateChanges(
         for observer: NSFileProviderChangeObserver,
         from syncAnchor: NSFileProviderSyncAnchor
     ) {
-        observer.finishEnumeratingWithError(syncAnchorExpiredError())
+        do {
+            observer.didUpdate(try currentItems())
+            observer.finishEnumeratingChanges(upTo: currentSyncAnchor(), moreComing: false)
+        } catch {
+            observer.finishEnumeratingWithError(agentFSFileProviderError(error))
+        }
     }
-}
 
-private func syncAnchorExpiredError() -> NSError {
-    NSError(
-        domain: NSFileProviderErrorDomain,
-        code: NSFileProviderError.syncAnchorExpired.rawValue,
-        userInfo: [
-            NSLocalizedDescriptionKey: "Locality refreshes this folder by re-enumerating it."
-        ]
-    )
+    private func currentItems() throws -> [LocalityFileProviderItem] {
+        guard let client else {
+            return []
+        }
+
+        if let domainId {
+            let response = try client.domainChildren(domainId: domainId)
+            return response.children.map { child in
+                LocalityFileProviderItem(metadata: child.item.namespaced(for: child.mountId))
+            }
+        }
+        if let mountId, let containerIdentifier {
+            let response = try client.children(
+                mountId: mountId,
+                containerIdentifier: containerIdentifier
+            )
+            return response.children.map { child in
+                let metadata = namespaceMountId.map { child.namespaced(for: $0) } ?? child
+                return LocalityFileProviderItem(metadata: metadata)
+            }
+        }
+        return []
+    }
+
+    private func currentSyncAnchor() -> NSFileProviderSyncAnchor {
+        NSFileProviderSyncAnchor(Data(Date().timeIntervalSince1970.description.utf8))
+    }
 }
 
 func agentFSFileProviderError(_ error: Error) -> NSError {

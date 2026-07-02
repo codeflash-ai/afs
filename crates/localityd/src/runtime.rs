@@ -2554,12 +2554,33 @@ fn signal_macos_file_provider_enumerator_impl(
     } else {
         shared_domain_item_identifier(mount_id, container_identifier)
     };
+    match run_macos_file_provider_helper_action(&helper, "reimport", &identifier) {
+        Ok(()) => return Ok(()),
+        Err(reimport_error) => {
+            if let Err(signal_error) =
+                run_macos_file_provider_helper_action(&helper, "signal", &identifier)
+            {
+                return Err(format!(
+                    "reimport failed: {reimport_error}; signal failed: {signal_error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_file_provider_helper_action(
+    helper: &Path,
+    action: &str,
+    identifier: &str,
+) -> Result<(), String> {
     let output = Command::new(&helper)
-        .arg("signal")
+        .arg(action)
         .arg("--mount-id")
         .arg(file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
         .arg("--identifier")
-        .arg(&identifier)
+        .arg(identifier)
         .arg("--json")
         .output()
         .map_err(|error| error.to_string())?;
