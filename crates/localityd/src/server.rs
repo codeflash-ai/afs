@@ -366,10 +366,7 @@ impl DaemonWatchManager {
 }
 
 fn should_watch_mount(mount: &MountConfig) -> bool {
-    matches!(
-        mount.projection,
-        ProjectionMode::PlainFiles | ProjectionMode::MacosFileProvider
-    )
+    matches!(mount.projection, ProjectionMode::PlainFiles)
 }
 
 #[cfg(unix)]
@@ -442,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_manager_reload_watches_plain_and_macos_mounts_only() {
+    fn watch_manager_reload_watches_plain_mounts_only() {
         let config = test_config("reload-skip-virtual");
         let runtime = DaemonRuntime::spawn(config.clone()).expect("spawn runtime");
         let mut manager =
@@ -474,15 +471,12 @@ mod tests {
 
         let report = manager.reload_mounts().expect("reload mounts");
 
-        assert_eq!(report.added, 2);
+        assert_eq!(report.added, 1);
         assert_eq!(report.removed, 0);
-        assert_eq!(report.watches.watched_mounts, 2);
+        assert_eq!(report.watches.watched_mounts, 1);
         assert_eq!(
             report.watches.watched_roots,
-            vec![
-                macos_root.display().to_string(),
-                plain_root.display().to_string()
-            ]
+            vec![plain_root.display().to_string()]
         );
         runtime.shutdown();
     }

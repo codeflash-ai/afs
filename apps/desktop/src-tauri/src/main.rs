@@ -725,7 +725,9 @@ async fn choose_mount_folder(
 async fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(|| {
         let state_root = default_state_root();
-        ensure_daemon_running(&state_root)
+        ensure_virtual_projection_domains_for_state(&state_root)
+            .and_then(|_| repair_macos_file_provider_mount_roots(&state_root))
+            .and_then(|_| ensure_daemon_running(&state_root))
             .and_then(|_| reload_daemon_mounts(&state_root))
             .and_then(|_| ensure_virtual_projection_runtimes_for_state(&state_root))
     })
@@ -5417,6 +5419,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     if mount_id.is_empty() {
         return Err("Mount id is required.".to_string());
     }
+    ensure_virtual_projection_domain_available(&projection)?;
     let root = resolve_desktop_mount_root(&request.path)?;
     validate_desktop_mount_root(&root, &state_root, &projection)?;
     let mut store = SqliteStateStore::open(state_root.clone())
@@ -6811,6 +6814,125 @@ fn ensure_virtual_projection_runtimes_for_state(state_root: &Path) -> Result<(),
     }
 }
 
+fn ensure_virtual_projection_domains_for_state(state_root: &Path) -> Result<(), String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    for mount in store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?
+    {
+        ensure_virtual_projection_domain_available(&mount.projection)?;
+    }
+    Ok(())
+}
+
+fn ensure_virtual_projection_domain_available(projection: &ProjectionMode) -> Result<(), String> {
+    match projection {
+        ProjectionMode::MacosFileProvider => ensure_macos_file_provider_domain_available(),
+        ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles
+        | ProjectionMode::WindowsCloudFiles => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_file_provider_domain_available() -> Result<(), String> {
+    register_macos_file_provider_domain(
+        localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+        localityd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
+    )
+    .map_err(|error| {
+        format!(
+            "Could not register macOS File Provider: {}",
+            error.message()
+        )
+    })?;
+    macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not open macOS File Provider domain `{}`: {}",
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                error.message()
+            )
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_macos_file_provider_domain_available() -> Result<(), String> {
+    Ok(())
+}
+
+fn repair_macos_file_provider_mount_roots(state_root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut store = SqliteStateStore::open(state_root.to_path_buf())
+            .map_err(|error| format!("Could not open Locality state: {error}"))?;
+        let mounts = store
+            .load_mounts()
+            .map_err(|error| format!("Could not load mounts: {error}"))?;
+        for mut mount in mounts {
+            let original = mount.root.clone();
+            repair_macos_file_provider_mount_root(&mut mount)?;
+            if mount.root != original {
+                store.save_mount(mount).map_err(|error| {
+                    format!("Could not repair macOS File Provider mount root: {error}")
+                })?;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state_root;
+    }
+
+    Ok(())
+}
+
+fn repair_macos_file_provider_mount_root(mount: &mut MountConfig) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.projection != ProjectionMode::MacosFileProvider {
+            return Ok(());
+        }
+        let provider_root =
+            macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+                .map_err(|error| {
+                    format!(
+                        "Could not resolve macOS File Provider domain `{}`: {}",
+                        localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                        error.message()
+                    )
+                })?;
+        let repaired = macos_file_provider_repaired_mount_root(mount, &provider_root);
+        if mount.root != repaired {
+            desktop_log(
+                "info",
+                "file_provider.mount_root_repaired",
+                format!(
+                    "updated macOS File Provider mount `{}` root from `{}` to `{}`",
+                    mount.mount_id.0,
+                    mount.root.display(),
+                    repaired.display()
+                ),
+            );
+            mount.root = repaired;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = mount;
+    }
+
+    Ok(())
+}
+
+fn macos_file_provider_repaired_mount_root(mount: &MountConfig, provider_root: &Path) -> PathBuf {
+    provider_root.join(mount_point_directory_name(mount))
+}
+
 #[cfg(target_os = "windows")]
 #[derive(Default)]
 struct WindowsCloudFilesProviderSupervisor;
@@ -7389,6 +7511,8 @@ fn refresh_notion_mount_after_connect(
     };
 
     mount.connection_id = Some(connection_id);
+    ensure_virtual_projection_domain_available(&mount.projection)?;
+    repair_macos_file_provider_mount_root(&mut mount)?;
     store
         .save_mount(mount.clone())
         .map_err(|error| format!("Could not update Notion mount connection: {error}"))?;
@@ -9833,6 +9957,24 @@ mod tests {
         assert_eq!(
             super::default_notion_access_root(),
             super::default_notion_mount_root()
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_mount_root_repair_uses_visible_mount_point_name() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/Users/test/Library/CloudStorage/Locality/notion",
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+
+        assert_eq!(
+            super::macos_file_provider_repaired_mount_root(
+                &mount,
+                Path::new("/Users/test/Library/CloudStorage/Locality-Locality")
+            ),
+            PathBuf::from("/Users/test/Library/CloudStorage/Locality-Locality/notion")
         );
     }
 
