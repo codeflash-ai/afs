@@ -69,10 +69,17 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
     for containerItemIdentifier: NSFileProviderItemIdentifier,
     request: NSFileProviderRequest
   ) throws -> NSFileProviderEnumerator {
-    if containerItemIdentifier == .workingSet || containerItemIdentifier == .trashContainer {
+    if containerItemIdentifier == .trashContainer {
       return LocalityEnumerator(empty: ())
     }
     let client = try daemonClient()
+    if containerItemIdentifier == .workingSet {
+      return LocalityEnumerator(
+        client: client,
+        domainId: domain.identifier.rawValue,
+        includeMountRootChildren: true
+      )
+    }
     if isSharedDomain && containerItemIdentifier == .rootContainer {
       return LocalityEnumerator(client: client, domainId: domain.identifier.rawValue)
     }

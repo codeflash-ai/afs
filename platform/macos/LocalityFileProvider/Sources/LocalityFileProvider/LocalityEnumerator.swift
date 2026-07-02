@@ -7,6 +7,7 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
     private let containerIdentifier: String?
     private let domainId: String?
     private let namespaceMountId: String?
+    private let includeMountRootChildren: Bool
 
     init(
         client: LocalityDaemonClient,
@@ -19,15 +20,17 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         self.containerIdentifier = containerIdentifier
         self.domainId = nil
         self.namespaceMountId = namespaceMountId
+        self.includeMountRootChildren = false
         super.init()
     }
 
-    init(client: LocalityDaemonClient, domainId: String) {
+    init(client: LocalityDaemonClient, domainId: String, includeMountRootChildren: Bool = false) {
         self.client = client
         self.mountId = nil
         self.containerIdentifier = nil
         self.domainId = domainId
         self.namespaceMountId = nil
+        self.includeMountRootChildren = includeMountRootChildren
         super.init()
     }
 
@@ -37,6 +40,7 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         self.containerIdentifier = nil
         self.domainId = nil
         self.namespaceMountId = nil
+        self.includeMountRootChildren = false
         super.init()
     }
 
@@ -79,9 +83,21 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
 
         if let domainId {
             let response = try client.domainChildren(domainId: domainId)
-            return response.children.map { child in
+            var items = response.children.map { child in
                 LocalityFileProviderItem(metadata: child.item.namespaced(for: child.mountId))
             }
+            if includeMountRootChildren {
+                for child in response.children {
+                    let children = try client.children(
+                        mountId: child.mountId,
+                        containerIdentifier: child.item.identifier
+                    )
+                    items.append(contentsOf: children.children.map { metadata in
+                        LocalityFileProviderItem(metadata: metadata.namespaced(for: child.mountId))
+                    })
+                }
+            }
+            return items
         }
         if let mountId, let containerIdentifier {
             let response = try client.children(

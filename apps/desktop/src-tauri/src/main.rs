@@ -7131,6 +7131,9 @@ fn signal_virtual_projection_refresh(mount: &MountConfig) {
 }
 
 fn virtual_projection_refresh_signal_identifiers(mount: &MountConfig) -> Vec<String> {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        return vec!["working-set".to_string()];
+    }
     vec![
         ROOT_CONTAINER_IDENTIFIER.to_string(),
         mount_point_identifier(mount),
@@ -7153,7 +7156,20 @@ fn signal_virtual_projection_container(
 
 #[cfg(target_os = "macos")]
 fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
-    let provider_identifier = macos_file_provider_item_identifier(mount_id, identifier);
+    let provider_identifier = if identifier == "working-set" {
+        "working-set".to_string()
+    } else {
+        macos_file_provider_item_identifier(mount_id, identifier)
+    };
+    if identifier == "working-set" {
+        return run_macos_file_provider_refresh_action("signal", &provider_identifier).map_err(
+            |signal_error| {
+                format!(
+                    "Could not refresh macOS File Provider working set: signal failed: {signal_error}"
+                )
+            },
+        );
+    }
     match run_macos_file_provider_refresh_action("reimport", &provider_identifier) {
         Ok(()) => Ok(()),
         Err(reimport_error) => {
@@ -10231,7 +10247,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_projection_refresh_signals_shared_and_mount_point_roots() {
+    fn virtual_projection_refresh_signals_macos_file_provider_working_set() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
@@ -10241,7 +10257,7 @@ mod tests {
 
         assert_eq!(
             virtual_projection_refresh_signal_identifiers(&mount),
-            vec!["root".to_string(), "mount:notion-main".to_string()]
+            vec!["working-set".to_string()]
         );
     }
 

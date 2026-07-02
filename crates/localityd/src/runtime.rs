@@ -16,7 +16,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locality_connector::{Connector, ObserveRequest};
 use locality_core::LocalityError;
 use locality_core::canonical::parse_canonical_markdown;
@@ -2549,24 +2548,8 @@ fn signal_macos_file_provider_enumerator_impl(
     let Some(helper) = macos_file_provider_helper_path() else {
         return Err("locality-file-providerctl was not found".to_string());
     };
-    let identifier = if container_identifier == ROOT_CONTAINER_IDENTIFIER {
-        ROOT_CONTAINER_IDENTIFIER.to_string()
-    } else {
-        shared_domain_item_identifier(mount_id, container_identifier)
-    };
-    match run_macos_file_provider_helper_action(&helper, "reimport", &identifier) {
-        Ok(()) => return Ok(()),
-        Err(reimport_error) => {
-            if let Err(signal_error) =
-                run_macos_file_provider_helper_action(&helper, "signal", &identifier)
-            {
-                return Err(format!(
-                    "reimport failed: {reimport_error}; signal failed: {signal_error}"
-                ));
-            }
-        }
-    }
-    Ok(())
+    let _ = (mount_id, container_identifier);
+    run_macos_file_provider_helper_action(&helper, "signal", "working-set")
 }
 
 #[cfg(target_os = "macos")]
@@ -2611,15 +2594,6 @@ fn signal_macos_file_provider_enumerator_impl(
     _container_identifier: &str,
 ) -> Result<(), String> {
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn shared_domain_item_identifier(mount_id: &str, daemon_identifier: &str) -> String {
-    format!(
-        "m:{}:{}",
-        URL_SAFE_NO_PAD.encode(mount_id),
-        URL_SAFE_NO_PAD.encode(daemon_identifier)
-    )
 }
 
 #[cfg(target_os = "macos")]

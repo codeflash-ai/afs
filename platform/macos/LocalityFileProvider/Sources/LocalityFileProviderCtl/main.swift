@@ -242,6 +242,9 @@ private func fileProviderItemIdentifier(_ identifier: String) -> NSFileProviderI
   if identifier == "root" {
     return .rootContainer
   }
+  if identifier == "working-set" {
+    return .workingSet
+  }
   return NSFileProviderItemIdentifier(identifier)
 }
 
