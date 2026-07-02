@@ -7126,23 +7126,36 @@ fn signal_virtual_projection_container(
 #[cfg(target_os = "macos")]
 fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
     let provider_identifier = macos_file_provider_item_identifier(mount_id, identifier);
+    match run_macos_file_provider_refresh_action("reimport", &provider_identifier) {
+        Ok(()) => Ok(()),
+        Err(reimport_error) => {
+            run_macos_file_provider_refresh_action("signal", &provider_identifier).map_err(
+                |signal_error| {
+                    format!(
+                        "Could not refresh macOS File Provider for `{identifier}`: reimport failed: {reimport_error}; signal failed: {signal_error}"
+                    )
+                },
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_file_provider_refresh_action(
+    action: &str,
+    provider_identifier: &str,
+) -> Result<(), String> {
     run_macos_file_provider_helper(
-        "signal",
+        action,
         vec![
             "--mount-id".to_string(),
             localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
             "--identifier".to_string(),
-            provider_identifier,
+            provider_identifier.to_string(),
         ],
     )
     .map(|_| ())
-    .map_err(|error| {
-        format!(
-            "Could not signal macOS File Provider refresh for `{}`: {}",
-            identifier,
-            error.message()
-        )
-    })
+    .map_err(|error| error.message().to_string())
 }
 
 #[cfg(target_os = "macos")]
